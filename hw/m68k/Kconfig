@@ -49,3 +49,13 @@ config M68K_VIRT
 
 config MC68EZ328
     bool
+    select M68K_IRQC
+    select DRAGONBALL_PLL
+    select DRAGONBALL_GPIO
+    select DRAGONBALL_INTC
+    select DRAGONBALL_UART
+    select DRAGONBALL_TIMER
+    select DRAGONBALL_SPI
+    select SSI_SD
+    select DRAGONBALL_LCDC
+    select DRAGONBALL_RTC
