@@ -101,3 +101,6 @@ config LOONGARCH_PCH_MSI
 
 config LOONGARCH_EXTIOI
     bool
+
+config DRAGONBALL_INTC
+    bool
