@@ -1,5 +1,5 @@
 /*
- * QEMU Motorla MC68EZ328 System Emulator
+ * QEMU Motorola MC68EZ328 System Emulator
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -85,7 +85,7 @@ static void mc68ez328_init(MachineState *machine)
     M68kCPU *cpu = NULL;
     DeviceState *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
                 *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev;
-    DeviceState *sd_dev;
+    DeviceState *ds1305_dev, *sd_dev;
     SSIBus *ssi_bus;
 
 //    DriveInfo *dinfo;
@@ -142,10 +142,17 @@ static void mc68ez328_init(MachineState *machine)
     qdev_connect_gpio_out_named(spi_dev, "sysbus-irq", 0,
                           qdev_get_gpio_in_named(intc_dev, "peripheral_interrupts", 0));
 
-    /* SD card connected to SPI */
     ssi_bus = (SSIBus *) qdev_get_child_bus(spi_dev, "ssi");
-    assert(ssi_bus);
-    sd_dev = ssi_create_peripheral(ssi_bus, "ssi-sd");
+
+    /* DS1305 connected to SPI */
+    ds1305_dev = ssi_create_peripheral(ssi_bus, "ds1305");
+    qdev_connect_gpio_out(gpio_dev, 9,
+                          qdev_get_gpio_in_named(ds1305_dev, SSI_GPIO_CS, 0));
+
+    /* SD card connected to SPI */
+    sd_dev = qdev_new("ssi-sd");
+    qdev_prop_set_uint8(sd_dev, "cs", 1);
+    ssi_realize_and_unref(sd_dev, ssi_bus, &error_fatal);
     qdev_connect_gpio_out(gpio_dev, 24,
                           qdev_get_gpio_in_named(sd_dev, SSI_GPIO_CS, 0));
 
