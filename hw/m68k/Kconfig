@@ -59,3 +59,4 @@ config MC68EZ328
     select SSI_SD
     select DRAGONBALL_LCDC
     select DRAGONBALL_RTC
+    select DS1305
