@@ -34,3 +34,7 @@ config RS5C372_RTC
 
 config DRAGONBALL_RTC
     bool
+
+config DS1305
+    bool
+    select SSI
