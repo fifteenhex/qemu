@@ -29,3 +29,7 @@ config LS7A_RTC
 
 config DRAGONBALL_RTC
     bool
+
+config DS1305
+    bool
+    select SSI
