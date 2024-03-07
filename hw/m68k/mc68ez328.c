@@ -87,6 +87,7 @@ static void mc68ez328_init(MachineState *machine)
                 *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev;
     DeviceState *ds1305_dev, *sd_dev;
     SSIBus *ssi_bus;
+    MemoryRegion *address_space_mem = get_system_memory();
 
 //    DriveInfo *dinfo;
 //    BlockBackend *blk;
@@ -166,6 +167,8 @@ static void mc68ez328_init(MachineState *machine)
 
     /* LCDC */
     lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
+    object_property_set_link(OBJECT(lcdc_dev), "framebuffer-memory",
+                             OBJECT(address_space_mem), &error_fatal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(lcdc_dev), 0, MC68EZ328_MMIO_LCDC);
 
