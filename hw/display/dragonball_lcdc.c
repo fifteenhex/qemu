@@ -27,7 +27,7 @@ static void draw_line1_32(void *opaque, uint8_t *d, const uint8_t *s,
                           int width, int deststep)
 {
     int i, j;
-    //assert(deststep == sizeof(uint32_t));
+    assert(deststep == sizeof(uint32_t));
 
 
     for (i = 0; i < width; i += 8) {
@@ -89,8 +89,12 @@ static void dragonball_lcdc_updatefb_params(DragonBallLCDCState *s)
 {
     unsigned int width = DRAGBONBALL_LCDC_WIDTH(s);
     unsigned int height = DRAGBONBALL_LCDC_HEIGHT(s);
+    DisplaySurface *surface;
 
-    qemu_console_resize(s->con, width, height);
+    surface = qemu_console_surface(s->con);
+    if (width != surface_width(surface) ||
+            height != surface_height(surface))
+        qemu_console_resize(s->con, width, height);
 }
 
 
@@ -143,8 +147,6 @@ static void dragonball_lcdc_write(void *opaque, hwaddr addr, uint64_t value,
             s->lymax = value;
             break;
     }
-
-    dragonball_lcdc_updatefb_params(s);
 }
 
 static const MemoryRegionOps dragonball_lcdc_ops = {
@@ -175,8 +177,6 @@ static void dragonball_lcdc_reset(DeviceState *dev)
     s->lfrcm = 0xb9;
     s->lgpmr = 0x84;
     s->pwmr = 0;
-
-    dragonball_lcdc_updatefb_params(s);
 }
 
 static void dragonball_update_display(void *opaque)
@@ -187,11 +187,15 @@ static void dragonball_update_display(void *opaque)
     unsigned int width = DRAGBONBALL_LCDC_WIDTH(s);
     unsigned int height = DRAGBONBALL_LCDC_HEIGHT(s);
     unsigned int linewidth = (dragonball_lcdc_bpp(s, &fn) * width) / 8;
+    unsigned int surfacebpp;
     int first = 0, last;
 
+    dragonball_lcdc_updatefb_params(s);
+
     surface = qemu_console_surface(s->con);
-    if (!surface_bits_per_pixel(surface))
+    if (!(surfacebpp = surface_bits_per_pixel(surface)))
         return;
+
 
     framebuffer_update_memory_section(&s->fbsection,
                                       s->fbmem,
@@ -205,7 +209,7 @@ static void dragonball_update_display(void *opaque)
                                height,
                                linewidth,
                                width * 4,
-                               0,
+                               surfacebpp / 8,
                                1,
                                fn,
                                NULL,
