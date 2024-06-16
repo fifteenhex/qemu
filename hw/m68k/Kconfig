@@ -46,3 +46,18 @@ config M68K_VIRT
     select GOLDFISH_TTY
     select GOLDFISH_RTC
     select VIRTIO_MMIO
+
+config MC68EZ328
+    bool
+    default y
+    select M68K_IRQC
+    select DRAGONBALL_PLL
+    select DRAGONBALL_GPIO
+    select DRAGONBALL_INTC
+    select DRAGONBALL_UART
+    select DRAGONBALL_TIMER
+    select DRAGONBALL_SPI
+    select SSI_SD
+    select DRAGONBALL_LCDC
+    select DRAGONBALL_RTC
+    select DS1305
