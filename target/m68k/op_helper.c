@@ -579,6 +579,15 @@ raise_exception_format2(CPUM68KState *env, int tt, int ilen, uintptr_t raddr)
     cpu_loop_exit(cs);
 }
 
+G_NORETURN void m68k_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+                                             MMUAccessType access_type,
+                                             int mmu_idx, uintptr_t retaddr)
+{
+    CPUM68KState *env = cpu_env(cs);
+
+    raise_exception(env, EXCP_ADDRESS);
+}
+
 void HELPER(divuw)(CPUM68KState *env, int destr, uint32_t den, int ilen)
 {
     uint32_t num = env->dregs[destr];
