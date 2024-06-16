@@ -49,6 +49,7 @@ config M68K_VIRT
 
 config MC68EZ328
     bool
+    default y
     select M68K_IRQC
     select DRAGONBALL_PLL
     select DRAGONBALL_GPIO
