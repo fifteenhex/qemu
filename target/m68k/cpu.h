@@ -185,9 +185,6 @@ struct M68kCPUClass {
 
 #ifndef CONFIG_USER_ONLY
 void m68k_cpu_do_interrupt(CPUState *cpu);
-G_NORETURN void m68k_cpu_do_unaligned_access(CPUState *cpu, vaddr addr,
-                                             MMUAccessType access_type,
-                                             int mmu_idx, uintptr_t retaddr);
 bool m68k_cpu_exec_interrupt(CPUState *cpu, int int_req);
 hwaddr m68k_cpu_get_phys_page_debug(CPUState *cpu, vaddr addr);
 #endif /* !CONFIG_USER_ONLY */

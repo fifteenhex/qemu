@@ -514,17 +514,6 @@ bool m68k_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     return false;
 }
 
-G_NORETURN void m68k_cpu_do_unaligned_access(CPUState *cpu, vaddr addr,
-                                             MMUAccessType access_type,
-                                             int mmu_idx, uintptr_t retaddr)
-{
-    CPUM68KState *env = cpu_env(cpu);
-
-    cpu->exception_index = EXCP_ADDRESS;
-    m68k_interrupt_all(env, 0);
-    cpu_loop_exit(cpu);
-}
-
 #endif /* !CONFIG_USER_ONLY */
 
 G_NORETURN static void
