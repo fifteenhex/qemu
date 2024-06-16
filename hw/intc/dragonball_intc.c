@@ -54,7 +54,8 @@ static void dragonball_intc_updateirqs(DragonBallINTCState *s)
         if (level == s->levelstates[i])
             continue;
 
-        //printf("%d:%d\n", vector, level);
+        //if (vector != 70)
+        //    printf("%d:%d\n", vector, level);
         m68k_set_irq_level(cpu, level, vector);
     }
 
