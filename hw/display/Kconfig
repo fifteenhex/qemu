@@ -140,3 +140,8 @@ config XLNX_DISPLAYPORT
 
 config DM163
     bool
+
+config DRAGONBALL_LCDC
+    bool
+    select FRAMEBUFFER
+
