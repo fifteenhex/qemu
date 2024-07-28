@@ -183,12 +183,18 @@ static void dragonball_update_display(void *opaque)
 {
     DragonBallLCDCState *s = opaque;
     DisplaySurface *surface;
-    drawfn fn;
+    drawfn fn = NULL;
     unsigned int width = DRAGBONBALL_LCDC_WIDTH(s);
     unsigned int height = DRAGBONBALL_LCDC_HEIGHT(s);
-    unsigned int linewidth = (dragonball_lcdc_bpp(s, &fn) * width) / 8;
+    unsigned int linewidth;
     unsigned int surfacebpp;
     int first = 0, last;
+    int ret;
+
+    ret = dragonball_lcdc_bpp(s, &fn);
+    if (ret < 0)
+	return;
+    linewidth = (ret * width) / 8;
 
     dragonball_lcdc_updatefb_params(s);
 
