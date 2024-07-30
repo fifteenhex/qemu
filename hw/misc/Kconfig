@@ -243,4 +243,10 @@ config XLNX_VERSAL_TRNG
 config DRAGONBALL_PLL
     bool
 
+config MVME147_PCC
+    bool
+
+config MVME147_VMECHIP
+    bool
+
 source macio/Kconfig
