@@ -65,3 +65,8 @@ config MVME147
     bool
     default y
     select M68K_IRQC
+    select MVME147_PCC
+    select MVME147_VMECHIP
+    select ESCC
+    select M48T59
+    select LANCE
