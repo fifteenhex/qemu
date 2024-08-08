@@ -1496,7 +1496,59 @@ DISAS_INSN(undef_mac)
 
 DISAS_INSN(undef_fpu)
 {
-    gen_exception(s, s->base.pc_next, EXCP_LINEF);
+    if (m68k_feature(s->env, M68K_FEATURE_M68030) && ((insn & ~0x003F) == 0xf000)) {
+    	uint16_t params = read_im16(env, s);
+    	uint16_t op = params & 0xe000;
+    	printf("missing fpu instruction? 0x%04x - 0x%04x\n",
+    			(unsigned) insn, (unsigned) params);
+    	if (op == 0x2000) {
+    		printf("PLOAD\n");
+    	}
+    	else {
+    	    uint16_t preg = (params >> 10) & 0x7;
+    	    TCGv addr;
+
+    		printf("PMOVE, reg %x\n", (unsigned) preg);
+    		addr = gen_lea(env, s, insn, OS_LONG);
+    		if (IS_NULL_QREG(addr)) {
+    		    gen_addr_fault(s);
+    		    return;
+    		}
+    		/* SRP, CRP, and TC Registers */
+    		if (op == 0x4000) {
+    			switch(preg) {
+    			case 0:
+    				printf("TC\n");
+    				break;
+    			case 2:
+    				printf("SRP\n");
+    				break;
+    			case 3:
+    				printf("CRP\n");
+    				break;
+    			}
+    		}
+    		else if (op == 0x6000) {
+    			switch(preg) {
+    			case 0:
+    				printf("MMUSR\n");
+    				break;
+    			}
+    		}
+    		else if (op == 0x0000) {
+    			switch(preg) {
+    			case 2:
+    				printf("TT0\n");
+    				break;
+    			case 3:
+    				printf("TT1\n");
+    				break;
+    			}
+    		}
+    	}
+    }
+    else
+        gen_exception(s, s->base.pc_next, EXCP_LINEF);
 }
 
 DISAS_INSN(undef)
