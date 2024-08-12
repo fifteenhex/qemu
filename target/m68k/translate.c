@@ -5457,7 +5457,7 @@ DISAS_INSN(frestore)
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
-    if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
+    if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
         SRC_EA(env, addr, OS_LONG, 0, NULL);
         /* FIXME: check the state frame */
     } else {
@@ -5474,7 +5474,7 @@ DISAS_INSN(fsave)
         return;
     }
 
-    if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
+    if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
         /* always write IDLE */
         TCGv idle = tcg_constant_i32(0x41000000);
         DEST_EA(env, insn, OS_LONG, idle, NULL);
