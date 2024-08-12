@@ -70,3 +70,4 @@ config MVME147
     select ESCC
     select M48T59
     select LANCE
+    select WD33C93

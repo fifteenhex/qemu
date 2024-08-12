@@ -30,6 +30,7 @@
 #include "hw/misc/mvme147_pcc.h"
 #include "hw/misc/mvme147_vmechip.h"
 #include "hw/net/lance.h"
+#include "hw/scsi/wd33c93.h"
 #include "hw/rtc/m48t59.h"
 #include "elf.h"
 #include "exec/memory.h"
@@ -51,6 +52,7 @@
 #define MVME147_LANCE        0xfffe1800
 #define MVME147_VMECHIP      0xfffe2000
 #define MVME147_SCC          0xfffe3000
+#define MVME147_SCSI         0xfffe4000
 
 void ledma_memory_read(void *opaque, hwaddr addr,
                        uint8_t *buf, int len, int do_bswap);
@@ -116,6 +118,7 @@ static void mvme147_init(MachineState *machine)
     DeviceState *lance_dev;
     DeviceState *vmechip_dev;
     DeviceState *serial_dev;
+    DeviceState *scsi_dev;
 
     if(!machine)
         printf("machine is null\n");
@@ -169,6 +172,11 @@ static void mvme147_init(MachineState *machine)
     qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, MVME147_SCC);
+
+    /* SCSI */
+    scsi_dev = qdev_new(TYPE_WD33C93);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(scsi_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(scsi_dev), 0, MVME147_SCSI);
 }
 
 #define MVME147_DEFAULT_SDRAM_SIZE (16 * MiB)
