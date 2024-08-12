@@ -5451,6 +5451,8 @@ DISAS_INSN(frestore)
 {
     TCGv addr;
 
+    printf("%s:%d\n", __func__, __LINE__);
+
     if (IS_USER(s)) {
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
@@ -5465,6 +5467,8 @@ DISAS_INSN(frestore)
 
 DISAS_INSN(fsave)
 {
+    printf("%s:%d\n", __func__, __LINE__);
+
     if (IS_USER(s)) {
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
