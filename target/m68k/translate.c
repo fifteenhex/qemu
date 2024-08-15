@@ -5026,12 +5026,15 @@ DISAS_INSN(fpu)
     int opsize;
     TCGv_ptr cpu_src, cpu_dest;
 
+    printf("%s %d 0x%08x\n", __func__, __LINE__, (unsigned) s->pc);
+
     ext = read_im16(env, s);
     s->ext = ext;
 
     opmode = ext & 0x7f;
     switch ((ext >> 13) & 7) {
     case 0:
+    	 printf("%s %d\n", __func__, __LINE__);
         break;
     case 1:
         goto undef;
