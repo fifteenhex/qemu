@@ -108,6 +108,7 @@ typedef struct CPUArchState {
     FPReg fp_result;
     uint32_t fpcr;
     uint32_t fpsr;
+    uint32_t fpiar;
     float_status fp_status;
 
     uint64_t mactmp;
@@ -202,6 +203,8 @@ void cpu_m68k_restore_fp_status(CPUM68KState *env);
 void cpu_m68k_set_fpcr(CPUM68KState *env, uint32_t val);
 uint32_t cpu_m68k_get_fpsr(CPUM68KState *env);
 void cpu_m68k_set_fpsr(CPUM68KState *env, uint32_t val);
+uint32_t cpu_m68k_get_fpiar(CPUM68KState *env);
+void cpu_m68k_set_fpiar(CPUM68KState *env, uint32_t val);
 
 /*
  * Instead of computing the condition codes after each m68k instruction,

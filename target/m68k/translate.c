@@ -4812,7 +4812,7 @@ static void gen_load_fcr(DisasContext *s, TCGv res, int reg)
 {
     switch (reg) {
     case M68K_FPIAR:
-        tcg_gen_movi_i32(res, 0);
+        gen_helper_get_fpiar(res, tcg_env);
         break;
     case M68K_FPSR:
         gen_helper_get_fpsr(res, tcg_env);
@@ -4827,6 +4827,7 @@ static void gen_store_fcr(DisasContext *s, TCGv val, int reg)
 {
     switch (reg) {
     case M68K_FPIAR:
+        gen_helper_set_fpiar(tcg_env, val);
         break;
     case M68K_FPSR:
         gen_helper_set_fpsr(tcg_env, val);
@@ -6281,6 +6282,7 @@ void m68k_cpu_dump_state(CPUState *cs, FILE *f, int flags)
         break;
     }
     qemu_fprintf(f, "\n");
+    qemu_fprintf(f, "FPIAR =     %04x\n", env->fpiar);
 #ifndef CONFIG_USER_ONLY
     qemu_fprintf(f, "%sA7(MSP) = %08x %sA7(USP) = %08x %sA7(ISP) = %08x\n",
                  env->current_sp == M68K_SSP ? "->" : "  ", env->sp[M68K_SSP],

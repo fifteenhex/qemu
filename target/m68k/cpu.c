@@ -110,6 +110,7 @@ static void m68k_cpu_reset_hold(Object *obj, ResetType type)
      */
     set_float_2nan_prop_rule(float_2nan_prop_ab, &env->fp_status);
     env->fpsr = 0;
+    env->fpiar = 0;
 
     /* TODO: We should set PC from the interrupt vector.  */
     env->pc = 0;

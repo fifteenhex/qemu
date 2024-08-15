@@ -236,6 +236,28 @@ void HELPER(set_fpsr)(CPUM68KState *env, uint32_t val)
     cpu_m68k_set_fpsr(env, val);
 }
 
+uint32_t cpu_m68k_get_fpiar(CPUM68KState *env)
+{
+	printf("get fpiar 0x%08x\n", env->fpiar);
+    return env->fpiar;
+}
+
+uint32_t HELPER(get_fpiar)(CPUM68KState *env)
+{
+	return cpu_m68k_get_fpiar(env);
+}
+
+void cpu_m68k_set_fpiar(CPUM68KState *env, uint32_t val)
+{
+    env->fpiar = val;
+    printf("set fpiar 0x%08x\n", env->fpiar);
+}
+
+void HELPER(set_fpiar)(CPUM68KState *env, uint32_t val)
+{
+    cpu_m68k_set_fpiar(env, val);
+}
+
 #define PREC_BEGIN(prec)                                        \
     do {                                                        \
         FloatX80RoundPrec old =                                 \
