@@ -5085,6 +5085,7 @@ DISAS_INSN(fpu)
     cpu_dest = gen_fp_ptr(REG(ext, 7));
     switch (opmode) {
     case 0: /* fmove */
+    	printf("%s:%d\n", __func__, __LINE__);
         gen_fp_move(cpu_dest, cpu_src);
         break;
     case 0x40: /* fsmove */
@@ -5253,6 +5254,7 @@ DISAS_INSN(fpu)
     default:
         goto undef;
     }
+    printf("%s:%d\n", __func__, __LINE__);
     gen_helper_ftst(tcg_env, cpu_dest);
     return;
 undef:

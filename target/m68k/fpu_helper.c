@@ -545,7 +545,8 @@ static int cpu_ld_floatx80_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
 static int cpu_st_floatx80_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
                                uintptr_t ra)
 {
-    cpu_stl_data_ra(env, addr, fp->l.upper << 16, ra);
+    printf("%s:%d\n", __func__, __LINE__);
+	cpu_stl_data_ra(env, addr, fp->l.upper << 16, ra);
     cpu_stq_data_ra(env, addr + 4, fp->l.lower, ra);
 
     return 12;
