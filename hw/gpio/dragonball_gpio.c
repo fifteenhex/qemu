@@ -168,7 +168,7 @@ static void dragonball_gpio_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, dragonball_gpio_properties);
     dc->vmsd = &vmstate_sifive_gpio;
     dc->realize = dragonball_gpio_realize;
-    dc->reset = dragonball_gpio_reset;
+    dc->legacy_reset = dragonball_gpio_reset;
 }
 
 static const TypeInfo dragonball_gpio_info = {
