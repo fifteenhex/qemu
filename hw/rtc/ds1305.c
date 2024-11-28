@@ -111,7 +111,7 @@ static void ds1305_class_init(ObjectClass *klass, void *data)
     k->realize = ds1305_realize;
     k->cs_polarity = SSI_CS_HIGH;
     k->set_cs = ds1305_set_cs;
-    dc->reset = ds1305_reset;
+    dc->legacy_reset = ds1305_reset;
     dc->vmsd = &vmstate_ds1305;
 }
 
