@@ -265,7 +265,7 @@ static void dragonball_lcdc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = dragonball_lcdc_reset;
+    dc->legacy_reset = dragonball_lcdc_reset;
     device_class_set_props(dc, dragonball_lcdc_properties);
     dc->realize = dragonball_lcdc_realize;
     dc->vmsd = &vmstate_dragonball_lcdc;
