@@ -164,7 +164,7 @@ static void dragonball_intc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = dragonball_intc_reset;
+    dc->legacy_reset = dragonball_intc_reset;
     device_class_set_props(dc, dragonball_intc_properties);
     dc->realize = dragonball_intc_realize;
     dc->vmsd = &vmstate_dragonball_intc;
