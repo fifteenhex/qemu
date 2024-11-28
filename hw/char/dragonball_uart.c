@@ -260,7 +260,7 @@ static void dragonball_uart_class_init(ObjectClass *klass, void *data)
 
     dc->realize = dragonball_uart_realize;
     dc->vmsd = &vmstate_dragonball_uart;
-    dc->reset = dragonball_uart_reset;
+    dc->legacy_reset = dragonball_uart_reset;
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
     dc->desc = "DragonBall UART";
     device_class_set_props(dc, dragonball_uart_properties);
