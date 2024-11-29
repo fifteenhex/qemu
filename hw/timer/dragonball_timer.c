@@ -71,7 +71,7 @@ static void dragonball_timer_update(DragonBallTimerState *t)
     ptimer_set_limit(t->timer, t->tcmp, 1);
 
     /* Start or stop the timer */
-    if (dragonball_timer_running(t))
+    if (dragonball_timer_running(t) && t->tcmp)
         ptimer_run(t->timer, 0);
     else
         ptimer_stop(t->timer);
