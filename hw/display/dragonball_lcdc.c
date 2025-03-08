@@ -255,10 +255,9 @@ static const VMStateDescription vmstate_dragonball_lcdc = {
         }
 };
 
-static Property dragonball_lcdc_properties[] = {
+static const Property dragonball_lcdc_properties[] = {
     DEFINE_PROP_LINK("framebuffer-memory", DragonBallLCDCState, fbmem,
                      TYPE_MEMORY_REGION, MemoryRegion *),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void dragonball_lcdc_class_init(ObjectClass *klass, void *data)
