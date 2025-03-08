@@ -234,9 +234,9 @@ static const VMStateDescription vmstate_mvme147_pcc = {
         }
 };
 
-static Property mvme147_pcc_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static Property mvme147_pcc_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void mvme147_pcc_timer_overflow(MVME147PCCState *s, unsigned int which)
 {
@@ -278,7 +278,7 @@ static void mvme147_pcc_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = mvme147_pcc_reset;
-    device_class_set_props(dc, mvme147_pcc_properties);
+//    device_class_set_props(dc, mvme147_pcc_properties);
     dc->realize = mvme147_pcc_realize;
     dc->vmsd = &vmstate_mvme147_pcc;
 }
