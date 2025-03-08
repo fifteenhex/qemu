@@ -96,16 +96,16 @@ static const VMStateDescription vmstate_mvme147_vmechip = {
     }
 };
 
-static Property mvme147_vmechip_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static Property mvme147_vmechip_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void mvme147_vmechip_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = mvme147_vmechip_reset;
-    device_class_set_props(dc, mvme147_vmechip_properties);
+//    device_class_set_props(dc, mvme147_vmechip_properties);
     dc->realize = mvme147_vmechip_realize;
     dc->vmsd = &vmstate_mvme147_vmechip;
 }
