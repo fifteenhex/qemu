@@ -490,9 +490,9 @@ static const VMStateDescription vmstate_wd33c93 = {
         }
 };
 
-static Property wd33c93_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static const Property wd33c93_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void wd33c93_init(Object *obj)
 {
@@ -513,7 +513,7 @@ static void wd33c93_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = wd33c93_reset;
-    device_class_set_props(dc, wd33c93_properties);
+//    device_class_set_props(dc, wd33c93_properties);
     dc->realize = wd33c93_realize;
     dc->vmsd = &vmstate_wd33c93;
 
