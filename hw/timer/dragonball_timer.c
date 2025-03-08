@@ -9,7 +9,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qom/object.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 
 #include "hw/timer/dragonball_timer.h"
 
@@ -146,9 +146,9 @@ static void dragonball_timer_reset(DeviceState *dev)
     t->tcmp = ~0;
 }
 
-static Property dragonball_timer_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static const Property dragonball_timer_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void dragonball_timer_class_init(ObjectClass *klass, void *data)
 {
@@ -156,7 +156,7 @@ static void dragonball_timer_class_init(ObjectClass *klass, void *data)
 
     dc->realize = dragonball_timer_realize;
     dc->legacy_reset = dragonball_timer_reset;
-    device_class_set_props(dc, dragonball_timer_properties);
+//    device_class_set_props(dc, dragonball_timer_properties);
 }
 
 static const TypeInfo dragonball_timer_info = {
