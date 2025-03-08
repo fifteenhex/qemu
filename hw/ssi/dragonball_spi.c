@@ -121,15 +121,15 @@ static void dragonball_spi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->mmio);
 }
 
-static Property dragonball_spi_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static const Property dragonball_spi_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void dragonball_spi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    device_class_set_props(dc, dragonball_spi_properties);
+//    device_class_set_props(dc, dragonball_spi_properties);
     dc->legacy_reset = dragonball_spi_reset;
     dc->realize = dragonball_spi_realize;
 }
