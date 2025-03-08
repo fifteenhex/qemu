@@ -155,10 +155,9 @@ static const VMStateDescription vmstate_dragonball_intc = {
         }
 };
 
-static Property dragonball_intc_properties[] = {
+static const Property dragonball_intc_properties[] = {
     DEFINE_PROP_LINK("m68k-cpu", DragonBallINTCState, cpu,
                      TYPE_M68K_CPU, ArchCPU *),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void dragonball_intc_class_init(ObjectClass *klass, void *data)
