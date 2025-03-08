@@ -58,16 +58,16 @@ static const VMStateDescription vmstate_dragonball_pll = {
         }
 };
 
-static Property dragonball_rtc_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static Property dragonball_rtc_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void dragonball_rtc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = dragonball_rtc_reset;
-    device_class_set_props(dc, dragonball_rtc_properties);
+//    device_class_set_props(dc, dragonball_rtc_properties);
     dc->realize = dragonball_rtc_realize;
     dc->vmsd = &vmstate_dragonball_pll;
 }
