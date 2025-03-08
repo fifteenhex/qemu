@@ -9,8 +9,8 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/qdev-properties.h"
-#include "sysemu/sysemu.h"
-#include "sysemu/rtc.h"
+#include "system/system.h"
+#include "system/rtc.h"
 #include "qemu/bcd.h"
 
 static uint32_t ds1305_read(DS1305State *s)
