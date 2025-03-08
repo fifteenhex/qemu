@@ -140,9 +140,8 @@ static const VMStateDescription vmstate_sifive_gpio = {
     }
 };
 
-static Property dragonball_gpio_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static const Property dragonball_gpio_properties[] = {
+//};
 
 static void dragonball_gpio_realize(DeviceState *dev, Error **errp)
 {
