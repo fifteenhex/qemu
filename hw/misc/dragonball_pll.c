@@ -14,7 +14,7 @@
 #include "hw/irq.h"
 
 /* For clk32 bit */
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "qemu/timer.h"
 
 #define OSCFREQ 32768
@@ -108,16 +108,16 @@ static const VMStateDescription vmstate_dragonball_pll = {
         }
 };
 
-static Property dragonball_pll_properties[] = {
-    DEFINE_PROP_END_OF_LIST(),
-};
+//static Property dragonball_pll_properties[] = {
+//    DEFINE_PROP_END_OF_LIST(),
+//};
 
 static void dragonball_pll_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = dragonball_pll_reset;
-    device_class_set_props(dc, dragonball_pll_properties);
+//    device_class_set_props(dc, dragonball_pll_properties);
     dc->realize = dragonball_pll_realize;
     dc->vmsd = &vmstate_dragonball_pll;
 }
