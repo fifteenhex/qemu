@@ -164,7 +164,7 @@ static void dragonball_gpio_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    device_class_set_props(dc, dragonball_gpio_properties);
+    //device_class_set_props(dc, dragonball_gpio_properties);
     dc->vmsd = &vmstate_sifive_gpio;
     dc->realize = dragonball_gpio_realize;
     dc->legacy_reset = dragonball_gpio_reset;
