@@ -249,9 +249,8 @@ static void dragonball_uart_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
 }
 
-static Property dragonball_uart_properties[] = {
+static const Property dragonball_uart_properties[] = {
     DEFINE_PROP_CHR("chardev", DragonBallUartState, chr),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void dragonball_uart_class_init(ObjectClass *klass, void *data)
