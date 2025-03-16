@@ -56,7 +56,8 @@ static void dragonball_spi_do_transfer(DragonBallSPIState *s)
 
     /* Clear running flag later to simulate the real speed */
     ptimer_transaction_begin(s->timer);
-    ptimer_set_freq(s->timer, 4000000);
+    ptimer_set_freq(s->timer, 40000000);
+//  ptimer_set_freq(s->timer, 4000000);
     ptimer_set_limit(s->timer, 16, 1);
     ptimer_run(s->timer, 1);
     ptimer_transaction_commit(s->timer);
