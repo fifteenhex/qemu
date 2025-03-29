@@ -91,6 +91,9 @@ static void dragonball_lcdc_updatefb_params(DragonBallLCDCState *s)
     unsigned int height = DRAGBONBALL_LCDC_HEIGHT(s);
     DisplaySurface *surface;
 
+    /* width could be zero and that'll cause qemu to crash when it tries to allocate the buffer */
+    width = MAX(width, 1);
+
     surface = qemu_console_surface(s->con);
     if (width != surface_width(surface) ||
             height != surface_height(surface))
@@ -266,6 +269,7 @@ static void dragonball_lcdc_class_init(ObjectClass *klass, void *data)
 
     dc->legacy_reset = dragonball_lcdc_reset;
     device_class_set_props(dc, dragonball_lcdc_properties);
+    device_class_set_legacy_reset(dc, dragonball_lcdc_reset);
     dc->realize = dragonball_lcdc_realize;
     dc->vmsd = &vmstate_dragonball_lcdc;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
