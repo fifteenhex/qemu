@@ -33,7 +33,7 @@
 #include "hw/scsi/wd33c93.h"
 #include "hw/rtc/m48t59.h"
 #include "elf.h"
-#include "exec/memory.h"
+//#include "exec/memory.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "hw/qdev-properties.h"
@@ -134,7 +134,7 @@ static void mvme147_init(MachineState *machine)
     memory_region_init_rom(rombank1, NULL, "mvme147.rombank1", MVME147_ROM_BANK1_SZ, &error_fatal);
     memory_region_add_subregion(sysmem, MVME147_ROM_BANK1, rombank1);
     if (machine->firmware)
-        load_image_targphys(machine->firmware, MVME147_ROM_BANK1, MVME147_ROM_BANK1_SZ);
+        load_image_targphys(machine->firmware, MVME147_ROM_BANK1, MVME147_ROM_BANK1_SZ, NULL);
 
     /* ROM bank 2 */
     memory_region_init_rom(rombank2, NULL, "mvme147.rombank2", MVME147_ROM_BANK2_SZ, &error_fatal);
