@@ -160,7 +160,7 @@ static const Property dragonball_intc_properties[] = {
                      TYPE_M68K_CPU, ArchCPU *),
 };
 
-static void dragonball_intc_class_init(ObjectClass *klass, void *data)
+static void dragonball_intc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
