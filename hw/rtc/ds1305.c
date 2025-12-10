@@ -102,7 +102,7 @@ static int ds1305_set_cs(SSIPeripheral *dev, bool select)
     return 0;
 }
 
-static void ds1305_class_init(ObjectClass *klass, void *data)
+static void ds1305_class_init(ObjectClass *klass, const void *data)
 {
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);
