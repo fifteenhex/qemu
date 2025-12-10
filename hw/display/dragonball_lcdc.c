@@ -263,7 +263,7 @@ static const Property dragonball_lcdc_properties[] = {
                      TYPE_MEMORY_REGION, MemoryRegion *),
 };
 
-static void dragonball_lcdc_class_init(ObjectClass *klass, void *data)
+static void dragonball_lcdc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
