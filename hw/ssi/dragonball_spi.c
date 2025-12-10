@@ -125,7 +125,7 @@ static void dragonball_spi_realize(DeviceState *dev, Error **errp)
 //    DEFINE_PROP_END_OF_LIST(),
 //};
 
-static void dragonball_spi_class_init(ObjectClass *klass, void *data)
+static void dragonball_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
