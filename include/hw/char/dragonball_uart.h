@@ -31,7 +31,7 @@ struct DragonBallUartState {
     uint16_t nipr;
 
     qemu_irq irq;
-    CharBackend chr;
+    CharFrontend chr;
 };
 
 #define TXFIFOSZ        8
