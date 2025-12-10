@@ -253,7 +253,7 @@ static const Property dragonball_uart_properties[] = {
     DEFINE_PROP_CHR("chardev", DragonBallUartState, chr),
 };
 
-static void dragonball_uart_class_init(ObjectClass *klass, void *data)
+static void dragonball_uart_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
