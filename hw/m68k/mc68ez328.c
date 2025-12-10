@@ -27,7 +27,7 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "elf.h"
-#include "exec/memory.h"
+//#include "exec/memory.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "hw/qdev-properties.h"
@@ -110,7 +110,7 @@ static void mc68ez328_init(MachineState *machine)
                            MC68EZ328_FLASHSZ, &error_fatal);
     memory_region_add_subregion(get_system_memory(), MC68EZ328_FLASHBASE,
                                 &flash);
-    load_image_targphys(machine->firmware, MC68EZ328_FLASHBASE, MC68EZ328_FLASHSZ);
+    load_image_targphys(machine->firmware, MC68EZ328_FLASHBASE, MC68EZ328_FLASHSZ, NULL);
 
     /* PLL */
     pll_dev = qdev_new(TYPE_DRAGONBALL_PLL);
