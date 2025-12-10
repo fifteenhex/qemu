@@ -100,7 +100,7 @@ static const VMStateDescription vmstate_mvme147_vmechip = {
 //    DEFINE_PROP_END_OF_LIST(),
 //};
 
-static void mvme147_vmechip_class_init(ObjectClass *klass, void *data)
+static void mvme147_vmechip_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
