@@ -146,7 +146,7 @@ static void dragonball_timer_reset(DeviceState *dev)
     t->tcmp = ~0;
 }
 
-static void dragonball_timer_class_init(ObjectClass *klass, void *data)
+static void dragonball_timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
