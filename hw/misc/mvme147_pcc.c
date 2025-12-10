@@ -273,7 +273,7 @@ static void mvme147_pcc_finalize(Object *obj)
     ptimer_free(s->timers[1]);
 }
 
-static void mvme147_pcc_class_init(ObjectClass *klass, void *data)
+static void mvme147_pcc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
