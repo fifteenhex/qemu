@@ -508,7 +508,7 @@ static void wd33c93_finalize(Object *obj)
 	fifo8_destroy(&s->fifo);
 }
 
-static void wd33c93_class_init(ObjectClass *klass, void *data)
+static void wd33c93_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
