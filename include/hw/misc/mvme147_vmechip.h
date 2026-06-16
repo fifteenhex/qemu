@@ -5,7 +5,7 @@
 #ifndef HW_MVME147_VMECHIP_H
 #define HW_MVME147_VMECHIP_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 
 #define TYPE_MVME147_VMECHIP "mvme147.vmechip"
