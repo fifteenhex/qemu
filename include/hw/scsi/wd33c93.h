@@ -5,8 +5,8 @@
 #ifndef HW_WD33C93_H
 #define HW_WD33C93_H
 
+#include "hw/core/sysbus.h"
 #include "hw/scsi/scsi.h"
-#include "hw/sysbus.h"
 #include "qemu/fifo8.h"
 #include "qom/object.h"
 
