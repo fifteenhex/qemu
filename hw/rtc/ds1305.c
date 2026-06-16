@@ -3,12 +3,12 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/rtc/ds1305.h"
-#include "hw/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#include "hw/qdev-properties.h"
 #include "system/system.h"
 #include "system/rtc.h"
 #include "qemu/bcd.h"
