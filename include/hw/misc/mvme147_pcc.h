@@ -5,8 +5,8 @@
 #ifndef HW_MVME147_PCC_H
 #define HW_MVME147_PCC_H
 
-#include "hw/sysbus.h"
-#include "hw/ptimer.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/ptimer.h"
 #include "qom/object.h"
 
 #define TYPE_MVME147_PCC "mvme147.pcc"
