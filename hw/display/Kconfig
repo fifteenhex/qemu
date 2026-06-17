@@ -157,3 +157,7 @@ config MAC_PVG_PCI
 config DRAGONBALL_LCDC
     bool
     select FRAMEBUFFER
+
+config MEGADRIVE_VDP
+    bool
+    select FRAMEBUFFER
