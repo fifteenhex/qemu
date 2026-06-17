@@ -72,3 +72,10 @@ config MVME147
     select M48T59
     select LANCE
     select WD33C93
+
+config MEGADRIVE
+    bool
+    default y
+    select M68K_IRQC
+    select MEGADRIVE_VDP
+    select MEGADRIVE_EVERDRIVE
