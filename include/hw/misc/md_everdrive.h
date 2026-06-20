@@ -46,6 +46,11 @@ struct MDEverdriveState {
     /* Host -> guest RX FIFO */
     Fifo8    rx_fifo;
 
+    /* Staged command responses, flushed to rx_fifo after resp_delay_us */
+    Fifo8     pending_fifo;
+    QEMUTimer *resp_timer;
+    uint32_t  resp_delay_us;
+
     /* Disk / file backend */
     char    *disk_dir;          /* exported host directory (property) */
     char    *dir_path;          /* currently-loaded relative dir      */

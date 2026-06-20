@@ -117,13 +117,14 @@ static void ed_dbg_hex(const char *tag, const void *buf, size_t len)
 /*  RX FIFO (host -> guest)                                            */
 /* ------------------------------------------------------------------ */
 
+/* Command responses are staged here, then flushed to rx_fifo after a delay. */
 static void md_everdrive_rx_push(MDEverdriveState *s, uint8_t b)
 {
-    if (fifo8_is_full(&s->rx_fifo)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "md_everdrive: RX FIFO overflow\n");
+    if (fifo8_is_full(&s->pending_fifo)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "md_everdrive: response FIFO overflow\n");
         return;
     }
-    fifo8_push(&s->rx_fifo, b);
+    fifo8_push(&s->pending_fifo, b);
 }
 
 static void md_everdrive_rx_push_buf(MDEverdriveState *s,
@@ -177,7 +178,10 @@ static void md_everdrive_receive(void *opaque, const uint8_t *buf, int size)
     int i;
 
     for (i = 0; i < size; i++) {
-        md_everdrive_rx_push(s, buf[i]);
+        if (fifo8_is_full(&s->rx_fifo)) {
+            break;
+        }
+        fifo8_push(&s->rx_fifo, buf[i]);
     }
 }
 
@@ -409,7 +413,7 @@ static void md_everdrive_collect(MDEverdriveState *s, uint32_t need)
 
 static void md_everdrive_fifo_command(MDEverdriveState *s)
 {
-    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
+    uint32_t rx_before = fifo8_num_used(&s->pending_fifo);
 
     ED_DBG("CMD 0x%02x (%s)", s->cmd, ed_cmd_name(s->cmd));
 
@@ -467,15 +471,15 @@ static void md_everdrive_fifo_command(MDEverdriveState *s)
         break;
     }
 
-    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
-        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
+    if (fifo8_num_used(&s->pending_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->pending_fifo) - rx_before);
     }
 }
 
 /* Fixed-size arg block complete: act on it (some commands then read a str). */
 static void md_everdrive_args_done(MDEverdriveState *s)
 {
-    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
+    uint32_t rx_before = fifo8_num_used(&s->pending_fifo);
 
     ed_dbg_hex("args", s->arg_buf, s->arg_pos);
 
@@ -508,15 +512,15 @@ static void md_everdrive_args_done(MDEverdriveState *s)
         break;
     }
 
-    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
-        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
+    if (fifo8_num_used(&s->pending_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->pending_fifo) - rx_before);
     }
 }
 
 /* String body complete (appended after the fixed args in arg_buf). */
 static void md_everdrive_str_done(MDEverdriveState *s)
 {
-    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
+    uint32_t rx_before = fifo8_num_used(&s->pending_fifo);
 
     ed_dbg_hex("str+args", s->arg_buf, s->arg_pos);
 
@@ -532,14 +536,24 @@ static void md_everdrive_str_done(MDEverdriveState *s)
     }
     s->fifo_state = ED_FIFO_HDR;
 
-    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
-        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
+    if (fifo8_num_used(&s->pending_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->pending_fifo) - rx_before);
     }
 }
 
 /* ------------------------------------------------------------------ */
 /*  Mailbox byte parser                                                */
 /* ------------------------------------------------------------------ */
+
+/* After the modelled latency, make the staged response visible to the guest. */
+static void md_everdrive_resp_cb(void *opaque)
+{
+    MDEverdriveState *s = opaque;
+
+    while (!fifo8_is_empty(&s->pending_fifo) && !fifo8_is_full(&s->rx_fifo)) {
+        fifo8_push(&s->rx_fifo, fifo8_pop(&s->pending_fifo));
+    }
+}
 
 static void md_everdrive_fifo_write(MDEverdriveState *s, uint8_t b)
 {
@@ -617,6 +631,12 @@ static void md_everdrive_fifo_write(MDEverdriveState *s, uint8_t b)
             md_everdrive_str_done(s);
         }
         break;
+    }
+
+    /* If a command staged a response, deliver it after the modelled delay. */
+    if (!fifo8_is_empty(&s->pending_fifo) && !timer_pending(s->resp_timer)) {
+        timer_mod(s->resp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)s->resp_delay_us * SCALE_US);
     }
 }
 
@@ -697,8 +717,8 @@ static const MemoryRegionOps md_everdrive_ops = {
 
 static const VMStateDescription vmstate_md_everdrive = {
     .name           = "md-everdrive",
-    .version_id     = 8,
-    .minimum_version_id = 8,
+    .version_id     = 9,
+    .minimum_version_id = 9,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(fifo_state, MDEverdriveState),
         VMSTATE_UINT8(hdr_pos, MDEverdriveState),
@@ -712,6 +732,8 @@ static const VMStateDescription vmstate_md_everdrive = {
         VMSTATE_INT64(timer_base, MDEverdriveState),
         VMSTATE_UINT16(status, MDEverdriveState),
         VMSTATE_FIFO8(rx_fifo, MDEverdriveState),
+        VMSTATE_FIFO8(pending_fifo, MDEverdriveState),
+        VMSTATE_TIMER_PTR(resp_timer, MDEverdriveState),
         VMSTATE_UINT8_ARRAY(bank, MDEverdriveState, MD_EVERDRIVE_NUM_BANKS),
         VMSTATE_END_OF_LIST()
     },
@@ -724,6 +746,8 @@ static void md_everdrive_realize(DeviceState *dev, Error **errp)
 
     s->file_fd = -1;
     fifo8_create(&s->rx_fifo, MD_EVERDRIVE_RX_FIFO);
+    fifo8_create(&s->pending_fifo, MD_EVERDRIVE_RX_FIFO);
+    s->resp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, md_everdrive_resp_cb, s);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &md_everdrive_ops, s,
                           "md-everdrive", MD_EVERDRIVE_REG_SIZE);
@@ -750,6 +774,10 @@ static void md_everdrive_reset(DeviceState *dev)
     s->timer_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     fifo8_reset(&s->rx_fifo);
+    fifo8_reset(&s->pending_fifo);
+    if (s->resp_timer) {
+        timer_del(s->resp_timer);
+    }
     s->status = ED_STATUS_OK;
 
     if (s->dir) {
@@ -769,6 +797,7 @@ static void md_everdrive_reset(DeviceState *dev)
 static const Property md_everdrive_properties[] = {
     DEFINE_PROP_CHR("chardev", MDEverdriveState, chr),
     DEFINE_PROP_STRING("dir", MDEverdriveState, disk_dir),
+    DEFINE_PROP_UINT32("resp-delay-us", MDEverdriveState, resp_delay_us, 1000000/4),
 };
 
 static void md_everdrive_class_init(ObjectClass *klass, const void *data)
