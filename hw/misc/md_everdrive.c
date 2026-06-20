@@ -29,6 +29,7 @@
 #include "qom/object.h"
 #include "migration/vmstate.h"
 #include "chardev/char-fe.h"
+#include "qemu/fifo8.h"
 
 #include <dirent.h>
 
@@ -118,12 +119,11 @@ static void ed_dbg_hex(const char *tag, const void *buf, size_t len)
 
 static void md_everdrive_rx_push(MDEverdriveState *s, uint8_t b)
 {
-    if (s->rx_count >= MD_EVERDRIVE_RX_FIFO) {
+    if (fifo8_is_full(&s->rx_fifo)) {
         qemu_log_mask(LOG_GUEST_ERROR, "md_everdrive: RX FIFO overflow\n");
         return;
     }
-    s->rx_buf[(s->rx_head + s->rx_count) % MD_EVERDRIVE_RX_FIFO] = b;
-    s->rx_count++;
+    fifo8_push(&s->rx_fifo, b);
 }
 
 static void md_everdrive_rx_push_buf(MDEverdriveState *s,
@@ -158,22 +158,17 @@ static void md_everdrive_rx_push_u64(MDEverdriveState *s, uint64_t v)
 
 static uint8_t md_everdrive_rx_pop(MDEverdriveState *s)
 {
-    uint8_t b;
-
-    if (s->rx_count == 0) {
+    if (fifo8_is_empty(&s->rx_fifo)) {
         return 0;
     }
-    b = s->rx_buf[s->rx_head];
-    s->rx_head = (s->rx_head + 1) % MD_EVERDRIVE_RX_FIFO;
-    s->rx_count--;
-    return b;
+    return fifo8_pop(&s->rx_fifo);
 }
 
 static int md_everdrive_can_receive(void *opaque)
 {
     MDEverdriveState *s = MD_EVERDRIVE(opaque);
 
-    return MD_EVERDRIVE_RX_FIFO - s->rx_count;
+    return fifo8_num_free(&s->rx_fifo);
 }
 
 static void md_everdrive_receive(void *opaque, const uint8_t *buf, int size)
@@ -414,7 +409,7 @@ static void md_everdrive_collect(MDEverdriveState *s, uint32_t need)
 
 static void md_everdrive_fifo_command(MDEverdriveState *s)
 {
-    uint32_t rx_before = s->rx_count;
+    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
 
     ED_DBG("CMD 0x%02x (%s)", s->cmd, ed_cmd_name(s->cmd));
 
@@ -472,15 +467,15 @@ static void md_everdrive_fifo_command(MDEverdriveState *s)
         break;
     }
 
-    if (s->rx_count != rx_before) {
-        ED_DBG("  queued %u response byte(s)", s->rx_count - rx_before);
+    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
     }
 }
 
 /* Fixed-size arg block complete: act on it (some commands then read a str). */
 static void md_everdrive_args_done(MDEverdriveState *s)
 {
-    uint32_t rx_before = s->rx_count;
+    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
 
     ed_dbg_hex("args", s->arg_buf, s->arg_pos);
 
@@ -513,15 +508,15 @@ static void md_everdrive_args_done(MDEverdriveState *s)
         break;
     }
 
-    if (s->rx_count != rx_before) {
-        ED_DBG("  queued %u response byte(s)", s->rx_count - rx_before);
+    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
     }
 }
 
 /* String body complete (appended after the fixed args in arg_buf). */
 static void md_everdrive_str_done(MDEverdriveState *s)
 {
-    uint32_t rx_before = s->rx_count;
+    uint32_t rx_before = fifo8_num_used(&s->rx_fifo);
 
     ed_dbg_hex("str+args", s->arg_buf, s->arg_pos);
 
@@ -537,8 +532,8 @@ static void md_everdrive_str_done(MDEverdriveState *s)
     }
     s->fifo_state = ED_FIFO_HDR;
 
-    if (s->rx_count != rx_before) {
-        ED_DBG("  queued %u response byte(s)", s->rx_count - rx_before);
+    if (fifo8_num_used(&s->rx_fifo) != rx_before) {
+        ED_DBG("  queued %u response byte(s)", fifo8_num_used(&s->rx_fifo) - rx_before);
     }
 }
 
@@ -644,7 +639,7 @@ static uint64_t md_everdrive_read(void *opaque, hwaddr offset, unsigned size)
     }
     case ED_REG_MAILBOX_STAT:
         /* low 11 bits = RX fill level; TX always ready */
-        return MIN(s->rx_count, FIFO_RXF_MSK);
+        return MIN(fifo8_num_used(&s->rx_fifo), FIFO_RXF_MSK);
     case ED_REG_TIMER:
         return md_everdrive_timer_get(s);
     default:
@@ -660,8 +655,8 @@ static void md_everdrive_write(void *opaque, hwaddr offset, uint64_t val,
     MDEverdriveState *s = MD_EVERDRIVE(opaque);
 
     if (offset == ED_REG_MAILBOX) {
-	if (s->rx_count)
-        ED_DBG("write when fifo still has: 0x%02x", s->rx_count);
+	if (fifo8_num_used(&s->rx_fifo))
+        ED_DBG("write when fifo still has: 0x%02x", fifo8_num_used(&s->rx_fifo));
 
         md_everdrive_fifo_write(s, val & 0xFF);
         return;
@@ -702,8 +697,8 @@ static const MemoryRegionOps md_everdrive_ops = {
 
 static const VMStateDescription vmstate_md_everdrive = {
     .name           = "md-everdrive",
-    .version_id     = 7,
-    .minimum_version_id = 7,
+    .version_id     = 8,
+    .minimum_version_id = 8,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(fifo_state, MDEverdriveState),
         VMSTATE_UINT8(hdr_pos, MDEverdriveState),
@@ -716,9 +711,7 @@ static const VMStateDescription vmstate_md_everdrive = {
         VMSTATE_UINT8_ARRAY(arg_buf, MDEverdriveState, MD_EVERDRIVE_ARG_MAX),
         VMSTATE_INT64(timer_base, MDEverdriveState),
         VMSTATE_UINT16(status, MDEverdriveState),
-        VMSTATE_UINT8_ARRAY(rx_buf, MDEverdriveState, MD_EVERDRIVE_RX_FIFO),
-        VMSTATE_UINT32(rx_head, MDEverdriveState),
-        VMSTATE_UINT32(rx_count, MDEverdriveState),
+        VMSTATE_FIFO8(rx_fifo, MDEverdriveState),
         VMSTATE_UINT8_ARRAY(bank, MDEverdriveState, MD_EVERDRIVE_NUM_BANKS),
         VMSTATE_END_OF_LIST()
     },
@@ -730,6 +723,7 @@ static void md_everdrive_realize(DeviceState *dev, Error **errp)
     SysBusDevice     *sbd = SYS_BUS_DEVICE(dev);
 
     s->file_fd = -1;
+    fifo8_create(&s->rx_fifo, MD_EVERDRIVE_RX_FIFO);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &md_everdrive_ops, s,
                           "md-everdrive", MD_EVERDRIVE_REG_SIZE);
@@ -755,8 +749,7 @@ static void md_everdrive_reset(DeviceState *dev)
 
     s->timer_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->rx_head = 0;
-    s->rx_count = 0;
+    fifo8_reset(&s->rx_fifo);
     s->status = ED_STATUS_OK;
 
     if (s->dir) {

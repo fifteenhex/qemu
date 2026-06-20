@@ -5,6 +5,7 @@
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "chardev/char-fe.h"
+#include "qemu/fifo8.h"
 
 #define TYPE_MD_EVERDRIVE "md-everdrive"
 OBJECT_DECLARE_SIMPLE_TYPE(MDEverdriveState, MD_EVERDRIVE)
@@ -43,9 +44,7 @@ struct MDEverdriveState {
     int64_t  timer_base;    /* virtual-clock ns at counter zero */
 
     /* Host -> guest RX FIFO */
-    uint8_t  rx_buf[MD_EVERDRIVE_RX_FIFO];
-    uint32_t rx_head;
-    uint32_t rx_count;
+    Fifo8    rx_fifo;
 
     /* Disk / file backend */
     char    *disk_dir;          /* exported host directory (property) */
