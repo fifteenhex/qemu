@@ -57,6 +57,7 @@ struct MDEverdriveState {
     void    *dir;               /* open DIR* for listing              */
     int      file_fd;           /* currently open file, or -1         */
     uint16_t status;            /* last command status (read via STATUS) */
+    bool     disk_ready;        /* DISK_INIT has been performed         */
 
     uint8_t bank[MD_EVERDRIVE_NUM_BANKS];
 };

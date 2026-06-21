@@ -68,9 +68,14 @@ enum {
 
 /* Status (offset 0x02): low 11 bits = RX FIFO fill level (FIFO_RXF_MSK). */
 #define FIFO_RXF_MSK   0x7FF
+/* Bit 15: set when the CPU is allowed to read the RX FIFO (data available). */
+#define FIFO_CPU_RD    0x8000
 
-#define ED_STATUS_OK   0x0000
-#define ED_STATUS_ERR  0x00FF
+#define ED_STATUS_OK   0xa500
+/* Not sure what is actually shown on an error, the krikzz code just
+ * checks for anything that isn't 0xa500
+ */
+#define ED_STATUS_ERR  0x0000
 
 /* ------------------------------------------------------------------ */
 /*  Debug tracing (enable with -d unimp)                               */
@@ -222,10 +227,25 @@ static char *md_everdrive_resolve(MDEverdriveState *s, const char *rel)
 /*  Disk / file command execution                                     */
 /* ------------------------------------------------------------------ */
 
+/* False (and flags an error) if DISK_INIT has not been issued yet. */
+static bool md_everdrive_disk_ready(MDEverdriveState *s)
+{
+    if (!s->disk_ready) {
+        ED_DBG("disk command 0x%02x before DISK_INIT - failing", s->cmd);
+        s->status = ED_STATUS_ERR;
+        return false;
+    }
+    return true;
+}
+
 static void md_everdrive_dir_load(MDEverdriveState *s)
 {
     /* arg_buf: [0] = flags, [1..] = path body (pathlen = arg_pos - 1) */
     g_autofree char *rel = g_strndup((char *)s->arg_buf + 1, s->arg_pos - 1);
+
+    if (!md_everdrive_disk_ready(s)) {
+        return;
+    }
 
     g_free(s->dir_path);
     s->dir_path = g_strdup(rel);
@@ -264,6 +284,10 @@ static unsigned md_everdrive_dir_count(MDEverdriveState *s)
 
 static void md_everdrive_dir_size(MDEverdriveState *s)
 {
+    if (!md_everdrive_disk_ready(s)) {
+        md_everdrive_rx_push_u16(s, 0);
+        return;
+    }
     md_everdrive_rx_push_u16(s, md_everdrive_dir_count(s));
     s->status = ED_STATUS_OK;
 }
@@ -277,6 +301,11 @@ static void md_everdrive_dir_get(MDEverdriveState *s)
     DIR *d;
     struct dirent *de;
     unsigned idx = 0, sent = 0;
+
+    if (!md_everdrive_disk_ready(s)) {
+        md_everdrive_rx_push(s, 1);     /* terminate: no entries */
+        return;
+    }
 
     if (!path || !(d = opendir(path))) {
         md_everdrive_rx_push(s, 1);     /* terminate: no entries */
@@ -327,6 +356,10 @@ static void md_everdrive_file_open(MDEverdriveState *s)
     g_autofree char *rel = g_strndup((char *)s->arg_buf + 1, s->arg_pos - 1);
     g_autofree char *full = md_everdrive_resolve(s, rel);
 
+    if (!md_everdrive_disk_ready(s)) {
+        return;
+    }
+
     if (s->file_fd >= 0) {
         close(s->file_fd);
         s->file_fd = -1;
@@ -347,6 +380,11 @@ static void md_everdrive_file_avb(MDEverdriveState *s)
 {
     uint64_t avb = 0;
 
+    if (!md_everdrive_disk_ready(s)) {
+        md_everdrive_rx_push_u64(s, 0);
+        return;
+    }
+
     if (s->file_fd >= 0) {
         off_t cur = lseek(s->file_fd, 0, SEEK_CUR);
         off_t end = lseek(s->file_fd, 0, SEEK_END);
@@ -366,6 +404,12 @@ static void md_everdrive_file_read(MDEverdriveState *s)
     g_autofree uint8_t *buf = g_malloc0(amount);
     ssize_t got = 0;
 
+    if (!md_everdrive_disk_ready(s)) {
+        md_everdrive_rx_push(s, 1);             /* resp: error */
+        md_everdrive_rx_push_buf(s, buf, amount);
+        return;
+    }
+
     if (s->file_fd >= 0) {
         got = read(s->file_fd, buf, amount);
         if (got < 0) {
@@ -380,6 +424,9 @@ static void md_everdrive_file_read(MDEverdriveState *s)
 
 static void md_everdrive_file_close(MDEverdriveState *s)
 {
+    if (!md_everdrive_disk_ready(s)) {
+        return;
+    }
     if (s->file_fd >= 0) {
         close(s->file_fd);
         s->file_fd = -1;
@@ -390,6 +437,10 @@ static void md_everdrive_file_close(MDEverdriveState *s)
 static void md_everdrive_file_fptr(MDEverdriveState *s)
 {
     uint32_t ptr = ed_arg_u32(s->arg_buf);
+
+    if (!md_everdrive_disk_ready(s)) {
+        return;
+    }
 
     if (s->file_fd >= 0) {
         lseek(s->file_fd, ptr, SEEK_SET);
@@ -429,6 +480,7 @@ static void md_everdrive_fifo_command(MDEverdriveState *s)
         break;
 
     case ED_CMD_DISK_INIT:
+        s->disk_ready = true;
         s->status = ED_STATUS_OK;
         break;
 
@@ -657,9 +709,14 @@ static uint64_t md_everdrive_read(void *opaque, hwaddr offset, unsigned size)
         qemu_chr_fe_accept_input(&s->chr);
         return b;
     }
-    case ED_REG_MAILBOX_STAT:
-        /* low 11 bits = RX fill level; TX always ready */
-        return MIN(fifo8_num_used(&s->rx_fifo), FIFO_RXF_MSK);
+    case ED_REG_MAILBOX_STAT: {
+        /* low 11 bits = RX fill level; bit 15 = CPU may read; TX always ready */
+        uint16_t v = MIN(fifo8_num_used(&s->rx_fifo), FIFO_RXF_MSK);
+        if (!fifo8_is_empty(&s->rx_fifo)) {
+            v |= FIFO_CPU_RD;
+        }
+        return v;
+    }
     case ED_REG_TIMER:
         return md_everdrive_timer_get(s);
     default:
@@ -717,8 +774,8 @@ static const MemoryRegionOps md_everdrive_ops = {
 
 static const VMStateDescription vmstate_md_everdrive = {
     .name           = "md-everdrive",
-    .version_id     = 9,
-    .minimum_version_id = 9,
+    .version_id     = 10,
+    .minimum_version_id = 10,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(fifo_state, MDEverdriveState),
         VMSTATE_UINT8(hdr_pos, MDEverdriveState),
@@ -731,6 +788,7 @@ static const VMStateDescription vmstate_md_everdrive = {
         VMSTATE_UINT8_ARRAY(arg_buf, MDEverdriveState, MD_EVERDRIVE_ARG_MAX),
         VMSTATE_INT64(timer_base, MDEverdriveState),
         VMSTATE_UINT16(status, MDEverdriveState),
+        VMSTATE_BOOL(disk_ready, MDEverdriveState),
         VMSTATE_FIFO8(rx_fifo, MDEverdriveState),
         VMSTATE_FIFO8(pending_fifo, MDEverdriveState),
         VMSTATE_TIMER_PTR(resp_timer, MDEverdriveState),
@@ -779,6 +837,7 @@ static void md_everdrive_reset(DeviceState *dev)
         timer_del(s->resp_timer);
     }
     s->status = ED_STATUS_OK;
+    s->disk_ready = false;
 
     if (s->dir) {
         closedir(s->dir);
@@ -797,7 +856,7 @@ static void md_everdrive_reset(DeviceState *dev)
 static const Property md_everdrive_properties[] = {
     DEFINE_PROP_CHR("chardev", MDEverdriveState, chr),
     DEFINE_PROP_STRING("dir", MDEverdriveState, disk_dir),
-    DEFINE_PROP_UINT32("resp-delay-us", MDEverdriveState, resp_delay_us, 1000000/4),
+    DEFINE_PROP_UINT32("resp-delay-us", MDEverdriveState, resp_delay_us, 10000),
 };
 
 static void md_everdrive_class_init(ObjectClass *klass, const void *data)
