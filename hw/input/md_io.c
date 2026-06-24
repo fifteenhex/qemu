@@ -9,7 +9,7 @@
 #include "migration/vmstate.h"
 #include "system/reset.h"
 
-#include "hw/misc/md_io.h"
+#include "hw/input/md_io.h"
 
 static void md_io_reset(void *opaque);
 
