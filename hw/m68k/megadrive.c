@@ -40,6 +40,7 @@
 
 #include "hw/display/md_vdp.h"
 #include "hw/misc/md_everdrive.h"
+#include "hw/input/md_io.h"
 
 /*
  * MegaDrive + Everdrive memory map:
@@ -54,6 +55,7 @@
  */
 #define MD_VDP_BASE         0xC00000
 #define MD_EVERDRIVE_BASE   0xA130D0
+#define MD_IO_BASE          0xA10000
 
 /*
  * ROM is always at zero, also we are going to emulate as
@@ -84,6 +86,8 @@ static void megadrive_init(MachineState *machine)
     SysBusDevice  *vdp_sbd;
     DeviceState   *everdrive_dev;
     SysBusDevice  *everdrive_sbd;
+    DeviceState   *io_dev;
+    SysBusDevice  *io_sbd;
     MemoryRegion  *address_space_mem = get_system_memory();
     ssize_t        rom_size;
 
@@ -127,6 +131,12 @@ static void megadrive_init(MachineState *machine)
     everdrive_sbd = SYS_BUS_DEVICE(everdrive_dev);
     sysbus_realize_and_unref(everdrive_sbd, &error_fatal);
     sysbus_mmio_map(everdrive_sbd, 0, MD_EVERDRIVE_BASE);
+
+    /* I/O area: version register + controller ports */
+    io_dev = qdev_new(TYPE_MD_IO);
+    io_sbd = SYS_BUS_DEVICE(io_dev);
+    sysbus_realize_and_unref(io_sbd, &error_fatal);
+    sysbus_mmio_map(io_sbd, 0, MD_IO_BASE);
 }
 
 #define MEGADRIVE_DEFAULT_PSRAM_SIZE (4 * MiB)
