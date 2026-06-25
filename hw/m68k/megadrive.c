@@ -63,6 +63,10 @@
  */
 #define MD_ROM_BASE         0x000000
 
+/* Built-in work RAM (the console's 64 KB of SRAM) */
+#define MD_WORK_RAM_BASE    0xFF0000
+#define MD_WORK_RAM_SIZE    (64 * KiB)
+
 static void main_cpu_reset(void *opaque)
 {
     M68kCPU  *cpu = opaque;
@@ -89,6 +93,7 @@ static void megadrive_init(MachineState *machine)
     DeviceState   *io_dev;
     SysBusDevice  *io_sbd;
     MemoryRegion  *address_space_mem = get_system_memory();
+    MemoryRegion  *work_ram;
     ssize_t        rom_size;
 
     if (!machine->firmware) {
@@ -116,6 +121,12 @@ static void megadrive_init(MachineState *machine)
     }
 
     printf("Loaded firmware: %s (%zd KB)\n", machine->firmware, rom_size / 1024);
+
+    /* Built-in 64 KB work RAM (SRAM) at 0xFF0000-0xFFFFFF */
+    work_ram = g_new(MemoryRegion, 1);
+    memory_region_init_ram(work_ram, NULL, "md.work-ram",
+                           MD_WORK_RAM_SIZE, &error_fatal);
+    memory_region_add_subregion(address_space_mem, MD_WORK_RAM_BASE, work_ram);
 
     /* VDP */
     vdp_dev = qdev_new(TYPE_MD_VDP);
