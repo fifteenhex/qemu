@@ -364,6 +364,40 @@ static int vdp_plane_pixel(MDVDPState *s, int plane, uint32_t ntbase,
     return idx ? (pal * 16 + idx) : -1;
 }
 
+/*
+ * Sample one window-plane pixel at screen position (x, y).  The window plane
+ * replaces plane A inside its region; it uses screen coordinates (no scroll)
+ * and its own nametable (reg3).  ww is the window width in cells (32 for H32,
+ * 64 for H40).  Returns a CRAM index, or -1 if the pixel is transparent.
+ */
+static int vdp_window_pixel(MDVDPState *s, uint32_t wbase, int ww, int x, int y)
+{
+    int col = x >> 3, row = y >> 3;
+    int tx = x & 7, ty = y & 7;
+    uint32_t nt, paddr;
+    uint16_t entry;
+    int tile, pal, idx;
+    uint8_t byte;
+
+    nt = (wbase + ((row * ww + col) << 1)) & 0xFFFF;
+    entry = (s->vram[nt] << 8) | s->vram[(nt + 1) & 0xFFFF];
+    tile = entry & 0x07FF;
+    pal  = (entry >> 13) & 3;
+
+    if (entry & 0x0800) {           /* hflip */
+        tx = 7 - tx;
+    }
+    if (entry & 0x1000) {           /* vflip */
+        ty = 7 - ty;
+    }
+
+    paddr = (tile * 32 + ty * 4 + (tx >> 1)) & 0xFFFF;
+    byte = s->vram[paddr];
+    idx = (tx & 1) ? (byte & 0x0F) : (byte >> 4);
+
+    return idx ? (pal * 16 + idx) : -1;
+}
+
 /* Draw the sprite layer on top of the planes. */
 static void vdp_draw_sprites(MDVDPState *s, uint8_t *fb, int stride,
                              int nw, int nh, unsigned scale)
@@ -470,17 +504,37 @@ static bool md_vdp_gfx_update(void *opaque)
     uint32_t a_base = (s->regs[2] & 0x38) << 10;
     uint32_t backdrop = vdp_cram_to_rgb(s->cram[s->regs[7] & 0x3F]);
     bool display_on = s->regs[1] & VDP_REG1_DISP_EN;
+
+    /* Window plane: own nametable (reg3), no scroll, region from reg17/reg18. */
+    int ww = nw / 8;                              /* window width in cells */
+    uint32_t w_base = (nw == 320) ? (s->regs[3] & 0x3C) << 10
+                                  : (s->regs[3] & 0x3E) << 10;
+    int  win_hp    = (s->regs[17] & 0x1F) * 2;    /* horiz split, in cells */
+    bool win_rigt  = s->regs[17] & 0x80;          /* window on right side  */
+    int  win_vp    = (s->regs[18] & 0x1F);        /* vert split, in cells  */
+    bool win_down  = s->regs[18] & 0x80;          /* window on bottom side */
     int x, y;
     unsigned sx, sy;
 
     for (y = 0; y < nh; y++) {
+        int wrow = y >> 3;
+        bool in_v = win_down ? (wrow >= win_vp) : (wrow < win_vp);
+
         for (x = 0; x < nw; x++) {
             int ci = -1;
             uint32_t color;
 
             if (display_on) {
+                int wcol = x >> 3;
+                bool in_h = win_rigt ? (wcol >= win_hp) : (wcol < win_hp);
+                int a;
+
                 ci = vdp_plane_pixel(s, 1, b_base, pw, ph, x, y);
-                int a = vdp_plane_pixel(s, 0, a_base, pw, ph, x, y);
+                if (in_v || in_h) {
+                    a = vdp_window_pixel(s, w_base, ww, x, y);
+                } else {
+                    a = vdp_plane_pixel(s, 0, a_base, pw, ph, x, y);
+                }
                 if (a >= 0) {
                     ci = a;
                 }
