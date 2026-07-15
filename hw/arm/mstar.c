@@ -20,6 +20,9 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/core/boards.h"
 #include "hw/char/serial-mm.h"
+#include "hw/core/loader.h"
+#include "qemu/datadir.h"
+#include "qemu/error-report.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -54,6 +57,7 @@ struct MStarSoCState {
     /*< private >*/
     DeviceState parent_obj;
     /*< public >*/
+    bool secure_boot;       /* start the CPU in Secure EL3 (mask ROM boot) */
     ARMCPU cpu[MSTAR_SOC_MAX_CPUS];
     GICState gic;
     MstIntcState intc_irq;
@@ -64,6 +68,7 @@ struct MStarSoCState {
     Msc313GpioState gpio;
     Msc313IspState isp;
     Msc313BdmaState bdma;
+    MemoryRegion imi;
 };
 
 struct MStarSoCClass {
@@ -92,6 +97,41 @@ static void mstar_l3bridge_write(void *opaque, hwaddr addr, uint64_t val,
 static const MemoryRegionOps mstar_l3bridge_ops = {
     .read = mstar_l3bridge_read,
     .write = mstar_l3bridge_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+
+/* --------------------------------------------------------------- did (chip) */
+
+/*
+ * The "did" block. The boot ROM reads DID_KEY (vendor register 0x70, i.e.
+ * byte offset 0x1c0 at the 4-byte register stride) and takes bits[5:2] as
+ * the boot-media strap:
+ *   0x20 - SPI-NOR (read via the ISP/QSPI XIP window)
+ *   0x10 - NAND
+ *   0x08 - SPINAND / eMMC (a separate controller, not modelled)
+ * Anything else makes the ROM print "... undefined! [HALT]". We report NOR,
+ * which is what the breadbee-class boards boot from; that is all the ROM
+ * needs from this block.
+ */
+#define DID_BOOTMEDIA_REG   0x1c0
+#define DID_BOOTMEDIA_NOR   0x20
+
+static uint64_t mstar_did_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == DID_BOOTMEDIA_REG) {
+        return DID_BOOTMEDIA_NOR;
+    }
+    return 0;
+}
+
+static void mstar_did_write(void *opaque, hwaddr addr, uint64_t v, unsigned size)
+{
+}
+
+static const MemoryRegionOps mstar_did_ops = {
+    .read = mstar_did_read,
+    .write = mstar_did_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
@@ -160,13 +200,15 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         object_property_set_int(OBJECT(&s->cpu[i]), "cntfrq",
                                 MSTAR_ARCH_TIMER_FREQ, &error_abort);
         /*
-         * No EL2/EL3: the mainline kernel starts at EL1 (SVC). With EL2
-         * present QEMU's cortex-a7 would enter HYP and hang on the unwired
-         * HYP timer.
+         * No EL2 for a kernel boot: the kernel starts at EL1 (SVC); with EL2
+         * present QEMU's cortex-a7 would enter HYP and hang on the unwired HYP
+         * timer. EL3 is only enabled for a mask-ROM boot: the ROM/IPL run in
+         * Secure state and touch Secure-only registers (e.g. NSACR), which are
+         * UNDEFINED without the Security Extensions.
          */
         object_property_set_bool(OBJECT(&s->cpu[i]), "has_el2", false,
                                  &error_abort);
-        object_property_set_bool(OBJECT(&s->cpu[i]), "has_el3", false,
+        object_property_set_bool(OBJECT(&s->cpu[i]), "has_el3", s->secure_boot,
                                  &error_abort);
         if (!qdev_realize(DEVICE(&s->cpu[i]), NULL, errp)) {
             return;
@@ -208,6 +250,19 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                           "mstar.l3bridge", MSTAR_L3BRIDGE_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTAR_L3BRIDGE_BASE,
                                 &s->l3bridge);
+
+    /* On-chip SRAM ("IMI"), used by the boot ROM as scratch/IPL load area. */
+    memory_region_init_ram(&s->imi, OBJECT(s), "mstar.imi", MSTAR_IMI_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(get_system_memory(), MSTAR_IMI_BASE, &s->imi);
+
+    /* "did" chip block - the boot ROM reads the boot-media strap from here. */
+    {
+        MemoryRegion *did = g_new(MemoryRegion, 1);
+        memory_region_init_io(did, OBJECT(s), &mstar_did_ops, s,
+                              "mstar.did", 0x200);
+        memory_region_add_subregion(get_system_memory(), MSTAR_DID_BASE, did);
+    }
 
     /* The two "mst-intc" instances between the peripherals and the GIC. */
     if (!mstar_realize_intc(&s->intc_irq, gicdev, MSTAR_INTC_IRQ_BASE,
@@ -321,14 +376,57 @@ static void mstar_machine_init(MachineState *machine)
     soc = MSTAR_SOC(object_new(mmc->soc_type));
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
     object_unref(OBJECT(soc));
+    /* A mask-ROM boot (-bios) runs in Secure state, so give the CPU EL3. */
+    soc->secure_boot = machine->firmware != NULL;
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,
                                 machine->ram);
 
-    mstar_binfo.loader_start = MSTAR_DRAM_BASE;
-    mstar_binfo.ram_size = machine->ram_size;
-    arm_load_kernel(&soc->cpu[0], machine, &mstar_binfo);
+    if (machine->firmware) {
+        /*
+         * Boot ROM mode: map the mask ROM at address 0 and let the CPU reset
+         * straight into it (no kernel boot wrapper). The ROM brings up the
+         * SoC and chain-loads the next stage itself. As observed on the
+         * msc313e mask ROM, the flow is:
+         *
+         *   1. Read the boot-media strap from DID_KEY (0x1f0071c0) bits[5:2]:
+         *      0x20 selects SPI-NOR (the ISP/QSPI).
+         *   2. Read the "IPL" from the SPI-NOR flash (the partition table
+         *      points it at flash offset 0x4000) through the memory-mapped
+         *      XIP window at 0x14000000, and copy it into IMI SRAM at
+         *      0xa0000000.
+         *   3. Check the "IPL_" magic at IMI+4 and jump to 0xa0000000.
+         *
+         * So to reach the IPL, pass the ROM with -bios and the NOR flash
+         * image with -drive if=mtd.
+         *
+         * The IPL then runs its own DDR/PLL bring-up, prints its banner
+         * ("IPL <ver>", "512MB", ...) on the pm UART, passes the MIU memory
+         * BIST (see the "miu" block), decompresses the next stage and hands
+         * off to u-boot. u-boot comes up on the console, runs its MDIO PHY
+         * scan against the modelled "emac" (finds no PHY, fakes a link) and
+         * reaches its command prompt.
+         */
+        MemoryRegion *rom = g_new(MemoryRegion, 1);
+        char *fn = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
+
+        memory_region_init_rom(rom, NULL, "mstar.bootrom", MSTAR_BOOTROM_SIZE,
+                               &error_fatal);
+        memory_region_add_subregion(get_system_memory(), MSTAR_BOOTROM_BASE,
+                                    rom);
+        if (load_image_mr(fn ? fn : machine->firmware, rom) < 0) {
+            error_report("could not load boot ROM '%s'", machine->firmware);
+            exit(1);
+        }
+        g_free(fn);
+    } else {
+        mstar_binfo.loader_start = MSTAR_DRAM_BASE;
+        mstar_binfo.ram_size = machine->ram_size;
+        /* The vendor kernel expects to enter in Secure state (see above). */
+        mstar_binfo.secure_boot = soc->secure_boot;
+        arm_load_kernel(&soc->cpu[0], machine, &mstar_binfo);
+    }
 }
 
 static void mstar_machine_class_init(ObjectClass *oc, const void *data)

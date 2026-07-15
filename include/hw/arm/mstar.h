@@ -191,6 +191,9 @@ struct Msc313BdmaState {
 #define MSTAR_BOOTROM_BASE      0x0
 #define MSTAR_BOOTROM_SIZE      0x8000
 
+/* The "did" chip block (did@7000); holds the boot-media strap the ROM reads. */
+#define MSTAR_DID_BASE          (MSTAR_RIU_BASE + 0x7000)
+
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
 #define MSTAR_GIC_DIST_BASE     0x16001000
