@@ -21,6 +21,9 @@
 #include "hw/core/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/core/loader.h"
+#include "hw/sd/sd.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "hw/core/qdev-properties.h"
@@ -69,6 +72,7 @@ struct MStarSoCState {
     Msc313IspState isp;
     Msc313BdmaState bdma;
     Msc313ClkgenState clkgen;
+    Msc313SdioState sdio;
     MemoryRegion imi;
 };
 
@@ -315,6 +319,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
+    object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -498,6 +503,26 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTAR_CLKGEN_BASE);
+
+    /* "sdio" FCIE SD/MMC host, with a card backed by "-drive if=sd" if given. */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdio), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdio), 0, MSTAR_SDIO_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdio), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_SDIO_HWIRQ));
+    {
+        DriveInfo *di = drive_get(IF_SD, 0, 0);
+
+        if (di) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+            BusState *bus = qdev_get_child_bus(DEVICE(&s->sdio), "sd-bus");
+
+            qdev_prop_set_drive_err(card, "drive",
+                                    blk_by_legacy_dinfo(di), &error_fatal);
+            qdev_realize_and_unref(card, bus, &error_fatal);
+        }
+    }
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,

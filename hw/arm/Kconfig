@@ -111,6 +111,7 @@ config MSTAR
     select SERIAL_MM
     select SSI
     select SSI_M25P80
+    select SD
 
 config MUSICPAL
     bool
@@ -207,6 +208,7 @@ config SABRELITE
     depends on TCG && ARM
     select FSL_IMX6
     select SSI_M25P80
+    select SD
 
 config STELLARIS
     bool
@@ -294,6 +296,7 @@ config ZYNQ
     select PL330
     select SDHCI
     select SSI_M25P80
+    select SD
     select USB_CHIPIDEA
     select XILINX # UART
     select XILINX_AXI
@@ -437,6 +440,7 @@ config XLNX_ZYNQMP_ARM
     select SDHCI
     select SSI
     select SSI_M25P80
+    select SD
     select XILINX_AXI
     select XILINX_SPIPS
     select XLNX_CSU_DMA
@@ -557,6 +561,7 @@ config ASPEED_SOC
     select PCA954X
     select SSI
     select SSI_M25P80
+    select SD
     select TMP105
     select TMP421
     select EMC141X
@@ -703,6 +708,7 @@ config EMCRAFT_SF2
     depends on TCG && ARM
     select MSF2
     select SSI_M25P80
+    select SD
 
 config MSF2
     bool

@@ -12,6 +12,7 @@
 #include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
+#include "hw/sd/sd.h"
 #include "qom/object.h"
 
 /*
@@ -191,6 +192,33 @@ struct Msc313ClkgenState {
 };
 
 /*
+ * The "sdio": the MStar "FCIE" SD/MMC host controller (mstar,msc313-sdio).
+ * Register map from the mainline driver drivers/mmc/host/mstar-fcie.c: a
+ * bank of 16-bit registers plus a small command/response FIFO. The guest
+ * loads a command into the FIFO, programs SD_CTL and fires the job; we run
+ * the request on a QEMU SD card and post the completion interrupt.
+ */
+#define TYPE_MSC313_SDIO "mstar-msc313-sdio"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313SdioState, MSC313_SDIO)
+
+#define TYPE_MSC313_SDIO_BUS "mstar-msc313-sdio-bus"
+
+#define MSTAR_SDIO_NUM_REGS  (0x100 / 4)
+#define MSTAR_SDIO_FIFO_BYTES 64
+
+struct Msc313SdioState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    SDBus sdbus;
+    qemu_irq irq;
+    uint16_t regs[MSTAR_SDIO_NUM_REGS];
+    uint8_t fifo[MSTAR_SDIO_FIFO_BYTES];
+    uint8_t last_cmd;       /* opcode of the in-flight command (for auto-stop) */
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -225,6 +253,11 @@ struct Msc313ClkgenState {
 /* The "clkgen" clock mux/gate block (reg = <0x207000 0x200>). */
 #define MSTAR_CLKGEN_BASE           (MSTAR_RIU_BASE + 0x207000)
 #define MSTAR_CLKGEN_SIZE           0x200
+
+/* The "sdio" FCIE SD/MMC host controller (sdio@282000). */
+#define MSTAR_SDIO_BASE             (MSTAR_RIU_BASE + 0x282000)
+#define MSTAR_SDIO_SIZE             0x200
+#define MSTAR_SDIO_HWIRQ            19      /* line on the "irq" mst-intc */
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
