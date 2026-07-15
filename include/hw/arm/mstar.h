@@ -286,6 +286,24 @@ struct Msc313DispState {
 };
 
 /*
+ * The "dphy": the SSD20xD MIPI D-PHY between the DSI controller and the panel
+ * (dphy@2a5000). A deliberately minimal model - it stores/returns 16-bit
+ * registers so a real Linux PHY driver can be written and exercised against it.
+ */
+#define TYPE_MSTAR_DPHY "mstar-ssd20xd-dphy"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarDphyState, MSTAR_DPHY)
+
+#define MSTAR_DPHY_NUM_REGS (0x200 / 4)
+
+struct MstarDphyState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint16_t regs[MSTAR_DPHY_NUM_REGS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -348,6 +366,10 @@ struct Msc313DispState {
 #define MSTAR_DISP_DSI_BASE         (MSTAR_RIU_BASE + 0x345200)
 #define MSTAR_DISP_DSI_SIZE         0x400
 #define MSTAR_DISP_HWIRQ            50      /* display-top vsync, "irq" intc */
+
+/* The MIPI D-PHY for the DSI link (dphy@2a5000, vendor "DPHY_DSI" bank). */
+#define MSTAR_DPHY_BASE             (MSTAR_RIU_BASE + 0x2a5000)
+#define MSTAR_DPHY_SIZE             0x200
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128

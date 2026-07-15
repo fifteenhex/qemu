@@ -79,6 +79,7 @@ struct MStarSoCState {
     Msc313SdioState sdio;
     Msc313PwmState pwm;
     Msc313DispState disp;
+    MstarDphyState dphy;
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
     uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
@@ -424,6 +425,7 @@ static void mstar_soc_init(Object *obj)
     if (sc->info.has_display) {
         object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSC313_PWM);
         object_initialize_child(obj, "disp", &s->disp, TYPE_MSC313_DISP);
+        object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
     }
 }
 
@@ -663,6 +665,10 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTAR_DISP_TOP_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTAR_DISP_MOP_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 3, MSTAR_DISP_DSI_BASE);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->dphy), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->dphy), 0, MSTAR_DPHY_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
                            qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                             MSTAR_DISP_HWIRQ));
