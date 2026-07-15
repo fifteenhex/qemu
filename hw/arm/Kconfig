@@ -103,6 +103,12 @@ config MUSCA
 config MARVELL_88W8618
     bool
 
+config MSTAR
+    bool
+    default y
+    depends on TCG && ARM
+    select SERIAL_MM
+
 config MUSICPAL
     bool
     default y
