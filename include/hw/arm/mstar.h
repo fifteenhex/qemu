@@ -198,6 +198,10 @@ struct Msc313BdmaState {
 #define MSTAR_MIU_BASE          (MSTAR_RIU_BASE + 0x202000)
 #define MSTAR_MIU_SIZE          0x1000
 
+/* The "emac" Cadence GEM (emac@2a2000), accessed over the 16-bit XIU bus. */
+#define MSTAR_EMAC_BASE         (MSTAR_RIU_BASE + 0x2a2000)
+#define MSTAR_EMAC_SIZE         0x1000
+
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
 #define MSTAR_GIC_DIST_BASE     0x16001000
