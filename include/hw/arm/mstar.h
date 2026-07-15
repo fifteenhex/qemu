@@ -95,6 +95,24 @@ struct Msc313RtcState {
 };
 
 /*
+ * The "msc313-gpio": a bank of single-byte pad control registers. Each pad
+ * offset holds IN (bit0, the pin level, read-only), OUT (bit4) and OEN
+ * (bit5, output disable) bits. reg = <0x207800 0x200> on the riu bus.
+ */
+#define TYPE_MSC313_GPIO "mstar-msc313-gpio"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)
+
+#define MSTAR_GPIO_NUM_REGS 0x200
+
+struct Msc313GpioState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint8_t regs[MSTAR_GPIO_NUM_REGS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -159,5 +177,9 @@ struct Msc313RtcState {
 #define MSTAR_RTC_BASE              (MSTAR_RIU_BASE + 0x2400)
 #define MSTAR_RTC_SIZE              0x40
 #define MSTAR_RTC_HWIRQ             44
+
+/* The "msc313-gpio" pad register bank (reg = <0x207800 0x200>). */
+#define MSTAR_GPIO_BASE             (MSTAR_RIU_BASE + 0x207800)
+#define MSTAR_GPIO_SIZE             MSTAR_GPIO_NUM_REGS
 
 #endif /* HW_ARM_MSTAR_H */
