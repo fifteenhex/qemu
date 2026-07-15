@@ -85,4 +85,14 @@ struct MstIntcState {
 #define MSTAR_INTC_FIQ_START    96
 #define MSTAR_INTC_FIQ_NUM      32
 
+/*
+ * The "l3bridge" MIU write-flush block. mstarv7_mb() triggers a flush and
+ * spins on the STATUS DONE bit; since QEMU's memory is coherent the flush is
+ * a no-op and STATUS always reports done.
+ */
+#define MSTAR_L3BRIDGE_BASE         (MSTAR_RIU_BASE + 0x204400)
+#define MSTAR_L3BRIDGE_SIZE         0x200
+#define MSTAR_L3BRIDGE_STATUS       0x40
+#define MSTAR_L3BRIDGE_STATUS_DONE  (1 << 12)
+
 #endif /* HW_ARM_MSTAR_H */

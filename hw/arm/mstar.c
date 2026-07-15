@@ -57,6 +57,7 @@ struct MStarSoCState {
     GICState gic;
     MstIntcState intc_irq;
     MstIntcState intc_fiq;
+    MemoryRegion l3bridge;
 };
 
 struct MStarSoCClass {
@@ -65,6 +66,29 @@ struct MStarSoCClass {
     /*< public >*/
     MStarSoCInfo info;
 };
+
+/* ----------------------------------------------------------- l3bridge */
+
+static uint64_t mstar_l3bridge_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* Report every MIU flush as already complete. */
+    if (addr == MSTAR_L3BRIDGE_STATUS) {
+        return MSTAR_L3BRIDGE_STATUS_DONE;
+    }
+    return 0;
+}
+
+static void mstar_l3bridge_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+}
+
+static const MemoryRegionOps mstar_l3bridge_ops = {
+    .read = mstar_l3bridge_read,
+    .write = mstar_l3bridge_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 
 /* ------------------------------------------------------------------ SoC */
 
@@ -159,6 +183,12 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->gic), i + sc->info.num_cpus,
                            qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
     }
+
+    /* l3bridge (MIU write-flush) used by the SoC memory barrier. */
+    memory_region_init_io(&s->l3bridge, OBJECT(s), &mstar_l3bridge_ops, s,
+                          "mstar.l3bridge", MSTAR_L3BRIDGE_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTAR_L3BRIDGE_BASE,
+                                &s->l3bridge);
 
     /* The two "mst-intc" instances between the peripherals and the GIC. */
     if (!mstar_realize_intc(&s->intc_irq, gicdev, MSTAR_INTC_IRQ_BASE,
