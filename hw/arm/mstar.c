@@ -82,6 +82,7 @@ struct MStarSoCState {
     MstarDphyState dphy;
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
+    MemoryRegion cpupll;    /* CPU PLL registers (nonzero LPF/post-div) */
     uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
     uint16_t smpctrl_regs[0x200 / 4];   /* MSTAR_SMPCTRL_SIZE/4, read-back */
 };
@@ -391,6 +392,63 @@ static const MemoryRegionOps mstar_smpctrl_ops = {
 };
 
 
+/* --------------------------------------------------------------- cpupll */
+
+/*
+ * CPU PLL (the vendor "CLK_cpupll" bank at 0x1f206400, vendor register base
+ * 0x103200 at the RIU 2x stride). The clock driver reads an "LPF value" and a
+ * post-divider and back-computes the CPU frequency:
+ *
+ *   lpf  = reg[0x1032a4] | reg[0x1032a6] << 16   (phys 0x206548 / 0x20654c)
+ *   pdiv = reg[0x103232] + 1                      (phys 0x206464)
+ *   rate = div64_u64(432000000 * 2^19, lpf) * 2 / pdiv * 32 / 2
+ *
+ * With the registers reading 0 the vendor kernel divides by zero and panics
+ * ("Division by zero in kernel" in ms_cpuclk_recalc_rate). Return an LPF that
+ * yields ~1 GHz with post_div = 2, i.e. lpf = (432MHz / (1GHz*2/32)) * 2^19 =
+ * 0x374cc7. Real silicon holds these values after the boot ROM/IPL bring the
+ * PLL up; we do the same so the recalc is well-defined.
+ */
+#define CPUPLL_LPF_LOW      0x148    /* 0x1032a4 << 1 - base */
+#define CPUPLL_LPF_HIGH     0x14c    /* 0x1032a6 << 1 - base */
+#define CPUPLL_POSTDIV      0x064    /* 0x103232 << 1 - base */
+#define CPUPLL_LPF_DONE     0x174    /* 0x1032ba << 1 - base */
+
+static uint64_t mstar_cpupll_read(void *opaque, hwaddr addr, unsigned size)
+{
+    switch (addr) {
+    case CPUPLL_LPF_LOW:
+        return 0x4cc7;
+    case CPUPLL_LPF_HIGH:
+        return 0x0037;
+    case CPUPLL_POSTDIV:
+        return 0x0001;      /* post_div = value + 1 = 2 */
+    case CPUPLL_LPF_DONE:
+        /*
+         * ms_cpuclk_set_rate() programs the LPF then spins on bit0 of this
+         * register waiting for the frequency switch to "settle". The switch is
+         * instantaneous for us, so always report done.
+         */
+        return 0x0001;
+    }
+    return 0;
+}
+
+static void mstar_cpupll_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    /* The frequency-switch sequence writes here; nothing to model. */
+}
+
+static const MemoryRegionOps mstar_cpupll_ops = {
+    .read = mstar_cpupll_read,
+    .write = mstar_cpupll_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+
 /* ------------------------------------------------------------------ SoC */
 
 /* "fiq" mst-intc input line for each timer@6040/80/c0 (from the DT). */
@@ -450,6 +508,26 @@ static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
     return true;
 }
 
+/* Catch-all overlay for the RIU tracer: logs accesses no device claimed. */
+static uint64_t mstar_iolog_catchall_read(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    mstar_iolog(MSTAR_RIU_BASE + addr, false, 0, size);
+    return 0;
+}
+
+static void mstar_iolog_catchall_write(void *opaque, hwaddr addr, uint64_t val,
+                                       unsigned size)
+{
+    mstar_iolog(MSTAR_RIU_BASE + addr, true, val, size);
+}
+
+static const MemoryRegionOps mstar_iolog_catchall_ops = {
+    .read = mstar_iolog_catchall_read,
+    .write = mstar_iolog_catchall_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
 {
     MStarSoCState *s = MSTAR_SOC(dev);
@@ -468,7 +546,8 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
          * Secure state and touch Secure-only registers (e.g. NSACR), which are
          * UNDEFINED without the Security Extensions.
          */
-        object_property_set_bool(OBJECT(&s->cpu[i]), "has_el2", false,
+        object_property_set_bool(OBJECT(&s->cpu[i]), "has_el2",
+                                 getenv("MSTAR_SECURE_KERNEL") != NULL,
                                  &error_abort);
         object_property_set_bool(OBJECT(&s->cpu[i]), "has_el3", s->secure_boot,
                                  &error_abort);
@@ -533,6 +612,12 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         memory_region_add_subregion(get_system_memory(), MSTAR_SMPCTRL_BASE,
                                     &s->smpctrl);
     }
+
+    /* CPU PLL - realistic LPF/post-div so clock recalc doesn't divide by 0. */
+    memory_region_init_io(&s->cpupll, OBJECT(s), &mstar_cpupll_ops, s,
+                          "mstar.cpupll", MSTAR_CPUPLL_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTAR_CPUPLL_BASE,
+                                &s->cpupll);
 
     /* "did" chip block - the boot ROM reads the boot-media strap from here. */
     {
@@ -674,6 +759,17 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                             MSTAR_DISP_HWIRQ));
     }
 
+    /* Optional RIU I/O tracer (MSTAR_IOLOG=<file>): see mstar_iolog(). */
+    if (getenv("MSTAR_IOLOG") && !mstar_iolog_fp) {
+        MemoryRegion *log = g_new(MemoryRegion, 1);
+
+        mstar_iolog_fp = fopen(getenv("MSTAR_IOLOG"), "w");
+        memory_region_init_io(log, OBJECT(s), &mstar_iolog_catchall_ops, s,
+                              "mstar.iolog", 0x400000);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            MSTAR_RIU_BASE, log, -1);
+    }
+
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
                    MSTAR_PM_UART_REGSHIFT,
@@ -735,7 +831,7 @@ static void mstar_machine_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
     object_unref(OBJECT(soc));
     /* A mask-ROM boot (-bios) runs in Secure state, so give the CPU EL3. */
-    soc->secure_boot = machine->firmware != NULL;
+    soc->secure_boot = machine->firmware != NULL || getenv("MSTAR_SECURE_KERNEL");
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,

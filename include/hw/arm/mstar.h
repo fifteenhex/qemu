@@ -332,6 +332,10 @@ struct MstarDphyState {
 #define MSTAR_SMPCTRL_BASE          (MSTAR_RIU_BASE + 0x204000)
 #define MSTAR_SMPCTRL_SIZE          0x200
 
+/* CPU PLL register bank (vendor 0x103200 base, at the RIU 2x stride). */
+#define MSTAR_CPUPLL_BASE           (MSTAR_RIU_BASE + 0x206400)
+#define MSTAR_CPUPLL_SIZE           0x200
+
 /* The "did" chip block (did@7000); holds the boot-media strap the ROM reads. */
 #define MSTAR_DID_BASE          (MSTAR_RIU_BASE + 0x7000)
 
