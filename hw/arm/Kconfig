@@ -112,6 +112,7 @@ config MSTAR
     select SSI
     select SSI_M25P80
     select SD
+    select I2C
 
 config MUSICPAL
     bool

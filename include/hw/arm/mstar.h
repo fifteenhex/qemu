@@ -13,6 +13,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
 #include "hw/sd/sd.h"
+#include "hw/i2c/i2c.h"
 #include "qom/object.h"
 
 /*
@@ -304,6 +305,32 @@ struct MstarDphyState {
 };
 
 /*
+ * The "i2c": the mstar/sstar HWI2C master (i2c@223000/223200). A QEMU I2CBus
+ * is exposed so slaves can be attached (none by default, so transfers NAK).
+ * This lets the vendor kernel's i2c driver complete its transfers (setting the
+ * done flag) instead of polling forever.
+ */
+#define TYPE_MSC313_I2C "mstar-msc313-i2c"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313I2cState, MSC313_I2C)
+
+#define MSTAR_I2C_NUM_REGS (0x200 / 4)
+#define MSTAR_NUM_I2C 2
+
+struct Msc313I2cState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    I2CBus *bus;
+    uint16_t regs[MSTAR_I2C_NUM_REGS];
+    bool int_pending;       /* INT_CTL bit0: a byte/command completed */
+    bool nak;               /* last byte was not acked (no slave) */
+    bool active;            /* a transfer is in progress on the bus */
+    bool start_pending;     /* START seen; next WDATA is the address */
+    uint8_t rdata;          /* last byte clocked in from the bus */
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -374,6 +401,11 @@ struct MstarDphyState {
 /* The MIPI D-PHY for the DSI link (dphy@2a5000, vendor "DPHY_DSI" bank). */
 #define MSTAR_DPHY_BASE             (MSTAR_RIU_BASE + 0x2a5000)
 #define MSTAR_DPHY_SIZE             0x200
+
+/* The two HWI2C masters (i2c@223000 / i2c@223200); MSTAR_NUM_I2C is above. */
+#define MSTAR_I2C0_BASE             (MSTAR_RIU_BASE + 0x223000)
+#define MSTAR_I2C1_BASE             (MSTAR_RIU_BASE + 0x223200)
+#define MSTAR_I2C_SIZE              0x200
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128

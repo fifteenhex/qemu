@@ -80,6 +80,7 @@ struct MStarSoCState {
     Msc313PwmState pwm;
     Msc313DispState disp;
     MstarDphyState dphy;
+    Msc313I2cState i2c[MSTAR_NUM_I2C];
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
     MemoryRegion cpupll;    /* CPU PLL registers (nonzero LPF/post-div) */
@@ -480,6 +481,9 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
+    for (i = 0; i < MSTAR_NUM_I2C; i++) {
+        object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
+    }
     if (sc->info.has_display) {
         object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSC313_PWM);
         object_initialize_child(obj, "disp", &s->disp, TYPE_MSC313_DISP);
@@ -757,6 +761,18 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
                            qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                             MSTAR_DISP_HWIRQ));
+    }
+
+    /* HWI2C masters (transfers NAK until a slave is attached to the bus). */
+    for (i = 0; i < MSTAR_NUM_I2C; i++) {
+        static const hwaddr i2c_base[MSTAR_NUM_I2C] = {
+            MSTAR_I2C0_BASE, MSTAR_I2C1_BASE,
+        };
+
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->i2c[i]), 0, i2c_base[i]);
     }
 
     /* Optional RIU I/O tracer (MSTAR_IOLOG=<file>): see mstar_iolog(). */
