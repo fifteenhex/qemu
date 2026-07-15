@@ -62,6 +62,7 @@ struct MStarSoCState {
     Msc313eTimerState timer[MSTAR_NUM_TIMERS];
     Msc313RtcState rtc;
     Msc313GpioState gpio;
+    Msc313IspState isp;
 };
 
 struct MStarSoCClass {
@@ -121,6 +122,7 @@ static void mstar_soc_init(Object *obj)
 
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_MSC313_RTC);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_MSC313_GPIO);
+    object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -248,6 +250,15 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, MSTAR_GPIO_BASE);
+
+    /* ISP SPI-NOR controller (core regs, qspi config, XIP window). */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->isp), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 0, MSTAR_ISP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 1, MSTAR_FSP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 2, MSTAR_ISP_QSPI_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 3, MSTAR_ISP_XIP_BASE);
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,

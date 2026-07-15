@@ -11,6 +11,7 @@
 
 #include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
+#include "hw/ssi/ssi.h"
 #include "qom/object.h"
 
 /*
@@ -113,6 +114,38 @@ struct Msc313GpioState {
 };
 
 /*
+ * The "isp" SPI-NOR controller (mstar,msc313-isp): a byte-at-a-time SPI
+ * master plus a memory-mapped XIP read window. It drives an m25p80 SPI-NOR
+ * flash over an SSI bus.
+ */
+#define TYPE_MSC313_ISP "mstar-msc313-isp"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313IspState, MSC313_ISP)
+
+#define MSTAR_ISP_QSPI_NUM_REGS (0x200 / 4)
+#define MSTAR_ISP_FSP_NUM_REGS  (0x200 / 4)
+
+struct Msc313IspState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;     /* isp core registers @0x1f001000 */
+    MemoryRegion fsp;       /* fsp flash controller  @0x1f002c00 */
+    MemoryRegion qspi;      /* qspi config registers @0x1f002e00 */
+    MemoryRegion xip;       /* memory-mapped read window @0x14000000 */
+    SSIBus *spi;
+    qemu_irq cs;            /* chip select to the flash (active low) */
+    bool cs_asserted;
+    uint16_t rdata;         /* last byte clocked in from the flash */
+    uint8_t *flash_cache;   /* in-memory copy of the flash for XIP reads */
+    uint16_t password;
+    uint16_t clkdiv;
+    uint16_t trigger;
+    uint16_t rst;
+    uint16_t qspi_regs[MSTAR_ISP_QSPI_NUM_REGS];
+    uint16_t fsp_regs[MSTAR_ISP_FSP_NUM_REGS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -181,5 +214,20 @@ struct Msc313GpioState {
 /* The "msc313-gpio" pad register bank (reg = <0x207800 0x200>). */
 #define MSTAR_GPIO_BASE             (MSTAR_RIU_BASE + 0x207800)
 #define MSTAR_GPIO_SIZE             MSTAR_GPIO_NUM_REGS
+
+/* The "fsp" flash controller (the ISP block's second register window). */
+#define MSTAR_FSP_BASE          (MSTAR_RIU_BASE + 0x2c00)
+#define MSTAR_FSP_SIZE          0x200
+
+/*
+ * The "isp" SPI-NOR controller: core regs @0x1f001000, qspi config regs
+ * @0x1f002e00, and a 16 MiB memory-mapped XIP read window @0x14000000.
+ */
+#define MSTAR_ISP_BASE              (MSTAR_RIU_BASE + 0x1000)
+#define MSTAR_ISP_SIZE              0x400
+#define MSTAR_ISP_QSPI_BASE         (MSTAR_RIU_BASE + 0x2e00)
+#define MSTAR_ISP_QSPI_SIZE         0x200
+#define MSTAR_ISP_XIP_BASE          0x14000000
+#define MSTAR_ISP_XIP_SIZE          0x1000000
 
 #endif /* HW_ARM_MSTAR_H */
