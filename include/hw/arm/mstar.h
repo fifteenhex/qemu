@@ -109,6 +109,28 @@ struct Msc313RtcState {
  * offset holds IN (bit0, the pin level, read-only), OUT (bit4) and OEN
  * (bit5, output disable) bits. reg = <0x207800 0x200> on the riu bus.
  */
+/*
+ * The "sar": the SAR ADC (sar@2800). Four voltage channels plus an internal
+ * temperature sensor, and four SAR pads that double as a GPIO group. Register
+ * layout from the mainline driver drivers/iio/adc/msc313e_sar.c; the model
+ * returns a fixed synthesised sample per channel on a one-shot conversion.
+ */
+#define TYPE_MSC313_SAR "mstar-msc313-sar"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313SarState, MSC313_SAR)
+
+#define MSTAR_SAR_NUM_REGS  (0x200 / 4)
+#define MSTAR_SAR_CHANNELS  8
+
+struct Msc313SarState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;
+    uint16_t regs[MSTAR_SAR_NUM_REGS];
+    uint16_t chan_input[MSTAR_SAR_CHANNELS]; /* synthesised per-channel sample */
+};
+
 #define TYPE_MSC313_GPIO "mstar-msc313-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)
 
@@ -459,6 +481,14 @@ struct Msc313I2cState {
 #define MSTAR_RTC_BASE              (MSTAR_RIU_BASE + 0x2400)
 #define MSTAR_RTC_SIZE              0x40
 #define MSTAR_RTC_HWIRQ             44
+
+/*
+ * The "sar" SAR ADC (sar@2800, reg = <0x2800 0x200>). Its conversion-done
+ * interrupt is line 45 of the "irq" mst-intc.
+ */
+#define MSTAR_SAR_BASE              (MSTAR_RIU_BASE + 0x2800)
+#define MSTAR_SAR_SIZE              0x200
+#define MSTAR_SAR_HWIRQ             45
 
 /* The "msc313-gpio" pad register bank (reg = <0x207800 0x200>). */
 #define MSTAR_GPIO_BASE             (MSTAR_RIU_BASE + 0x207800)
