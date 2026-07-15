@@ -72,6 +72,29 @@ struct Msc313eTimerState {
 #define MSTAR_NUM_TIMERS 3
 
 /*
+ * The "msc313-rtc": a free-running 1 Hz seconds counter with a match-based
+ * alarm interrupt.
+ */
+#define TYPE_MSC313_RTC "mstar-msc313-rtc"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313RtcState, MSC313_RTC)
+
+struct Msc313RtcState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;
+    uint16_t ctrl;
+    uint16_t status;
+    uint32_t freq_cw;       /* clock divider written by the guest (unused) */
+    uint32_t load_val;      /* seconds value to load into the counter */
+    uint32_t match_val;     /* alarm match value */
+    uint32_t cnt_latch;     /* counter latched on a READ_EN trigger */
+    int64_t base_ns;        /* virtual time the counter was (re)based */
+    uint32_t base_count;    /* counter value at base_ns */
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -128,5 +151,13 @@ struct Msc313eTimerState {
 #define MSTAR_TIMER_BASE            (MSTAR_RIU_BASE + 0x6040)
 #define MSTAR_TIMER_STRIDE          0x40
 #define MSTAR_TIMER_FREQ            12000000
+
+/*
+ * The "msc313-rtc" at 0x1f002400 (reg = <0x2400 0x40> on the riu bus). Its
+ * alarm interrupt is line 44 of the "irq" mst-intc.
+ */
+#define MSTAR_RTC_BASE              (MSTAR_RIU_BASE + 0x2400)
+#define MSTAR_RTC_SIZE              0x40
+#define MSTAR_RTC_HWIRQ             44
 
 #endif /* HW_ARM_MSTAR_H */

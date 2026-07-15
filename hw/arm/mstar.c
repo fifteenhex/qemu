@@ -60,6 +60,7 @@ struct MStarSoCState {
     MstIntcState intc_fiq;
     MemoryRegion l3bridge;
     Msc313eTimerState timer[MSTAR_NUM_TIMERS];
+    Msc313RtcState rtc;
 };
 
 struct MStarSoCClass {
@@ -116,6 +117,8 @@ static void mstar_soc_init(Object *obj)
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_MSC313E_TIMER);
     }
+
+    object_initialize_child(obj, "rtc", &s->rtc, TYPE_MSC313_RTC);
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -229,6 +232,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                            qdev_get_gpio_in(DEVICE(&s->intc_fiq),
                                             mstar_timer_hwirq[i]));
     }
+
+    /* RTC - its alarm interrupt routed through the "irq" mst-intc. */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rtc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtc), 0, MSTAR_RTC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_RTC_HWIRQ));
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
