@@ -194,6 +194,10 @@ struct Msc313BdmaState {
 /* The "did" chip block (did@7000); holds the boot-media strap the ROM reads. */
 #define MSTAR_DID_BASE          (MSTAR_RIU_BASE + 0x7000)
 
+/* The MIU DDR controller (miu@202000); the IPL's memory BIST lives here. */
+#define MSTAR_MIU_BASE          (MSTAR_RIU_BASE + 0x202000)
+#define MSTAR_MIU_SIZE          0x1000
+
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
 #define MSTAR_GIC_DIST_BASE     0x16001000

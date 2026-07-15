@@ -136,6 +136,109 @@ static const MemoryRegionOps mstar_did_ops = {
 };
 
 
+/* ------------------------------------------------------------------- miu */
+
+/*
+ * The MIU (Memory Interface Unit - the DDR controller). QEMU's DRAM is a plain
+ * always-there RAM region, so there is no analog PHY to train or memory to
+ * bring up; this model exists only so the mask-ROM IPL's DDR bring-up runs to
+ * completion instead of spinning on a status poll.
+ *
+ * The 0x1000 window at 0x1f202000 is split into four 16-bit register banks
+ * (registers at their native 2-byte stride; the IPL uses byte and halfword
+ * accesses interchangeably):
+ *
+ *   0x1f202000  MIU_ANA        analog PHY: DDR PLL, DQ/DQS phase/drive training
+ *   0x1f202200  MIU_ARB        arbiter: request groups 4-6, protection windows
+ *   0x1f202400  MIU_DIG        digital: memory config, DRAM timings, MRx, BIST
+ *   0x1f202c00  MIU_M5_GROUPS  extra arbiter request groups (pioneer3 "m5")
+ *
+ * How the DDR init happens (register names/offsets from the u-boot mstar ddr
+ * driver drivers/ddr/mstar/{ana,arb,dig}.h + miu.c, itself reverse engineered
+ * from the vendor IPL). The full bring-up (miu_configure_dram()) is:
+ *
+ *   1. hold the digital block in reset      (DIG SW_RST 0x3c)
+ *   2. block every arbiter request mask     (DIG/ARB group REQ_MASK regs)
+ *   3. reset the analog block               (ANA F0/48 "drive cal" sequence)
+ *   4. start the DDR PLL / set the clock     (ANA 6c=0x400, 68=0x2004, 114=1,
+ *                                            DDFSET_L 0x60=0x8000, _H 0x64=0x29)
+ *   5. program the memory config + timings  (DIG CONFIG1..7 0x04-0x1c: memtype/
+ *                                            buswidth/banks/cols, tRCD/tRP/tRAS,
+ *                                            tWL/tWR..., mode regs MR0..3 0x20)
+ *   6. set the arbiter request priorities   (DIG groups 0-3 0x80/c0/100/140,
+ *                                            ARB groups 4-6)
+ *   7. analog config + power-up             (ANA E0/D8/DC/EC..., then the ANA00
+ *                                            power-up + 3C=5/f/5 pulse)
+ *   8. run the "initial cycle"              (DIG CNTRL0 0x00: step RSTZ->CS->CKE
+ *                                            ->INIT_MIU, poll INITDONE bit15)
+ *   9. latch init-done                      (DIG SW_RST 0x3c |= SW_INIT_DONE
+ *                                            bit3 - "if this is not set any DDR
+ *                                            access locks up the CPU")
+ *  10. run the memory BIST self test        (see below)
+ *
+ * The vendor IPL in the emulated Miyoo/SSD202 flash takes a shortened path
+ * (captured live with MSTAR_IOLOG): it can't identify the PLL ("unknown
+ * miupll") so it skips the analog PLL/training in steps 3-4/7-8 and jumps
+ * straight to the arbiter setup (step 6: DIG groups 0-3 CTRL=0x8015,
+ * CONFIG0=0x2008, PRIORITY0..3=0x3210/7654/ba98/fedc; ARB group6 0x1c0..0x1f0),
+ * unmasks the requests (step 2 in reverse), latches init-done (step 9: DIG
+ * SW_RST 0x3c=0x8c08), then runs the BIST.
+ *
+ * The BIST lives at MIU_DIG + 0x1c0.. (0x1f2025c0). Programming, from the
+ * trace: PROTECT2_START 0x1a4=0x9000, pulse 0x1bc 1->0, then length 0x1c8=
+ * 0xffff, 0x1cc=0x01fe, test pattern 0x1d0=0x5aa5, MIUSEL0 0x1e0=0, and finally
+ * write bit0 of the control/status reg 0x1c0 to start. The IPL then polls 0x1c0
+ * for bit15 = done, bits[14:13] = error (so 0x8000 = done, no error; 0xe000 =
+ * done, failed). This is the one register the IPL reads-and-waits-on.
+ *
+ * What we model: DRAM training is instantaneous here, so report both completion
+ * gates as finished with no error - BIST 0x1c0 -> 0x8000, and (for the full
+ * u-boot/kernel path) the initial-cycle CNTRL0 -> INITDONE. Every other MIU
+ * register is write-only to the IPL (fire and forget) or only read to
+ * read-modify-write, so returning zero for them is fine.
+ *
+ * Note the IPL does NOT read the DRAM size from any MIU register: it sizes
+ * memory by probing address aliasing - writing distinct markers at DRAM +0,
+ * +32M, +64M, +128M and +256M and reading them back to find where the address
+ * wraps. Real DRAM wraps above its size; QEMU's flat RAM does not, so the
+ * machine mirrors RAM above its real size (see mstar_machine_init) to make the
+ * probe detect the true amount instead of the 512MB "no wrap" maximum.
+ */
+#define MIU_ANA_BASE            0x000
+#define MIU_ARB_BASE            0x200
+#define MIU_DIG_BASE            0x400
+#define MIU_M5_GROUPS_BASE      0xc00
+
+#define MIU_DIG_CNTRL0          (MIU_DIG_BASE + 0x000)  /* init-cycle control */
+#define MIU_DIG_CNTRL0_INITDONE (1 << 15)
+#define MIU_DIG_BIST_CTRL       (MIU_DIG_BASE + 0x1c0)  /* start (W) / status (R) */
+#define MIU_DIG_BIST_DONE       (1 << 15)               /* bits 14:13 = error */
+
+static uint64_t mstar_miu_read(void *opaque, hwaddr addr, unsigned size)
+{
+    switch (addr) {
+    case MIU_DIG_BIST_CTRL:
+        /* Memory self-test finished, no error (emulated DRAM never fails). */
+        return MIU_DIG_BIST_DONE;
+    case MIU_DIG_CNTRL0:
+        /* Initial DRAM training cycle completed (full-config path). */
+        return MIU_DIG_CNTRL0_INITDONE;
+    }
+    return 0;
+}
+
+static void mstar_miu_write(void *opaque, hwaddr addr, uint64_t v, unsigned size)
+{
+    /* No analog PHY / DRAM to program; the training writes are no-ops here. */
+}
+
+static const MemoryRegionOps mstar_miu_ops = {
+    .read = mstar_miu_read,
+    .write = mstar_miu_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+
 /* ------------------------------------------------------------------ SoC */
 
 /* "fiq" mst-intc input line for each timer@6040/80/c0 (from the DT). */
@@ -262,6 +365,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         memory_region_init_io(did, OBJECT(s), &mstar_did_ops, s,
                               "mstar.did", 0x200);
         memory_region_add_subregion(get_system_memory(), MSTAR_DID_BASE, did);
+    }
+
+    /* MIU (DDR controller) - only enough for the mask-ROM IPL's memory BIST. */
+    {
+        MemoryRegion *miu = g_new(MemoryRegion, 1);
+        memory_region_init_io(miu, OBJECT(s), &mstar_miu_ops, s,
+                              "mstar.miu", MSTAR_MIU_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSTAR_MIU_BASE, miu);
     }
 
     /* The two "mst-intc" instances between the peripherals and the GIC. */
