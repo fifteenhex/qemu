@@ -24,6 +24,7 @@
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
+#include "hw/intc/arm_gic.h"
 #include "qom/object.h"
 
 /*
@@ -53,6 +54,7 @@ struct MStarSoCState {
     DeviceState parent_obj;
     /*< public >*/
     ARMCPU cpu[MSTAR_SOC_MAX_CPUS];
+    GICState gic;
 };
 
 struct MStarSoCClass {
@@ -74,15 +76,21 @@ static void mstar_soc_init(Object *obj)
         object_initialize_child(obj, "cpu[*]", &s->cpu[i],
                                 sc->info.cpu_type);
     }
+
+    object_initialize_child(obj, "gic", &s->gic, TYPE_ARM_GIC);
 }
 
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
 {
     MStarSoCState *s = MSTAR_SOC(dev);
     MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(dev);
+    DeviceState *gicdev = DEVICE(&s->gic);
     unsigned int i;
 
     for (i = 0; i < sc->info.num_cpus; i++) {
+        /* The architected timer runs at the rate given in the device tree. */
+        object_property_set_int(OBJECT(&s->cpu[i]), "cntfrq",
+                                MSTAR_ARCH_TIMER_FREQ, &error_abort);
         /*
          * No EL2/EL3: the mainline kernel starts at EL1 (SVC). With EL2
          * present QEMU's cortex-a7 would enter HYP and hang on the unwired
@@ -95,6 +103,36 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         if (!qdev_realize(DEVICE(&s->cpu[i]), NULL, errp)) {
             return;
         }
+    }
+
+    /* GIC-400 (GICv2). Model only the distributor + CPU interface. */
+    qdev_prop_set_uint32(gicdev, "num-irq", MSTAR_GIC_NUM_SPI + GIC_INTERNAL);
+    qdev_prop_set_uint32(gicdev, "revision", 2);
+    qdev_prop_set_uint32(gicdev, "num-cpu", sc->info.num_cpus);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gic), errp)) {
+        return;
+    }
+
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gic), 0, MSTAR_GIC_DIST_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->gic), 1, MSTAR_GIC_CPU_BASE);
+
+    for (i = 0; i < sc->info.num_cpus; i++) {
+        DeviceState *cpudev = DEVICE(&s->cpu[i]);
+        int ppibase = MSTAR_GIC_NUM_SPI + i * GIC_INTERNAL + GIC_NR_SGIS;
+
+        /* CPU generic timer outputs -> GIC PPI inputs */
+        qdev_connect_gpio_out(cpudev, GTIMER_PHYS,
+                              qdev_get_gpio_in(gicdev,
+                                       ppibase + MSTAR_GIC_PPI_PHYSTIMER));
+        qdev_connect_gpio_out(cpudev, GTIMER_VIRT,
+                              qdev_get_gpio_in(gicdev,
+                                       ppibase + MSTAR_GIC_PPI_VIRTTIMER));
+
+        /* GIC outputs -> CPU interrupt inputs */
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gic), i,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gic), i + sc->info.num_cpus,
+                           qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
     }
 
     /* "pm" UART - the kernel console. */

@@ -34,4 +34,20 @@
 
 #define MSTAR_DRAM_BASE         0x20000000
 
+/* GIC (arm,cortex-a7-gic), with 128 SPIs. */
+#define MSTAR_GIC_NUM_SPI       128
+#define MSTAR_GIC_DIST_BASE     0x16001000
+#define MSTAR_GIC_CPU_BASE      0x16002000
+#define MSTAR_GIC_HYP_BASE      0x16004000
+#define MSTAR_GIC_VCPU_BASE     0x16006000
+
+/* Architected timer frequency, from the arm,armv7-timer clock-frequency. */
+#define MSTAR_ARCH_TIMER_FREQ   6000000
+
+/* Architected timer PPIs, from the arm,armv7-timer node. */
+#define MSTAR_GIC_PPI_HYPTIMER  10
+#define MSTAR_GIC_PPI_VIRTTIMER 11
+#define MSTAR_GIC_PPI_SECTIMER  13
+#define MSTAR_GIC_PPI_PHYSTIMER 14
+
 #endif /* HW_ARM_MSTAR_H */

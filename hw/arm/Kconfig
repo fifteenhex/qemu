@@ -107,6 +107,7 @@ config MSTAR
     bool
     default y
     depends on TCG && ARM
+    select ARM_GIC
     select SERIAL_MM
 
 config MUSICPAL
