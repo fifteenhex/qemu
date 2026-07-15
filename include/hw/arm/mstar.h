@@ -239,6 +239,14 @@ struct Msc313SdioState {
 #define MSTAR_BOOTROM_BASE      0x0
 #define MSTAR_BOOTROM_SIZE      0x8000
 
+/*
+ * The "smpctrl" secondary-CPU boot mailbox (mstar,smpctrl), present on the
+ * multi-core SoCs (infinity2m/pioneer3). The kernel writes CPU1's entry
+ * address then an unlock magic to release it; see arch/arm/mach-mstar.
+ */
+#define MSTAR_SMPCTRL_BASE          (MSTAR_RIU_BASE + 0x204000)
+#define MSTAR_SMPCTRL_SIZE          0x200
+
 /* The "did" chip block (did@7000); holds the boot-media strap the ROM reads. */
 #define MSTAR_DID_BASE          (MSTAR_RIU_BASE + 0x7000)
 

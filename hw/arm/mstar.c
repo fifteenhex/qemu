@@ -26,10 +26,12 @@
 #include "system/block-backend.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "target/arm/cpu.h"
+#include "target/arm/arm-powerctl.h"
 #include "hw/intc/arm_gic.h"
 #include "qom/object.h"
 
@@ -46,6 +48,7 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 
 /* Concrete SoC variants */
 #define TYPE_MSTAR_INFINITY3_SOC "mstar-infinity3-soc"
+#define TYPE_MSTAR_INFINITY2M_SOC "mstar-infinity2m-soc"
 
 #define MSTAR_SOC_MAX_CPUS 2
 
@@ -53,6 +56,7 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 typedef struct MStarSoCInfo {
     const char *cpu_type;
     unsigned int num_cpus;
+    bool has_display;           /* SSD20xD-style GOP/display pipeline */
     uint32_t timer_freq;        /* SoC PIT (timer@6040) input clock, Hz */
 } MStarSoCInfo;
 
@@ -74,6 +78,9 @@ struct MStarSoCState {
     Msc313ClkgenState clkgen;
     Msc313SdioState sdio;
     MemoryRegion imi;
+    MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
+    uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
+    uint16_t smpctrl_regs[0x200 / 4];   /* MSTAR_SMPCTRL_SIZE/4, read-back */
 };
 
 struct MStarSoCClass {
@@ -289,6 +296,78 @@ static const MemoryRegionOps mstar_emac_ops = {
 };
 
 
+/* --------------------------------------------------------------- smpctrl */
+
+/*
+ * Secondary-CPU boot mailbox (mstar,smpctrl). mstarv7_boot_secondary()
+ * writes CPU1's entry address as two halfwords then an unlock magic; the
+ * hardware then releases CPU1 to that address. Register byte offsets are
+ * from arch/arm/mach-mstar/mstarv7.c.
+ */
+#define SMPCTRL_CPU1_BOOT_HIGH  0x4c
+#define SMPCTRL_CPU1_BOOT_LOW   0x50
+#define SMPCTRL_CPU1_UNLOCK     0x58
+#define SMPCTRL_UNLOCK_MAGIC    0xbabe
+
+static uint64_t mstar_smpctrl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarSoCState *s = opaque;
+
+    /*
+     * Return what was written. The vendor kernel's boot_secondary writes the
+     * entry address a halfword at a time and spins reading it back until the
+     * readback matches (see mach-sstar), so a read-as-zero register livelocks
+     * it before it ever brings up CPU1.
+     */
+    return s->smpctrl_regs[addr / 4];
+}
+
+static void mstar_smpctrl_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    MStarSoCState *s = opaque;
+
+    s->smpctrl_regs[addr / 4] = val;
+
+    switch (addr) {
+    case SMPCTRL_CPU1_BOOT_LOW:
+        s->smp_bootaddr = (s->smp_bootaddr & 0xffff0000) | (val & 0xffff);
+        break;
+    case SMPCTRL_CPU1_BOOT_HIGH:
+        s->smp_bootaddr = (s->smp_bootaddr & 0x0000ffff) | ((val & 0xffff) << 16);
+        break;
+    case SMPCTRL_CPU1_UNLOCK:
+        if ((val & 0xffff) == SMPCTRL_UNLOCK_MAGIC) {
+            /*
+             * Real hardware releases the secondary from reset in Secure state,
+             * so it can run the same Secure init the primary did (Monitor-mode
+             * SCR/CNTVOFF setup). Start it at EL3 (Secure Monitor); starting it
+             * Non-secure (EL1) makes those Secure-only accesses UNDEFINED and
+             * the secondary oopses. Only meaningful when the CPU has EL3 (the
+             * vendor-kernel path); fall back to EL1 otherwise.
+             */
+            uint32_t el = arm_feature(&s->cpu[1].env, ARM_FEATURE_EL3) ? 3 : 1;
+            int ret = arm_set_cpu_on(s->cpu[1].mp_affinity, s->smp_bootaddr, 0,
+                                     el, false /* AArch32 */);
+
+            if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "mstar-smpctrl: could not start CPU1 (%d)\n", ret);
+            }
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps mstar_smpctrl_ops = {
+    .read = mstar_smpctrl_read,
+    .write = mstar_smpctrl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
+};
+
+
 /* ------------------------------------------------------------------ SoC */
 
 /* "fiq" mst-intc input line for each timer@6040/80/c0 (from the DT). */
@@ -365,6 +444,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                  &error_abort);
         object_property_set_bool(OBJECT(&s->cpu[i]), "has_el3", s->secure_boot,
                                  &error_abort);
+        /*
+         * Secondary CPUs start held; the kernel releases them one at a time
+         * through the smpctrl mailbox (see mstar_smpctrl_write).
+         */
+        if (i > 0) {
+            object_property_set_bool(OBJECT(&s->cpu[i]), "start-powered-off",
+                                     true, &error_abort);
+        }
         if (!qdev_realize(DEVICE(&s->cpu[i]), NULL, errp)) {
             return;
         }
@@ -410,6 +497,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->imi, OBJECT(s), "mstar.imi", MSTAR_IMI_SIZE,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), MSTAR_IMI_BASE, &s->imi);
+
+    /* smpctrl mailbox used to release the secondary CPU on multi-core SoCs. */
+    if (sc->info.num_cpus > 1) {
+        memory_region_init_io(&s->smpctrl, OBJECT(s), &mstar_smpctrl_ops, s,
+                              "mstar.smpctrl", MSTAR_SMPCTRL_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSTAR_SMPCTRL_BASE,
+                                    &s->smpctrl);
+    }
 
     /* "did" chip block - the boot ROM reads the boot-media strap from here. */
     {
@@ -549,6 +644,17 @@ static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.timer_freq = 12000000;     /* xtal_div2 */
 }
 
+static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
+{
+    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
+
+    /* SSD20xD: dual Cortex-A7, secondary released via the smpctrl mailbox. */
+    sc->info.cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
+    sc->info.num_cpus = 2;
+    sc->info.has_display = true;
+    sc->info.timer_freq = 432000000;    /* clk_timer */
+}
+
 /* ---------------------------------------------------------------- Boards */
 
 #define TYPE_MSTAR_MACHINE MACHINE_TYPE_NAME("mstar")
@@ -652,6 +758,19 @@ static void breadbee_machine_class_init(ObjectClass *oc, const void *data)
     mmc->soc_type = TYPE_MSTAR_INFINITY3_SOC;
 }
 
+static void dongshanpione_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
+
+    mc->desc = "100ask DongShanPi One (MStar infinity2m/SSD202D)";
+    mc->default_ram_size = 128 * MiB;
+    mc->min_cpus = 2;
+    mc->default_cpus = 2;
+    mc->max_cpus = 2;
+    mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
+}
+
 /* ----------------------------------------------------------------- Types */
 
 static const TypeInfo mstar_types[] = {
@@ -670,6 +789,11 @@ static const TypeInfo mstar_types[] = {
         .class_init     = mstar_infinity3_soc_class_init,
     },
     {
+        .name           = TYPE_MSTAR_INFINITY2M_SOC,
+        .parent         = TYPE_MSTAR_SOC,
+        .class_init     = mstar_infinity2m_soc_class_init,
+    },
+    {
         .name           = TYPE_MSTAR_MACHINE,
         .parent         = TYPE_MACHINE,
         .instance_size  = sizeof(MStarMachineState),
@@ -683,6 +807,11 @@ static const TypeInfo mstar_types[] = {
         .name           = MACHINE_TYPE_NAME("breadbee"),
         .parent         = TYPE_MSTAR_MACHINE,
         .class_init     = breadbee_machine_class_init,
+    },
+    {
+        .name           = MACHINE_TYPE_NAME("dongshanpione"),
+        .parent         = TYPE_MSTAR_MACHINE,
+        .class_init     = dongshanpione_machine_class_init,
     },
 };
 
