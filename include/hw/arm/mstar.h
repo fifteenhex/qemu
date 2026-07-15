@@ -171,6 +171,26 @@ struct Msc313BdmaState {
 };
 
 /*
+ * The "clkgen": the main clock mux/gate block. Each mux lives in one 16-bit
+ * register (gate bit + parent-select field + deglitch bit). The Linux driver
+ * (drivers/clk/mstar/clk-msc313-clkgen.c) was reverse engineered and only
+ * knows some registers/bits, so the model logs anything the firmware touches
+ * outside what the driver describes (via LOG_UNIMP / -d unimp).
+ */
+#define TYPE_MSC313_CLKGEN "mstar-msc313-clkgen"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313ClkgenState, MSC313_CLKGEN)
+
+#define MSTAR_CLKGEN_NUM_REGS (0x200 / 4)
+
+struct Msc313ClkgenState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint16_t regs[MSTAR_CLKGEN_NUM_REGS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -201,6 +221,10 @@ struct Msc313BdmaState {
 /* The "emac" Cadence GEM (emac@2a2000), accessed over the 16-bit XIU bus. */
 #define MSTAR_EMAC_BASE         (MSTAR_RIU_BASE + 0x2a2000)
 #define MSTAR_EMAC_SIZE         0x1000
+
+/* The "clkgen" clock mux/gate block (reg = <0x207000 0x200>). */
+#define MSTAR_CLKGEN_BASE           (MSTAR_RIU_BASE + 0x207000)
+#define MSTAR_CLKGEN_SIZE           0x200
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
