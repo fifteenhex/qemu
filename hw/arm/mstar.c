@@ -77,6 +77,7 @@ struct MStarSoCState {
     Msc313BdmaState bdma;
     Msc313ClkgenState clkgen;
     Msc313SdioState sdio;
+    Msc313PwmState pwm;
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
     uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
@@ -399,6 +400,9 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
+    if (sc->info.has_display) {
+        object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSC313_PWM);
+    }
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -617,6 +621,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                     blk_by_legacy_dinfo(di), &error_fatal);
             qdev_realize_and_unref(card, bus, &error_fatal);
         }
+    }
+
+    /* "pwm" controller; its channel 0 is the panel backlight. */
+    if (sc->info.has_display) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm), 0, MSTAR_PWM_BASE);
     }
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */

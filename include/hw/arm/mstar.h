@@ -219,6 +219,30 @@ struct Msc313SdioState {
 };
 
 /*
+ * The "pwm": the MStar/SSD20xD PWM controller (mstar,ssd20xd-pwm). A bank of
+ * per-channel duty/period/divider/control registers; on this board channel 0
+ * drives the panel backlight. Register layout is from the mainline driver
+ * drivers/pwm/pwm-msc313e.c.
+ */
+#define TYPE_MSC313_PWM "mstar-msc313-pwm"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313PwmState, MSC313_PWM)
+
+#define MSTAR_PWM_NUM_REGS (0x400 / 4)
+#define MSTAR_PWM_CHANNELS 4
+
+struct Msc313PwmState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint16_t regs[MSTAR_PWM_NUM_REGS];
+};
+
+/* Channel brightness 0..256 (implemented in hw/gpio/mstar_pwm.c); the display
+ * scanout reads channel 0 to dim the panel backlight. */
+unsigned int msc313_pwm_brightness(Msc313PwmState *s, unsigned int ch);
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -266,6 +290,10 @@ struct Msc313SdioState {
 #define MSTAR_SDIO_BASE             (MSTAR_RIU_BASE + 0x282000)
 #define MSTAR_SDIO_SIZE             0x200
 #define MSTAR_SDIO_HWIRQ            19      /* line on the "irq" mst-intc */
+
+/* The "pwm" controller (pwm@3400); channel 0 is the panel backlight. */
+#define MSTAR_PWM_BASE              (MSTAR_RIU_BASE + 0x3400)
+#define MSTAR_PWM_SIZE              0x400
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
