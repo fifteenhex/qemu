@@ -146,6 +146,31 @@ struct Msc313IspState {
 };
 
 /*
+ * The "bdma" bulk DMA engine (mstar,msc313-bdma): a 2-channel copy engine.
+ * Each channel (0x40 apart) copies "size" bytes between two slaves (MIU
+ * DRAM, the QSPI flash, ...) and raises a completion interrupt.
+ */
+#define TYPE_MSC313_BDMA "mstar-msc313-bdma"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313BdmaState, MSC313_BDMA)
+
+#define MSTAR_BDMA_NUM_CHANNELS 2
+#define MSTAR_BDMA_CHAN_SIZE    0x40
+#define MSTAR_BDMA_CHAN_NREGS   (MSTAR_BDMA_CHAN_SIZE / 4)
+
+typedef struct Msc313BdmaChan {
+    uint16_t regs[MSTAR_BDMA_CHAN_NREGS];
+    qemu_irq irq;
+} Msc313BdmaChan;
+
+struct Msc313BdmaState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    Msc313BdmaChan chans[MSTAR_BDMA_NUM_CHANNELS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -157,6 +182,14 @@ struct Msc313IspState {
 #define MSTAR_PM_UART_HWIRQ     34      /* line on the "irq" mst-intc */
 
 #define MSTAR_DRAM_BASE         0x20000000
+
+/* On-chip "IMI" SRAM (sram@a0000000); the boot ROM loads the IPL here. */
+#define MSTAR_IMI_BASE          0xa0000000
+#define MSTAR_IMI_SIZE          0x20000
+
+/* The mask boot ROM, mapped at address 0 and loaded via -bios. */
+#define MSTAR_BOOTROM_BASE      0x0
+#define MSTAR_BOOTROM_SIZE      0x8000
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128
@@ -229,5 +262,14 @@ struct Msc313IspState {
 #define MSTAR_ISP_QSPI_SIZE         0x200
 #define MSTAR_ISP_XIP_BASE          0x14000000
 #define MSTAR_ISP_XIP_SIZE          0x1000000
+
+/*
+ * The "bdma" engine (reg = <0x200400 0x80>). Its two channels interrupt on
+ * lines 40 and 41 of the "irq" mst-intc.
+ */
+#define MSTAR_BDMA_BASE             (MSTAR_RIU_BASE + 0x200400)
+#define MSTAR_BDMA_SIZE             0x80
+#define MSTAR_BDMA_CH0_HWIRQ        40
+#define MSTAR_BDMA_CH1_HWIRQ        41
 
 #endif /* HW_ARM_MSTAR_H */

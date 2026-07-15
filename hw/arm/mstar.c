@@ -63,6 +63,7 @@ struct MStarSoCState {
     Msc313RtcState rtc;
     Msc313GpioState gpio;
     Msc313IspState isp;
+    Msc313BdmaState bdma;
 };
 
 struct MStarSoCClass {
@@ -123,6 +124,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_MSC313_RTC);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_MSC313_GPIO);
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
+    object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -259,6 +261,16 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 1, MSTAR_FSP_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 2, MSTAR_ISP_QSPI_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->isp), 3, MSTAR_ISP_XIP_BASE);
+
+    /* BDMA engine, its two channels interrupting via the "irq" mst-intc. */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->bdma), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->bdma), 0, MSTAR_BDMA_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->bdma), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BDMA_CH0_HWIRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->bdma), 1,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BDMA_CH1_HWIRQ));
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
