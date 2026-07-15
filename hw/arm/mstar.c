@@ -55,6 +55,8 @@ struct MStarSoCState {
     /*< public >*/
     ARMCPU cpu[MSTAR_SOC_MAX_CPUS];
     GICState gic;
+    MstIntcState intc_irq;
+    MstIntcState intc_fiq;
 };
 
 struct MStarSoCClass {
@@ -78,6 +80,29 @@ static void mstar_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "gic", &s->gic, TYPE_ARM_GIC);
+    object_initialize_child(obj, "intc-irq", &s->intc_irq, TYPE_MST_INTC);
+    object_initialize_child(obj, "intc-fiq", &s->intc_fiq, TYPE_MST_INTC);
+}
+
+static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
+                               hwaddr base, uint32_t irq_start, uint32_t num,
+                               Error **errp)
+{
+    SysBusDevice *sbd = SYS_BUS_DEVICE(intc);
+    unsigned int i;
+
+    qdev_prop_set_uint32(DEVICE(intc), "irq-start", irq_start);
+    qdev_prop_set_uint32(DEVICE(intc), "num-irqs", num);
+    if (!sysbus_realize(sbd, errp)) {
+        return false;
+    }
+    sysbus_mmio_map(sbd, 0, base);
+
+    /* Each input forwards to GIC SPI (irq_start + line). */
+    for (i = 0; i < num; i++) {
+        sysbus_connect_irq(sbd, i, qdev_get_gpio_in(gicdev, irq_start + i));
+    }
+    return true;
 }
 
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
@@ -135,9 +160,18 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                            qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
     }
 
-    /* "pm" UART - the kernel console. */
+    /* The two "mst-intc" instances between the peripherals and the GIC. */
+    if (!mstar_realize_intc(&s->intc_irq, gicdev, MSTAR_INTC_IRQ_BASE,
+                            MSTAR_INTC_IRQ_START, MSTAR_INTC_IRQ_NUM, errp) ||
+        !mstar_realize_intc(&s->intc_fiq, gicdev, MSTAR_INTC_FIQ_BASE,
+                            MSTAR_INTC_FIQ_START, MSTAR_INTC_FIQ_NUM, errp)) {
+        return;
+    }
+
+    /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
-                   MSTAR_PM_UART_REGSHIFT, NULL,
+                   MSTAR_PM_UART_REGSHIFT,
+                   qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_PM_UART_HWIRQ),
                    MSTAR_PM_UART_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
 }
 
