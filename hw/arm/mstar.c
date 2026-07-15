@@ -47,6 +47,7 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 typedef struct MStarSoCInfo {
     const char *cpu_type;
     unsigned int num_cpus;
+    uint32_t timer_freq;        /* SoC PIT (timer@6040) input clock, Hz */
 } MStarSoCInfo;
 
 struct MStarSoCState {
@@ -58,6 +59,7 @@ struct MStarSoCState {
     MstIntcState intc_irq;
     MstIntcState intc_fiq;
     MemoryRegion l3bridge;
+    Msc313eTimerState timer[MSTAR_NUM_TIMERS];
 };
 
 struct MStarSoCClass {
@@ -92,6 +94,9 @@ static const MemoryRegionOps mstar_l3bridge_ops = {
 
 /* ------------------------------------------------------------------ SoC */
 
+/* "fiq" mst-intc input line for each timer@6040/80/c0 (from the DT). */
+static const unsigned int mstar_timer_hwirq[MSTAR_NUM_TIMERS] = { 0, 1, 12 };
+
 static void mstar_soc_init(Object *obj)
 {
     MStarSoCState *s = MSTAR_SOC(obj);
@@ -106,6 +111,11 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "gic", &s->gic, TYPE_ARM_GIC);
     object_initialize_child(obj, "intc-irq", &s->intc_irq, TYPE_MST_INTC);
     object_initialize_child(obj, "intc-fiq", &s->intc_fiq, TYPE_MST_INTC);
+
+    for (i = 0; i < MSTAR_NUM_TIMERS; i++) {
+        object_initialize_child(obj, "timer[*]", &s->timer[i],
+                                TYPE_MSC313E_TIMER);
+    }
 }
 
 static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
@@ -198,6 +208,28 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    /*
+     * SoC PIT timers (timer@6040, free-running counters). Their input clock is
+     * per-variant: the SSD20xD family runs them from the 432MHz clk_timer, the
+     * msc313/infinity3 from the 12MHz xtal_div2. The vendor kernel programs its
+     * clockevent using this rate, so getting it wrong makes every deadline land
+     * in the past and storms the timer interrupt.
+     */
+    for (i = 0; i < MSTAR_NUM_TIMERS; i++) {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->timer[i]);
+
+        object_property_set_int(OBJECT(&s->timer[i]), "freq",
+                                sc->info.timer_freq, &error_abort);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, MSTAR_TIMER_BASE + i * MSTAR_TIMER_STRIDE);
+        /* timer@6040/80/c0 interrupt on "fiq" mst-intc lines 0, 1 and 12. */
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_fiq),
+                                            mstar_timer_hwirq[i]));
+    }
+
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
                    MSTAR_PM_UART_REGSHIFT,
@@ -220,6 +252,7 @@ static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
 
     sc->info.cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
     sc->info.num_cpus = 1;
+    sc->info.timer_freq = 12000000;     /* xtal_div2 */
 }
 
 /* ---------------------------------------------------------------- Boards */

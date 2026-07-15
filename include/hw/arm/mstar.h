@@ -46,6 +46,32 @@ struct MstIntcState {
 };
 
 /*
+ * The "msc313e-timer": a free-running up-counter used as the clock source
+ * and, on the other instances, as a clock event.
+ */
+#define TYPE_MSC313E_TIMER "mstar-msc313e-timer"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313eTimerState, MSC313E_TIMER)
+
+struct Msc313eTimerState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;           /* counter-reached-MAX interrupt (INT_EN gated) */
+    QEMUTimer *hrtimer;     /* fires in host time when the counter hits MAX */
+    uint32_t freq;
+    uint16_t ctrl;
+    uint16_t divide;
+    uint32_t max;
+    int64_t base_ns;        /* virtual time the counter was (re)based */
+    uint64_t base_count;    /* counter value at base_ns */
+    uint32_t latch;         /* latched on a COUNTER_LOW read */
+    bool int_pending;       /* the counter has reached MAX since the last ack */
+};
+
+#define MSTAR_NUM_TIMERS 3
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -94,5 +120,13 @@ struct MstIntcState {
 #define MSTAR_L3BRIDGE_SIZE         0x200
 #define MSTAR_L3BRIDGE_STATUS       0x40
 #define MSTAR_L3BRIDGE_STATUS_DONE  (1 << 12)
+
+/*
+ * The msc313e-timer instances at 0x1f206040/80/c0, clocked from xtal_div2
+ * (12MHz). Their interrupts are lines 0, 1 and 12 of the "fiq" mst-intc.
+ */
+#define MSTAR_TIMER_BASE            (MSTAR_RIU_BASE + 0x6040)
+#define MSTAR_TIMER_STRIDE          0x40
+#define MSTAR_TIMER_FREQ            12000000
 
 #endif /* HW_ARM_MSTAR_H */
