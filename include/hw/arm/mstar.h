@@ -25,6 +25,13 @@
  */
 
 /*
+ * RIU I/O tracer (implemented in hw/arm/mstar.c). Device models that own
+ * registers claimed away from the catch-all overlay (display, dphy, i2c) log
+ * their accesses through this when MSTAR_IOLOG is set. A no-op otherwise.
+ */
+void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size);
+
+/*
  * The "mst-intc" (also on MediaTek chips): a hierarchical interrupt
  * controller sitting between the peripherals and the GIC. It adds a per-line
  * mask and forwards each input to a GIC SPI (irq_start + line).
@@ -243,6 +250,42 @@ struct Msc313PwmState {
 unsigned int msc313_pwm_brightness(Msc313PwmState *s, unsigned int ch);
 
 /*
+ * The "disp": enough of the SSD20xD display pipeline to scan out to a QEMU
+ * console and drive DRM vblank (gop1 primary plane, display-top vsync, the
+ * mopg overlay/video plane and the MIPI DSI controller). Register layout is
+ * from the mstar DRM driver (drivers/gpu/drm/mstar/mstar_{gop,top,mop,dsi}.c).
+ */
+#define TYPE_MSC313_DISP "mstar-msc313-disp"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313DispState, MSC313_DISP)
+
+#define MSTAR_DISP_GOP_NUM_REGS (0x400 / 4)
+#define MSTAR_DISP_TOP_NUM_REGS (0x200 / 4)
+#define MSTAR_DISP_MOP_NUM_REGS (0x600 / 4)
+#define MSTAR_DISP_DSI_NUM_REGS (0x400 / 4)
+
+struct Msc313DispState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion gop;       /* gop1 primary plane registers @0x1f246800 */
+    MemoryRegion top;       /* display-top registers        @0x1f225000 */
+    MemoryRegion mop;       /* mopg overlay (video) plane   @0x1f280a00 */
+    MemoryRegion dsi;       /* MIPI DSI controller          @0x1f345200 */
+    qemu_irq irq;           /* display-top vsync interrupt */
+    QemuConsole *con;
+    QEMUTimer *vblank;
+    MemoryRegionSection fbsection;
+    Msc313PwmState *backlight;   /* PWM whose channel 0 dims the panel */
+    unsigned int brightness;     /* backlight level, 0..256 */
+    uint16_t gopregs[MSTAR_DISP_GOP_NUM_REGS];
+    uint16_t topregs[MSTAR_DISP_TOP_NUM_REGS];
+    uint16_t mopregs[MSTAR_DISP_MOP_NUM_REGS];
+    uint32_t dsiregs[MSTAR_DISP_DSI_NUM_REGS];
+    uint32_t width, height;
+    bool invalidate;
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -294,6 +337,17 @@ unsigned int msc313_pwm_brightness(Msc313PwmState *s, unsigned int ch);
 /* The "pwm" controller (pwm@3400); channel 0 is the panel backlight. */
 #define MSTAR_PWM_BASE              (MSTAR_RIU_BASE + 0x3400)
 #define MSTAR_PWM_SIZE              0x400
+
+/* The "disp" pipeline: gop1 primary plane + display-top (SSD20xD). */
+#define MSTAR_DISP_GOP_BASE         (MSTAR_RIU_BASE + 0x246800)
+#define MSTAR_DISP_GOP_SIZE         0x400
+#define MSTAR_DISP_TOP_BASE         (MSTAR_RIU_BASE + 0x225000)
+#define MSTAR_DISP_TOP_SIZE         0x200
+#define MSTAR_DISP_MOP_BASE         (MSTAR_RIU_BASE + 0x280a00)
+#define MSTAR_DISP_MOP_SIZE         0x600
+#define MSTAR_DISP_DSI_BASE         (MSTAR_RIU_BASE + 0x345200)
+#define MSTAR_DISP_DSI_SIZE         0x400
+#define MSTAR_DISP_HWIRQ            50      /* display-top vsync, "irq" intc */
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */
 #define MSTAR_GIC_NUM_SPI       128

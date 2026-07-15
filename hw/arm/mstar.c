@@ -78,6 +78,7 @@ struct MStarSoCState {
     Msc313ClkgenState clkgen;
     Msc313SdioState sdio;
     Msc313PwmState pwm;
+    Msc313DispState disp;
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
     uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
@@ -90,6 +91,26 @@ struct MStarSoCClass {
     /*< public >*/
     MStarSoCInfo info;
 };
+
+/*
+ * Optional RIU I/O tracer for reverse-engineering. When the environment
+ * variable MSTAR_IOLOG names a file, every access logged via mstar_iolog() is
+ * appended to it as "R|W <phys> <size> <value>". Two sources feed it: a
+ * catch-all overlay over the whole RIU (added in mstar_soc_realize, priority
+ * -1, so it only sees registers no device has claimed) and explicit calls in
+ * the display/dphy/dsi/mop register handlers (whose registers ARE claimed, so
+ * the overlay would never see them).
+ */
+static FILE *mstar_iolog_fp;
+
+void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size)
+{
+    if (mstar_iolog_fp) {
+        fprintf(mstar_iolog_fp, "%c %08x %u %0*x\n", write ? 'W' : 'R',
+                (uint32_t)phys, size, size * 2, (uint32_t)val);
+        fflush(mstar_iolog_fp);
+    }
+}
 
 /* ----------------------------------------------------------- l3bridge */
 
@@ -402,6 +423,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
     if (sc->info.has_display) {
         object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSC313_PWM);
+        object_initialize_child(obj, "disp", &s->disp, TYPE_MSC313_DISP);
     }
 }
 
@@ -629,6 +651,21 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
             return;
         }
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm), 0, MSTAR_PWM_BASE);
+    }
+
+    /* "disp" GOP/display-top pipeline, scanned out to a QEMU console. */
+    if (sc->info.has_display) {
+        s->disp.backlight = &s->pwm;
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 0, MSTAR_DISP_GOP_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTAR_DISP_TOP_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTAR_DISP_MOP_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 3, MSTAR_DISP_DSI_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTAR_DISP_HWIRQ));
     }
 
     /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
