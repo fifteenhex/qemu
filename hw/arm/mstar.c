@@ -58,6 +58,11 @@ typedef struct MStarSoCInfo {
     unsigned int num_cpus;
     bool has_display;           /* SSD20xD-style GOP/display pipeline */
     uint32_t timer_freq;        /* SoC PIT (timer@6040) input clock, Hz */
+    uint16_t bond;              /* package/variant strap at chiptop+0x120; the
+                                 * IPL reads it to pick the DRAM profile/size
+                                 * (0x1d = SSD201/64MB, 0x1e = SSD202D/128MB) */
+    uint16_t chip_id;           /* CHIPID @0x1f003c00: 0xc2 = MSC313E/infinity3,
+                                 * 0xf0 = SSD20xD/infinity2m */
 } MStarSoCInfo;
 
 struct MStarSoCState {
@@ -451,6 +456,71 @@ static const MemoryRegionOps mstar_cpupll_ops = {
 };
 
 
+/* --------------------------------------------------------------- chipid */
+
+/*
+ * The "chipid" register (chip@1f003c00). The mask-ROM IPL reads the byte here
+ * to identify the chip family and prints it as "D-<id>"; msc313e/infinity3 is
+ * 0xc2, the SSD20xD/infinity2m is 0xf0.
+ */
+static uint64_t mstar_chipid_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarSoCState *s = opaque;
+    MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(s);
+
+    if (addr == 0) {
+        return sc->info.chip_id;
+    }
+    return 0;
+}
+
+static void mstar_chipid_write(void *opaque, hwaddr addr, uint64_t v,
+                               unsigned size)
+{
+}
+
+static const MemoryRegionOps mstar_chipid_ops = {
+    .read = mstar_chipid_read,
+    .write = mstar_chipid_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* --------------------------------------------------------------- chiptop */
+
+/*
+ * The "chiptop" pin-mux / chip-strap block (pinctrl@1f203c00). Only one
+ * register matters to the mask-ROM IPL: the package/variant strap "BOND" at
+ * +0x120 (0x1f203d20). The IPL reads it to identify the chip - it prints
+ * "D-<bond>" - and picks the matching DDR timing profile and PLL: with the
+ * right strap (0x1e = SSD202D, 0x1d = SSD201) it reports e.g. "miupll_233MHz",
+ * left at 0 it can't identify the part and prints "unknown miupll". (The DRAM
+ * *size* is not read from here - the IPL probes it by aliasing; see the miu
+ * block.) The rest of the block is stubbed (reads 0, writes dropped), matching
+ * what the IPL and the pinctrl driver need.
+ */
+static uint64_t mstar_chiptop_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarSoCState *s = opaque;
+    MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(s);
+
+    if (addr == MSTAR_CHIPTOP_BOND) {
+        return sc->info.bond;
+    }
+    return 0;
+}
+
+static void mstar_chiptop_write(void *opaque, hwaddr addr, uint64_t v,
+                                unsigned size)
+{
+}
+
+static const MemoryRegionOps mstar_chiptop_ops = {
+    .read = mstar_chiptop_read,
+    .write = mstar_chiptop_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+
 /* ------------------------------------------------------------------ SoC */
 
 /* "fiq" mst-intc input line for each timer@6040/80/c0 (from the DT). */
@@ -641,6 +711,24 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         memory_region_add_subregion(get_system_memory(), MSTAR_MIU_BASE, miu);
     }
 
+    /* chipid: the CHIPID byte the mask-ROM IPL reads to identify the chip. */
+    if (sc->info.chip_id) {
+        MemoryRegion *chipid = g_new(MemoryRegion, 1);
+        memory_region_init_io(chipid, OBJECT(s), &mstar_chipid_ops, s,
+                              "mstar.chipid", MSTAR_CHIPID_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSTAR_CHIPID_BASE,
+                                    chipid);
+    }
+
+    /* chiptop: the package BOND strap the IPL reads to size in-package DRAM. */
+    if (sc->info.bond) {
+        MemoryRegion *chiptop = g_new(MemoryRegion, 1);
+        memory_region_init_io(chiptop, OBJECT(s), &mstar_chiptop_ops, s,
+                              "mstar.chiptop", MSTAR_CHIPTOP_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSTAR_CHIPTOP_BASE,
+                                    chiptop);
+    }
+
     /* emac (Cadence GEM behind the XIU bus) - just enough for u-boot's MDIO. */
     {
         MemoryRegion *emac = g_new(MemoryRegion, 1);
@@ -819,6 +907,7 @@ static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
     sc->info.num_cpus = 1;
     sc->info.timer_freq = 12000000;     /* xtal_div2 */
+    sc->info.chip_id = 0xc2;            /* MSC313E */
 }
 
 static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
@@ -830,6 +919,8 @@ static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.num_cpus = 2;
     sc->info.has_display = true;
     sc->info.timer_freq = 432000000;    /* clk_timer */
+    sc->info.bond = 0x1e;               /* SSD202D (128MB in-package DRAM) */
+    sc->info.chip_id = 0xf0;            /* SSD20xD */
 }
 
 /* ---------------------------------------------------------------- Boards */
@@ -862,6 +953,31 @@ static void mstar_machine_init(MachineState *machine)
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,
                                 machine->ram);
+
+    if (machine->firmware) {
+        /*
+         * Real DRAM wraps (aliases) above its size, and the mask-ROM IPL relies
+         * on that to size memory: it writes distinct markers at DRAM +0/+32M/
+         * +64M/+128M/+256M and reads them back to find the wrap boundary (there
+         * is no size register). QEMU's RAM is a flat region, so accesses above
+         * the real size would just fall into unmapped space and the IPL would
+         * detect no wrap and print the 512MB maximum. Mirror the RAM above its
+         * real size, across the range the IPL probes, to reproduce the wrap so
+         * it detects the true size (e.g. an SSD202D reports "128MB"). Only the
+         * mask-ROM path needs this; a -kernel boot takes its size from the DTB.
+         */
+        uint64_t ram_size = machine->ram_size;
+        uint64_t off;
+
+        for (off = ram_size; off + ram_size <= 512 * MiB; off += ram_size) {
+            MemoryRegion *mirror = g_new(MemoryRegion, 1);
+
+            memory_region_init_alias(mirror, OBJECT(soc), "mstar.dram-mirror",
+                                     machine->ram, 0, ram_size);
+            memory_region_add_subregion(get_system_memory(),
+                                        MSTAR_DRAM_BASE + off, mirror);
+        }
+    }
 
     if (machine->firmware) {
         /*

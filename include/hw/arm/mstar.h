@@ -388,9 +388,21 @@ struct Msc313I2cState {
 /* The "did" chip block (did@7000); holds the boot-media strap the ROM reads. */
 #define MSTAR_DID_BASE          (MSTAR_RIU_BASE + 0x7000)
 
+/* The "chipid" register (chip@3c00); the mask-ROM IPL reads it as "D-<id>". */
+#define MSTAR_CHIPID_BASE       (MSTAR_RIU_BASE + 0x3c00)
+#define MSTAR_CHIPID_SIZE       0x200
+
 /* The MIU DDR controller (miu@202000); the IPL's memory BIST lives here. */
 #define MSTAR_MIU_BASE          (MSTAR_RIU_BASE + 0x202000)
 #define MSTAR_MIU_SIZE          0x1000
+
+/*
+ * The "chiptop" pin-mux / chip-strap block (pinctrl@203c00). The IPL reads the
+ * package "BOND" strap at +0x120 (0x1f203d20) to identify the chip variant.
+ */
+#define MSTAR_CHIPTOP_BASE      (MSTAR_RIU_BASE + 0x203c00)
+#define MSTAR_CHIPTOP_SIZE      0x400
+#define MSTAR_CHIPTOP_BOND      0x120
 
 /* The "emac" Cadence GEM (emac@2a2000), accessed over the 16-bit XIU bus. */
 #define MSTAR_EMAC_BASE         (MSTAR_RIU_BASE + 0x2a2000)
