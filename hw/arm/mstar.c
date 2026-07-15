@@ -820,6 +820,19 @@ static void dongshanpione_machine_class_init(ObjectClass *oc, const void *data)
     mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
 }
 
+static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
+
+    mc->desc = "Miyoo Mini (MStar infinity2m/SSD202D)";
+    mc->default_ram_size = 128 * MiB;
+    mc->min_cpus = 2;
+    mc->default_cpus = 2;
+    mc->max_cpus = 2;
+    mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
+}
+
 /* ----------------------------------------------------------------- Types */
 
 static const TypeInfo mstar_types[] = {
@@ -861,6 +874,11 @@ static const TypeInfo mstar_types[] = {
         .name           = MACHINE_TYPE_NAME("dongshanpione"),
         .parent         = TYPE_MSTAR_MACHINE,
         .class_init     = dongshanpione_machine_class_init,
+    },
+    {
+        .name           = MACHINE_TYPE_NAME("miyoomini"),
+        .parent         = TYPE_MSTAR_MACHINE,
+        .class_init     = miyoomini_machine_class_init,
     },
 };
 
