@@ -167,6 +167,19 @@ static void msc313_sdio_run(Msc313SdioState *s)
         } else if (rlen == 16) {
             s->fifo[0] = 0x3f;
             memcpy(&s->fifo[1], resp, 16);
+        } else if (s->last_cmd == 12) {
+            /*
+             * A STOP for a transfer this model already auto-stopped (see the
+             * multi-block read path): the card is back in the transfer state
+             * and would not respond, but a driver that sends its own CMD12
+             * expects an R1b. Report the card as ready in the transfer state
+             * (status 0x900) rather than a no-response error.
+             */
+            s->fifo[0] = 12;
+            s->fifo[1] = 0x00;
+            s->fifo[2] = 0x00;
+            s->fifo[3] = 0x09;
+            s->fifo[4] = 0x00;
         } else if (ctl & SDIO_SD_CTL_RSPEN) {
             s->regs[SDIO_SD_STS / 4] |= SDIO_SD_STS_NORSP;
         }
@@ -185,13 +198,27 @@ static void msc313_sdio_run(Msc313SdioState *s)
 static uint64_t msc313_sdio_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313SdioState *s = opaque;
+    uint16_t regval;
+    unsigned int byteoff;
 
     if (addr >= SDIO_FIFO && addr < SDIO_FIFO_END) {
-        unsigned int b = (addr - SDIO_FIFO) / 2;
+        /*
+         * The command/response FIFO is 16-bit words at a 4-byte stride, each
+         * word holding two consecutive bytes. The mainline driver reads whole
+         * words; the vendor SDK driver reads the command response a byte at a
+         * time (CARD_REG_L8/H8 -> Hal_SDMMC_GetRspToken), so byte accesses must
+         * be served the right half of the word rather than dropped.
+         */
+        unsigned int word = (addr - SDIO_FIFO) / 4;
 
-        return s->fifo[b] | (s->fifo[b + 1] << 8);
+        regval = s->fifo[word * 2] | (s->fifo[word * 2 + 1] << 8);
+        byteoff = (addr - SDIO_FIFO) & 3;
+    } else {
+        regval = s->regs[addr / 4];
+        byteoff = addr & 3;
     }
-    return s->regs[addr / 4];
+
+    return (regval >> (8 * byteoff)) & (size == 1 ? 0xff : 0xffff);
 }
 
 static void msc313_sdio_write(void *opaque, hwaddr addr, uint64_t val,
@@ -246,7 +273,7 @@ static const MemoryRegionOps msc313_sdio_ops = {
     .read = msc313_sdio_read,
     .write = msc313_sdio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 2,
+    .valid.min_access_size = 1,     /* vendor driver reads the response as bytes */
     .valid.max_access_size = 4,
 };
 
