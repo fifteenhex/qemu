@@ -64,3 +64,8 @@ imx_i2c_write(const char *id, const char *reg, uint64_t ofs, uint64_t value) "%s
 
 # mstar_i2c.c
 msc313_i2c_addr(uint8_t addr, unsigned read, unsigned nak) "addr 0x%02x read %u nak %u"
+
+# mstar_secelem.c
+mstar_secelem_event(const char *e) "%s"
+mstar_secelem_send(unsigned pos, uint8_t data) "cmd[%u] = 0x%02x"
+mstar_secelem_recv(unsigned pos, uint8_t data) "resp[%u] -> 0x%02x"

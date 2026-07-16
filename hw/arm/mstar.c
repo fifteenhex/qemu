@@ -935,6 +935,7 @@ struct MStarMachineState {
 struct MStarMachineClass {
     MachineClass parent_class;
     const char *soc_type;
+    bool has_secelem;       /* board has the i2c0 security element at 0x3d */
 };
 
 static struct arm_boot_info mstar_binfo;
@@ -950,6 +951,11 @@ static void mstar_machine_init(MachineState *machine)
     /* A mask-ROM boot (-bios) runs in Secure state, so give the CPU EL3. */
     soc->secure_boot = machine->firmware != NULL || getenv("MSTAR_SECURE_KERNEL");
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
+
+    /* Board-specific security element on i2c1 @ 0x3d (Miyoo Mini). */
+    if (mmc->has_secelem) {
+        i2c_slave_create_simple(soc->i2c[1].bus, TYPE_MSTAR_SECELEM, 0x3d);
+    }
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,
                                 machine->ram);
@@ -1075,6 +1081,7 @@ static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpus = 2;
     mc->max_cpus = 2;
     mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
+    mmc->has_secelem = true;    /* auth chip on i2c0 @ 0x3d (see mstar_secelem) */
 }
 
 /* ----------------------------------------------------------------- Types */

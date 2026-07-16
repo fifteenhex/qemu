@@ -353,6 +353,28 @@ struct Msc313I2cState {
 };
 
 /*
+ * Dummy "security element" i2c slave (Miyoo Mini, i2c1 address 0x3d). The
+ * vendor kernel has a client driver that talks to a small auth/security chip
+ * and dereferences a NULL pointer (killing init) when the chip does not answer.
+ * This slave just ACKs every transfer and returns a canned response so the
+ * driver's probe succeeds and the board boots. It models no real crypto.
+ */
+#define TYPE_MSTAR_SECELEM "mstar-secelem"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarSecElemState, MSTAR_SECELEM)
+
+#define MSTAR_SECELEM_BUFSZ 64
+
+struct MstarSecElemState {
+    /*< private >*/
+    I2CSlave parent_obj;
+    /*< public >*/
+    bool reading;                       /* current transfer is master-read */
+    unsigned cmd_len;                   /* bytes written by the host */
+    uint8_t cmd[MSTAR_SECELEM_BUFSZ];
+    unsigned resp_pos;                  /* next response byte to hand back */
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
