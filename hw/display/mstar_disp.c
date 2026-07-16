@@ -21,6 +21,7 @@
 #include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/arm/mstar.h"
+#include "trace.h"
 
 /* ------------------------------------------------------------- disp (GOP) */
 
@@ -57,14 +58,38 @@
 
 /*
  * MIPI DSI controller (drivers/gpu/drm/mstar/mstar_dsi.c). This is a MediaTek
- * DSI clone; the register map matches mtk_dsi. We model only what the vendor
- * u-boot panel init polls: a command-mode transfer, kicked by writing DSI_START,
- * completes immediately by raising CMD_DONE in DSI_INTSTA.
+ * DSI clone; the register map matches mtk_dsi/mstar_dsi. The layout below was
+ * confirmed against the running Miyoo Mini firmware, whose panel bring-up
+ * programs a 640x480 24bpp RGB888 video-mode panel:
+ *
+ *   0x00 START      bit0 = kick the queued command-mode packet
+ *   0x0c INTSTA     bit1 = CMD_DONE (polled), bit2 = TE_RDY, bit31 = BUSY
+ *   0x10 CON_CTRL   bit0 DSI_RESET, bit1 DSI_EN, bit2 DPHY_RESET
+ *   0x14 MODE_CTRL  0 = command mode, 1 = sync-pulse video, 2/3 = event/burst
+ *   0x1c PSCTRL     [13:0] word count = width*bpp, [17:16] pixel select
+ *                   (3 = packed 24bit RGB888)
+ *   0x20-0x2c       VSA/VBP/VFP/VACT line counts (video mode)
+ *   0x50-0x58       HSA/HBP/HFP word counts
+ *   0x60 CMDQ_SIZE  [5:0] number of 32-bit CMDQ words in the queued packet
+ *   0x104-0x11c     D-PHY LCCON + HS lane TIMECON0..3 (in-controller PHY)
+ *   0x200 CMDQ0..   command queue: word0 = MIPI packet header
+ *                   (config | data_id<<8 | data0<<16 | data1<<24); for a long
+ *                   packet data0|data1<<8 is the payload word count and the
+ *                   bytes follow in CMDQ1.. .
+ *
+ * The queued packet is sent when the guest writes START; hardware streams it
+ * over the D-PHY and raises CMD_DONE. We have no panel, so complete instantly.
+ * Each kicked packet is decoded to a trace event (msc313_dsi_cmd) so a driver's
+ * panel init sequence is self-documenting.
  */
 #define DSI_START           0x00        /* bit0 = kick the queued command */
 #define DSI_INTSTA          0x0c        /* interrupt status (polled) */
 #define DSI_CMD_DONE_FLAG   (1 << 1)
+#define DSI_TE_RDY_FLAG     (1 << 2)
 #define DSI_BUSY_FLAG       (1u << 31)
+#define DSI_MODE_CTRL       0x14
+#define DSI_CMDQ_SIZE       0x60        /* [5:0] queued packet word count */
+#define DSI_CMDQ            0x200        /* command queue base */
 
 #define MSTAR_DISP_REFRESH_NS (NANOSECONDS_PER_SECOND / 60)
 
@@ -176,6 +201,27 @@ static uint64_t msc313_disp_dsi_read(void *opaque, hwaddr addr, unsigned size)
     return s->dsiregs[addr / 4];
 }
 
+/* Decode the queued command-mode packet to a trace event. */
+static void msc313_disp_dsi_decode(Msc313DispState *s)
+{
+    uint32_t hdr = s->dsiregs[DSI_CMDQ / 4];
+    unsigned int data_id = (hdr >> 8) & 0xff;
+    unsigned int data0 = (hdr >> 16) & 0xff;
+    unsigned int data1 = (hdr >> 24) & 0xff;
+    bool is_long = (data_id & 0x0f) == 0x09;    /* DT[3:0]=9: long packet */
+
+    if (is_long) {
+        unsigned int wc = data0 | (data1 << 8);
+        /* First payload byte (in CMDQ1) is the DCS command for a DCS write. */
+        unsigned int cmd = s->dsiregs[(DSI_CMDQ + 4) / 4] & 0xff;
+
+        trace_msc313_dsi_cmd("long", data_id, cmd, wc);
+    } else {
+        /* Short packet: data0 = DCS command, data1 = parameter. */
+        trace_msc313_dsi_cmd("short", data_id, data0, data1);
+    }
+}
+
 static void msc313_disp_dsi_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
@@ -187,12 +233,20 @@ static void msc313_disp_dsi_write(void *opaque, hwaddr addr, uint64_t val,
      * Kicking DSI_START runs the queued command-mode packet. On real hardware
      * this streams over the D-PHY to the panel and raises CMD_DONE when the
      * transfer finishes; we have no panel, so complete it instantly and clear
-     * BUSY. The vendor u-boot polls DSI_INTSTA for CMD_DONE (otherwise it spins
-     * until "CMD Done Time Out").
+     * BUSY. The vendor u-boot/kernel poll DSI_INTSTA for CMD_DONE (otherwise
+     * they spin until "CMD Done Time Out").
      */
     if (addr == DSI_START && (val & 1)) {
+        msc313_disp_dsi_decode(s);
         s->dsiregs[DSI_INTSTA / 4] =
             (s->dsiregs[DSI_INTSTA / 4] | DSI_CMD_DONE_FLAG) & ~DSI_BUSY_FLAG;
+    }
+    /*
+     * In video mode the controller free-runs, so a tear-effect poll must make
+     * progress: latch TE_RDY whenever the driver selects a display mode.
+     */
+    if (addr == DSI_MODE_CTRL) {
+        s->dsiregs[DSI_INTSTA / 4] |= DSI_TE_RDY_FLAG;
     }
 }
 
