@@ -186,7 +186,123 @@ static void msc313_disp_top_write(void *opaque, hwaddr addr, uint64_t val,
  * are built on top of this. Register map: linux-chenxing ip/ge.md.
  */
 #define GE_STATUS       0x1c        /* GE_WaitIdle polls bits[7:3] for 0x10 */
-#define GE_STATUS_IDLE  0x0080      /* CMDQ FIFO empty (b7), engine not busy */
+/*
+ * Idle status: bit7 = CMDQ FIFO empty (GE_WaitIdle wants bits[7:3]==0x10),
+ * bit0 = not busy, bits[15:11] = free CMDQ slots (GE_WaitCmdQAvail waits until
+ * (status>>11) >= the number of commands it wants to push - report the FIFO as
+ * fully free so it never blocks).
+ */
+#define GE_STATUS_IDLE  0xf880
+
+/* GE pixel-format codes (ip/ge.md b_fm field) we handle. */
+#define GE_FMT_RGB565   0x8
+#define GE_FMT_ARGB1555 0x9
+#define GE_FMT_ARGB4444 0xa
+#define GE_FMT_ARGB8888 0xf
+
+static unsigned ge_bpp(unsigned fmt)
+{
+    return fmt == GE_FMT_ARGB8888 ? 4 : 2;   /* the formats MainUI uses */
+}
+
+/* Decode one source pixel to 0xAARRGGBB. */
+static uint32_t ge_to_argb(unsigned fmt, uint32_t px)
+{
+    unsigned a, r, g, b;
+
+    switch (fmt) {
+    case GE_FMT_ARGB8888:
+        return px;                            /* stored B,G,R,A LE == ARGB32 */
+    case GE_FMT_RGB565:
+        r = (px >> 11) & 0x1f; g = (px >> 5) & 0x3f; b = px & 0x1f;
+        r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
+        return 0xff000000 | (r << 16) | (g << 8) | b;
+    case GE_FMT_ARGB1555:
+        a = (px & 0x8000) ? 0xff : 0;
+        r = (px >> 10) & 0x1f; g = (px >> 5) & 0x1f; b = px & 0x1f;
+        r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    case GE_FMT_ARGB4444:
+        a = (px >> 12) & 0xf; r = (px >> 8) & 0xf; g = (px >> 4) & 0xf; b = px & 0xf;
+        return ((a * 0x11) << 24) | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11);
+    default:
+        return px;
+    }
+}
+
+/* Encode 0xAARRGGBB into a destination pixel. */
+static uint32_t ge_from_argb(unsigned fmt, uint32_t argb)
+{
+    unsigned a = (argb >> 24) & 0xff, r = (argb >> 16) & 0xff;
+    unsigned g = (argb >> 8) & 0xff, b = argb & 0xff;
+
+    switch (fmt) {
+    case GE_FMT_ARGB8888:
+        return argb;
+    case GE_FMT_RGB565:
+        return ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3);
+    case GE_FMT_ARGB1555:
+        return (a ? 0x8000 : 0) | ((r & 0xf8) << 7) | ((g & 0xf8) << 2) | (b >> 3);
+    case GE_FMT_ARGB4444:
+        return ((a & 0xf0) << 8) | ((r & 0xf0) << 4) | (g & 0xf0) | (b >> 4);
+    default:
+        return argb;
+    }
+}
+
+/*
+ * Execute a bitblt (cmd 0x180 bit6). MI_GFX programs the GE with a source and
+ * destination surface (MIU addresses, so physical = DRAM base + reg), pitches,
+ * pixel formats and a destination rectangle whose size is srcw x srch. Copy the
+ * pixels, converting the format, so MainUI's composited UI actually lands in the
+ * framebuffer the GOP scans out. Alpha blending/ROP/stretch are not modelled yet.
+ */
+static void msc313_disp_ge_bitblt(Msc313DispState *s)
+{
+    uint16_t *r = s->geregs;
+    uint32_t src = MSTAR_DRAM_BASE + (((uint32_t)r[0x84 / 4] << 16) | r[0x80 / 4]);
+    uint32_t dst = MSTAR_DRAM_BASE + (((uint32_t)r[0x9c / 4] << 16) | r[0x98 / 4]);
+    unsigned spit = r[0xc0 / 4], dpit = r[0xcc / 4];
+    unsigned sfmt = r[0xd0 / 4] & 0xf, dfmt = (r[0xd0 / 4] >> 8) & 0xf;
+    unsigned w = r[0x1b8 / 4], h = r[0x1bc / 4];
+    unsigned sbpp = ge_bpp(sfmt), dbpp = ge_bpp(dfmt);
+    /*
+     * The x0/y0 (v0) registers hold the destination rectangle's BOTTOM-RIGHT
+     * corner, so the top-left position is (x0-(w-1), y0-(h-1)) - e.g. a
+     * full-screen 640x480 blit programs (639,479) = position (0,0).
+     */
+    int dx = (int)r[0x1a0 / 4] - (int)w + 1;
+    int dy = (int)r[0x1a4 / 4] - (int)h + 1;
+
+    if (w == 0 || h == 0 || w > 4096 || h > 4096 || dx < 0 || dy < 0) {
+        return;
+    }
+
+    for (unsigned row = 0; row < h; row++) {
+        uint8_t sbuf[4096 * 4], dbuf[4096 * 4];
+        uint32_t srow = src + row * spit;
+        uint32_t drow = dst + (dy + row) * dpit + dx * dbpp;
+
+        if (address_space_read(&address_space_memory, srow, MEMTXATTRS_UNSPECIFIED,
+                               sbuf, w * sbpp) != MEMTX_OK) {
+            return;
+        }
+        for (unsigned col = 0; col < w; col++) {
+            uint32_t px = sbpp == 4 ? ldl_le_p(sbuf + col * 4)
+                                    : lduw_le_p(sbuf + col * 2);
+            uint32_t out = ge_from_argb(dfmt, ge_to_argb(sfmt, px));
+
+            if (dbpp == 4) {
+                stl_le_p(dbuf + col * 4, out);
+            } else {
+                stw_le_p(dbuf + col * 2, out);
+            }
+        }
+        address_space_write(&address_space_memory, drow, MEMTXATTRS_UNSPECIFIED,
+                            dbuf, w * dbpp);
+    }
+    s->invalidate = true;
+}
 
 static uint64_t msc313_disp_ge_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -207,6 +323,11 @@ static void msc313_disp_ge_write(void *opaque, hwaddr addr, uint64_t val,
 
     mstar_iolog(MSTAR_DISP_GE_BASE + addr, true, val, size);
     s->geregs[addr / 4] = val;
+
+    /* cmd register: bit6 kicks a bitblt. */
+    if (addr == 0x180 && (val & 0x40)) {
+        msc313_disp_ge_bitblt(s);
+    }
 }
 
 static const MemoryRegionOps msc313_disp_ge_ops = {
