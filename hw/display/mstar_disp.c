@@ -178,6 +178,45 @@ static void msc313_disp_top_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
+/*
+ * GE - the SoC 2D graphics engine (a bitblt/fill/line accelerator) at
+ * 0x1f281200. MI_GFX/MainUI composites its UI through it, so nothing appears on
+ * screen until the blits actually run. For now this stores the 16-bit registers
+ * and reports the engine idle; the command-queue playback and the blit executor
+ * are built on top of this. Register map: linux-chenxing ip/ge.md.
+ */
+#define GE_STATUS       0x1c        /* GE_WaitIdle polls bits[7:3] for 0x10 */
+#define GE_STATUS_IDLE  0x0080      /* CMDQ FIFO empty (b7), engine not busy */
+
+static uint64_t msc313_disp_ge_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Msc313DispState *s = opaque;
+    uint16_t val = s->geregs[addr / 4];
+
+    if (addr == GE_STATUS) {
+        val = GE_STATUS_IDLE;
+    }
+    mstar_iolog(MSTAR_DISP_GE_BASE + addr, false, val, size);
+    return val;
+}
+
+static void msc313_disp_ge_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    Msc313DispState *s = opaque;
+
+    mstar_iolog(MSTAR_DISP_GE_BASE + addr, true, val, size);
+    s->geregs[addr / 4] = val;
+}
+
+static const MemoryRegionOps msc313_disp_ge_ops = {
+    .read = msc313_disp_ge_read,
+    .write = msc313_disp_ge_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
+};
+
 static const MemoryRegionOps msc313_disp_gop_ops = {
     .read = msc313_disp_gop_read,
     .write = msc313_disp_gop_write,
@@ -551,6 +590,7 @@ static void msc313_disp_reset_hold(Object *obj, ResetType type)
     memset(s->topregs, 0, sizeof(s->topregs));
     memset(s->mopregs, 0, sizeof(s->mopregs));
     memset(s->dsiregs, 0, sizeof(s->dsiregs));
+    memset(s->geregs, 0, sizeof(s->geregs));
     s->width = 0;
     s->height = 0;
     s->brightness = 256;
@@ -575,6 +615,9 @@ static void msc313_disp_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->dsi, OBJECT(dev), &msc313_disp_dsi_ops, s,
                           "mstar.disp-dsi", MSTAR_DISP_DSI_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->dsi);
+    memory_region_init_io(&s->ge, OBJECT(dev), &msc313_disp_ge_ops, s,
+                          "mstar.disp-ge", MSTAR_DISP_GE_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->ge);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->gop_irq);
 

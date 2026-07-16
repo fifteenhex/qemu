@@ -886,6 +886,7 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTAR_DISP_TOP_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTAR_DISP_MOP_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 3, MSTAR_DISP_DSI_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 4, MSTAR_DISP_GE_BASE);
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->dphy), errp)) {
             return;
         }
