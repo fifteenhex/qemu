@@ -101,6 +101,13 @@ static void msc313_disp_update_irq(Msc313DispState *s)
     qemu_set_irq(s->irq, flag && !masked);
 }
 
+static void msc313_disp_gop_off(void *opaque)
+{
+    Msc313DispState *s = opaque;
+
+    qemu_set_irq(s->gop_irq, 0);
+}
+
 static void msc313_disp_vblank(void *opaque)
 {
     Msc313DispState *s = opaque;
@@ -110,6 +117,21 @@ static void msc313_disp_vblank(void *opaque)
         s->topregs[TOP_VSYNC_FLAG / 4] |= TOP_VSYNC_BIT;
         msc313_disp_update_irq(s);
     }
+
+    /*
+     * The GOP/fbdev vsync is a distinct disp interrupt (the vendor DT's first
+     * disp interrupt, GIC SPI 52). The fbdev driver's ISR (_sstar_FB_VsyncISR)
+     * has no status register - it just bumps a counter and wakes its vsync
+     * waitqueue - so opening /dev/fb0 (sstar_FB_WaitForVsync) blocks until it
+     * fires. It is edge-like (the oneshot threaded handler acks via mask), so
+     * pulse it once per frame. The mst-intc is level-based, so assert it and
+     * lower it a short while later (long enough for the CPU to latch it, short
+     * enough not to storm the level-shared, un-acked handler).
+     */
+    qemu_set_irq(s->gop_irq, 1);
+    timer_mod(s->gop_off,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200 * 1000);
+
     timer_mod(s->vblank,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MSTAR_DISP_REFRESH_NS);
 }
@@ -554,8 +576,10 @@ static void msc313_disp_realize(DeviceState *dev, Error **errp)
                           "mstar.disp-dsi", MSTAR_DISP_DSI_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->dsi);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->gop_irq);
 
     s->con = qemu_graphic_console_create(dev, 0, &msc313_disp_gfx_ops, s);
+    s->gop_off = timer_new_ns(QEMU_CLOCK_VIRTUAL, msc313_disp_gop_off, s);
     s->vblank = timer_new_ns(QEMU_CLOCK_VIRTUAL, msc313_disp_vblank, s);
     timer_mod(s->vblank,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MSTAR_DISP_REFRESH_NS);

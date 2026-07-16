@@ -318,9 +318,11 @@ struct Msc313DispState {
     MemoryRegion top;       /* display-top registers        @0x1f225000 */
     MemoryRegion mop;       /* mopg overlay (video) plane   @0x1f280a00 */
     MemoryRegion dsi;       /* MIPI DSI controller          @0x1f345200 */
-    qemu_irq irq;           /* display-top vsync interrupt */
+    qemu_irq irq;           /* display-top vsync interrupt (SPI 82) */
+    qemu_irq gop_irq;       /* GOP/fbdev vsync interrupt (SPI 52) */
     QemuConsole *con;
     QEMUTimer *vblank;
+    QEMUTimer *gop_off;     /* lowers gop_irq shortly after each vblank pulse */
     MemoryRegionSection fbsection;
     Msc313PwmState *backlight;   /* PWM whose channel 0 dims the panel */
     unsigned int brightness;     /* backlight level, 0..256 */
@@ -522,7 +524,8 @@ struct Msc313BachState {
 #define MSTAR_DISP_MOP_SIZE         0x600
 #define MSTAR_DISP_DSI_BASE         (MSTAR_RIU_BASE + 0x345200)
 #define MSTAR_DISP_DSI_SIZE         0x400
-#define MSTAR_DISP_HWIRQ            50      /* display-top vsync, "irq" intc */
+#define MSTAR_DISP_HWIRQ            50      /* display-top vsync (SPI 82), "irq" intc */
+#define MSTAR_DISP_GOP_HWIRQ       20      /* GOP/fbdev vsync (SPI 52), "irq" intc */
 
 /* The "bach" audio controller + its "audiotop" syscon (mstar,msc313-bach). */
 #define MSTAR_BACH_BASE            (MSTAR_RIU_BASE + 0x2a0400)

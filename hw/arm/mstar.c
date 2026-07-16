@@ -893,6 +893,9 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
                            qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                             MSTAR_DISP_HWIRQ));
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 1,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTAR_DISP_GOP_HWIRQ));
     }
 
     /* HWI2C masters (transfers NAK until a slave is attached to the bus). */
