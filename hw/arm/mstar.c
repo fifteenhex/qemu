@@ -49,6 +49,8 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 /* Concrete SoC variants */
 #define TYPE_MSTAR_INFINITY3_SOC "mstar-infinity3-soc"
 #define TYPE_MSTAR_INFINITY2M_SOC "mstar-infinity2m-soc"
+/* SSD203D: an SSD202D (infinity2m) with an HDMI transmitter added. */
+#define TYPE_MSTAR_SSD203D_SOC "mstar-ssd203d-soc"
 
 #define MSTAR_SOC_MAX_CPUS 2
 
@@ -65,6 +67,7 @@ typedef struct MStarSoCInfo {
                                  * 0xf0 = SSD20xD/infinity2m */
     const char *clkgen_type;    /* SoC-specific clkgen/pinctrl reg-probe types */
     const char *pinctrl_type;
+    bool has_hdmi;              /* SSD203D adds an HDMI transmitter (hdmitx) */
 } MStarSoCInfo;
 
 struct MStarSoCState {
@@ -978,6 +981,20 @@ static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.pinctrl_type = TYPE_SSD20XD_PINCTRL;
 }
 
+static void mstar_ssd203d_soc_class_init(ObjectClass *oc, const void *data)
+{
+    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
+
+    /*
+     * SSD203D == SSD202D (infinity2m) with an HDMI transmitter (hdmitx)
+     * bolted onto the display pipeline.  It inherits the infinity2m class
+     * (dual Cortex-A7, same clkgen/pinctrl base, bond 0x1e, chip 0xf0 — the
+     * n1pro boot ROM reports "D-1e" like the SSD202D) and only flags the
+     * extra HDMI block so the display model can wire it up.
+     */
+    sc->info.has_hdmi = true;
+}
+
 /* ---------------------------------------------------------------- Boards */
 
 #define TYPE_MSTAR_MACHINE MACHINE_TYPE_NAME("mstar")
@@ -1143,6 +1160,20 @@ static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
     mmc->panel_flip = true;     /* the panel is mounted 180deg */
 }
 
+static void n1pro_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
+
+    /* N1PRO: SSD203D board with HDMI output (no auth chip, HDMI not a panel). */
+    mc->desc = "N1PRO (MStar infinity2m/SSD203D, HDMI)";
+    mc->default_ram_size = 128 * MiB;
+    mc->min_cpus = 2;
+    mc->default_cpus = 2;
+    mc->max_cpus = 2;
+    mmc->soc_type = TYPE_MSTAR_SSD203D_SOC;
+}
+
 /* ----------------------------------------------------------------- Types */
 
 static const TypeInfo mstar_types[] = {
@@ -1164,6 +1195,12 @@ static const TypeInfo mstar_types[] = {
         .name           = TYPE_MSTAR_INFINITY2M_SOC,
         .parent         = TYPE_MSTAR_SOC,
         .class_init     = mstar_infinity2m_soc_class_init,
+    },
+    {
+        /* SSD203D derives from infinity2m and only adds HDMI. */
+        .name           = TYPE_MSTAR_SSD203D_SOC,
+        .parent         = TYPE_MSTAR_INFINITY2M_SOC,
+        .class_init     = mstar_ssd203d_soc_class_init,
     },
     {
         .name           = TYPE_MSTAR_MACHINE,
@@ -1189,6 +1226,11 @@ static const TypeInfo mstar_types[] = {
         .name           = MACHINE_TYPE_NAME("miyoomini"),
         .parent         = TYPE_MSTAR_MACHINE,
         .class_init     = miyoomini_machine_class_init,
+    },
+    {
+        .name           = MACHINE_TYPE_NAME("n1pro"),
+        .parent         = TYPE_MSTAR_MACHINE,
+        .class_init     = n1pro_machine_class_init,
     },
 };
 
