@@ -1,23 +1,33 @@
 /*
- * MStar/SigmaStar "bach" audio controller (dummy)
+ * MStar/SigmaStar "bach" audio controller
  *
  * Copyright (c) 2026 ...
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * A scaffold for reverse engineering / developing the Linux sound driver
- * (sound/soc/mstar/msc313-bach.c). The bach block (mstar,msc313-bach) is the
- * SoC audio controller - a set of DMA sub-channels that move PCM between DRAM
- * and an analog codec, plus a sine generator and mixer. Its analog codec
- * registers live in a separate "audiotop" syscon, which the driver reaches
- * through the mstar,audiotop phandle (regmap offset REG_ATOP_OFFSET, 0x1000).
+ * The bach block (mstar,msc313-bach) is the SoC audio controller: a set of DMA
+ * sub-channels that move PCM between DRAM and an analog codec, plus a sine
+ * generator and mixer. Its analog codec registers live in a separate
+ * "audiotop" syscon, which the driver reaches through the mstar,audiotop
+ * phandle (regmap offset REG_ATOP_OFFSET, 0x1000).
  *
- * This model does not produce sound. It stores and returns 16-bit register
- * values (RIU registers at the usual 4-byte stride) for both the bach block
- * and the audiotop syscon, and logs every access via mstar_iolog(), so the
- * driver's register programming (DMA setup, codec bring-up, playback trigger)
- * can be captured and studied. The DMA-completion interrupt line is wired but
- * not yet raised.
+ * This model plays back the DMA "reader" sub-channel through QEMU's audio
+ * subsystem so a "-audiodev" backend hears what the firmware renders. It still
+ * stores/returns the raw 16-bit registers (RIU registers at the usual 4-byte
+ * stride) for both the bach block and the audiotop syscon and logs every access
+ * via mstar_iolog(), so the rest of the driver's programming can be captured.
+ *
+ * Reader (playback) sub-channel, byte offsets from the bach base:
+ *   0x100 CTRL0        channel control (reset/enable/int flags)
+ *   0x104 EN           addr_lo[11:0], count[12], trigger[13], init[14], en[15]
+ *   0x108 ADDR         addr_hi[14:0]
+ *   0x10c SIZE         ring size, in MIU units (bytes = size << ADDR_SHIFT)
+ *   0x110 TRIGGER      trigger level, in MIU units (bytes queued per trigger)
+ *   0x118 UNDERRUN     underrun threshold
+ *   0x11c LEVEL        bytes queued but not yet consumed, in MIU units
+ * The DMA buffer address is ((addr_hi << 12) | addr_lo) << ADDR_SHIFT, a DRAM
+ * bus address; each trigger (EN bit13 rising edge) queues TRIGGER<<ADDR_SHIFT
+ * more bytes. The Miyoo firmware runs this at 44100 Hz, stereo, S16_LE.
  */
 
 #include "qemu/osdep.h"
@@ -30,24 +40,184 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/audio.h"
 #include "system/address-spaces.h"
 #include "hw/arm/mstar.h"
+
+/* MIU address/size granularity for the msc313-bach variant (addr_sz_shift=3). */
+#define BACH_ADDR_SHIFT     3
+
+/* Reader (playback) sub-channel register byte offsets. */
+#define BACH_RD_CTRL0       0x100
+#define BACH_RD_EN          0x104
+#define BACH_RD_ADDR        0x108
+#define BACH_RD_SIZE        0x10c
+#define BACH_RD_TRIGGER     0x110
+#define BACH_RD_UNDERRUN    0x118
+#define BACH_RD_LEVEL       0x11c
+
+#define BACH_EN_ADDRLO_MASK 0x0fff
+#define BACH_EN_COUNT       (1 << 12)
+#define BACH_EN_TRIGGER     (1 << 13)
+#define BACH_EN_INIT        (1 << 14)
+#define BACH_EN_EN          (1 << 15)
+
+/* Playback format the Miyoo firmware programs (Ao Param: 44100, channel 2). */
+#define BACH_FREQ           44100
+#define BACH_CHANNELS       2
+#define BACH_BYTES_PER_FRAME (BACH_CHANNELS * 2)   /* S16_LE stereo */
+
+static uint32_t bach_ring_addr(Msc313BachState *s)
+{
+    uint32_t lo = s->regs[BACH_RD_EN / 4] & BACH_EN_ADDRLO_MASK;
+    uint32_t hi = s->regs[BACH_RD_ADDR / 4] & 0x7fff;
+
+    return (((hi << 12) | lo) << BACH_ADDR_SHIFT);
+}
+
+static uint32_t bach_ring_size(Msc313BachState *s)
+{
+    return (s->regs[BACH_RD_SIZE / 4] & 0xffff) << BACH_ADDR_SHIFT;
+}
+
+/* Bytes snapshotted from the ring but not yet handed to the backend. */
+static unsigned bach_backlog(Msc313BachState *s)
+{
+    return s->pcm->len - s->pcm_rdpos;
+}
+
+/*
+ * The backend voice must run whenever the guest wants playback *or* there is
+ * still snapshotted PCM to drain. The emulated CPU and the audio clock are
+ * decoupled: the guest typically renders a whole sound and moves on (even
+ * reusing the ring) long before it has been heard, so keep the voice active
+ * until the snapshotted data is actually consumed.
+ */
+static void mstar_bach_update_voice(Msc313BachState *s)
+{
+    bool want = s->play_active || bach_backlog(s) > 0;
+
+    if (s->voice && want != s->voice_on) {
+        s->voice_on = want;
+        audio_be_set_active_out(s->audio_be, s->voice, want);
+    }
+}
+
+/*
+ * Audio backend pull callback. "avail" is how many bytes the backend can take;
+ * feed it from the snapshotted PCM FIFO. Once fully drained (and the guest has
+ * disabled the channel) the voice is deactivated.
+ */
+static void mstar_bach_out_cb(void *opaque, int avail)
+{
+    Msc313BachState *s = opaque;
+    unsigned backlog = bach_backlog(s);
+    size_t written;
+
+    if (backlog == 0) {
+        mstar_bach_update_voice(s);
+        return;
+    }
+    if ((unsigned)avail > backlog) {
+        avail = backlog;
+    }
+    written = audio_be_write(s->audio_be, s->voice,
+                             s->pcm->data + s->pcm_rdpos, avail);
+    s->pcm_rdpos += written;
+
+    /* Reclaim space once the FIFO has been fully consumed. */
+    if (s->pcm_rdpos >= s->pcm->len) {
+        g_byte_array_set_size(s->pcm, 0);
+        s->pcm_rdpos = 0;
+    } else if (s->pcm_rdpos >= 0x10000) {
+        g_byte_array_remove_range(s->pcm, 0, s->pcm_rdpos);
+        s->pcm_rdpos = 0;
+    }
+
+    mstar_bach_update_voice(s);
+}
+
+/*
+ * Copy "len" bytes of freshly written PCM out of the DRAM ring (starting at the
+ * guest write pointer, wrapping at the ring end) into the playout FIFO, so the
+ * audio survives the guest reusing or resetting the ring.
+ */
+static void mstar_bach_snapshot(Msc313BachState *s, uint32_t len)
+{
+    uint32_t base = MSTAR_DRAM_BASE + bach_ring_addr(s);
+    uint32_t size = bach_ring_size(s);
+    uint8_t buf[4096];
+
+    if (size == 0) {
+        return;
+    }
+    while (len > 0) {
+        uint32_t chunk = MIN(len, sizeof(buf));
+
+        if (s->play_wptr + chunk > size) {
+            chunk = size - s->play_wptr;
+        }
+        if (address_space_read(&address_space_memory, base + s->play_wptr,
+                               MEMTXATTRS_UNSPECIFIED, buf, chunk) != MEMTX_OK) {
+            break;
+        }
+        g_byte_array_append(s->pcm, buf, chunk);
+        s->play_wptr = (s->play_wptr + chunk) % size;
+        len -= chunk;
+    }
+}
+
+/* React to a write of the reader sub-channel EN register (playback control). */
+static void mstar_bach_rd_en(Msc313BachState *s, uint16_t oldval, uint16_t val)
+{
+    if (val & BACH_EN_INIT) {
+        s->play_wptr = 0;
+    }
+
+    /*
+     * The trigger bit is a self-clearing "queue one trigger level of data"
+     * command: each write with it set means the guest has filled another
+     * TRIGGER << ADDR_SHIFT bytes at the ring write pointer (the driver holds
+     * it high across the en/count writes of a period, so this is level- not
+     * edge-triggered). Snapshot that PCM immediately.
+     */
+    if (val & BACH_EN_TRIGGER) {
+        uint32_t add = (s->regs[BACH_RD_TRIGGER / 4] & 0xffff) << BACH_ADDR_SHIFT;
+
+        mstar_bach_snapshot(s, add);
+        s->regs[BACH_RD_EN / 4] &= ~BACH_EN_TRIGGER;   /* auto-clear */
+    }
+
+    s->play_active = (val & BACH_EN_EN) != 0;
+    mstar_bach_update_voice(s);
+}
 
 static uint64_t mstar_bach_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313BachState *s = opaque;
+    uint16_t val = s->regs[addr / 4];
 
-    mstar_iolog(MSTAR_BACH_BASE + addr, false, s->regs[addr / 4], size);
-    return s->regs[addr / 4];
+    /* Report the live FIFO fill level (in MIU units) as the DMA drains it. */
+    if (addr == BACH_RD_LEVEL) {
+        val = (uint16_t)(bach_backlog(s) >> BACH_ADDR_SHIFT);
+    }
+
+    mstar_iolog(MSTAR_BACH_BASE + addr, false, val, size);
+    return val;
 }
 
 static void mstar_bach_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     Msc313BachState *s = opaque;
+    uint16_t oldval = s->regs[addr / 4];
 
     mstar_iolog(MSTAR_BACH_BASE + addr, true, val, size);
     s->regs[addr / 4] = val;
+
+    if (addr == BACH_RD_EN) {
+        mstar_bach_rd_en(s, oldval, val);
+    }
 }
 
 static const MemoryRegionOps mstar_bach_ops = {
@@ -89,12 +259,37 @@ static void mstar_bach_reset_hold(Object *obj, ResetType type)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->atopregs, 0, sizeof(s->atopregs));
+    s->play_wptr = 0;
+    s->pcm_rdpos = 0;
+    g_byte_array_set_size(s->pcm, 0);
+    s->play_active = false;
+    mstar_bach_update_voice(s);
     qemu_set_irq(s->irq, 0);
+}
+
+static void mstar_bach_init(Object *obj)
+{
+    Msc313BachState *s = MSC313_BACH(obj);
+
+    s->pcm = g_byte_array_new();
+}
+
+static void mstar_bach_finalize(Object *obj)
+{
+    Msc313BachState *s = MSC313_BACH(obj);
+
+    g_byte_array_free(s->pcm, TRUE);
 }
 
 static void mstar_bach_realize(DeviceState *dev, Error **errp)
 {
     Msc313BachState *s = MSC313_BACH(dev);
+    struct audsettings as = {
+        .freq = BACH_FREQ,
+        .nchannels = BACH_CHANNELS,
+        .fmt = AUDIO_FORMAT_S16,
+        .big_endian = 0,
+    };
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &mstar_bach_ops, s,
                           "mstar.bach", MSTAR_BACH_SIZE);
@@ -105,7 +300,23 @@ static void mstar_bach_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->atop);
 
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+
+    if (!audio_be_check(&s->audio_be, errp)) {
+        return;
+    }
+    s->voice = audio_be_open_out(s->audio_be, s->voice, "mstar-bach",
+                                 s, mstar_bach_out_cb, &as);
+    if (!s->voice) {
+        error_setg(errp, "mstar-bach: could not open audio output");
+        return;
+    }
+    s->voice_on = false;
+    audio_be_set_active_out(s->audio_be, s->voice, false);
 }
+
+static const Property mstar_bach_properties[] = {
+    DEFINE_AUDIO_PROPERTIES(Msc313BachState, audio_be),
+};
 
 static void mstar_bach_class_init(ObjectClass *oc, const void *data)
 {
@@ -114,6 +325,7 @@ static void mstar_bach_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mstar_bach_realize;
     rc->phases.hold = mstar_bach_reset_hold;
+    device_class_set_props(dc, mstar_bach_properties);
 }
 
 static const TypeInfo mstar_bach_types[] = {
@@ -121,6 +333,8 @@ static const TypeInfo mstar_bach_types[] = {
         .name           = TYPE_MSC313_BACH,
         .parent         = TYPE_SYS_BUS_DEVICE,
         .instance_size  = sizeof(Msc313BachState),
+        .instance_init  = mstar_bach_init,
+        .instance_finalize = mstar_bach_finalize,
         .class_init     = mstar_bach_class_init,
     },
 };

@@ -14,6 +14,7 @@
 #include "hw/ssi/ssi.h"
 #include "hw/sd/sd.h"
 #include "hw/i2c/i2c.h"
+#include "qemu/audio.h"
 #include "qom/object.h"
 
 /*
@@ -421,6 +422,15 @@ struct Msc313BachState {
     qemu_irq irq;
     uint16_t regs[MSTAR_BACH_NUM_REGS];
     uint16_t atopregs[MSTAR_AUDIOTOP_NUM_REGS];
+
+    /* QEMU audio output for the DMA-reader (playback) sub-channel. */
+    AudioBackend *audio_be;
+    SWVoiceOut *voice;
+    bool play_active;       /* guest has the reader sub-channel enabled */
+    bool voice_on;          /* backend voice is currently active */
+    uint32_t play_wptr;     /* guest write pointer within the DRAM ring */
+    GByteArray *pcm;        /* PCM snapshotted from the ring, pending playout */
+    unsigned pcm_rdpos;     /* consume offset into pcm */
 };
 
 /*
