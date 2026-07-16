@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "hw/core/resettable.h"
@@ -35,6 +36,20 @@
 #define PM_GPIO_SD_CDZ      0x11c   /* bank register 0x47 */
 #define PM_GPIO_SD_CDZ_BIT  (1 << 2)
 
+/*
+ * Two board buttons live on this PM bank (Miyoo Mini 6.5 dts gpio-keys):
+ *   key_down  -> SSD20XD_PM_LED0, PM pad register 0x128
+ *   key_left  -> SSD20XD_PM_LED1, PM pad register 0x12c
+ * Both active-low (idle high via pull-up, pressed low); their input level is
+ * the pad IN bit. NB the PM bank's bit layout differs from the main gpio bank:
+ * OEN=bit0, OUT=bit1, IN=bit2 (mainline gpio-msc313-pm.c) - which is also why
+ * SD_CDZ above reads on bit2. The firmware polls these pads directly. Injected
+ * through the "buttons" property: bit0 down, bit1 left.
+ */
+#define PM_GPIO_KEY_DOWN    0x128
+#define PM_GPIO_KEY_LEFT    0x12c
+#define PM_GPIO_IN          (1 << 2)
+
 static uint64_t mstar_pm_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     MstarPmGpioState *s = opaque;
@@ -46,6 +61,13 @@ static uint64_t mstar_pm_gpio_read(void *opaque, hwaddr addr, unsigned size)
             v &= ~PM_GPIO_SD_CDZ_BIT;
         } else {
             v |= PM_GPIO_SD_CDZ_BIT;
+        }
+    } else if (addr == PM_GPIO_KEY_DOWN || addr == PM_GPIO_KEY_LEFT) {
+        bool pressed = s->buttons & (addr == PM_GPIO_KEY_DOWN ? 1u : 2u);
+        if (pressed) {
+            v &= ~PM_GPIO_IN;   /* pressed: pull IN low */
+        } else {
+            v |= PM_GPIO_IN;    /* released: pull-up reads high */
         }
     }
     return v;
@@ -74,6 +96,27 @@ static void mstar_pm_gpio_reset_hold(Object *obj, ResetType type)
     memset(s->regs, 0, sizeof(s->regs));
 }
 
+static void mstar_pm_gpio_get_buttons(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    MstarPmGpioState *s = MSTAR_PM_GPIO(obj);
+    uint32_t value = s->buttons;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void mstar_pm_gpio_set_buttons(Object *obj, Visitor *v, const char *name,
+                                      void *opaque, Error **errp)
+{
+    MstarPmGpioState *s = MSTAR_PM_GPIO(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    s->buttons = value;
+}
+
 static void mstar_pm_gpio_realize(DeviceState *dev, Error **errp)
 {
     MstarPmGpioState *s = MSTAR_PM_GPIO(dev);
@@ -84,6 +127,14 @@ static void mstar_pm_gpio_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &mstar_pm_gpio_ops, s,
                           "mstar.pm-gpio", MSTAR_PM_GPIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /*
+     * Live-settable bitmask of the pressed PM-bank buttons (bit0 = down,
+     * bit1 = left); e.g. `qom-set /machine/soc/pm-gpio buttons=<mask>`.
+     */
+    object_property_add(OBJECT(dev), "buttons", "uint32",
+                        mstar_pm_gpio_get_buttons, mstar_pm_gpio_set_buttons,
+                        NULL, NULL);
 }
 
 static void mstar_pm_gpio_class_init(ObjectClass *oc, const void *data)

@@ -166,6 +166,7 @@ struct MstarPmGpioState {
     MemoryRegion iomem;
     uint16_t regs[MSTAR_PM_GPIO_NUM_REGS];
     bool card_present;      /* an SD card is inserted (drives SD_CDZ low) */
+    uint32_t buttons;       /* pressed PM-bank buttons: bit0 down, bit1 left */
 };
 
 /*
