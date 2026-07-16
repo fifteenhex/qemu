@@ -397,6 +397,15 @@ struct MstarSecElemState {
     unsigned cmd_len;                   /* bytes written by the host */
     uint8_t cmd[MSTAR_SECELEM_BUFSZ];
     unsigned resp_pos;                  /* next response byte to hand back */
+
+    /* Emulated challenge-response crypto state (see mstar_secelem.c). */
+    uint8_t ac1;                        /* mirror of the host buf_ac[1] counter */
+    bool have_e9;                       /* a challenge was written to reg 0xe9 */
+    bool have_87;                       /* a challenge was written to reg 0x87 */
+    uint8_t tgt_e9[8];                  /* captured arg0 from the 0xe9 write */
+    uint8_t tgt_87[8];                  /* captured arg0 from the 0x87 write */
+    uint8_t resp[16];                   /* prepared response for the next read */
+    unsigned resp_len;
 };
 
 /*
