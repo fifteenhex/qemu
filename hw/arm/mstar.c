@@ -86,6 +86,7 @@ struct MStarSoCState {
     Msc313PwmState pwm;
     Msc313DispState disp;
     MstarDphyState dphy;
+    Msc313BachState bach;
     Msc313I2cState i2c[MSTAR_NUM_I2C];
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
@@ -553,6 +554,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
+    object_initialize_child(obj, "bach", &s->bach, TYPE_MSC313_BACH);
     for (i = 0; i < MSTAR_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
     }
@@ -807,6 +809,15 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BDMA_CH0_HWIRQ));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->bdma), 1,
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BDMA_CH1_HWIRQ));
+
+    /* bach audio controller + its audiotop syscon (dummy, logs accesses). */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->bach), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->bach), 0, MSTAR_BACH_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->bach), 1, MSTAR_AUDIOTOP_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->bach), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BACH_HWIRQ));
 
     /* clkgen clock mux/gate block (register storage + unknown-access logging). */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->clkgen), errp)) {

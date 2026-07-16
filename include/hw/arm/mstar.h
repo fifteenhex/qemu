@@ -375,6 +375,31 @@ struct MstarSecElemState {
 };
 
 /*
+ * The "bach" audio controller (mstar,msc313-bach): the SoC audio block plus
+ * its DMA sub-channels and analog codec, alongside the separate "audiotop"
+ * syscon it uses for the analog codec registers. This is a scaffold for
+ * reverse engineering / developing the Linux sound driver (sound/soc/mstar/
+ * msc313-bach.c): it just stores and returns register values and logs every
+ * access via mstar_iolog(), so the driver's programming can be captured.
+ */
+#define TYPE_MSC313_BACH "mstar-msc313-bach"
+OBJECT_DECLARE_SIMPLE_TYPE(Msc313BachState, MSC313_BACH)
+
+#define MSTAR_BACH_NUM_REGS      (0x600 / 4)
+#define MSTAR_AUDIOTOP_NUM_REGS  (0x200 / 4)
+
+struct Msc313BachState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;     /* bach controller  @0x1f2a0400 */
+    MemoryRegion atop;      /* audiotop syscon  @0x1f206800 */
+    qemu_irq irq;
+    uint16_t regs[MSTAR_BACH_NUM_REGS];
+    uint16_t atopregs[MSTAR_AUDIOTOP_NUM_REGS];
+};
+
+/*
  * Physical memory map shared by the MStar/SigmaStar Armv7 SoCs. The on-chip
  * peripherals live inside the "riu" register bus at 0x1f000000; DRAM is
  * mapped at 0x20000000.
@@ -453,6 +478,13 @@ struct MstarSecElemState {
 #define MSTAR_DISP_DSI_BASE         (MSTAR_RIU_BASE + 0x345200)
 #define MSTAR_DISP_DSI_SIZE         0x400
 #define MSTAR_DISP_HWIRQ            50      /* display-top vsync, "irq" intc */
+
+/* The "bach" audio controller + its "audiotop" syscon (mstar,msc313-bach). */
+#define MSTAR_BACH_BASE            (MSTAR_RIU_BASE + 0x2a0400)
+#define MSTAR_BACH_SIZE            0x600
+#define MSTAR_AUDIOTOP_BASE        (MSTAR_RIU_BASE + 0x206800)
+#define MSTAR_AUDIOTOP_SIZE        0x200
+#define MSTAR_BACH_HWIRQ           42      /* audio DMA, "irq" intc */
 
 /* The MIPI D-PHY for the DSI link (dphy@2a5000, vendor "DPHY_DSI" bank). */
 #define MSTAR_DPHY_BASE             (MSTAR_RIU_BASE + 0x2a5000)
