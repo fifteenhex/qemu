@@ -45,6 +45,8 @@
 #define SDIO_SD_STS          0x34
 #define SDIO_SD_STS_NORSP    (1 << 3)
 #define SDIO_SD_STS_D0       (1 << 8)
+/* Error bits (RD/WR CRC, WR/RD timeout, no-response); write-1-to-clear. */
+#define SDIO_SD_STS_ERRMASK  0x3f
 #define SDIO_FIFO            0x80
 #define SDIO_FIFO_END        0xc0
 #define SDIO_RST             0xfc
@@ -218,6 +220,15 @@ static void msc313_sdio_write(void *opaque, hwaddr addr, uint64_t val,
         /* nrst low -> reset status reads 0x7; nrst high -> 0 (reset done). */
         s->regs[SDIO_RST / 4] = (val & SDIO_RST_NRST) ? SDIO_RST_NRST
                                                       : (0x7 << 1);
+        break;
+    case SDIO_SD_STS:
+        /*
+         * The error bits are write-1-to-clear; D0 (data-line level) is live
+         * status. The vendor driver clears the error status before each
+         * command and treats a failed clear as an IP error, so a plain store
+         * (which would latch the written bits) must not be used here.
+         */
+        s->regs[SDIO_SD_STS / 4] &= ~((uint16_t)val & SDIO_SD_STS_ERRMASK);
         break;
     case SDIO_SD_CTL:
         s->regs[SDIO_SD_CTL / 4] = val;
