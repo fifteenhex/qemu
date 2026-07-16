@@ -55,12 +55,22 @@
 #define BACH_RD_TRIGGER     0x110
 #define BACH_RD_UNDERRUN    0x118
 #define BACH_RD_LEVEL       0x11c
+#define BACH_RD_CTRL8       0x120      /* interrupt/status flags */
 
 #define BACH_EN_ADDRLO_MASK 0x0fff
 #define BACH_EN_COUNT       (1 << 12)
 #define BACH_EN_TRIGGER     (1 << 13)
 #define BACH_EN_INIT        (1 << 14)
 #define BACH_EN_EN          (1 << 15)
+
+/* CTRL0 (0x100) interrupt control bits (see the msc313-bach ALSA driver). */
+#define BACH_CTRL0_INT_CLEAR    (1 << 8)    /* ack: write 1 then 0 */
+#define BACH_CTRL0_EMPTY_IE     (1 << 10)
+#define BACH_CTRL0_UNDERRUN_IE  (1 << 13)
+
+/* CTRL8 (0x120) reader flag bits. */
+#define BACH_CTRL8_UNDERRUN_FLAG (1 << 2)
+#define BACH_CTRL8_EMPTY_FLAG    (1 << 4)
 
 /* Playback format the Miyoo firmware programs (Ao Param: 44100, channel 2). */
 #define BACH_FREQ           44100
@@ -84,6 +94,47 @@ static uint32_t bach_ring_size(Msc313BachState *s)
 static unsigned bach_backlog(Msc313BachState *s)
 {
     return s->pcm->len - s->pcm_rdpos;
+}
+
+/* Queued-but-unplayed level, in MIU units, as the LEVEL register reports it. */
+static unsigned bach_level_miu(Msc313BachState *s)
+{
+    return bach_backlog(s) >> BACH_ADDR_SHIFT;
+}
+
+/*
+ * Reader interrupt. The driver arms an underrun (and empty) interrupt after
+ * queuing a period; the hardware raises the shared bach IRQ - and latches the
+ * matching CTRL8 flag - once the DMA has drained the queue down to (or below)
+ * the underrun threshold. Its ISR reads the flags, acks via CTRL0.INT_CLEAR
+ * (write 1 then 0) and queues the next period (snd_pcm_period_elapsed). We fire
+ * on the falling edge across the threshold and re-arm once the guest has queued
+ * back above it, so a stream advances one period per interrupt without storming.
+ */
+static void mstar_bach_update_irq(Msc313BachState *s)
+{
+    uint16_t ctrl0 = s->regs[BACH_RD_CTRL0 / 4];
+    unsigned thresh = s->regs[BACH_RD_UNDERRUN / 4] & 0xffff;
+    uint16_t flags = 0;
+
+    if (bach_level_miu(s) > thresh) {
+        s->irq_armed = true;            /* guest queued fresh data above thresh */
+    }
+
+    if (s->play_active && s->irq_armed && !s->irq_pending) {
+        if ((ctrl0 & BACH_CTRL0_UNDERRUN_IE) && bach_level_miu(s) <= thresh) {
+            flags |= BACH_CTRL8_UNDERRUN_FLAG;
+        }
+        if ((ctrl0 & BACH_CTRL0_EMPTY_IE) && bach_backlog(s) == 0) {
+            flags |= BACH_CTRL8_EMPTY_FLAG;
+        }
+        if (flags) {
+            s->regs[BACH_RD_CTRL8 / 4] |= flags;
+            s->irq_pending = true;
+            s->irq_armed = false;
+            qemu_set_irq(s->irq, 1);
+        }
+    }
 }
 
 /*
@@ -134,6 +185,7 @@ static void mstar_bach_out_cb(void *opaque, int avail)
         s->pcm_rdpos = 0;
     }
 
+    mstar_bach_update_irq(s);        /* level dropped: maybe underrun/empty */
     mstar_bach_update_voice(s);
 }
 
@@ -189,6 +241,7 @@ static void mstar_bach_rd_en(Msc313BachState *s, uint16_t oldval, uint16_t val)
     }
 
     s->play_active = (val & BACH_EN_EN) != 0;
+    mstar_bach_update_irq(s);        /* fresh data queued: re-arm / maybe fire */
     mstar_bach_update_voice(s);
 }
 
@@ -217,6 +270,21 @@ static void mstar_bach_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (addr == BACH_RD_EN) {
         mstar_bach_rd_en(s, oldval, val);
+    } else if (addr == BACH_RD_CTRL0) {
+        /*
+         * The driver acks by pulsing INT_CLEAR high: clear the latched flags
+         * and drop the line. Then re-evaluate (e.g. an interrupt was just
+         * unmasked, or it is still under threshold and armed).
+         */
+        if (val & BACH_CTRL0_INT_CLEAR) {
+            s->regs[BACH_RD_CTRL8 / 4] &=
+                ~(BACH_CTRL8_UNDERRUN_FLAG | BACH_CTRL8_EMPTY_FLAG);
+            s->irq_pending = false;
+            qemu_set_irq(s->irq, 0);
+        }
+        mstar_bach_update_irq(s);
+    } else if (addr == BACH_RD_UNDERRUN) {
+        mstar_bach_update_irq(s);
     }
 }
 
@@ -263,6 +331,8 @@ static void mstar_bach_reset_hold(Object *obj, ResetType type)
     s->pcm_rdpos = 0;
     g_byte_array_set_size(s->pcm, 0);
     s->play_active = false;
+    s->irq_pending = false;
+    s->irq_armed = false;
     mstar_bach_update_voice(s);
     qemu_set_irq(s->irq, 0);
 }

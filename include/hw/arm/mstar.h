@@ -440,6 +440,8 @@ struct Msc313BachState {
     uint32_t play_wptr;     /* guest write pointer within the DRAM ring */
     GByteArray *pcm;        /* PCM snapshotted from the ring, pending playout */
     unsigned pcm_rdpos;     /* consume offset into pcm */
+    bool irq_pending;       /* reader underrun/empty IRQ asserted, awaiting ack */
+    bool irq_armed;         /* level rose above threshold; a new IRQ may fire */
 };
 
 /*
