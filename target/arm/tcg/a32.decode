@@ -72,9 +72,14 @@ TEQ_xrri         .... 000 1001 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
 CMP_xrri         .... 000 1010 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
 CMN_xrri         .... 000 1011 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
 ORR_rrri         .... 000 1100 . .... .... ..... .. 0 ....    @s_rrr_shi
-MOV_rxri         .... 000 1101 . 0000 .... ..... .. 0 ....    @s_rxr_shi
+# MOV/MVN (shifted register): bits [19:16] are SBZ. The architecture says a
+# non-zero value there is UNPREDICTABLE, but real cores (e.g. Cortex-A7) ignore
+# the field and execute the MOV/MVN. Some SigmaStar boot IPLs rely on this, so
+# match any Rn (via @s_rrr_shi, whose rn is ignored by trans_MOV/MVN_rxri)
+# instead of UNDEFing, rather than requiring rn == 0000.
+MOV_rxri         .... 000 1101 . .... .... ..... .. 0 ....    @s_rrr_shi
 BIC_rrri         .... 000 1110 . .... .... ..... .. 0 ....    @s_rrr_shi
-MVN_rxri         .... 000 1111 . 0000 .... ..... .. 0 ....    @s_rxr_shi
+MVN_rxri         .... 000 1111 . .... .... ..... .. 0 ....    @s_rrr_shi
 
 %imm16           16:4 0:12
 @mov16           ---- .... .... .... rd:4 ............        &ri imm=%imm16
