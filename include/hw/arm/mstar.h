@@ -232,17 +232,49 @@ struct Msc313BdmaState {
  * knows some registers/bits, so the model logs anything the firmware touches
  * outside what the driver describes (via LOG_UNIMP / -d unimp).
  */
-#define TYPE_MSC313_CLKGEN "mstar-msc313-clkgen"
-OBJECT_DECLARE_SIMPLE_TYPE(Msc313ClkgenState, MSC313_CLKGEN)
+/*
+ * A generic "register probe" for RE: a block of 16-bit registers (4-byte
+ * stride) that stores/returns writes and logs any access the mainline Linux
+ * driver does not describe, so registers/bits the firmware uses that are not
+ * in the v6.5 kernel can be found. The set of described registers is SoC- and
+ * block-specific, so each (block, SoC) pair is its own concrete type carrying
+ * its own table in the class. Used for the clkgen and pinctrl blocks, whose
+ * layouts differ between the msc313 (infinity3) and ssd20xd (infinity2m) SoCs.
+ */
+#define TYPE_MSTAR_REGPROBE "mstar-regprobe"
+OBJECT_DECLARE_TYPE(MstarRegProbeState, MstarRegProbeClass, MSTAR_REGPROBE)
 
-#define MSTAR_CLKGEN_NUM_REGS (0x200 / 4)
+#define TYPE_MSC313_CLKGEN  "mstar-msc313-clkgen"
+#define TYPE_SSD20XD_CLKGEN "mstar-ssd20xd-clkgen"
+#define TYPE_MSC313_PINCTRL "mstar-msc313-pinctrl"
+#define TYPE_SSD20XD_PINCTRL "mstar-ssd20xd-pinctrl"
 
-struct Msc313ClkgenState {
+#define MSTAR_REGPROBE_MAX_REGS (0x400 / 4)
+
+/* One described register: its byte offset, a label, and the bits the driver
+ * knows about (0xffff = the whole 16-bit register is described). */
+typedef struct MstarRegProbeReg {
+    uint16_t offset;
+    const char *name;
+    uint16_t known;
+} MstarRegProbeReg;
+
+struct MstarRegProbeState {
     /*< private >*/
     SysBusDevice parent_obj;
     /*< public >*/
     MemoryRegion iomem;
-    uint16_t regs[MSTAR_CLKGEN_NUM_REGS];
+    uint16_t regs[MSTAR_REGPROBE_MAX_REGS];
+};
+
+struct MstarRegProbeClass {
+    /*< private >*/
+    SysBusDeviceClass parent_class;
+    /*< public >*/
+    const char *label;                  /* "clkgen"/"pinctrl" for log messages */
+    uint32_t size;                      /* MMIO region size */
+    const MstarRegProbeReg *known;      /* registers the v6.5 driver describes */
+    unsigned n_known;
 };
 
 /*
@@ -508,6 +540,8 @@ struct Msc313BachState {
 /* The "clkgen" clock mux/gate block (reg = <0x207000 0x200>). */
 #define MSTAR_CLKGEN_BASE           (MSTAR_RIU_BASE + 0x207000)
 #define MSTAR_CLKGEN_SIZE           0x200
+#define MSTAR_PINCTRL_BASE          (MSTAR_RIU_BASE + 0x203c00)
+#define MSTAR_PINCTRL_SIZE          0x200
 
 /* The "sdio" FCIE SD/MMC host controller (sdio@282000). */
 #define MSTAR_SDIO_BASE             (MSTAR_RIU_BASE + 0x282000)

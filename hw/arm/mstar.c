@@ -63,6 +63,8 @@ typedef struct MStarSoCInfo {
                                  * (0x1d = SSD201/64MB, 0x1e = SSD202D/128MB) */
     uint16_t chip_id;           /* CHIPID @0x1f003c00: 0xc2 = MSC313E/infinity3,
                                  * 0xf0 = SSD20xD/infinity2m */
+    const char *clkgen_type;    /* SoC-specific clkgen/pinctrl reg-probe types */
+    const char *pinctrl_type;
 } MStarSoCInfo;
 
 struct MStarSoCState {
@@ -82,7 +84,8 @@ struct MStarSoCState {
     MstarPmGpioState pm_gpio;
     Msc313IspState isp;
     Msc313BdmaState bdma;
-    Msc313ClkgenState clkgen;
+    MstarRegProbeState clkgen;
+    MstarRegProbeState pinctrl;
     Msc313SdioState sdio;
     Msc313PwmState pwm;
     Msc313DispState disp;
@@ -569,7 +572,8 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "pm-gpio", &s->pm_gpio, TYPE_MSTAR_PM_GPIO);
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
-    object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
+    object_initialize_child(obj, "clkgen", &s->clkgen, sc->info.clkgen_type);
+    object_initialize_child(obj, "pinctrl", &s->pinctrl, sc->info.pinctrl_type);
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
     object_initialize_child(obj, "bach", &s->bach, TYPE_MSC313_BACH);
     for (i = 0; i < MSTAR_NUM_I2C; i++) {
@@ -842,11 +846,20 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->bach), 0,
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BACH_HWIRQ));
 
-    /* clkgen clock mux/gate block (register storage + unknown-access logging). */
+    /*
+     * clkgen and pinctrl: SoC-specific register-probe blocks that store the
+     * registers and log anything the v6.5 driver does not describe (see
+     * mstar_regprobe.c), for finding registers not yet in the mainline kernel.
+     */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->clkgen), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTAR_CLKGEN_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pinctrl), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pinctrl), 0, MSTAR_PINCTRL_BASE);
 
     /* "sdio" FCIE SD/MMC host, with a card backed by "-drive if=sd" if given. */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdio), errp)) {
@@ -946,6 +959,8 @@ static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.num_cpus = 1;
     sc->info.timer_freq = 12000000;     /* xtal_div2 */
     sc->info.chip_id = 0xc2;            /* MSC313E */
+    sc->info.clkgen_type = TYPE_MSC313_CLKGEN;
+    sc->info.pinctrl_type = TYPE_MSC313_PINCTRL;
 }
 
 static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
@@ -959,6 +974,8 @@ static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.timer_freq = 432000000;    /* clk_timer */
     sc->info.bond = 0x1e;               /* SSD202D (128MB in-package DRAM) */
     sc->info.chip_id = 0xf0;            /* SSD20xD */
+    sc->info.clkgen_type = TYPE_SSD20XD_CLKGEN;
+    sc->info.pinctrl_type = TYPE_SSD20XD_PINCTRL;
 }
 
 /* ---------------------------------------------------------------- Boards */
