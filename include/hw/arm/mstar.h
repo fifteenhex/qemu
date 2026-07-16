@@ -146,6 +146,28 @@ struct Msc313GpioState {
 };
 
 /*
+ * The "pm_gpio" bank (gpio_pm@1e00, the power-management GPIO controller). Its
+ * pads survive suspend and carry the SD card-detect (SD_CDZ) among others. On
+ * the Miyoo Mini the SD card-detect is on this bank (6.5 dts cd-gpios =
+ * <&gpio_pm SSD20XD_PM_SD_CDZ GPIO_ACTIVE_LOW>); the vendor sdmmc driver reads
+ * it as bank register 0x47 bit 2. We model register storage plus that one
+ * input bit so the host detects the "-drive if=sd" card.
+ */
+#define TYPE_MSTAR_PM_GPIO "mstar-pm-gpio"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarPmGpioState, MSTAR_PM_GPIO)
+
+#define MSTAR_PM_GPIO_NUM_REGS (0x200 / 4)
+
+struct MstarPmGpioState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint16_t regs[MSTAR_PM_GPIO_NUM_REGS];
+    bool card_present;      /* an SD card is inserted (drives SD_CDZ low) */
+};
+
+/*
  * The "isp" SPI-NOR controller (mstar,msc313-isp): a byte-at-a-time SPI
  * master plus a memory-mapped XIP read window. It drives an m25p80 SPI-NOR
  * flash over an SSI bus.
@@ -560,6 +582,10 @@ struct Msc313BachState {
 /* The "msc313-gpio" pad register bank (reg = <0x207800 0x200>). */
 #define MSTAR_GPIO_BASE             (MSTAR_RIU_BASE + 0x207800)
 #define MSTAR_GPIO_SIZE             MSTAR_GPIO_NUM_REGS
+
+/* The "pm_gpio" bank (gpio_pm@1e00): PM-domain pads incl. the SD card-detect. */
+#define MSTAR_PM_GPIO_BASE          (MSTAR_RIU_BASE + 0x001e00)
+#define MSTAR_PM_GPIO_SIZE          0x200
 
 /* The "fsp" flash controller (the ISP block's second register window). */
 #define MSTAR_FSP_BASE          (MSTAR_RIU_BASE + 0x2c00)

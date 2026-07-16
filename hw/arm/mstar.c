@@ -79,6 +79,7 @@ struct MStarSoCState {
     Msc313RtcState rtc;
     Msc313SarState sar;
     Msc313GpioState gpio;
+    MstarPmGpioState pm_gpio;
     Msc313IspState isp;
     Msc313BdmaState bdma;
     Msc313ClkgenState clkgen;
@@ -550,6 +551,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_MSC313_RTC);
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSC313_SAR);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_MSC313_GPIO);
+    object_initialize_child(obj, "pm-gpio", &s->pm_gpio, TYPE_MSTAR_PM_GPIO);
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSC313_CLKGEN);
@@ -790,6 +792,12 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, MSTAR_GPIO_BASE);
+
+    /* PM-domain GPIO bank (carries the SD card-detect). */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pm_gpio), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_gpio), 0, MSTAR_PM_GPIO_BASE);
 
     /* ISP SPI-NOR controller (core regs, qspi config, XIP window). */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->isp), errp)) {
