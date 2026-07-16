@@ -142,6 +142,7 @@ struct Msc313GpioState {
     /*< public >*/
     MemoryRegion iomem;
     uint8_t regs[MSTAR_GPIO_NUM_REGS];
+    uint32_t buttons;       /* bitmask of pressed board buttons (QOM property) */
 };
 
 /*
