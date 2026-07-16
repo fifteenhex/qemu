@@ -39,7 +39,15 @@
 #define BDMA_SIZE_L         0x20
 #define BDMA_SIZE_H         0x24
 
+/*
+ * Slave (port) IDs in the CONFIG register's src/dst selects. The MIU/IMI
+ * memory port is reachable through either of two DMA channels - id 0
+ * (MIU_IMI_CH0) and id 1 (MIU_IMI_CH1) - both of which address the same memory
+ * (which MIU/IMI is picked by the replace_miu field). The vendor kernel's flash
+ * read uses CH1 for the destination, so both must translate as memory.
+ */
 #define BDMA_SLAVE_MIU      0x0
+#define BDMA_SLAVE_MIU_CH1  0x1
 #define BDMA_SLAVE_QSPI     0x5
 
 /* MISC bits 12-13 select which memory the MIU port addresses. 0 is DRAM; the
@@ -53,6 +61,7 @@ static hwaddr msc313_bdma_translate(unsigned int slave_id, unsigned int miu_sel,
 {
     switch (slave_id) {
     case BDMA_SLAVE_MIU:
+    case BDMA_SLAVE_MIU_CH1:
         if (miu_sel == BDMA_MIU_SEL_IMI) {
             return MSTAR_IMI_BASE + addr;
         }
