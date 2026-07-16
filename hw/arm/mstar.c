@@ -659,6 +659,40 @@ static const MemoryRegionOps mstar_iolog_catchall_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * SCLDMA - the scaler output DMA that writes captured frames to DRAM on the
+ * MSC313 camera pipeline (sensor -> CSI -> ISP -> HVSP scaler -> SCLDMA; see
+ * the linux-chenxing camera page). The IP-camera firmware busy-polls the
+ * double-buffer / frame-done status at offset 0xfc waiting for a completed
+ * frame. There is no real sensor in the model, so toggle that status on each
+ * read to let the capture "request controller" advance past the poll; other
+ * registers just store/read back.
+ */
+static uint16_t mstar_scldma_regs[0x200 / 2];
+static uint16_t mstar_scldma_status;
+
+static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == 0xfc) {
+        return mstar_scldma_status ^= 0xffff;
+    }
+    return mstar_scldma_regs[(addr >> 1) & 0xff];
+}
+
+static void mstar_scldma_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    mstar_scldma_regs[(addr >> 1) & 0xff] = val;
+}
+
+static const MemoryRegionOps mstar_scldma_ops = {
+    .read = mstar_scldma_read,
+    .write = mstar_scldma_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
 {
     MStarSoCState *s = MSTAR_SOC(dev);
@@ -764,6 +798,22 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         memory_region_init_io(miu, OBJECT(s), &mstar_miu_ops, s,
                               "mstar.miu", MSTAR_MIU_SIZE);
         memory_region_add_subregion(get_system_memory(), MSTAR_MIU_BASE, miu);
+    }
+
+    /*
+     * SCLDMA capture-status stub (MSC313 camera pipeline). Only on the
+     * camera-class SoC (no GOP/MOP display) so it can't shadow anything on the
+     * SSD20xD display machines. This is a first, partial piece: it lets the
+     * capture busy-poll advance, but the IP-camera firmware still parks in its
+     * H2BR request controller waiting for a real frame-done interrupt + sensor
+     * data (see the linux-chenxing camera page for what a full model needs).
+     */
+    if (!sc->info.has_display) {
+        MemoryRegion *scldma = g_new(MemoryRegion, 1);
+        memory_region_init_io(scldma, OBJECT(s), &mstar_scldma_ops, s,
+                              "mstar.scldma", 0x200);
+        memory_region_add_subregion(get_system_memory(),
+                                    MSTAR_RIU_BASE + 0x280400, scldma);
     }
 
     /* chipid: the CHIPID byte the mask-ROM IPL reads to identify the chip. */
