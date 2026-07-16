@@ -610,18 +610,47 @@ static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
     return true;
 }
 
-/* Catch-all overlay for the RIU tracer: logs accesses no device claimed. */
+/*
+ * Catch-all overlay for the RIU tracer: logs accesses no device claimed.
+ * When MSTAR_IOLOG_UNIQUE is set, each (address, direction) is logged only
+ * once, so a full boot yields the *set* of unhandled registers instead of
+ * millions of poll hits - fast enough to run to the UI. The RIU window is
+ * 0x400000 bytes; track first-seen at 4-byte granularity (2 bits per reg).
+ */
+static uint8_t *mstar_iolog_seen;   /* 0x400000/4 entries, bit0 read bit1 write */
+
+static bool mstar_iolog_first(hwaddr addr, bool write)
+{
+    unsigned int idx;
+    uint8_t bit;
+
+    if (!mstar_iolog_seen) {
+        return true;
+    }
+    idx = (addr / 4) & 0xfffff;
+    bit = write ? 2 : 1;
+    if (mstar_iolog_seen[idx] & bit) {
+        return false;
+    }
+    mstar_iolog_seen[idx] |= bit;
+    return true;
+}
+
 static uint64_t mstar_iolog_catchall_read(void *opaque, hwaddr addr,
                                           unsigned size)
 {
-    mstar_iolog(MSTAR_RIU_BASE + addr, false, 0, size);
+    if (mstar_iolog_first(addr, false)) {
+        mstar_iolog(MSTAR_RIU_BASE + addr, false, 0, size);
+    }
     return 0;
 }
 
 static void mstar_iolog_catchall_write(void *opaque, hwaddr addr, uint64_t val,
                                        unsigned size)
 {
-    mstar_iolog(MSTAR_RIU_BASE + addr, true, val, size);
+    if (mstar_iolog_first(addr, true)) {
+        mstar_iolog(MSTAR_RIU_BASE + addr, true, val, size);
+    }
 }
 
 static const MemoryRegionOps mstar_iolog_catchall_ops = {
@@ -932,6 +961,9 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         MemoryRegion *log = g_new(MemoryRegion, 1);
 
         mstar_iolog_fp = fopen(getenv("MSTAR_IOLOG"), "w");
+        if (getenv("MSTAR_IOLOG_UNIQUE")) {
+            mstar_iolog_seen = g_malloc0(0x100000);   /* 0x400000/4 entries */
+        }
         memory_region_init_io(log, OBJECT(s), &mstar_iolog_catchall_ops, s,
                               "mstar.iolog", 0x400000);
         memory_region_add_subregion_overlap(get_system_memory(),
