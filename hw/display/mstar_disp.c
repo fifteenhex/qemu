@@ -265,11 +265,15 @@ static void msc313_disp_ge_bitblt(Msc313DispState *s)
     unsigned spit = r[0xc0 / 4], dpit = r[0xcc / 4];
     unsigned sfmt = r[0xd0 / 4] & 0xf, dfmt = (r[0xd0 / 4] >> 8) & 0xf;
     unsigned w = r[0x1b8 / 4], h = r[0x1bc / 4];
+    unsigned rot = r[0x164 / 4] & 3;      /* 0/1/2/3 = 0/90/180/270 degrees */
     unsigned sbpp = ge_bpp(sfmt), dbpp = ge_bpp(dfmt);
     /*
      * The x0/y0 (v0) registers hold the destination rectangle's BOTTOM-RIGHT
      * corner, so the top-left position is (x0-(w-1), y0-(h-1)) - e.g. a
-     * full-screen 640x480 blit programs (639,479) = position (0,0).
+     * full-screen 640x480 blit programs (639,479) = position (0,0). MainUI
+     * blits to the framebuffer with a 180-degree rotation (reg 0x164) to
+     * pre-rotate for the upside-down panel, so honour that (reverse rows and
+     * columns). 90/270-degree rotation is not modelled.
      */
     int dx = (int)r[0x1a0 / 4] - (int)w + 1;
     int dy = (int)r[0x1a4 / 4] - (int)h + 1;
@@ -280,8 +284,9 @@ static void msc313_disp_ge_bitblt(Msc313DispState *s)
 
     for (unsigned row = 0; row < h; row++) {
         uint8_t sbuf[4096 * 4], dbuf[4096 * 4];
+        unsigned orow = rot == 2 ? h - 1 - row : row;
         uint32_t srow = src + row * spit;
-        uint32_t drow = dst + (dy + row) * dpit + dx * dbpp;
+        uint32_t drow = dst + (dy + orow) * dpit + dx * dbpp;
 
         if (address_space_read(&address_space_memory, srow, MEMTXATTRS_UNSPECIFIED,
                                sbuf, w * sbpp) != MEMTX_OK) {
@@ -291,11 +296,12 @@ static void msc313_disp_ge_bitblt(Msc313DispState *s)
             uint32_t px = sbpp == 4 ? ldl_le_p(sbuf + col * 4)
                                     : lduw_le_p(sbuf + col * 2);
             uint32_t out = ge_from_argb(dfmt, ge_to_argb(sfmt, px));
+            unsigned ocol = rot == 2 ? w - 1 - col : col;
 
             if (dbpp == 4) {
-                stl_le_p(dbuf + col * 4, out);
+                stl_le_p(dbuf + ocol * 4, out);
             } else {
-                stw_le_p(dbuf + col * 2, out);
+                stw_le_p(dbuf + ocol * 2, out);
             }
         }
         address_space_write(&address_space_memory, drow, MEMTXATTRS_UNSPECIFIED,
