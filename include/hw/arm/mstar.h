@@ -144,6 +144,10 @@ struct Msc313GpioState {
     MemoryRegion iomem;
     uint8_t regs[MSTAR_GPIO_NUM_REGS];
     uint32_t buttons;       /* bitmask of pressed board buttons (QOM property) */
+    bool gpioi2c;           /* GPIO8=SDA / GPIO9=SCL bit-banged I2C (cameras) */
+    void *bbi2c;            /* bitbang_i2c_interface * */
+    void *i2c_bus;          /* I2CBus *; exposed so a sensor can be attached */
+    int sda_level;          /* current bus SDA (bit-bang readback) */
 };
 
 /*
@@ -423,6 +427,7 @@ struct Msc313I2cState {
  * driver's probe succeeds and the board boots. It models no real crypto.
  */
 #define TYPE_MSTAR_SECELEM "mstar-secelem"
+#define TYPE_MSTAR_CAM_SENSOR "mstar-cam-sensor"
 OBJECT_DECLARE_SIMPLE_TYPE(MstarSecElemState, MSTAR_SECELEM)
 
 #define MSTAR_SECELEM_BUFSZ 64

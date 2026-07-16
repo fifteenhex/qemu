@@ -18,7 +18,13 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "hw/i2c/i2c.h"
+#include "hw/i2c/bitbang_i2c.h"
 #include "hw/arm/mstar.h"
+
+/* GPIO pads used for the bit-banged sensor SCCB on the camera SoCs. */
+#define GPIO_I2C_SDA_PAD    0x20    /* GPIO8 */
+#define GPIO_I2C_SCL_PAD    0x24    /* GPIO9 */
 
 /* ---------------------------------------------------------- msc313-gpio */
 
@@ -81,8 +87,14 @@ static uint64_t msc313_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313GpioState *s = opaque;
     uint8_t v = s->regs[addr];
-    int level = msc313_gpio_button_level(s, addr);
+    int level;
 
+    /* Bit-banged sensor I2C: SDA reads back the (open-drain) bus level. */
+    if (s->gpioi2c && addr == GPIO_I2C_SDA_PAD) {
+        return s->sda_level ? (v | GPIO_IN) : (v & ~GPIO_IN);
+    }
+
+    level = msc313_gpio_button_level(s, addr);
     if (level >= 0) {
         /* A button pad: its input bit reflects the (physical) button level. */
         return level ? (v | GPIO_IN) : (v & ~GPIO_IN);
@@ -108,6 +120,19 @@ static void msc313_gpio_write(void *opaque, hwaddr addr, uint64_t val,
 
     /* Only OUT/OEN are writable; IN reflects the pin and is computed on read. */
     s->regs[addr] = val & (GPIO_OUT | GPIO_OEN);
+
+    /*
+     * Bit-banged sensor SCCB. The pad is open-drain: with OEN set (input) the
+     * line is released and pulled high; with OEN clear (output) it drives the
+     * OUT bit (drivers only ever drive it low). Feed SCL/SDA to the bit-bang
+     * engine, which returns the resulting bus SDA level for reads.
+     */
+    if (s->gpioi2c && (addr == GPIO_I2C_SDA_PAD || addr == GPIO_I2C_SCL_PAD)) {
+        int drive = (val & GPIO_OEN) ? 1 : ((val & GPIO_OUT) ? 1 : 0);
+        int line = (addr == GPIO_I2C_SDA_PAD) ? BITBANG_I2C_SDA
+                                              : BITBANG_I2C_SCL;
+        s->sda_level = bitbang_i2c_set((bitbang_i2c_interface *)s->bbi2c, line, drive);
+    }
 }
 
 static const MemoryRegionOps msc313_gpio_ops = {
@@ -164,6 +189,18 @@ static void msc313_gpio_realize(DeviceState *dev, Error **errp)
     object_property_add(OBJECT(dev), "buttons", "uint32",
                         msc313_gpio_get_buttons, msc313_gpio_set_buttons,
                         NULL, NULL);
+
+    /*
+     * Bit-banged sensor SCCB (camera SoCs): GPIO8=SDA, GPIO9=SCL. Create the
+     * I2C bus + bit-bang engine so a camera-module sensor slave can be
+     * attached to s->i2c_bus by the SoC.
+     */
+    if (s->gpioi2c) {
+        s->i2c_bus = i2c_init_bus(dev, "gpioi2c");
+        s->bbi2c = g_new0(bitbang_i2c_interface, 1);
+        bitbang_i2c_init(s->bbi2c, s->i2c_bus);
+        s->sda_level = 1;
+    }
 }
 
 static void msc313_gpio_class_init(ObjectClass *oc, const void *data)
