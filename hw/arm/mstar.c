@@ -131,8 +131,9 @@ static FILE *mstar_iolog_fp;
 void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size)
 {
     if (mstar_iolog_fp) {
-        fprintf(mstar_iolog_fp, "%c %08x %u %0*x\n", write ? 'W' : 'R',
-                (uint32_t)phys, size, size * 2, (uint32_t)val);
+        uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+        fprintf(mstar_iolog_fp, "%c %08x %u %0*x %08x\n", write ? 'W' : 'R',
+                (uint32_t)phys, size, size * 2, (uint32_t)val, pc);
         fflush(mstar_iolog_fp);
     }
 }
@@ -681,6 +682,7 @@ static uint16_t mstar_scldma_status;
 
 static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
 {
+    if (mstar_iolog_first(0x280400 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, false, 0, size);
     if (addr == 0xfc) {
         return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
     }
@@ -690,6 +692,7 @@ static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
 static void mstar_scldma_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size)
 {
+    if (mstar_iolog_first(0x280400 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, true, val, size);
     mstar_scldma_regs[(addr >> 1) & 0xff] = val;
 }
 
@@ -717,6 +720,7 @@ static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarSoCState *s = opaque;
 
+    if (mstar_iolog_first(0x242000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, false, 0, size);
     if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
         addr == ISP_FRAMECNT + 4) {
         if (!timer_pending(s->scldma_timer)) {
@@ -731,6 +735,7 @@ static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
 static void mstar_isppoll_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
+    if (mstar_iolog_first(0x242000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, true, val, size);
     mstar_isppoll_regs[(addr >> 1) & 0x1fff] = val;
 }
 
@@ -754,6 +759,7 @@ static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
     MStarSoCState *s = opaque;
 
     (void)s;
+    if (mstar_iolog_first(0x260000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, false, 0, size);
     if (addr == 0x5e8) {
         /* SCLDMA/HVSP clock heartbeat: toggle so a "clock is running" wait
          * (Hal_SCLDMA_CLKInit / Hal_HVSP_SetIdclkOnOff) sees it change. */
@@ -766,6 +772,7 @@ static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
 static void mstar_hvsp_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
+    if (mstar_iolog_first(0x260000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, true, val, size);
     mstar_hvsp_regs[(addr >> 1) & 0xfff] = val;
 }
 
