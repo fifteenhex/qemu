@@ -51,9 +51,13 @@ static const MstarRegProbeReg msc313_clkgen_known[] = {
 /*
  * SSD20xD clkgen. The COMMON muxes are shared with msc313 except that mcu and
  * spi have a 3-bit parent field here (and a deglitch bit at 5), and there are
- * extra muxes: mspi_movedma (shares 0xcc), ge, sc_pixel, mipi_tx_dsi. The
- * mop/sata/dec/disp clocks the driver also lists were not resolved to
- * offsets and are intentionally left out, so they show up in the log.
+ * extra muxes: mspi_movedma (shares 0xcc), ge, sc_pixel, mipi_tx_dsi, and the
+ * display/codec clocks mop, sata, dec_[pabc]clk and disp_432/disp_216. The
+ * offsets for those were recovered from the Linux driver headers (see the
+ * linux-chenxing clkgen page) and are now described here. What still shows up
+ * in the -d unimp log on a miyoo/SSD202D boot is the genuinely undocumented
+ * set: 0x000/0x008/0x00c/0x010 (gate-only regs), 0x060, 0x118, 0x148, 0x15c,
+ * 0x1b0, 0x1b4 (see mstar-regprobe memory / the wiki register table).
  */
 static const MstarRegProbeReg ssd20xd_clkgen_known[] = {
     { 0x04, "mcu(w3)/riubrdg", 0x0d3d },
@@ -67,11 +71,16 @@ static const MstarRegProbeReg ssd20xd_clkgen_known[] = {
     { 0x108, "emac_ahb",       0x000d },
     { 0x114, "sdio",           0x001d },
     { 0x144, "ge",             0x001d },
+    { 0x14c, "disp_432/216",   0x0d0d },
+    { 0x150, "mop",            0x000d },
+    { 0x154, "dec_pclk/aclk",  0x0d0d },
     { 0x180, "bdma",           0x001d },
     { 0x184, "aesdma",         0x001d },
     { 0x18c, "sc_pixel",       0x003d },
     { 0x1a8, "jpe",            0x000d },
+    { 0x1b8, "sata",           0x000d },
     { 0x1bc, "mipi_tx_dsi",    0x001d },
+    { 0x1f8, "dec_bclk/cclk",  0x1d1d },
 };
 
 /* ----------------------------------------------------------- pinctrl tables */
@@ -131,6 +140,13 @@ static const MstarRegProbeReg ssd20xd_pinctrl_known[] = {
     { 0xf4, "sr_pull_dir1", WHOLE },
     { 0xf8, "sr_drive0",    WHOLE },
     { 0xfc, "sr_drive1",    WHOLE },
+    /* Recovered from the linux-chenxing pinctrl page + live capture. 0x140
+     * bit15 forces all pads to input; 0x14c routes the four UARTs (nibble per
+     * uart: [3:0] pm_uart, [7:4] fuart, [11:8] uart0, [15:12] uart1). Still
+     * undocumented on an SSD202D boot: 0x028, 0x02c, 0x048 (polled ~heavily,
+     * likely a pad/GPIO input status), 0x084, 0x15c. */
+    { 0x140, "all_input",   WHOLE },
+    { 0x14c, "uart_sel",    WHOLE },
 };
 
 /* -------------------------------------------------------------- device core */
