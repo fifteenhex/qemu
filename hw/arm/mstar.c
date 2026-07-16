@@ -27,6 +27,8 @@
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -100,6 +102,12 @@ struct MStarSoCState {
     MemoryRegion cpupll;    /* CPU PLL registers (nonzero LPF/post-div) */
     uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
     uint16_t smpctrl_regs[0x200 / 4];   /* MSTAR_SMPCTRL_SIZE/4, read-back */
+    MemoryRegion scldma;    /* camera scaler-DMA capture (infinity3) */
+    MemoryRegion isppoll;   /* camera ISP frame-counter poll */
+    MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
+    QEMUTimer *scldma_timer;
+    qemu_irq scldma_irq;
+    uint32_t frame_count;   /* advanced once per fake captured frame */
 };
 
 struct MStarSoCClass {
@@ -674,7 +682,7 @@ static uint16_t mstar_scldma_status;
 static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
 {
     if (addr == 0xfc) {
-        return mstar_scldma_status ^= 0xffff;
+        return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
     }
     return mstar_scldma_regs[(addr >> 1) & 0xff];
 }
@@ -692,6 +700,117 @@ static const MemoryRegionOps mstar_scldma_ops = {
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
 };
+
+/*
+ * ISP core (0x1f242000..0x1f246000). The camera firmware verifies most of its
+ * ISP config by writing then reading back, so a plain store/read-back keeps
+ * those loops happy. Two special cases:
+ *  - the frame-counter triple at 0x1f24304c/50/54 (region offset 0x104c/50/54)
+ *    returns the fake captured-frame counter, and reaching it means capture is
+ *    set up, so we start delivering frames.
+ */
+#define ISP_BASE_OFF   0x2000               /* 0x1f242000 within this region */
+#define ISP_FRAMECNT   (0x3050 - ISP_BASE_OFF)  /* 0x1050 */
+static uint16_t mstar_isppoll_regs[0x4000 / 2];
+
+static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarSoCState *s = opaque;
+
+    if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
+        addr == ISP_FRAMECNT + 4) {
+        if (!timer_pending(s->scldma_timer)) {
+            timer_mod(s->scldma_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 33);
+        }
+        return s->frame_count;
+    }
+    return mstar_isppoll_regs[(addr >> 1) & 0x1fff];
+}
+
+static void mstar_isppoll_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    mstar_isppoll_regs[(addr >> 1) & 0x1fff] = val;
+}
+
+static const MemoryRegionOps mstar_isppoll_ops = {
+    .read = mstar_isppoll_read,
+    .write = mstar_isppoll_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * HVSP / SCL scaler (0x1f260000..0x1f262000). Store/read-back for config, and
+ * report the scaler/idclk clock-ready status (polled at 0x1f2605e8 by
+ * Hal_HVSP_SetIdclkOnOff / Hal_SCLDMA_CLKInit) as always ready.
+ */
+static uint16_t mstar_hvsp_regs[0x2000 / 2];
+
+static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarSoCState *s = opaque;
+
+    (void)s;
+    if (addr == 0x5e8) {
+        /* SCLDMA/HVSP clock heartbeat: toggle so a "clock is running" wait
+         * (Hal_SCLDMA_CLKInit / Hal_HVSP_SetIdclkOnOff) sees it change. */
+        static uint16_t hb;
+        return hb ^= 0xffff;
+    }
+    return mstar_hvsp_regs[(addr >> 1) & 0xfff];
+}
+
+static void mstar_hvsp_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    mstar_hvsp_regs[(addr >> 1) & 0xfff] = val;
+}
+
+static const MemoryRegionOps mstar_hvsp_ops = {
+    .read = mstar_hvsp_read,
+    .write = mstar_hvsp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * Fake a captured video frame: the MSC313 camera scaler-DMA raises its
+ * frame-done interrupt (GIC SPI 52 = "irq" mst-intc line 20) ~30x/s. Raise the
+ * line, then lower it shortly after (the mst-intc is level-triggered, so a
+ * zero-width pulse is lost); the driver ISR then dequeues a buffer.
+ */
+static void mstar_scldma_tick(void *opaque)
+{
+    MStarSoCState *s = opaque;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    static bool asserted;
+
+    /*
+     * Advance the captured-frame counter. The interrupt path is left off by
+     * default: the vendor ISR indexes hardware structures from the scaler
+     * interrupt-status registers, which this stub does not fully model, so
+     * firing it faults. The capture app's poll()/select() path is driven by
+     * the frame counter + SCLDMA status instead. Set MSTAR_SCLDMA_IRQ=1 to
+     * also pulse the frame-done IRQ (for experimenting with the ISR path).
+     */
+    s->frame_count++;
+    mstar_scldma_status = 0xffff;
+    if (getenv("MSTAR_SCLDMA_IRQ")) {
+        if (!asserted) {
+            qemu_set_irq(s->scldma_irq, 1);
+            asserted = true;
+            timer_mod(s->scldma_timer, now + 2);
+            return;
+        }
+        qemu_set_irq(s->scldma_irq, 0);
+        asserted = false;
+    }
+    timer_mod(s->scldma_timer, now + 31);
+}
 
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
 {
@@ -808,13 +927,6 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
      * H2BR request controller waiting for a real frame-done interrupt + sensor
      * data (see the linux-chenxing camera page for what a full model needs).
      */
-    if (!sc->info.has_display) {
-        MemoryRegion *scldma = g_new(MemoryRegion, 1);
-        memory_region_init_io(scldma, OBJECT(s), &mstar_scldma_ops, s,
-                              "mstar.scldma", 0x200);
-        memory_region_add_subregion(get_system_memory(),
-                                    MSTAR_RIU_BASE + 0x280400, scldma);
-    }
 
     /* chipid: the CHIPID byte the mask-ROM IPL reads to identify the chip. */
     if (sc->info.chip_id) {
@@ -961,6 +1073,33 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                     blk_by_legacy_dinfo(di), &error_fatal);
             qdev_realize_and_unref(card, bus, &error_fatal);
         }
+    }
+
+    /*
+     * MSC313 camera scaler-DMA capture (only the camera-class SoC, which has no
+     * SSD20xD display). Provides the SCLDMA registers and a periodic frame-done
+     * interrupt so an IP-camera firmware's capture path thinks frames arrive.
+     * Wired here, after the "irq" mst-intc is realized.
+     */
+    if (!sc->info.has_display) {
+        memory_region_init_io(&s->scldma, OBJECT(s), &mstar_scldma_ops, s,
+                              "mstar.scldma", 0x200);
+        memory_region_add_subregion(get_system_memory(),
+                                    MSTAR_RIU_BASE + 0x280400, &s->scldma);
+        memory_region_init_io(&s->isppoll, OBJECT(s), &mstar_isppoll_ops, s,
+                              "mstar.isppoll", 0x4000);
+        memory_region_add_subregion(get_system_memory(),
+                                    MSTAR_RIU_BASE + 0x242000, &s->isppoll);
+        memory_region_init_io(&s->hvsp, OBJECT(s), &mstar_hvsp_ops, s,
+                              "mstar.hvsp", 0x2000);
+        memory_region_add_subregion(get_system_memory(),
+                                    MSTAR_RIU_BASE + 0x260000, &s->hvsp);
+        /* SCLDMA frame-done IRQ shares the "irq" mst-intc line 20 (SPI 52). */
+        s->scldma_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                         MSTAR_DISP_GOP_HWIRQ);
+        s->scldma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                       mstar_scldma_tick, s);
+        /* Armed lazily on the first ISP frame-counter poll (see above). */
     }
 
     /* "pwm" controller; its channel 0 is the panel backlight. */
