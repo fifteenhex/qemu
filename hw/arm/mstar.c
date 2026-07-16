@@ -36,86 +36,7 @@
 #include "target/arm/arm-powerctl.h"
 #include "hw/intc/arm_gic.h"
 #include "qom/object.h"
-
-/*
- * Abstract base type for the MStar/SigmaStar Armv7 SoCs. Concrete SoCs
- * (infinity3, infinity2m, ...) derive from it and only have to describe
- * themselves via MStarSoCInfo in their class_init; the shared realize code
- * builds the common peripherals. This container is ARM-specific (it embeds the
- * CPUs and GIC), so unlike the per-block device models (hw/<subsystem>/
- * mstar_*.c) it lives here rather than in the shared header.
- */
-#define TYPE_MSTAR_SOC "mstar-soc"
-OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
-
-/* Concrete SoC variants */
-#define TYPE_MSTAR_INFINITY3_SOC "mstar-infinity3-soc"
-#define TYPE_MSTAR_INFINITY2M_SOC "mstar-infinity2m-soc"
-/* SSD203D: an SSD202D (infinity2m) with an HDMI transmitter added. */
-#define TYPE_MSTAR_SSD203D_SOC "mstar-ssd203d-soc"
-
-#define MSTAR_SOC_MAX_CPUS 2
-
-/* Per-variant description, filled in by each SoC's class_init. */
-typedef struct MStarSoCInfo {
-    const char *cpu_type;
-    unsigned int num_cpus;
-    bool has_display;           /* SSD20xD-style GOP/display pipeline */
-    uint32_t timer_freq;        /* SoC PIT (timer@6040) input clock, Hz */
-    uint16_t bond;              /* package/variant strap at chiptop+0x120; the
-                                 * IPL reads it to pick the DRAM profile/size
-                                 * (0x1d = SSD201/64MB, 0x1e = SSD202D/128MB) */
-    uint16_t chip_id;           /* CHIPID @0x1f003c00: 0xc2 = MSC313E/infinity3,
-                                 * 0xf0 = SSD20xD/infinity2m */
-    const char *clkgen_type;    /* SoC-specific clkgen/pinctrl reg-probe types */
-    const char *pinctrl_type;
-    bool has_hdmi;              /* SSD203D adds an HDMI transmitter (hdmitx) */
-} MStarSoCInfo;
-
-struct MStarSoCState {
-    /*< private >*/
-    DeviceState parent_obj;
-    /*< public >*/
-    bool secure_boot;       /* start the CPU in Secure EL3 (mask ROM boot) */
-    ARMCPU cpu[MSTAR_SOC_MAX_CPUS];
-    GICState gic;
-    MstIntcState intc_irq;
-    MstIntcState intc_fiq;
-    MemoryRegion l3bridge;
-    Msc313eTimerState timer[MSTAR_NUM_TIMERS];
-    Msc313RtcState rtc;
-    Msc313SarState sar;
-    Msc313GpioState gpio;
-    MstarPmGpioState pm_gpio;
-    Msc313IspState isp;
-    Msc313BdmaState bdma;
-    MstarRegProbeState clkgen;
-    MstarRegProbeState pinctrl;
-    Msc313SdioState sdio;
-    Msc313PwmState pwm;
-    Msc313DispState disp;
-    MstarDphyState dphy;
-    Msc313BachState bach;
-    Msc313I2cState i2c[MSTAR_NUM_I2C];
-    MemoryRegion imi;
-    MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
-    MemoryRegion cpupll;    /* CPU PLL registers (nonzero LPF/post-div) */
-    uint32_t smp_bootaddr;  /* latched CPU1 entry address from smpctrl */
-    uint16_t smpctrl_regs[0x200 / 4];   /* MSTAR_SMPCTRL_SIZE/4, read-back */
-    MemoryRegion scldma;    /* camera scaler-DMA capture (infinity3) */
-    MemoryRegion isppoll;   /* camera ISP frame-counter poll */
-    MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
-    QEMUTimer *scldma_timer;
-    qemu_irq scldma_irq;
-    uint32_t frame_count;   /* advanced once per fake captured frame */
-};
-
-struct MStarSoCClass {
-    /*< private >*/
-    DeviceClass parent_class;
-    /*< public >*/
-    MStarSoCInfo info;
-};
+#include "mstar-soc.h"
 
 /*
  * Optional RIU I/O tracer for reverse-engineering. When the environment
@@ -628,7 +549,7 @@ static bool mstar_realize_intc(MstIntcState *intc, DeviceState *gicdev,
  */
 static uint8_t *mstar_iolog_seen;   /* 0x400000/4 entries, bit0 read bit1 write */
 
-static bool mstar_iolog_first(hwaddr addr, bool write)
+bool mstar_iolog_first(hwaddr addr, bool write)
 {
     unsigned int idx;
     uint8_t bit;
@@ -667,157 +588,6 @@ static const MemoryRegionOps mstar_iolog_catchall_ops = {
     .write = mstar_iolog_catchall_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
-
-/*
- * SCLDMA - the scaler output DMA that writes captured frames to DRAM on the
- * MSC313 camera pipeline (sensor -> CSI -> ISP -> HVSP scaler -> SCLDMA; see
- * the linux-chenxing camera page). The IP-camera firmware busy-polls the
- * double-buffer / frame-done status at offset 0xfc waiting for a completed
- * frame. There is no real sensor in the model, so toggle that status on each
- * read to let the capture "request controller" advance past the poll; other
- * registers just store/read back.
- */
-static uint16_t mstar_scldma_regs[0x200 / 2];
-static uint16_t mstar_scldma_status;
-
-static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
-{
-    if (mstar_iolog_first(0x280400 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, false, 0, size);
-    if (addr == 0xfc) {
-        return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
-    }
-    return mstar_scldma_regs[(addr >> 1) & 0xff];
-}
-
-static void mstar_scldma_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
-{
-    if (mstar_iolog_first(0x280400 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, true, val, size);
-    mstar_scldma_regs[(addr >> 1) & 0xff] = val;
-}
-
-static const MemoryRegionOps mstar_scldma_ops = {
-    .read = mstar_scldma_read,
-    .write = mstar_scldma_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * ISP core (0x1f242000..0x1f246000). The camera firmware verifies most of its
- * ISP config by writing then reading back, so a plain store/read-back keeps
- * those loops happy. Two special cases:
- *  - the frame-counter triple at 0x1f24304c/50/54 (region offset 0x104c/50/54)
- *    returns the fake captured-frame counter, and reaching it means capture is
- *    set up, so we start delivering frames.
- */
-#define ISP_BASE_OFF   0x2000               /* 0x1f242000 within this region */
-#define ISP_FRAMECNT   (0x3050 - ISP_BASE_OFF)  /* 0x1050 */
-static uint16_t mstar_isppoll_regs[0x4000 / 2];
-
-static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
-{
-    MStarSoCState *s = opaque;
-
-    if (mstar_iolog_first(0x242000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, false, 0, size);
-    if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
-        addr == ISP_FRAMECNT + 4) {
-        if (!timer_pending(s->scldma_timer)) {
-            timer_mod(s->scldma_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 33);
-        }
-        return s->frame_count;
-    }
-    return mstar_isppoll_regs[(addr >> 1) & 0x1fff];
-}
-
-static void mstar_isppoll_write(void *opaque, hwaddr addr, uint64_t val,
-                                unsigned size)
-{
-    if (mstar_iolog_first(0x242000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, true, val, size);
-    mstar_isppoll_regs[(addr >> 1) & 0x1fff] = val;
-}
-
-static const MemoryRegionOps mstar_isppoll_ops = {
-    .read = mstar_isppoll_read,
-    .write = mstar_isppoll_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * HVSP / SCL scaler (0x1f260000..0x1f262000). Store/read-back for config, and
- * report the scaler/idclk clock-ready status (polled at 0x1f2605e8 by
- * Hal_HVSP_SetIdclkOnOff / Hal_SCLDMA_CLKInit) as always ready.
- */
-static uint16_t mstar_hvsp_regs[0x2000 / 2];
-
-static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
-{
-    MStarSoCState *s = opaque;
-
-    (void)s;
-    if (mstar_iolog_first(0x260000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, false, 0, size);
-    if (addr == 0x5e8) {
-        /* SCLDMA/HVSP clock heartbeat: toggle so a "clock is running" wait
-         * (Hal_SCLDMA_CLKInit / Hal_HVSP_SetIdclkOnOff) sees it change. */
-        static uint16_t hb;
-        return hb ^= 0xffff;
-    }
-    return mstar_hvsp_regs[(addr >> 1) & 0xfff];
-}
-
-static void mstar_hvsp_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
-{
-    if (mstar_iolog_first(0x260000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, true, val, size);
-    mstar_hvsp_regs[(addr >> 1) & 0xfff] = val;
-}
-
-static const MemoryRegionOps mstar_hvsp_ops = {
-    .read = mstar_hvsp_read,
-    .write = mstar_hvsp_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * Fake a captured video frame: the MSC313 camera scaler-DMA raises its
- * frame-done interrupt (GIC SPI 52 = "irq" mst-intc line 20) ~30x/s. Raise the
- * line, then lower it shortly after (the mst-intc is level-triggered, so a
- * zero-width pulse is lost); the driver ISR then dequeues a buffer.
- */
-static void mstar_scldma_tick(void *opaque)
-{
-    MStarSoCState *s = opaque;
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-    static bool asserted;
-
-    /*
-     * Advance the captured-frame counter. The interrupt path is left off by
-     * default: the vendor ISR indexes hardware structures from the scaler
-     * interrupt-status registers, which this stub does not fully model, so
-     * firing it faults. The capture app's poll()/select() path is driven by
-     * the frame counter + SCLDMA status instead. Set MSTAR_SCLDMA_IRQ=1 to
-     * also pulse the frame-done IRQ (for experimenting with the ISR path).
-     */
-    s->frame_count++;
-    mstar_scldma_status = 0xffff;
-    if (getenv("MSTAR_SCLDMA_IRQ")) {
-        if (!asserted) {
-            qemu_set_irq(s->scldma_irq, 1);
-            asserted = true;
-            timer_mod(s->scldma_timer, now + 2);
-            return;
-        }
-        qemu_set_irq(s->scldma_irq, 0);
-        asserted = false;
-    }
-    timer_mod(s->scldma_timer, now + 31);
-}
 
 static void mstar_soc_realize(DeviceState *dev, Error **errp)
 {
@@ -1007,7 +777,12 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sar), 0,
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_SAR_HWIRQ));
 
-    /* GPIO pad register bank. */
+    /*
+     * GPIO pad register bank. On camera boards, GPIO8/GPIO9 are the bit-banged
+     * sensor SCCB: the board sets s->gpio.gpioi2c (via MStarMachineClass.
+     * has_gpioi2c) before realize so the gpio creates the i2c bus, and its
+     * board_init attaches a sensor module to it (see mstar_msc313e_cam.c).
+     */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
         return;
     }
@@ -1080,33 +855,6 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                     blk_by_legacy_dinfo(di), &error_fatal);
             qdev_realize_and_unref(card, bus, &error_fatal);
         }
-    }
-
-    /*
-     * MSC313 camera scaler-DMA capture (only the camera-class SoC, which has no
-     * SSD20xD display). Provides the SCLDMA registers and a periodic frame-done
-     * interrupt so an IP-camera firmware's capture path thinks frames arrive.
-     * Wired here, after the "irq" mst-intc is realized.
-     */
-    if (!sc->info.has_display) {
-        memory_region_init_io(&s->scldma, OBJECT(s), &mstar_scldma_ops, s,
-                              "mstar.scldma", 0x200);
-        memory_region_add_subregion(get_system_memory(),
-                                    MSTAR_RIU_BASE + 0x280400, &s->scldma);
-        memory_region_init_io(&s->isppoll, OBJECT(s), &mstar_isppoll_ops, s,
-                              "mstar.isppoll", 0x4000);
-        memory_region_add_subregion(get_system_memory(),
-                                    MSTAR_RIU_BASE + 0x242000, &s->isppoll);
-        memory_region_init_io(&s->hvsp, OBJECT(s), &mstar_hvsp_ops, s,
-                              "mstar.hvsp", 0x2000);
-        memory_region_add_subregion(get_system_memory(),
-                                    MSTAR_RIU_BASE + 0x260000, &s->hvsp);
-        /* SCLDMA frame-done IRQ shares the "irq" mst-intc line 20 (SPI 52). */
-        s->scldma_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
-                                         MSTAR_DISP_GOP_HWIRQ);
-        s->scldma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                       mstar_scldma_tick, s);
-        /* Armed lazily on the first ISP frame-counter poll (see above). */
     }
 
     /* "pwm" controller; its channel 0 is the panel backlight. */
@@ -1182,62 +930,13 @@ static void mstar_soc_class_init(ObjectClass *oc, const void *data)
     dc->user_creatable = false;
 }
 
-static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
-{
-    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
+/*
+ * The concrete SoC variants (infinity3/MSC313E, infinity2m/SSD20xD, SSD203D)
+ * and their boards live in the per-family files hw/arm/mstar_<family>.c; each
+ * subclasses TYPE_MSTAR_SOC / TYPE_MSTAR_MACHINE and fills in MStarSoCInfo.
+ */
 
-    sc->info.cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
-    sc->info.num_cpus = 1;
-    sc->info.timer_freq = 12000000;     /* xtal_div2 */
-    sc->info.chip_id = 0xc2;            /* MSC313E */
-    sc->info.clkgen_type = TYPE_MSC313_CLKGEN;
-    sc->info.pinctrl_type = TYPE_MSC313_PINCTRL;
-}
-
-static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
-{
-    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
-
-    /* SSD20xD: dual Cortex-A7, secondary released via the smpctrl mailbox. */
-    sc->info.cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
-    sc->info.num_cpus = 2;
-    sc->info.has_display = true;
-    sc->info.timer_freq = 432000000;    /* clk_timer */
-    sc->info.bond = 0x1e;               /* SSD202D (128MB in-package DRAM) */
-    sc->info.chip_id = 0xf0;            /* SSD20xD */
-    sc->info.clkgen_type = TYPE_SSD20XD_CLKGEN;
-    sc->info.pinctrl_type = TYPE_SSD20XD_PINCTRL;
-}
-
-static void mstar_ssd203d_soc_class_init(ObjectClass *oc, const void *data)
-{
-    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
-
-    /*
-     * SSD203D == SSD202D (infinity2m) with an HDMI transmitter (hdmitx)
-     * bolted onto the display pipeline.  It inherits the infinity2m class
-     * (dual Cortex-A7, same clkgen/pinctrl base, bond 0x1e, chip 0xf0 — the
-     * n1pro boot ROM reports "D-1e" like the SSD202D) and only flags the
-     * extra HDMI block so the display model can wire it up.
-     */
-    sc->info.has_hdmi = true;
-}
-
-/* ---------------------------------------------------------------- Boards */
-
-#define TYPE_MSTAR_MACHINE MACHINE_TYPE_NAME("mstar")
-OBJECT_DECLARE_TYPE(MStarMachineState, MStarMachineClass, MSTAR_MACHINE)
-
-struct MStarMachineState {
-    MachineState parent_obj;
-};
-
-struct MStarMachineClass {
-    MachineClass parent_class;
-    const char *soc_type;
-    bool has_secelem;       /* board has the i2c0 security element at 0x3d */
-    bool panel_flip;        /* panel mounted 180deg (rotate the display output) */
-};
+/* ------------------------------------------------------- abstract machine */
 
 static struct arm_boot_info mstar_binfo;
 
@@ -1251,14 +950,19 @@ static void mstar_machine_init(MachineState *machine)
     object_unref(OBJECT(soc));
     /* A mask-ROM boot (-bios) runs in Secure state, so give the CPU EL3. */
     soc->secure_boot = machine->firmware != NULL || getenv("MSTAR_SECURE_KERNEL");
+    /* Camera boards drive a sensor over GPIO8/9 bit-banged SCCB (pre-realize). */
+    soc->gpio.gpioi2c = mmc->has_gpioi2c;
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
 
-    /* Board-specific security element on i2c1 @ 0x3d (Miyoo Mini). */
-    if (mmc->has_secelem) {
-        i2c_slave_create_simple(soc->i2c[1].bus, TYPE_MSTAR_SECELEM, 0x3d);
+    /*
+     * Board-specific devices not present on every board with this SoC (e.g. the
+     * Miyoo Mini's alpu-fa auth chip, or a camera board's capture pipeline +
+     * sensor). Each board wires its own in its machine file, so nothing leaks
+     * onto the other boards.
+     */
+    if (mmc->board_init) {
+        mmc->board_init(soc);
     }
-    /* The Miyoo Mini's panel is mounted upside down. */
-    soc->disp.flip = mmc->panel_flip;
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,
                                 machine->ram);
@@ -1349,61 +1053,13 @@ static void mstar_machine_class_init(ObjectClass *oc, const void *data)
     mc->ignore_memory_transaction_failures = true;
 }
 
-static void breadbee_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
-
-    mc->desc = "thingy.jp BreadBee (MStar infinity3/MSC313E)";
-    mc->default_ram_size = 64 * MiB;
-    mc->max_cpus = 1;
-    mmc->soc_type = TYPE_MSTAR_INFINITY3_SOC;
-}
-
-static void dongshanpione_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
-
-    mc->desc = "100ask DongShanPi One (MStar infinity2m/SSD202D)";
-    mc->default_ram_size = 128 * MiB;
-    mc->min_cpus = 2;
-    mc->default_cpus = 2;
-    mc->max_cpus = 2;
-    mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
-}
-
-static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
-
-    mc->desc = "Miyoo Mini (MStar infinity2m/SSD202D)";
-    mc->default_ram_size = 128 * MiB;
-    mc->min_cpus = 2;
-    mc->default_cpus = 2;
-    mc->max_cpus = 2;
-    mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
-    mmc->has_secelem = true;    /* auth chip on i2c0 @ 0x3d (see mstar_secelem) */
-    mmc->panel_flip = true;     /* the panel is mounted 180deg */
-}
-
-static void n1pro_machine_class_init(ObjectClass *oc, const void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
-
-    /* N1PRO: SSD203D board with HDMI output (no auth chip, HDMI not a panel). */
-    mc->desc = "N1PRO (MStar infinity2m/SSD203D, HDMI)";
-    mc->default_ram_size = 128 * MiB;
-    mc->min_cpus = 2;
-    mc->default_cpus = 2;
-    mc->max_cpus = 2;
-    mmc->soc_type = TYPE_MSTAR_SSD203D_SOC;
-}
-
 /* ----------------------------------------------------------------- Types */
 
+/*
+ * Only the abstract base SoC and machine live here. Concrete SoCs and boards
+ * are registered by the per-family files (mstar_infinity3.c, mstar_infinity2m.c)
+ * which subclass these.
+ */
 static const TypeInfo mstar_types[] = {
     {
         .name           = TYPE_MSTAR_SOC,
@@ -1415,22 +1071,6 @@ static const TypeInfo mstar_types[] = {
         .abstract       = true,
     },
     {
-        .name           = TYPE_MSTAR_INFINITY3_SOC,
-        .parent         = TYPE_MSTAR_SOC,
-        .class_init     = mstar_infinity3_soc_class_init,
-    },
-    {
-        .name           = TYPE_MSTAR_INFINITY2M_SOC,
-        .parent         = TYPE_MSTAR_SOC,
-        .class_init     = mstar_infinity2m_soc_class_init,
-    },
-    {
-        /* SSD203D derives from infinity2m and only adds HDMI. */
-        .name           = TYPE_MSTAR_SSD203D_SOC,
-        .parent         = TYPE_MSTAR_INFINITY2M_SOC,
-        .class_init     = mstar_ssd203d_soc_class_init,
-    },
-    {
         .name           = TYPE_MSTAR_MACHINE,
         .parent         = TYPE_MACHINE,
         .instance_size  = sizeof(MStarMachineState),
@@ -1439,26 +1079,6 @@ static const TypeInfo mstar_types[] = {
         .abstract       = true,
         /* Make derived boards show up in qemu-system-arm/-aarch64. */
         .interfaces     = arm_machine_interfaces,
-    },
-    {
-        .name           = MACHINE_TYPE_NAME("breadbee"),
-        .parent         = TYPE_MSTAR_MACHINE,
-        .class_init     = breadbee_machine_class_init,
-    },
-    {
-        .name           = MACHINE_TYPE_NAME("dongshanpione"),
-        .parent         = TYPE_MSTAR_MACHINE,
-        .class_init     = dongshanpione_machine_class_init,
-    },
-    {
-        .name           = MACHINE_TYPE_NAME("miyoomini"),
-        .parent         = TYPE_MSTAR_MACHINE,
-        .class_init     = miyoomini_machine_class_init,
-    },
-    {
-        .name           = MACHINE_TYPE_NAME("n1pro"),
-        .parent         = TYPE_MSTAR_MACHINE,
-        .class_init     = n1pro_machine_class_init,
     },
 };
 

@@ -5,6 +5,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
+ * TODO(rename): this part is actually an "ALPU-FA" (ALPU-family i2c copy-
+ * protection / auth IC). Rename the type/file/struct to alpu-fa / AlpuFa* and
+ * update MStarMachineClass.has_secelem + the wiki accordingly. Behaviour is
+ * unchanged; this is a naming cleanup only.
+ *
  * The Miyoo Mini (SSD202D) carries a small crypto auth chip on i2c1 at address
  * 0x3d. Both the vendor 4.9 kernel and the MainUI app run a challenge-response
  * handshake against it and refuse to run (kernel BUG()s PID 1; MainUI exit(2)s)

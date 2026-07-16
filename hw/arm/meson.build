@@ -6,7 +6,16 @@ arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
 arm_common_ss.add(when: 'CONFIG_INTEGRATOR', if_true: files('integratorcp.c'))
 arm_common_ss.add(when: 'CONFIG_MICROBIT', if_true: files('microbit.c'))
 arm_common_ss.add(when: 'CONFIG_MPS3R', if_true: files('mps3r.c'))
-arm_common_ss.add(when: 'CONFIG_MSTAR', if_true: [files('mstar.c')])
+arm_common_ss.add(when: 'CONFIG_MSTAR', if_true: [files(
+  'mstar.c',                 # common SoC base + abstract machine
+  'mstar_infinity3.c',       # infinity3/MSC313E SoC
+  'mstar_infinity2m.c',      # infinity2m/SSD20xD + SSD203D SoCs
+  'mstar_breadbee.c',        # boards:
+  'mstar_msc313e_cam.c',
+  'mstar_dongshanpione.c',
+  'mstar_miyoomini.c',
+  'mstar_n1pro.c',
+)])
 arm_common_ss.add(when: 'CONFIG_MUSICPAL', if_true: [files('musicpal.c')])
 arm_common_ss.add(when: 'CONFIG_NETDUINOPLUS2', if_true: files('netduinoplus2.c'))
 arm_common_ss.add(when: 'CONFIG_OLIMEX_STM32_H405', if_true: files('olimex-stm32-h405.c'))
