@@ -259,6 +259,17 @@ static const MemoryRegionOps mstar_did_ops = {
 #define MIU_DIG_BIST_CTRL       (MIU_DIG_BASE + 0x1c0)  /* start (W) / status (R) */
 #define MIU_DIG_BIST_DONE       (1 << 15)               /* bits 14:13 = error */
 
+/*
+ * DDR-PLL frequency-set registers in the analog block. The 6.5 kernel's MIU
+ * clock driver (drivers/memory/mstar-msc313_miu.c mstar_miu_ddrpll_recalc_rate)
+ * divides the PLL base rate by ddfset = (DDFSET_H & 0xff)<<16 | DDFSET_L, and
+ * panics with a divide-by-zero if the pair reads 0. Report the values the
+ * vendor IPL programs during DDR bring-up (captured with MSTAR_IOLOG) so the
+ * clock registers with a sane, non-zero rate.
+ */
+#define MIU_ANA_DDFSET_L        (MIU_ANA_BASE + 0x60)
+#define MIU_ANA_DDFSET_H        (MIU_ANA_BASE + 0x64)
+
 static uint64_t mstar_miu_read(void *opaque, hwaddr addr, unsigned size)
 {
     switch (addr) {
@@ -268,6 +279,10 @@ static uint64_t mstar_miu_read(void *opaque, hwaddr addr, unsigned size)
     case MIU_DIG_CNTRL0:
         /* Initial DRAM training cycle completed (full-config path). */
         return MIU_DIG_CNTRL0_INITDONE;
+    case MIU_ANA_DDFSET_L:
+        return 0x8000;
+    case MIU_ANA_DDFSET_H:
+        return 0x0029;
     }
     return 0;
 }
