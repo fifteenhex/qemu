@@ -329,6 +329,7 @@ struct Msc313DispState {
     uint32_t dsiregs[MSTAR_DISP_DSI_NUM_REGS];
     uint32_t width, height;
     bool invalidate;
+    bool flip;              /* panel mounted 180deg (Miyoo Mini): rotate output */
 };
 
 /*

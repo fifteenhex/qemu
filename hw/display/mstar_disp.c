@@ -381,6 +381,39 @@ static void msc313_disp_scanout_mop(Msc313DispState *s)
     qemu_console_update(s->con, 0, 0, w, h);
 }
 
+/*
+ * The Miyoo Mini's panel is mounted upside down, so the firmware writes the
+ * framebuffer already rotated 180 degrees. Rotate the rendered surface back so
+ * a screendump shows what is physically on the panel (a 180 rotation of a
+ * row-major image is just a reversal of its pixels).
+ */
+static void msc313_disp_apply_flip(Msc313DispState *s)
+{
+    DisplaySurface *surface = qemu_console_surface(s->con);
+    int w = surface_width(surface);
+    int h = surface_height(surface);
+    int bpp = (surface_bits_per_pixel(surface) + 7) / 8;
+    int stride = surface_stride(surface);
+    uint8_t *data = surface_data(surface);
+    int n = w * h;
+    int i;
+
+    if (!s->flip) {
+        return;
+    }
+    for (i = 0; i < n / 2; i++) {
+        int j = n - 1 - i;
+        uint8_t *a = data + (i / w) * stride + (i % w) * bpp;
+        uint8_t *b = data + (j / w) * stride + (j % w) * bpp;
+        uint8_t tmp[4];
+
+        memcpy(tmp, a, bpp);
+        memcpy(a, b, bpp);
+        memcpy(b, tmp, bpp);
+    }
+    qemu_console_update(s->con, 0, 0, w, h);
+}
+
 static bool msc313_disp_gfx_update(void *opaque)
 {
     Msc313DispState *s = opaque;
@@ -401,6 +434,10 @@ static bool msc313_disp_gfx_update(void *opaque)
         s->brightness = bl;
         s->invalidate = true;
     }
+    /* The flip rotates the whole surface, so it needs the full frame each time. */
+    if (s->flip) {
+        s->invalidate = true;
+    }
 
     /*
      * The vendor u-boot bootlogo drives the MOP video plane (YUV420); the
@@ -409,6 +446,7 @@ static bool msc313_disp_gfx_update(void *opaque)
      */
     if (s->mopregs[MOP_REG(MOP_WIN0, MOP_WIN_EN)] & 1) {
         msc313_disp_scanout_mop(s);
+        msc313_disp_apply_flip(s);
         return true;
     }
 
@@ -437,6 +475,7 @@ static bool msc313_disp_gfx_update(void *opaque)
         qemu_console_update(s->con, 0, first, w, last - first + 1);
     }
     s->invalidate = false;
+    msc313_disp_apply_flip(s);
     return true;
 }
 

@@ -970,6 +970,7 @@ struct MStarMachineClass {
     MachineClass parent_class;
     const char *soc_type;
     bool has_secelem;       /* board has the i2c0 security element at 0x3d */
+    bool panel_flip;        /* panel mounted 180deg (rotate the display output) */
 };
 
 static struct arm_boot_info mstar_binfo;
@@ -990,6 +991,8 @@ static void mstar_machine_init(MachineState *machine)
     if (mmc->has_secelem) {
         i2c_slave_create_simple(soc->i2c[1].bus, TYPE_MSTAR_SECELEM, 0x3d);
     }
+    /* The Miyoo Mini's panel is mounted upside down. */
+    soc->disp.flip = mmc->panel_flip;
 
     memory_region_add_subregion(get_system_memory(), MSTAR_DRAM_BASE,
                                 machine->ram);
@@ -1116,6 +1119,7 @@ static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = 2;
     mmc->soc_type = TYPE_MSTAR_INFINITY2M_SOC;
     mmc->has_secelem = true;    /* auth chip on i2c0 @ 0x3d (see mstar_secelem) */
+    mmc->panel_flip = true;     /* the panel is mounted 180deg */
 }
 
 /* ----------------------------------------------------------------- Types */
