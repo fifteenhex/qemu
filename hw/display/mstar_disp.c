@@ -118,6 +118,7 @@ static uint64_t msc313_disp_gop_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313DispState *s = opaque;
 
+    mstar_iolog(MSTAR_DISP_GOP_BASE + addr, false, s->gopregs[addr / 4], size);
     return s->gopregs[addr / 4];
 }
 
@@ -126,6 +127,7 @@ static void msc313_disp_gop_write(void *opaque, hwaddr addr, uint64_t val,
 {
     Msc313DispState *s = opaque;
 
+    mstar_iolog(MSTAR_DISP_GOP_BASE + addr, true, val, size);
     s->gopregs[addr / 4] = val;
 }
 
@@ -133,6 +135,7 @@ static uint64_t msc313_disp_top_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313DispState *s = opaque;
 
+    mstar_iolog(MSTAR_DISP_TOP_BASE + addr, false, s->topregs[addr / 4], size);
     return s->topregs[addr / 4];
 }
 
@@ -141,6 +144,7 @@ static void msc313_disp_top_write(void *opaque, hwaddr addr, uint64_t val,
 {
     Msc313DispState *s = opaque;
 
+    mstar_iolog(MSTAR_DISP_TOP_BASE + addr, true, val, size);
     if (addr == TOP_VSYNC_FLAG) {
         s->topregs[TOP_VSYNC_FLAG / 4] &= ~(uint16_t)val;   /* write-1-clear */
         msc313_disp_update_irq(s);
@@ -258,7 +262,12 @@ static const MemoryRegionOps msc313_disp_dsi_ops = {
     .valid.max_access_size = 4,
 };
 
-/* Convert one RGB565 source row to the console surface. */
+/*
+ * Convert one GOP source row to the console surface. The source pixel format is
+ * taken from the WIN0 format field (drm_color_to_gop): 0x1 = RGB565 (mainline
+ * DRM fbcon), 0x5 = ARGB8888, 0x7 = ABGR8888 (the vendor mi_disp/SDL fbdev runs
+ * the primary plane as 32bpp ARGB8888). Other 16bpp codes decode as RGB565.
+ */
 static void msc313_disp_draw_row(void *opaque, uint8_t *dst, const uint8_t *src,
                                  int width, int deststep)
 {
@@ -266,14 +275,35 @@ static void msc313_disp_draw_row(void *opaque, uint8_t *dst, const uint8_t *src,
     DisplaySurface *surface = qemu_console_surface(s->con);
     int bpp = surface_bits_per_pixel(surface);
     unsigned int bl = s->brightness;
+    unsigned int fmt = (s->gopregs[GOP_WIN0 / 4] >> 4) & 0xf;
+    bool is32 = (fmt == 0x5 || fmt == 0x7);     /* ARGB8888 / ABGR8888 */
+    bool bgr = (fmt == 0x7);
 
     while (width--) {
-        uint16_t px = lduw_le_p(src);
-        uint8_t r = (((px >> 11) & 0x1f) << 3) * bl >> 8;
-        uint8_t g = (((px >> 5) & 0x3f) << 2) * bl >> 8;
-        uint8_t b = ((px & 0x1f) << 3) * bl >> 8;
+        uint8_t r, g, b;
 
-        src += 2;
+        if (is32) {
+            uint32_t px = ldl_le_p(src);
+            uint8_t c0 = px & 0xff, c1 = (px >> 8) & 0xff, c2 = (px >> 16) & 0xff;
+
+            /* ARGB8888 stores B,G,R,A in memory; ABGR8888 stores R,G,B,A. */
+            if (bgr) {
+                r = c0; g = c1; b = c2;
+            } else {
+                b = c0; g = c1; r = c2;
+            }
+            src += 4;
+        } else {
+            uint16_t px = lduw_le_p(src);
+
+            r = ((px >> 11) & 0x1f) << 3;
+            g = ((px >> 5) & 0x3f) << 2;
+            b = (px & 0x1f) << 3;
+            src += 2;
+        }
+        r = r * bl >> 8;
+        g = g * bl >> 8;
+        b = b * bl >> 8;
         switch (bpp) {
         case 16:
             *(uint16_t *)dst = rgb_to_pixel16(r, g, b);
@@ -423,8 +453,15 @@ static bool msc313_disp_gfx_update(void *opaque)
     uint32_t h = s->gopregs[GOP_STRETCH_H / 4] & 0xfff;
     uint32_t addrl = s->gopregs[GOP_WIN0_ADDRL / 4];
     uint32_t addrh = s->gopregs[GOP_WIN0_ADDRH / 4] & 0xfff;
-    /* The GOP is programmed with the framebuffer's full physical address. */
-    hwaddr fbaddr = ((hwaddr)((addrh << 16) | addrl)) << GOP_ADDR_SHIFT;
+    unsigned int fmt = (win >> 4) & 0xf;
+    bool is32 = (fmt == 0x5 || fmt == 0x7);
+    /*
+     * The GOP address register holds the DRAM-relative (MIU) address of the
+     * framebuffer (drm_gem_dma dma_addr, i.e. phys - MSTAR_DRAM_BASE), so add
+     * the DRAM base to reach it in system memory.
+     */
+    hwaddr fbaddr = MSTAR_DRAM_BASE +
+                    (((hwaddr)((addrh << 16) | addrl)) << GOP_ADDR_SHIFT);
     uint32_t pitch = (s->gopregs[GOP_WIN0_PITCH / 4] & 0x7ff) << GOP_ADDR_SHIFT;
     unsigned int bl = s->backlight ? msc313_pwm_brightness(s->backlight, 0) : 256;
     int first = 0, last = 0;
@@ -455,7 +492,7 @@ static bool msc313_disp_gfx_update(void *opaque)
         return true;
     }
     if (pitch == 0) {
-        pitch = w * 2;
+        pitch = w * (is32 ? 4 : 2);
     }
     if (w != s->width || h != s->height) {
         qemu_console_resize(s->con, w, h);
