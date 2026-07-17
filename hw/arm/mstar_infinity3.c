@@ -36,9 +36,27 @@
 static uint16_t mstar_scldma_regs[0x200 / 2];
 static uint16_t mstar_scldma_status;
 
+/*
+ * Debug: while an ISP frame-done IRQ is pending (between the tick raising and
+ * lowering it), MSTAR_ISP_TRACE logs every read the ISP/HVSP/SCLDMA regions
+ * see - i.e. exactly the registers the kernel ISP ISR reads for its status
+ * snapshot. This is how we locate the frame-done status registers.
+ */
+static bool mstar_isp_in_irq;
+static bool mstar_isp_frame_pending;    /* frame-done status latched, one-shot */
+
+static inline void isp_trace(hwaddr absaddr, unsigned size)
+{
+    if (mstar_isp_in_irq && getenv("MSTAR_ISP_TRACE")) {
+        fprintf(stderr, "[isptrace] R %08x sz%u\n",
+                (unsigned)(MSTAR_RIU_BASE + absaddr), size);
+    }
+}
+
 static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
 {
     if (mstar_iolog_first(0x280400 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, false, 0, size);
+    isp_trace(0x280400 + addr, size);
     if (addr == 0xfc) {
         return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
     }
@@ -90,6 +108,7 @@ static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
     MStarSoCState *s = opaque;
 
     if (mstar_iolog_first(0x242000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, false, 0, size);
+    isp_trace(0x242000 + addr, size);
     if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
         addr == ISP_FRAMECNT + 4) {
         if (!timer_pending(s->scldma_timer)) {
@@ -125,7 +144,37 @@ static uint16_t mstar_hvsp_regs[0x2000 / 2];
 
 static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
 {
+    MStarSoCState *s = opaque;
+
     if (mstar_iolog_first(0x260000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, false, 0, size);
+    isp_trace(0x260000 + addr, size);
+    /*
+     * SCL/ISP frame-done interrupt status (base 0x1f260400). The kernel ISP ISR
+     * computes three masks as (status & ~intmask) and drops the IRQ as
+     * "[ISP] False interrupt?" if all three are 0. Decoded from vmlinux:
+     *   mask1 = u16[0x4ac] & ~u16[0x4a0]
+     *   mask2 = (u8[0x4bc]&0xf) & ~(u8[0x4b4]&0xf)
+     *   mask3 = u16[0x534] & ~u16[0x528]
+     * The frame-complete handler runs on mask1 bit 14 (0x4000): it advances the
+     * ISP frame counter and pulls the captured frame via THalISPGetVDOSData.
+     * So while an ISP frame IRQ is pending report status1 bit14 set, unmasked,
+     * and one-shot (cleared once the ISR reads it) to avoid a re-entry storm.
+     * Experimental (MSTAR_ISP_IRQ).
+     */
+    if (mstar_isp_frame_pending) {
+        switch (addr) {
+        case 0x4ac:                             /* int status 1: frame-done */
+            /* One-shot ack: clear pending and deassert the level line now that
+             * the ISR has taken the frame, so it does not re-enter and storm. */
+            mstar_isp_frame_pending = false;
+            mstar_isp_in_irq = false;
+            qemu_set_irq(s->isp_img_irq, 0);
+            return 0x4000;
+        case 0x4a0: case 0x4b4: case 0x528:     /* int-mask regs: unmasked */
+        case 0x4bc: case 0x534:                 /* status 2/3: idle */
+            return 0x0000;
+        }
+    }
     if (addr == 0x5e8) {
         /* SCLDMA/HVSP clock heartbeat: toggle so a "clock is running" wait
          * (Hal_SCLDMA_CLKInit / Hal_HVSP_SetIdclkOnOff) sees it change. */
@@ -183,6 +232,8 @@ static void mstar_scldma_tick(void *opaque)
             qemu_set_irq(s->scldma_irq, 1);
         }
         if (getenv("MSTAR_ISP_IRQ")) {
+            mstar_isp_in_irq = true;        /* window for MSTAR_ISP_TRACE */
+            mstar_isp_frame_pending = true; /* latch a frame-done status */
             qemu_set_irq(s->isp_img_irq, 1);
         }
         s->frame_phase = 1;
@@ -192,6 +243,7 @@ static void mstar_scldma_tick(void *opaque)
 
     qemu_set_irq(s->scldma_irq, 0);
     qemu_set_irq(s->isp_img_irq, 0);
+    mstar_isp_in_irq = false;
     s->frame_phase = 0;
     timer_mod(s->scldma_timer, now + 39);
 }
