@@ -256,6 +256,16 @@ static void mstar_emac_write(void *opaque, hwaddr riu, uint64_t val,
     }
 
     switch (g) {
+    case EMAC_NCR:
+        /*
+         * The driver's RX errata toggles RE off then on; while it is off
+         * can_receive() is false and the net layer queues incoming frames.
+         * Flush them once RE comes back so RX does not stall after a burst.
+         */
+        if (emac_reg(s, EMAC_NCR) & NCR_RE) {
+            qemu_flush_queued_packets(qemu_get_queue(s->nic));
+        }
+        break;
     case EMAC_TCR:
         mstar_emac_do_tx(s);
         break;
@@ -351,9 +361,10 @@ static ssize_t mstar_emac_receive(NetClientState *nc, const uint8_t *buf,
 
     addr_w = ldl_le_phys(&address_space_memory, desc);
     if (getenv("MSTAR_EMAC_DBG")) {
-        fprintf(stderr, "[emac] RX %zu bytes idx=%u desc@0x%08x=0x%08x %s\n",
-                size, s->rx_idx, (uint32_t)desc, addr_w,
-                (addr_w & RXD_USED) ? "FULL-DROP" : "ok");
+        fprintf(stderr, "[emac] RX %zu bytes idx=%u %s dst %02x:%02x:%02x:%02x:%02x:%02x src %02x:%02x:%02x:%02x:%02x:%02x\n",
+                size, s->rx_idx, (addr_w & RXD_USED) ? "FULL-DROP" : "ok",
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
     }
     if (addr_w & RXD_USED) {
         /*
