@@ -94,14 +94,21 @@ static const MemoryRegionOps mstar_l3bridge_ops = {
  * Anything else makes the ROM print "... undefined! [HALT]". We report NOR,
  * which is what the breadbee-class boards boot from; that is all the ROM
  * needs from this block.
+ *
+ * mercury5's mask ROM reuses this register but also tests bit 0x800 to pick
+ * the flash offset it loads the IPL/MCR5 header from (clear = 0x8000, set = 0);
+ * a SoC that needs a different strap sets MStarSoCInfo::boot_strap.
  */
 #define DID_BOOTMEDIA_REG   0x1c0
 #define DID_BOOTMEDIA_NOR   0x20
 
 static uint64_t mstar_did_read(void *opaque, hwaddr addr, unsigned size)
 {
+    MStarSoCState *s = opaque;
+    MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(s);
+
     if (addr == DID_BOOTMEDIA_REG) {
-        return DID_BOOTMEDIA_NOR;
+        return sc->info.boot_strap ? sc->info.boot_strap : DID_BOOTMEDIA_NOR;
     }
     return 0;
 }
@@ -369,14 +376,16 @@ static const MemoryRegionOps mstar_cpupll_ops = {
 /*
  * The "chipid" register (chip@1f003c00). The mask-ROM IPL reads the byte here
  * to identify the chip family and prints it as "D-<id>"; msc313e/infinity3 is
- * 0xc2, the SSD20xD/infinity2m is 0xf0.
+ * 0xc2, the SSD20xD/infinity2m is 0xf0. The offset within the bank is
+ * SoC-specific (MStarSoCInfo::chipid_off): 0 for infinity, +0x198 (0x1f003d98)
+ * for mercury5, whose IPL prints "Chip:M5U" for 0xee.
  */
 static uint64_t mstar_chipid_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarSoCState *s = opaque;
     MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(s);
 
-    if (addr == 0) {
+    if (addr == sc->info.chipid_off) {
         return sc->info.chip_id;
     }
     return 0;
@@ -938,11 +947,18 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                             MSTAR_RIU_BASE, log, -1);
     }
 
-    /* "pm" UART - the kernel console, its IRQ routed through the "irq" intc. */
+    /* "pm" UART - the infinity/IPL console, its IRQ routed through "irq" intc. */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
                    MSTAR_PM_UART_REGSHIFT,
                    qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_PM_UART_HWIRQ),
                    MSTAR_PM_UART_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    /* uart1 (serial@221200): second dw-apb-uart, on the second -serial. The
+     * mercury5 kernel uses this as its console/earlyprintk. */
+    serial_mm_init(get_system_memory(), MSTAR_UART1_BASE,
+                   MSTAR_PM_UART_REGSHIFT,
+                   qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_UART1_HWIRQ),
+                   MSTAR_PM_UART_CLK / 16, serial_hd(1), DEVICE_LITTLE_ENDIAN);
 }
 
 static void mstar_soc_class_init(ObjectClass *oc, const void *data)

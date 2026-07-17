@@ -626,6 +626,10 @@ struct Msc313BachState {
 #define MSTAR_PM_UART_CLK       172000000
 #define MSTAR_PM_UART_HWIRQ     34      /* line on the "irq" mst-intc */
 
+/* uart1 (serial@221200): second dw-apb-uart, the mercury5 kernel console. */
+#define MSTAR_UART1_BASE        (MSTAR_RIU_BASE + 0x221200)
+#define MSTAR_UART1_HWIRQ       35      /* line on the "irq" mst-intc */
+
 #define MSTAR_DRAM_BASE         0x20000000
 
 /* On-chip "IMI" SRAM (sram@a0000000); the boot ROM loads the IPL here. */

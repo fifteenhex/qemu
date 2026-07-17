@@ -61,10 +61,14 @@ typedef struct MStarSoCInfo {
                                  * IPL reads it to pick the DRAM profile/size
                                  * (0x1d = SSD201/64MB, 0x1e = SSD202D/128MB) */
     uint16_t chip_id;           /* CHIPID @0x1f003c00: 0xc2 = MSC313E/infinity3,
-                                 * 0xf0 = SSD20xD/infinity2m */
+                                 * 0xf0 = SSD20xD/infinity2m, 0xee = mercury5 M5U */
+    uint16_t chipid_off;        /* byte offset of chip_id within the chipid bank
+                                 * (0 = infinity, 0x198 = mercury5 @0x1f003d98) */
     const char *clkgen_type;    /* SoC-specific clkgen/pinctrl reg-probe types */
     const char *pinctrl_type;
     bool has_hdmi;              /* SSD203D adds an HDMI transmitter (hdmitx) */
+    uint16_t boot_strap;        /* did@7000 reg 0x1c0: boot-media/flash-offset
+                                 * strap the mask ROM reads (0 = default NOR) */
 } MStarSoCInfo;
 
 struct MStarSoCState {

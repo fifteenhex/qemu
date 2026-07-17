@@ -62,6 +62,17 @@ static hwaddr msc313_bdma_translate(unsigned int slave_id, unsigned int miu_sel,
     switch (slave_id) {
     case BDMA_SLAVE_MIU:
     case BDMA_SLAVE_MIU_CH1:
+        /*
+         * mercury5's mask ROM programs an absolute CPU address as the MIU
+         * endpoint (IMI at 0xa0000000, or DRAM at 0x20000000+) and leaves
+         * miu_sel clear, whereas msc313's ROM/kernel program a MIU-relative
+         * offset and pick IMI vs DRAM via miu_sel. A relative offset is always
+         * below DRAM_BASE (DRAM is at most 128MB), so treat anything at/above
+         * it as an already-absolute address.
+         */
+        if (addr >= MSTAR_DRAM_BASE) {
+            return addr;
+        }
         if (miu_sel == BDMA_MIU_SEL_IMI) {
             return MSTAR_IMI_BASE + addr;
         }
