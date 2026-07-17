@@ -298,6 +298,38 @@ static void mstar_infinity3_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->vif), 0, MSTAR_VIF_BASE);
+
+    /*
+     * The rest of the on-die camera capture/codec pipeline. These sit downstream
+     * of the scaler/SCLDMA stall so the firmware does not reach them yet; give
+     * each a named store/read-back stub (instead of the logging catch-all) so
+     * the regions are identified and read-back consistent, ready to grow real
+     * behaviour (trigger/done + the per-block interrupt below). DT names, bases
+     * and GIC SPIs from cam.dtb:
+     *   isp_sc_vif@263200            scaler-side VIF
+     *   jpe@264000     SPI 0x3d      JPEG encoder
+     *   mfe@264800     SPI 0x3c      multi-format (H.264) encoder
+     *   vhe@265000     SPI 0x35      H.265 encoder (two banks 0x265000/0x265200)
+     *   ive@2a4000     SPI 0x58      intelligent video engine (two banks)
+     */
+    static const struct {
+        hwaddr off; uint32_t size; const char *name;
+    } cam_stubs[] = {
+        { 0x263200, 0x200, "mstar.isp_sc_vif" },
+        { 0x264000, 0x200, "mstar.jpe" },
+        { 0x264800, 0x200, "mstar.mfe" },
+        { 0x265000, 0x400, "mstar.vhe" },
+        { 0x2a4000, 0x400, "mstar.ive" },
+    };
+    for (unsigned int i = 0; i < ARRAY_SIZE(cam_stubs); i++) {
+        DeviceState *dev = qdev_new(TYPE_MSTAR_REGBANK);
+
+        qdev_prop_set_uint32(dev, "size", cam_stubs[i].size);
+        qdev_prop_set_string(dev, "name", cam_stubs[i].name);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0,
+                        MSTAR_RIU_BASE + cam_stubs[i].off);
+    }
 }
 
 static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)
