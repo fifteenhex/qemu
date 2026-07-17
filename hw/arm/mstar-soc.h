@@ -104,11 +104,11 @@ struct MStarSoCState {
      * present on every MSC313E board; whether a sensor is actually wired to the
      * SCCB bus is a per-board choice (only the camera board attaches one).
      */
+    MstarCmdqState cmdq;    /* command-queue engine (0x1f224000), all SoCs */
     MstarVifState vif;      /* camera sensor video-input front-end (csi@1f240800) */
     MemoryRegion scldma;    /* camera scaler-DMA capture */
     MemoryRegion isppoll;   /* camera ISP frame-counter poll */
     MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
-    MemoryRegion cmdq;      /* CMDQ/SCLIRQ - SCL frame interrupt flag */
     QEMUTimer *scldma_timer;
     qemu_irq scldma_irq;    /* SCLINTR / scaler-DMA frame-done (line 20) */
     qemu_irq isp_img_irq;   /* image-ISP frame-done (line 25, GIC 89) */

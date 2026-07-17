@@ -468,6 +468,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_MSTAR_WDT);
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "syscon", &s->syscon, TYPE_MSTAR_REGBANK);
+    object_initialize_child(obj, "cmdq", &s->cmdq, TYPE_MSTAR_CMDQ);
     for (i = 0; i < MSTAR_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
     }
@@ -750,6 +751,17 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->syscon), 0, MSTAR_SYSCON_BASE);
+
+    /*
+     * CMDQ command-queue engine (0x1f224000) - present on infinity/infinity2m/
+     * infinity3. Named store/read-back region; register layout still being
+     * mapped (see hw/misc/mstar_cmdq.c, MSTAR_CMDQ_DBG). The camera drives it as
+     * the SCLIRQ capture command queue; the Miyoo display path touches it too.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->cmdq), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->cmdq), 0, MSTAR_CMDQ_BASE);
 
     /*
      * SoC PIT timers (timer@6040, free-running counters). Their input clock is

@@ -205,6 +205,27 @@ struct MstarRegbankState {
 };
 
 /*
+ * CMDQ - the command-queue engine at 0x1f224000 (DT "msc313-cmdq"), on
+ * infinity/infinity2m/infinity3. Named store/read-back region while its
+ * register layout is being mapped (MSTAR_CMDQ_DBG=1 logs accesses+PC). See
+ * hw/misc/mstar_cmdq.c.
+ */
+#define TYPE_MSTAR_CMDQ "mstar-cmdq"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarCmdqState, MSTAR_CMDQ)
+
+#define MSTAR_CMDQ_BASE (MSTAR_RIU_BASE + 0x224000)
+#define MSTAR_CMDQ_SIZE 0x1000
+
+struct MstarCmdqState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint8_t *store;
+    uint32_t size;
+};
+
+/*
  * VIF - the sensor video-input interface (infinity3 csi@1f240800): the receiver
  * that clocks pixel data in from a MIPI or parallel image sensor and feeds the
  * ISP. See hw/misc/mstar_vif.c. Register file is store/read-back plus a 7-bit
