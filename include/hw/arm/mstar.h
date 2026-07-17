@@ -460,6 +460,8 @@ struct Msc313I2cState {
  */
 #define TYPE_MSTAR_SECELEM "mstar-secelem"
 #define TYPE_MSTAR_CAM_SENSOR "mstar-cam-sensor"
+/* Sony IMX323: a preset of mstar-cam-sensor (16-bit regs, chip-id 0x301c=0x50). */
+#define TYPE_IMX323 "imx323"
 OBJECT_DECLARE_SIMPLE_TYPE(MstarSecElemState, MSTAR_SECELEM)
 
 #define MSTAR_SECELEM_BUFSZ 64

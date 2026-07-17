@@ -27,6 +27,7 @@
 #include "hw/core/resettable.h"
 
 #define TYPE_MSTAR_CAM_SENSOR "mstar-cam-sensor"
+#define TYPE_IMX323 "imx323"        /* Sony IMX323 preset (also in mstar.h) */
 OBJECT_DECLARE_SIMPLE_TYPE(MstarCamSensorState, MSTAR_CAM_SENSOR)
 
 #define SENSOR_REGSPACE 0x10000
@@ -145,12 +146,61 @@ static void mstar_cam_sensor_class_init(ObjectClass *oc, const void *data)
     sc->recv = mstar_cam_sensor_recv;
 }
 
+/*
+ * Sony IMX323 (1/2.9" 1080p) - the sensor on the MSC313E camera boards this
+ * emulates. It is just mstar-cam-sensor with the IMX323's defaults: 16-bit
+ * register addresses, and the chip-id register 0x301c reading 0x50 (from the
+ * vendor sensor driver's Sensor_id_table: reg 0x301c == 0x50). Reusable as
+ * `-device imx323` or attached by any MStar camera board. Its full power-on
+ * register program (Sensor_init_table, 52 regs) is store/read-back here; the
+ * driver writes it and reads it back to verify, which just works.
+ */
+/*
+ * The IMX323's id registers are single bytes, so preset them directly rather
+ * than via the generic (16-bit) id-reg/id-val. Two drivers probe two different
+ * registers, so answer both:
+ *   - reg 0x301c == 0x50  (vendor MStar libdrv_ms_cus_imx323 Sensor_id_table)
+ *   - reg 0x0112 == 0x0a  (mainline imx323.c IMX323_REG_CHIP_ID)
+ */
+static void imx323_reset_hold(Object *obj, ResetType type)
+{
+    MstarCamSensorState *s = MSTAR_CAM_SENSOR(obj);
+
+    memset(s->regs, 0, SENSOR_REGSPACE);
+    s->ptr = 0;
+    s->addr_pos = 0;
+    s->regs[0x301c] = 0x50;
+    s->regs[0x0112] = 0x0a;
+}
+
+static void imx323_realize(DeviceState *dev, Error **errp)
+{
+    MstarCamSensorState *s = MSTAR_CAM_SENSOR(dev);
+
+    s->reg_bytes = 2;               /* 16-bit register addresses */
+    mstar_cam_sensor_realize(dev, errp);
+}
+
+static void imx323_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
+
+    dc->realize = imx323_realize;   /* IMX323 preset over the generic sensor */
+    rc->phases.hold = imx323_reset_hold;
+}
+
 static const TypeInfo mstar_cam_sensor_types[] = {
     {
         .name           = TYPE_MSTAR_CAM_SENSOR,
         .parent         = TYPE_I2C_SLAVE,
         .instance_size  = sizeof(MstarCamSensorState),
         .class_init     = mstar_cam_sensor_class_init,
+    },
+    {
+        .name           = TYPE_IMX323,
+        .parent         = TYPE_MSTAR_CAM_SENSOR,
+        .class_init     = imx323_class_init,
     },
 };
 
