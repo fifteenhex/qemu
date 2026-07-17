@@ -45,6 +45,23 @@ static uint16_t mstar_scldma_status;
 static bool mstar_isp_in_irq;
 static bool mstar_isp_frame_pending;    /* frame-done status latched, one-shot */
 
+/*
+ * CMDQ / SCLIRQ block (msc313-cmdq at 0x1f224000). This carries the SCL
+ * (scaler) frame interrupt: the kernel SCLIRQ IST (tSCLIRQ_DazaIST) reads the
+ * IRQ flag at region offset 0x110 (phys 0x1f224110; THal_SCLIRQ_Get_Flag),
+ * testing bit0 = frame start and bit2 = frame end, and on frame-end sets the
+ * event the userspace capture thread is blocked on (T_Drv_SCLIRQ_SetFrmEndEvent
+ * -> wakes the /dev/scldma poll). With this block unmodelled the flag read 0,
+ * the IST never saw a frame end, and capture "[SCL_MSOS]wait timeout"d. Model
+ * the flag so that while a frame is pending it reports start|end; it is
+ * read-to-clear (the IST reads it once per frame).
+ */
+#define CMDQ_SCLIRQ_FLAG    0x110
+#define SCLIRQ_FRAME_START  (1 << 0)
+#define SCLIRQ_FRAME_END    (1 << 2)
+static uint16_t mstar_cmdq_regs[0x200 / 2];
+static bool mstar_scl_frame_pending;    /* SCL frame-end latched for the IST */
+
 static inline void isp_trace(hwaddr absaddr, unsigned size)
 {
     if (mstar_isp_in_irq && getenv("MSTAR_ISP_TRACE")) {
@@ -199,6 +216,36 @@ static const MemoryRegionOps mstar_hvsp_ops = {
     .valid.max_access_size = 4,
 };
 
+static uint64_t mstar_cmdq_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (mstar_iolog_first(0x224000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x224000 + addr, false, 0, size);
+    if (addr == CMDQ_SCLIRQ_FLAG) {
+        /* SCL IRQ flag: report a frame start+end while one is pending, and
+         * clear on read (the IST reads it once, then handles frame-end). */
+        if (mstar_scl_frame_pending) {
+            mstar_scl_frame_pending = false;
+            return SCLIRQ_FRAME_START | SCLIRQ_FRAME_END;
+        }
+        return 0;
+    }
+    return mstar_cmdq_regs[(addr >> 1) & 0xff];
+}
+
+static void mstar_cmdq_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    if (mstar_iolog_first(0x224000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x224000 + addr, true, val, size);
+    mstar_cmdq_regs[(addr >> 1) & 0xff] = val;
+}
+
+static const MemoryRegionOps mstar_cmdq_ops = {
+    .read = mstar_cmdq_read,
+    .write = mstar_cmdq_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /*
  * Fake a captured video frame: the MSC313 camera scaler-DMA raises its
  * frame-done interrupt (GIC SPI 52 = "irq" mst-intc line 20) ~30x/s. Raise the
@@ -228,6 +275,7 @@ static void mstar_scldma_tick(void *opaque)
     if (s->frame_phase == 0) {
         s->frame_count++;
         mstar_scldma_status = 0xffff;
+        mstar_scl_frame_pending = true; /* SCL frame-end flag for the SCLIRQ IST */
         if (getenv("MSTAR_SCLDMA_IRQ")) {
             qemu_set_irq(s->scldma_irq, 1);
         }
@@ -279,6 +327,10 @@ static void mstar_infinity3_soc_realize(DeviceState *dev, Error **errp)
                           "mstar.hvsp", 0x2000);
     memory_region_add_subregion(get_system_memory(),
                                 MSTAR_RIU_BASE + 0x260000, &s->hvsp);
+    memory_region_init_io(&s->cmdq, OBJECT(s), &mstar_cmdq_ops, s,
+                          "mstar.cmdq", 0x200);
+    memory_region_add_subregion(get_system_memory(),
+                                MSTAR_RIU_BASE + 0x224000, &s->cmdq);
     /* SCLDMA frame-done IRQ shares the "irq" mst-intc line 20 (SPI 52). */
     s->scldma_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                      MSTAR_DISP_GOP_HWIRQ);

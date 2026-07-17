@@ -108,6 +108,7 @@ struct MStarSoCState {
     MemoryRegion scldma;    /* camera scaler-DMA capture */
     MemoryRegion isppoll;   /* camera ISP frame-counter poll */
     MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
+    MemoryRegion cmdq;      /* CMDQ/SCLIRQ - SCL frame interrupt flag */
     QEMUTimer *scldma_timer;
     qemu_irq scldma_irq;    /* SCLINTR / scaler-DMA frame-done (line 20) */
     qemu_irq isp_img_irq;   /* image-ISP frame-done (line 25, GIC 89) */
