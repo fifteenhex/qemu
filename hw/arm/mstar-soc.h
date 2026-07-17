@@ -43,6 +43,9 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 #define TYPE_MSTAR_INFINITY2M_SOC "mstar-infinity2m-soc"
 /* SSD203D: an SSD202D (infinity2m) with an HDMI transmitter added. */
 #define TYPE_MSTAR_SSD203D_SOC "mstar-ssd203d-soc"
+/* mercury5 family (dual Cortex-A7 camera/dashcam SoCs) + the SSC8336. */
+#define TYPE_MSTAR_MERCURY5_SOC "mstar-mercury5-soc"
+#define TYPE_MSTAR_SSC8336_SOC "mstar-ssc8336-soc"
 
 #define MSTAR_SOC_MAX_CPUS 2
 

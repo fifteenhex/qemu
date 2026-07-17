@@ -10,11 +10,13 @@ arm_common_ss.add(when: 'CONFIG_MSTAR', if_true: [files(
   'mstar.c',                 # common SoC base + abstract machine
   'mstar_infinity3.c',       # infinity3/MSC313E SoC
   'mstar_infinity2m.c',      # infinity2m/SSD20xD + SSD203D SoCs
+  'mstar_mercury5.c',        # mercury5/SSC8336 SoC
   'mstar_breadbee.c',        # boards:
   'mstar_msc313e_cam.c',
   'mstar_dongshanpione.c',
   'mstar_miyoomini.c',
   'mstar_n1pro.c',
+  'mstar_70mai.c',
 )])
 arm_common_ss.add(when: 'CONFIG_MUSICPAL', if_true: [files('musicpal.c')])
 arm_common_ss.add(when: 'CONFIG_NETDUINOPLUS2', if_true: files('netduinoplus2.c'))
