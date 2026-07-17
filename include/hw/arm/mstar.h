@@ -216,10 +216,17 @@ struct Msc313GpioState {
     MemoryRegion iomem;
     uint8_t regs[MSTAR_GPIO_NUM_REGS];
     uint32_t buttons;       /* bitmask of pressed board buttons (QOM property) */
-    bool gpioi2c;           /* GPIO8=SDA / GPIO9=SCL bit-banged I2C (cameras) */
-    void *bbi2c;            /* bitbang_i2c_interface * */
-    void *i2c_bus;          /* I2CBus *; exposed so a sensor can be attached */
-    int sda_level;          /* current bus SDA (bit-bang readback) */
+    bool gpioi2c;           /* enable the bit-banged SCCB buses (camera SoCs) */
+    /*
+     * The camera firmware bit-bangs two Linux i2c-gpio buses on this pad bank:
+     * bus 0 (SDA/SCL at +0x58/+0x5c) carries the module-ID EEPROM, bus 1
+     * (+0x1c8/+0x1cc) is the sensor SCCB. Devices are attached to i2c_bus[] by
+     * the board.
+     */
+#define MSTAR_GPIO_NUM_I2C 2
+    void *bbi2c[MSTAR_GPIO_NUM_I2C];    /* bitbang_i2c_interface * per bus */
+    void *i2c_bus[MSTAR_GPIO_NUM_I2C];  /* I2CBus * per bus (board attaches slaves) */
+    int sda_level[MSTAR_GPIO_NUM_I2C];  /* current bus SDA (bit-bang readback) */
 };
 
 /*

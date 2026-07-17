@@ -22,9 +22,18 @@
 #include "hw/i2c/bitbang_i2c.h"
 #include "hw/arm/mstar.h"
 
-/* GPIO pads used for the bit-banged sensor SCCB on the camera SoCs. */
-#define GPIO_I2C_SDA_PAD    0x20    /* GPIO8 */
-#define GPIO_I2C_SCL_PAD    0x24    /* GPIO9 */
+/*
+ * Bit-banged SCCB buses (mainline Linux i2c-gpio) on this pad bank. The MSC313E
+ * camera firmware drives two: bus 0 (module-ID EEPROM) on SDA/SCL = +0x58/+0x5c,
+ * bus 1 (sensor SCCB, /dev/i2c-1) on +0x1c8/+0x1cc. Open-drain: OEN (bit5) clear
+ * drives low, set releases high; SDA input reads back as bit0. (Found by logging
+ * the gpio writes' guest PC = the i2c-algo-bit set/clear helpers, and reading the
+ * drive/input bit masks with gdb on set_scl/get_sda_gpio_value.)
+ */
+static const struct { uint8_t sda, scl; } gpio_i2c_pads[MSTAR_GPIO_NUM_I2C] = {
+    { 0x58, 0x5c },
+    { 0xc8 + 0x100, 0xcc + 0x100 },     /* +0x1c8 / +0x1cc */
+};
 
 /* ---------------------------------------------------------- msc313-gpio */
 
@@ -89,9 +98,13 @@ static uint64_t msc313_gpio_read(void *opaque, hwaddr addr, unsigned size)
     uint8_t v = s->regs[addr];
     int level;
 
-    /* Bit-banged sensor I2C: SDA reads back the (open-drain) bus level. */
-    if (s->gpioi2c && addr == GPIO_I2C_SDA_PAD) {
-        return s->sda_level ? (v | GPIO_IN) : (v & ~GPIO_IN);
+    /* Bit-banged SCCB: an SDA pad reads back the (open-drain) bus level. */
+    if (s->gpioi2c) {
+        for (unsigned int i = 0; i < MSTAR_GPIO_NUM_I2C; i++) {
+            if (addr == gpio_i2c_pads[i].sda) {
+                return s->sda_level[i] ? (v | GPIO_IN) : (v & ~GPIO_IN);
+            }
+        }
     }
 
     level = msc313_gpio_button_level(s, addr);
@@ -127,11 +140,17 @@ static void msc313_gpio_write(void *opaque, hwaddr addr, uint64_t val,
      * OUT bit (drivers only ever drive it low). Feed SCL/SDA to the bit-bang
      * engine, which returns the resulting bus SDA level for reads.
      */
-    if (s->gpioi2c && (addr == GPIO_I2C_SDA_PAD || addr == GPIO_I2C_SCL_PAD)) {
+    if (s->gpioi2c) {
         int drive = (val & GPIO_OEN) ? 1 : ((val & GPIO_OUT) ? 1 : 0);
-        int line = (addr == GPIO_I2C_SDA_PAD) ? BITBANG_I2C_SDA
-                                              : BITBANG_I2C_SCL;
-        s->sda_level = bitbang_i2c_set((bitbang_i2c_interface *)s->bbi2c, line, drive);
+        for (unsigned int i = 0; i < MSTAR_GPIO_NUM_I2C; i++) {
+            if (addr == gpio_i2c_pads[i].sda || addr == gpio_i2c_pads[i].scl) {
+                int line = (addr == gpio_i2c_pads[i].sda) ? BITBANG_I2C_SDA
+                                                          : BITBANG_I2C_SCL;
+                s->sda_level[i] = bitbang_i2c_set(
+                    (bitbang_i2c_interface *)s->bbi2c[i], line, drive);
+                break;
+            }
+        }
     }
 }
 
@@ -191,15 +210,18 @@ static void msc313_gpio_realize(DeviceState *dev, Error **errp)
                         NULL, NULL);
 
     /*
-     * Bit-banged sensor SCCB (camera SoCs): GPIO8=SDA, GPIO9=SCL. Create the
-     * I2C bus + bit-bang engine so a camera-module sensor slave can be
-     * attached to s->i2c_bus by the SoC.
+     * Bit-banged SCCB (camera SoCs): create both i2c-gpio buses + their bit-bang
+     * engines so the board can attach the module EEPROM (bus 0) and the sensor
+     * (bus 1). See gpio_i2c_pads[] for the pads.
      */
     if (s->gpioi2c) {
-        s->i2c_bus = i2c_init_bus(dev, "gpioi2c");
-        s->bbi2c = g_new0(bitbang_i2c_interface, 1);
-        bitbang_i2c_init(s->bbi2c, s->i2c_bus);
-        s->sda_level = 1;
+        for (unsigned int i = 0; i < MSTAR_GPIO_NUM_I2C; i++) {
+            g_autofree char *name = g_strdup_printf("gpioi2c%u", i);
+            s->i2c_bus[i] = i2c_init_bus(dev, name);
+            s->bbi2c[i] = g_new0(bitbang_i2c_interface, 1);
+            bitbang_i2c_init(s->bbi2c[i], s->i2c_bus[i]);
+            s->sda_level[i] = 1;
+        }
     }
 }
 

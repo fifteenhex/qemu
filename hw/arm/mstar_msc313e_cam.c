@@ -15,6 +15,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "hw/nvram/eeprom_at24c.h"
 #include "mstar-soc.h"
 
 /*
@@ -28,9 +29,21 @@
  */
 static void msc313e_cam_board_init(MStarSoCState *soc)
 {
-    i2c_slave_create_simple(soc->i2c[1].bus, TYPE_IMX323, 0x36);
-    if (soc->gpio.i2c_bus) {
-        i2c_slave_create_simple(soc->gpio.i2c_bus, TYPE_IMX323, 0x36);
+    /*
+     * The IMX323 answers SCCB at i2c address 0x1a (its .so uses 0x1a; the
+     * write/read address bytes seen on the bus are 0x34/0x35). The firmware
+     * bit-bangs it on the gpio SCCB (gpio.i2c_bus, SCL/SDA at gpio +0x5c/+0x58).
+     */
+    /*
+     * The camera firmware bit-bangs two i2c-gpio buses (see hw/gpio/mstar_gpio.c):
+     * bus 0 (+0x58/+0x5c) carries the module-ID EEPROM at 0x50; bus 1
+     * (+0x1c8/+0x1cc) is the sensor SCCB (/dev/i2c-1). The IMX323 answers at 0x1a.
+     */
+    if (soc->gpio.i2c_bus[0]) {
+        at24c_eeprom_init(soc->gpio.i2c_bus[0], 0x50, 256);
+    }
+    if (soc->gpio.i2c_bus[1]) {
+        i2c_slave_create_simple(soc->gpio.i2c_bus[1], TYPE_IMX323, 0x1a);
     }
 }
 
