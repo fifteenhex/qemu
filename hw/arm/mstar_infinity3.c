@@ -43,6 +43,7 @@ static uint16_t mstar_scldma_status;
  * snapshot. This is how we locate the frame-done status registers.
  */
 static bool mstar_isp_in_irq;
+static bool mstar_scl_in_irq;           /* window while the SCLDMA IRQ is pending */
 static bool mstar_isp_frame_pending;    /* frame-done status latched, one-shot */
 
 /*
@@ -57,17 +58,21 @@ static bool mstar_isp_frame_pending;    /* frame-done status latched, one-shot *
 
 static inline void isp_trace(hwaddr absaddr, unsigned size)
 {
-    if (mstar_isp_in_irq && getenv("MSTAR_ISP_TRACE")) {
-        fprintf(stderr, "[isptrace] R %08x sz%u\n",
+    if ((mstar_isp_in_irq || mstar_scl_in_irq) && getenv("MSTAR_ISP_TRACE")) {
+        fprintf(stderr, "[%s] R %08x sz%u\n", mstar_scl_in_irq ? "scltrace" : "isptrace",
                 (unsigned)(MSTAR_RIU_BASE + absaddr), size);
     }
 }
+
+static unsigned long cam_dbg_scldma_poll, cam_dbg_framecnt_poll, cam_dbg_ticks;
 
 static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
 {
     if (mstar_iolog_first(0x280400 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, false, 0, size);
     isp_trace(0x280400 + addr, size);
     if (addr == 0xfc) {
+        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_scldma_poll % 200 == 1))
+            fprintf(stderr, "[camdbg] SCLDMA status poll #%lu\n", cam_dbg_scldma_poll);
         return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
     }
     return mstar_scldma_regs[(addr >> 1) & 0xff];
@@ -113,14 +118,30 @@ static uint16_t mstar_isppoll_regs[0x4000 / 2];
  * frame-done status bit; that is the remaining ISP-modelling work (task #15).
  */
 
+/* Sequential trace of the ISP-internal i2c master (0x1f244d00..0x1f244dff =
+ * region offset 0x2d00..). Env MSTAR_ISPI2C_TRACE logs every access in order so
+ * the byte-level i2c command protocol can be decoded from a live sensor probe. */
+static inline void ispi2c_trace(hwaddr addr, uint64_t val, unsigned size, bool w)
+{
+    if ((addr & ~0xff) == 0x2d00 && getenv("MSTAR_ISPI2C_TRACE")) {
+        fprintf(stderr, "[ispi2c] %c %04x sz%u = %04x\n", w ? 'W' : 'R',
+                (unsigned)(0x244d00 + (addr & 0xff)), size, (unsigned)val);
+        fflush(stderr);
+    }
+}
+
 static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarSoCState *s = opaque;
 
     if (mstar_iolog_first(0x242000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, false, 0, size);
     isp_trace(0x242000 + addr, size);
+    ispi2c_trace(addr, mstar_isppoll_regs[(addr >> 1) & 0x1fff], size, false);
     if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
         addr == ISP_FRAMECNT + 4) {
+        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_framecnt_poll % 200 == 1))
+            fprintf(stderr, "[camdbg] ISP framecnt poll #%lu (cnt=%u)\n",
+                    cam_dbg_framecnt_poll, s->frame_count);
         if (!timer_pending(s->scldma_timer)) {
             timer_mod(s->scldma_timer,
                       qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 33);
@@ -134,6 +155,7 @@ static void mstar_isppoll_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
     if (mstar_iolog_first(0x242000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, true, val, size);
+    ispi2c_trace(addr, val, size, true);
     mstar_isppoll_regs[(addr >> 1) & 0x1fff] = val;
 }
 
@@ -237,8 +259,12 @@ static void mstar_scldma_tick(void *opaque)
      */
     if (s->frame_phase == 0) {
         s->frame_count++;
+        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_ticks % 25 == 1))
+            fprintf(stderr, "[camdbg] frame tick #%lu (count=%u)\n",
+                    cam_dbg_ticks, s->frame_count);
         mstar_scldma_status = 0xffff;
         if (getenv("MSTAR_SCLDMA_IRQ")) {
+            mstar_scl_in_irq = true;        /* window for MSTAR_ISP_TRACE */
             qemu_set_irq(s->scldma_irq, 1);
         }
         if (getenv("MSTAR_ISP_IRQ")) {
@@ -254,6 +280,7 @@ static void mstar_scldma_tick(void *opaque)
     qemu_set_irq(s->scldma_irq, 0);
     qemu_set_irq(s->isp_img_irq, 0);
     mstar_isp_in_irq = false;
+    mstar_scl_in_irq = false;
     s->frame_phase = 0;
     timer_mod(s->scldma_timer, now + 39);
 }
