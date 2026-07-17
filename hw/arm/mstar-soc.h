@@ -88,6 +88,7 @@ struct MStarSoCState {
     Msc313DispState disp;
     MstarDphyState dphy;
     Msc313BachState bach;
+    MstarEmacState emac;
     Msc313I2cState i2c[MSTAR_NUM_I2C];
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */

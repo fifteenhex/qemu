@@ -235,51 +235,6 @@ static const MemoryRegionOps mstar_miu_ops = {
 };
 
 
-/* ------------------------------------------------------------------ emac */
-
-/*
- * The "emac" is a Cadence GEM (MACB) sitting behind MStar's "XIU" bus. From
- * the 6.5 kernel macb glue (drivers/net/ethernet/cadence/macb_main.c with
- * MACB_CAPS_MSTAR_RIU, and the accessors in include/soc/mstar/riuxiu.h) each
- * 32-bit GEM register at offset G is accessed as two 16-bit halves: the low
- * half at byte offset 2*G and the high half at 2*G+4.
- *
- * We don't model the MAC itself, only enough for u-boot's MAC/MDIO bring-up
- * not to spin: report the PHY-management logic as permanently idle so the
- * MDIO poll completes, and return 0xffff ("no PHY") for the PHY read data.
- * u-boot then probes all 32 PHY addresses, finds none, fakes a link and
- * drops to its prompt. Real networking would need QEMU's cadence_gem wired
- * up behind this XIU shim (plus the msc313 "julian" glue registers).
- */
-#define EMAC_GEM_NSR        0x08        /* network status */
-#define EMAC_GEM_NSR_IDLE   (1 << 2)    /* MDIO/PHY management idle */
-#define EMAC_GEM_MAN        0x34        /* PHY maintenance; read data in [15:0] */
-
-static uint64_t mstar_emac_read(void *opaque, hwaddr addr, unsigned size)
-{
-    unsigned int gem = (addr & ~(hwaddr)4) / 2;  /* XIU: 32-bit reg at 2*G */
-    bool high = addr & 4;
-
-    switch (gem) {
-    case EMAC_GEM_NSR:
-        return high ? 0 : EMAC_GEM_NSR_IDLE;
-    case EMAC_GEM_MAN:
-        return high ? 0 : 0xffff;      /* no PHY responds */
-    }
-    return 0;
-}
-
-static void mstar_emac_write(void *opaque, hwaddr addr, uint64_t v, unsigned size)
-{
-}
-
-static const MemoryRegionOps mstar_emac_ops = {
-    .read = mstar_emac_read,
-    .write = mstar_emac_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-};
-
-
 /* --------------------------------------------------------------- smpctrl */
 
 /*
@@ -509,6 +464,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "pinctrl", &s->pinctrl, sc->info.pinctrl_type);
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
     object_initialize_child(obj, "bach", &s->bach, TYPE_MSC313_BACH);
+    object_initialize_child(obj, "emac", &s->emac, TYPE_MSTAR_EMAC);
     for (i = 0; i < MSTAR_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
     }
@@ -723,14 +679,6 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                     chiptop);
     }
 
-    /* emac (Cadence GEM behind the XIU bus) - just enough for u-boot's MDIO. */
-    {
-        MemoryRegion *emac = g_new(MemoryRegion, 1);
-        memory_region_init_io(emac, OBJECT(s), &mstar_emac_ops, s,
-                              "mstar.emac", MSTAR_EMAC_SIZE);
-        memory_region_add_subregion(get_system_memory(), MSTAR_EMAC_BASE, emac);
-    }
-
     /* The two "mst-intc" instances between the peripherals and the GIC. */
     if (!mstar_realize_intc(&s->intc_irq, gicdev, MSTAR_INTC_IRQ_BASE,
                             MSTAR_INTC_IRQ_START, MSTAR_INTC_IRQ_NUM, errp) ||
@@ -738,6 +686,21 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                             MSTAR_INTC_FIQ_START, MSTAR_INTC_FIQ_NUM, errp)) {
         return;
     }
+
+    /*
+     * emac (classic Atmel MACB/EMAC behind the RIU bus). A real NIC wired to a
+     * QEMU netdev: attach with e.g. -nic user,model=mstar-emac,hostfwd=... . Its
+     * interrupt is "irq" mst-intc line 26 (from the DT); wired here, after the
+     * mst-intc is realized.
+     */
+    qemu_configure_nic_device(DEVICE(&s->emac), true, NULL);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->emac), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->emac), 0, MSTAR_EMAC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->emac), 1, MSTAR_EMACPHY_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->emac), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_EMAC_HWIRQ));
 
     /*
      * SoC PIT timers (timer@6040, free-running counters). Their input clock is

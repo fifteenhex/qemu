@@ -14,6 +14,7 @@
 #include "hw/ssi/ssi.h"
 #include "hw/sd/sd.h"
 #include "hw/i2c/i2c.h"
+#include "net/net.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
 
@@ -130,6 +131,37 @@ struct Msc313SarState {
     qemu_irq irq;
     uint16_t regs[MSTAR_SAR_NUM_REGS];
     uint16_t chan_input[MSTAR_SAR_CHANNELS]; /* synthesised per-channel sample */
+};
+
+/*
+ * The "emac" 10/100 Ethernet MAC (emac@2a2000). It is a classic Atmel MACB/
+ * EMAC (AT91RM9200 style, MACB_CAPS_MACB_IS_EMAC in the 6.5 macb driver, with
+ * the rm9200 transmit path) sitting behind MStar's RIU bus: each 32-bit MACB
+ * register at byte offset G is split into two 16-bit halves - the low half at
+ * RIU byte offset 2*G, the high half at 2*G+4 (see include/soc/mstar/riuxiu.h
+ * riu_readl/riu_writel). This models enough of it - MDIO PHY, rm9200 TX, the
+ * classic RX descriptor ring - to actually move packets to a QEMU netdev.
+ */
+#define TYPE_MSTAR_EMAC "mstar-emac"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarEmacState, MSTAR_EMAC)
+
+struct MstarEmacState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    MemoryRegion phy_iomem;     /* integrated PHY register block @ 0x1f006000 */
+    qemu_irq irq;
+    NICState *nic;
+    NICConf conf;
+    uint16_t phy_regs[32];      /* integrated PHY MDIO register table */
+    uint16_t raw[0x1000 / 2];   /* RIU 16-bit words, index = RIU addr/2 (MSTAR_EMAC_SIZE) */
+    uint32_t isr;           /* pending interrupt status */
+    uint32_t ien;           /* enabled interrupt mask (IER sets, IDR clears) */
+    uint32_t rsr;           /* receive status (REC/OVR/BNA) */
+    uint32_t man;           /* PHY maintenance read-back */
+    unsigned int rx_idx;    /* current RX descriptor index in the RBQP ring */
+    uint8_t phy_addr;       /* MDIO address the (single) PHY answers at */
 };
 
 #define TYPE_MSC313_GPIO "mstar-msc313-gpio"
@@ -539,9 +571,21 @@ struct Msc313BachState {
 #define MSTAR_CHIPTOP_SIZE      0x400
 #define MSTAR_CHIPTOP_BOND      0x120
 
-/* The "emac" Cadence GEM (emac@2a2000), accessed over the 16-bit XIU bus. */
+/* The "emac" 10/100 Ethernet MAC (emac@2a2000), on the 16-bit RIU bus. */
 #define MSTAR_EMAC_BASE         (MSTAR_RIU_BASE + 0x2a2000)
 #define MSTAR_EMAC_SIZE         0x1000
+#define MSTAR_EMAC_HWIRQ        26      /* "irq" mst-intc line 26 (from the DT) */
+
+/*
+ * The integrated Ethernet PHY register block (phys 0x1f006000). The vendor
+ * camera kernel does not do real MDIO for the internal PHY: it reads each PHY
+ * register directly from a table at offset 0x200 + reg*4 (writing bit2 of
+ * 0x204 to refresh), so the PHY has to appear here for the driver's PHY scan
+ * (which looks for a non-zero, non-0xffff BMSR) to find it.
+ */
+#define MSTAR_EMACPHY_BASE      (MSTAR_RIU_BASE + 0x006000)
+#define MSTAR_EMACPHY_SIZE      0x1000
+#define MSTAR_EMACPHY_TABLE     0x200   /* PHY register table: reg N at +N*4 */
 
 /* The "clkgen" clock mux/gate block (reg = <0x207000 0x200>). */
 #define MSTAR_CLKGEN_BASE           (MSTAR_RIU_BASE + 0x207000)

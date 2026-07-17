@@ -18,14 +18,16 @@
 #include "mstar-soc.h"
 
 /*
- * Board devices: attach a configurable sensor module to the gpio bit-banged
- * SCCB bus (enabled before realize via MStarMachineClass.has_gpioi2c). Default:
- * Sony IMX323 at SCCB address 0x36; override with -global
- * mstar-cam-sensor.id-val=... or attach another module to reverse-engineer a
- * different camera's bring-up.
+ * Board devices: attach a configurable sensor module to the sensor i2c bus.
+ * This MSC313E camera wires its IMX323 to the "Mstar I2C adapter 1" HWI2C
+ * controller (the firmware's media_server opens /dev/i2c-1 for the sensor), so
+ * attach there. Also attach on the gpio bit-banged SCCB bus (for boards/
+ * firmwares that wire the sensor to GPIO8/9 instead). Default: Sony IMX323 at
+ * i2c address 0x36; override with -global mstar-cam-sensor.id-val=... etc.
  */
 static void msc313e_cam_board_init(MStarSoCState *soc)
 {
+    i2c_slave_create_simple(soc->i2c[1].bus, TYPE_MSTAR_CAM_SENSOR, 0x36);
     if (soc->gpio.i2c_bus) {
         i2c_slave_create_simple(soc->gpio.i2c_bus, TYPE_MSTAR_CAM_SENSOR, 0x36);
     }

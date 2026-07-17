@@ -30,6 +30,7 @@ system_ss.add(when: 'CONFIG_MSF2', if_true: files('msf2-emac.c'))
 system_ss.add(when: 'CONFIG_MARVELL_88W8618', if_true: files('mv88w8618_eth.c'))
 
 system_ss.add(when: 'CONFIG_CADENCE', if_true: files('cadence_gem.c'))
+system_ss.add(when: 'CONFIG_MSTAR', if_true: files('mstar_emac.c'))
 system_ss.add(when: 'CONFIG_STELLARIS_ENET', if_true: files('stellaris_enet.c'))
 system_ss.add(when: 'CONFIG_LANCE', if_true: files('lance.c'))
 system_ss.add(when: 'CONFIG_LASI_82596', if_true: files('lasi_i82596.c'))
