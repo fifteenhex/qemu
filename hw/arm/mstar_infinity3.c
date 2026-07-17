@@ -286,6 +286,18 @@ static void mstar_infinity3_soc_realize(DeviceState *dev, Error **errp)
     s->isp_img_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                       MSTAR_ISP_IMG_HWIRQ);
     s->scldma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mstar_scldma_tick, s);
+
+    /*
+     * VIF: the sensor video-input front-end (csi@1f240800). Modelled as a proper
+     * block (store/read-back + a 7-bit interrupt) so the firmware's bring-up
+     * reads back what it wrote; its interrupt output is left for a future frame
+     * source to drive via mstar_vif_frame_irq().
+     */
+    object_initialize_child(OBJECT(s), "vif", &s->vif, TYPE_MSTAR_VIF);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->vif), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->vif), 0, MSTAR_VIF_BASE);
 }
 
 static void mstar_infinity3_soc_class_init(ObjectClass *oc, const void *data)

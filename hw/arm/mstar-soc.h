@@ -104,6 +104,7 @@ struct MStarSoCState {
      * present on every MSC313E board; whether a sensor is actually wired to the
      * SCCB bus is a per-board choice (only the camera board attaches one).
      */
+    MstarVifState vif;      /* camera sensor video-input front-end (csi@1f240800) */
     MemoryRegion scldma;    /* camera scaler-DMA capture */
     MemoryRegion isppoll;   /* camera ISP frame-counter poll */
     MemoryRegion hvsp;      /* camera HVSP/SCL scaler */

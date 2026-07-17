@@ -204,6 +204,31 @@ struct MstarRegbankState {
     char *name;                 /* region/log name (property) */
 };
 
+/*
+ * VIF - the sensor video-input interface (infinity3 csi@1f240800): the receiver
+ * that clocks pixel data in from a MIPI or parallel image sensor and feeds the
+ * ISP. See hw/misc/mstar_vif.c. Register file is store/read-back plus a 7-bit
+ * interrupt block; mstar_vif_frame_irq() lets a future frame source raise a
+ * per-frame VIF interrupt.
+ */
+#define TYPE_MSTAR_VIF "mstar-vif"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarVifState, MSTAR_VIF)
+
+#define MSTAR_VIF_SIZE 0x200
+
+struct MstarVifState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;
+    uint8_t store[MSTAR_VIF_SIZE];  /* config registers (store/read-back) */
+    uint8_t irq_raw;                /* 7-bit raw interrupt status */
+    uint8_t irq_mask;               /* 7-bit interrupt mask (1 = masked off) */
+};
+
+void mstar_vif_frame_irq(MstarVifState *s, unsigned bits);
+
 #define TYPE_MSC313_GPIO "mstar-msc313-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)
 
@@ -698,6 +723,8 @@ struct Msc313BachState {
 #define MSTAR_DISP_HWIRQ            50      /* display-top vsync (SPI 82), "irq" intc */
 #define MSTAR_DISP_GOP_HWIRQ       20      /* GOP/fbdev vsync (SPI 52), "irq" intc */
 #define MSTAR_ISP_IMG_HWIRQ        25      /* image-ISP frame-done (GIC 89), "irq" intc */
+/* VIF/CSI sensor video-input front-end (DT csi@1f240800; SPI 0x41 = GIC 97). */
+#define MSTAR_VIF_BASE             (MSTAR_RIU_BASE + 0x240800)
 
 /* The "bach" audio controller + its "audiotop" syscon (mstar,msc313-bach). */
 #define MSTAR_BACH_BASE            (MSTAR_RIU_BASE + 0x2a0400)
