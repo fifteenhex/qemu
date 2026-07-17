@@ -577,6 +577,13 @@ struct Msc313BachState {
 #define MSTAR_EMAC_BASE         (MSTAR_RIU_BASE + 0x2a2000)
 #define MSTAR_EMAC_SIZE         0x1000
 #define MSTAR_EMAC_HWIRQ        26      /* "irq" mst-intc line 26 (from the DT) */
+/*
+ * The mainline DT puts the MAC at 0x2a2000, but the vendor camera driver
+ * accesses the very same registers through a second RIU aperture at
+ * 0x1f343c00 (its MHal_EMAC_* accessors read e.g. TSR at 0x1f343c28 = base +
+ * 2*0x14). Alias the MAC there too so the vendor driver's register reads land.
+ */
+#define MSTAR_EMAC_ALT_BASE     (MSTAR_RIU_BASE + 0x343c00)
 
 /*
  * The integrated Ethernet PHY register block (phys 0x1f006000). The vendor

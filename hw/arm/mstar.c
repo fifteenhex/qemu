@@ -701,6 +701,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->emac), 1, MSTAR_EMACPHY_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->emac), 0,
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_EMAC_HWIRQ));
+    /* Second aperture the vendor camera driver uses for the same MAC regs. */
+    {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+        memory_region_init_alias(alias, OBJECT(s), "mstar.emac-alt",
+                                 &s->emac.iomem, 0, MSTAR_EMAC_SIZE);
+        memory_region_add_subregion(get_system_memory(), MSTAR_EMAC_ALT_BASE,
+                                    alias);
+    }
 
     /*
      * SoC PIT timers (timer@6040, free-running counters). Their input clock is

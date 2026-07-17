@@ -149,8 +149,13 @@ static void mstar_emac_do_tx(MstarEmacState *s)
     address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
                        buf, len);
     if (getenv("MSTAR_EMAC_DBG")) {
-        fprintf(stderr, "[emac] TX %u bytes from 0x%08x\n", len,
-                (uint32_t)addr);
+        int i, n = len < 34 ? len : 34;
+        fprintf(stderr, "[emac] TX %u bytes from 0x%08x:", len, (uint32_t)addr);
+        for (i = 0; i < n; i++) {
+            fprintf(stderr, "%s%02x", (i == 6 || i == 12 || i == 14) ? " " : "",
+                    buf[i]);
+        }
+        fprintf(stderr, "\n");
     }
     qemu_send_packet(qemu_get_queue(s->nic), buf, len);
 
@@ -174,10 +179,17 @@ static void mstar_emac_do_mdio(MstarEmacState *s)
     }
 }
 
+/*
+ * The MAC register file is reachable two ways (both put register byte-offset G
+ * at bus offset 2*G): the mainline driver uses RIU 16-bit half-lanes (low at
+ * 2*G, high at 2*G+4), the vendor camera driver uses XIU full 32-bit accesses
+ * (readl/writel at 2*G). Decode by access size: a 4-byte access is the whole
+ * register, a 2-byte access is one RIU half.
+ */
 static uint64_t mstar_emac_read(void *opaque, hwaddr riu, unsigned size)
 {
     MstarEmacState *s = opaque;
-    bool high = riu & 4;                     /* high 16-bit half of the register */
+    bool high = (size == 2) && (riu & 4);    /* RIU high 16-bit half */
     unsigned int g = high ? (riu - 4) / 2 : riu / 2;   /* MACB register offset */
     uint32_t v;
 
@@ -206,6 +218,9 @@ static uint64_t mstar_emac_read(void *opaque, hwaddr riu, unsigned size)
         v = emac_reg(s, g);
         break;
     }
+    if (size == 4) {
+        return v;                            /* XIU: whole 32-bit register */
+    }
     return high ? (v >> 16) & 0xffff : v & 0xffff;
 }
 
@@ -213,18 +228,30 @@ static void mstar_emac_write(void *opaque, hwaddr riu, uint64_t val,
                              unsigned size)
 {
     MstarEmacState *s = opaque;
-    bool high = riu & 4;
+    bool xiu = (size == 4);
+    bool high = !xiu && (riu & 4);
     unsigned int g = high ? (riu - 4) / 2 : riu / 2;
 
-    s->raw[riu / 2] = val & 0xffff;
-
-    if (getenv("MSTAR_EMAC_DBG")) {
-        fprintf(stderr, "[emac] W riu=0x%03x (reg 0x%02x %s) = 0x%04x\n",
-                (unsigned)riu, g, high ? "hi" : "lo", (unsigned)(val & 0xffff));
+    if (xiu) {
+        /* XIU: whole register at 2*G - store both RIU halves. */
+        s->raw[riu / 2] = val & 0xffff;
+        s->raw[riu / 2 + 2] = (val >> 16) & 0xffff;
+    } else {
+        s->raw[riu / 2] = val & 0xffff;
     }
 
-    /* Side effects fire once the whole 32-bit register is written (high half). */
-    if (!high) {
+    if (getenv("MSTAR_EMAC_DBG")) {
+        fprintf(stderr, "[emac] W riu=0x%03x (reg 0x%02x %s) = 0x%0*x\n",
+                (unsigned)riu, g, xiu ? "xiu" : high ? "hi" : "lo",
+                xiu ? 8 : 4, (unsigned)val);
+    }
+
+    /*
+     * Side effects fire when the whole 32-bit register value is present: for an
+     * XIU write that is this access; for RIU half-writes it is the high half
+     * (written last), so ignore the low half.
+     */
+    if (!xiu && !high) {
         return;
     }
 
@@ -323,12 +350,20 @@ static ssize_t mstar_emac_receive(NetClientState *nc, const uint8_t *buf,
     }
 
     addr_w = ldl_le_phys(&address_space_memory, desc);
+    if (getenv("MSTAR_EMAC_DBG")) {
+        fprintf(stderr, "[emac] RX %zu bytes idx=%u desc@0x%08x=0x%08x %s\n",
+                size, s->rx_idx, (uint32_t)desc, addr_w,
+                (addr_w & RXD_USED) ? "FULL-DROP" : "ok");
+    }
     if (addr_w & RXD_USED) {
-        /* No free descriptor: the ring is full, report overrun and drop. */
+        /*
+         * No free descriptor: report overrun and ask the net layer to hold the
+         * packet - it retries via qemu_flush_queued_packets() (see the poll).
+         */
         s->rsr |= RSR_OVR | RSR_BNA;
         s->isr |= ISR_RXUBR;
         mstar_emac_update_irq(s);
-        return -1;
+        return 0;
     }
 
     /* DMA the frame into the descriptor's buffer and hand it to the host. */
