@@ -60,11 +60,88 @@
 #define I2C_INT_CTL         0x10    /* read bit0 = int pending; write = clear */
 #define I2C_CUR_STATE       0x14    /* read: 0 = idle */
 
+/*
+ * DMA mode (drivers/sstar/i2c/infinity mhal_iic.c). The vendor camera kernel
+ * does NOT bit-bang START/WDATA - it programs a descriptor and lets the MIIC
+ * DMA engine run the whole transfer, streaming read data to/from a DRAM buffer.
+ * Register byte offsets below are the HAL's logical register * 4 (16-bit RIU
+ * registers at the 4-byte stride); 32-bit fields (MIU_ADR, DATLEN) span two.
+ * Two CMDDAT bytes pack into each 16-bit register (low/high lane).
+ */
+#define I2C_DMA_CFG         0x80    /* bit1 EN_DMA, bit1(within) RESET, ... */
+#define I2C_DMA_MIU_ADR     0x84    /* +0x84 low16, +0x88 high16 (MIU offset) */
+#define I2C_DMA_MIU_ADR_HI  0x88
+#define I2C_DMA_CTL         0x8c    /* bit5 TXNOSTOP, bit6 RDWTCMD(1=read) */
+#define I2C_DMA_CTL_RDWTCMD 0x40
+#define I2C_DMA_TXR         0x90    /* bit0 DONE (W1C to clear, HW sets on done) */
+#define DMA_TXR_DONE        0x01
+#define I2C_DMA_CMDDAT0     0x94    /* CMDDAT0..7: two bytes per 16-bit reg */
+#define I2C_DMA_CMDLEN      0xa4    /* number of command bytes (& 7) */
+#define I2C_DMA_DATLEN      0xa8    /* +0xa8 low16, +0xac high16 */
+#define I2C_DMA_SLVADR      0xb8    /* bit0..6 = 7-bit slave address */
+#define I2C_DMA_CTL_TRIG    0xbc    /* bit0 = trigger the descriptor */
+#define I2C_DMA_TRIG_BIT    0x01
+
+/*
+ * Run one DMA descriptor against the attached slave. For a read the received
+ * bytes are written to the guest DRAM buffer the driver programmed in MIU_ADR
+ * (a MIU offset; DRAM is at MSTAR_DRAM_BASE); for a write the payload comes from
+ * that same buffer. The command bytes (register address) always go out first.
+ */
+static void msc313_i2c_dma_run(Msc313I2cState *s)
+{
+    uint8_t slave = s->regs[I2C_DMA_SLVADR / 4] & 0x7f;
+    bool read = s->regs[I2C_DMA_CTL / 4] & I2C_DMA_CTL_RDWTCMD;
+    unsigned cmdlen = s->regs[I2C_DMA_CMDLEN / 4] & 0x7;
+    uint32_t datlen = (uint32_t)s->regs[I2C_DMA_DATLEN / 4] |
+                      ((uint32_t)s->regs[(I2C_DMA_DATLEN + 4) / 4] << 16);
+    hwaddr miu = ((uint32_t)s->regs[I2C_DMA_MIU_ADR / 4] |
+                  ((uint32_t)s->regs[I2C_DMA_MIU_ADR_HI / 4] << 16)) +
+                 MSTAR_DRAM_BASE;
+    uint8_t cmd[8];
+    unsigned i;
+
+    for (i = 0; i < cmdlen && i < sizeof(cmd); i++) {
+        uint16_t word = s->regs[(I2C_DMA_CMDDAT0 + (i / 2) * 4) / 4];
+        cmd[i] = (i & 1) ? (word >> 8) : (word & 0xff);
+    }
+
+    s->dma_done = true;                 /* the engine always reports completion */
+
+    /* Address + command phase (write). NAK => no slave: leave the buffer be. */
+    if (i2c_start_transfer(s->bus, slave, 0)) {
+        i2c_end_transfer(s->bus);
+        return;
+    }
+    for (i = 0; i < cmdlen; i++) {
+        i2c_send(s->bus, cmd[i]);
+    }
+
+    if (read) {
+        i2c_start_transfer(s->bus, slave, 1);   /* repeated START, read */
+        for (i = 0; i < datlen; i++) {
+            uint8_t b = i2c_recv(s->bus);
+            address_space_write(&address_space_memory, miu + i,
+                                MEMTXATTRS_UNSPECIFIED, &b, 1);
+        }
+    } else {
+        for (i = 0; i < datlen; i++) {
+            uint8_t b = 0;
+            address_space_read(&address_space_memory, miu + i,
+                               MEMTXATTRS_UNSPECIFIED, &b, 1);
+            i2c_send(s->bus, b);
+        }
+    }
+    i2c_end_transfer(s->bus);
+}
+
 static uint64_t msc313_i2c_read(void *opaque, hwaddr addr, unsigned size)
 {
     Msc313I2cState *s = opaque;
 
     switch (addr) {
+    case I2C_DMA_TXR:
+        return s->dma_done ? DMA_TXR_DONE : 0;
     case I2C_INT_CTL:
         return s->int_pending ? 1 : 0;
     case I2C_WDATA:
@@ -106,6 +183,18 @@ static void msc313_i2c_write(void *opaque, hwaddr addr, uint64_t val,
 
     s->regs[addr / 4] = val;
     if (addr >= 0x20) {
+        switch (addr) {
+        case I2C_DMA_TXR:
+            if (val & DMA_TXR_DONE) {
+                s->dma_done = false;    /* W1C: driver clears before triggering */
+            }
+            break;
+        case I2C_DMA_CTL_TRIG:
+            if (val & I2C_DMA_TRIG_BIT) {
+                msc313_i2c_dma_run(s);
+            }
+            break;
+        }
         return;                             /* clock/DMA config: store only */
     }
 
@@ -171,6 +260,7 @@ static void msc313_i2c_reset_hold(Object *obj, ResetType type)
     s->active = false;
     s->start_pending = false;
     s->rdata = 0xff;
+    s->dma_done = false;
 }
 
 static void msc313_i2c_realize(DeviceState *dev, Error **errp)

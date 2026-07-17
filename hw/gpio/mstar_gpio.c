@@ -23,16 +23,15 @@
 #include "hw/arm/mstar.h"
 
 /*
- * Bit-banged SCCB buses (mainline Linux i2c-gpio) on this pad bank. The MSC313E
- * camera firmware drives two: bus 0 (module-ID EEPROM) on SDA/SCL = +0x58/+0x5c,
- * bus 1 (sensor SCCB, /dev/i2c-1) on +0x1c8/+0x1cc. Open-drain: OEN (bit5) clear
- * drives low, set releases high; SDA input reads back as bit0. (Found by logging
- * the gpio writes' guest PC = the i2c-algo-bit set/clear helpers, and reading the
- * drive/input bit masks with gdb on set_scl/get_sda_gpio_value.)
+ * Bit-banged SCCB bus (Linux i2c-gpio "mstar,infinity-gpioi2c", cam.dtb: sda-gpio
+ * 8 / scl-gpio 9) on this pad bank at SDA/SCL = +0x58/+0x5c. The MSC313E camera
+ * firmware carries the module-ID EEPROM (0x50) here. Open-drain: OEN (bit5) clear
+ * drives low, set releases high; SDA input reads back as bit0. (The sensor is NOT
+ * on a gpio bus - it hangs off the hardware MIIC master at 0x1f223200; see
+ * hw/i2c/mstar_i2c.c and hw/arm/mstar_msc313e_cam.c.)
  */
 static const struct { uint8_t sda, scl; } gpio_i2c_pads[MSTAR_GPIO_NUM_I2C] = {
     { 0x58, 0x5c },
-    { 0xc8 + 0x100, 0xcc + 0x100 },     /* +0x1c8 / +0x1cc */
 };
 
 /* ---------------------------------------------------------- msc313-gpio */

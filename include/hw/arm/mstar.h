@@ -216,14 +216,14 @@ struct Msc313GpioState {
     MemoryRegion iomem;
     uint8_t regs[MSTAR_GPIO_NUM_REGS];
     uint32_t buttons;       /* bitmask of pressed board buttons (QOM property) */
-    bool gpioi2c;           /* enable the bit-banged SCCB buses (camera SoCs) */
+    bool gpioi2c;           /* enable the bit-banged SCCB bus (camera SoCs) */
     /*
-     * The camera firmware bit-bangs two Linux i2c-gpio buses on this pad bank:
-     * bus 0 (SDA/SCL at +0x58/+0x5c) carries the module-ID EEPROM, bus 1
-     * (+0x1c8/+0x1cc) is the sensor SCCB. Devices are attached to i2c_bus[] by
-     * the board.
+     * The camera firmware bit-bangs one Linux i2c-gpio bus on this pad bank
+     * (cam.dtb "mstar,infinity-gpioi2c", SDA/SCL at +0x58/+0x5c) carrying the
+     * module-ID EEPROM. A slave is attached to i2c_bus[] by the board. (The
+     * sensor is on the hardware MIIC master, not a gpio bus.)
      */
-#define MSTAR_GPIO_NUM_I2C 2
+#define MSTAR_GPIO_NUM_I2C 1
     void *bbi2c[MSTAR_GPIO_NUM_I2C];    /* bitbang_i2c_interface * per bus */
     void *i2c_bus[MSTAR_GPIO_NUM_I2C];  /* I2CBus * per bus (board attaches slaves) */
     int sda_level[MSTAR_GPIO_NUM_I2C];  /* current bus SDA (bit-bang readback) */
@@ -496,6 +496,7 @@ struct Msc313I2cState {
     bool active;            /* a transfer is in progress on the bus */
     bool start_pending;     /* START seen; next WDATA is the address */
     uint8_t rdata;          /* last byte clocked in from the bus */
+    bool dma_done;          /* DMA_TXR bit0: the DMA transfer completed */
 };
 
 /*
