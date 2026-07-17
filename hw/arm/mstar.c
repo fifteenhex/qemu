@@ -726,15 +726,19 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     /*
      * Watchdog (watchdog@6000), common to all these SoCs. Its own region at the
      * bottom of the 0x1f006000 bank (0x6000..0x603f), below the timers (+0x40)
-     * and the emac-phy (+0x200). Its pre-timeout interrupt is "fiq" mst-intc
-     * line 2.
+     * and the emac-phy (+0x200). Its pre-timeout interrupt is a "fiq" mst-intc
+     * line - 2 on infinity, but the mercury5 firmware routes it to line 34
+     * (its "sys_watchDogHandler" is at the matching GIC INTID 162), so the line
+     * is per-SoC (MStarSoCInfo::wdt_hwirq; 0 selects the infinity default).
      */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt), 0, MSTAR_WDT_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->wdt), 0,
-                       qdev_get_gpio_in(DEVICE(&s->intc_fiq), MSTAR_WDT_HWIRQ));
+                       qdev_get_gpio_in(DEVICE(&s->intc_fiq),
+                                        sc->info.wdt_hwirq ? sc->info.wdt_hwirq
+                                                           : MSTAR_WDT_HWIRQ));
 
     /*
      * Passive register banks common to the family (RAM-backed, read-after-write

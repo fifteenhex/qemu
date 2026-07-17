@@ -239,6 +239,14 @@ static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)
      */
     sc->info.boot_strap = 0x20 | 0x800;
     /*
+     * The watchdog pre-timeout interrupt is on "fiq" mst-intc line 34 (GIC
+     * INTID 162), where the firmware registers its "sys_watchDogHandler",
+     * rather than infinity's line 2. (The firmware kicks WDT_CLR at 0x1f006000
+     * continuously - the hot loop at RTOS 0x20239be0 - so it never actually
+     * fires, but wire the correct line so a real time-out would be delivered.)
+     */
+    sc->info.wdt_hwirq = 34;
+    /*
      * TODO: mercury5 has its own clkgen/pinctrl register maps; reuse the
      * infinity3 (msc313) reg-probe tables for now (mercury5 is closest to it),
      * and add mercury5-specific tables once the firmware's register use is

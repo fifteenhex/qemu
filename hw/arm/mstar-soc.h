@@ -69,6 +69,8 @@ typedef struct MStarSoCInfo {
     bool has_hdmi;              /* SSD203D adds an HDMI transmitter (hdmitx) */
     uint16_t boot_strap;        /* did@7000 reg 0x1c0: boot-media/flash-offset
                                  * strap the mask ROM reads (0 = default NOR) */
+    uint8_t wdt_hwirq;          /* watchdog pre-timeout "fiq" mst-intc line
+                                 * (0 = infinity default 2; mercury5 uses 34) */
 } MStarSoCInfo;
 
 struct MStarSoCState {
