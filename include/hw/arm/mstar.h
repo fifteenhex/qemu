@@ -164,6 +164,46 @@ struct MstarEmacState {
     uint8_t phy_addr;       /* MDIO address the (single) PHY answers at */
 };
 
+/*
+ * The watchdog (watchdog@1f006000), common to the MStar Armv7 SoCs (declared
+ * in mstar-v7.dtsi). See hw/watchdog/mstar_wdt.c.
+ */
+#define TYPE_MSTAR_WDT "mstar-wdt"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarWdtState, MSTAR_WDT)
+
+struct MstarWdtState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;               /* pre-timeout interrupt */
+    QEMUTimer *reset_timer;     /* counter reached MAX_PRD -> reset the SoC */
+    QEMUTimer *int_timer;       /* counter reached INT     -> pre-timeout irq */
+    uint32_t freq;              /* input clock (xtal_div2, 12MHz) */
+    uint16_t intr;              /* WDT_INT: pre-timeout threshold (top 16 bits) */
+    uint16_t prd_l;             /* WDT_MAX_PRD_L */
+    uint16_t prd_h;             /* WDT_MAX_PRD_H (period 0 = stopped) */
+};
+
+/*
+ * Generic passive register bank (RAM-backed, read-after-write consistent), used
+ * for RIU sub-blocks that only store/return configuration. See
+ * hw/misc/mstar_regbank.c.
+ */
+#define TYPE_MSTAR_REGBANK "mstar-regbank"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarRegbankState, MSTAR_REGBANK)
+
+struct MstarRegbankState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint8_t *store;             /* backing bytes, "size" long */
+    uint32_t size;              /* region size (property) */
+    bool readonly;             /* writes ignored (e.g. efuse) (property) */
+    char *name;                 /* region/log name (property) */
+};
+
 #define TYPE_MSC313_GPIO "mstar-msc313-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)
 
@@ -586,15 +626,40 @@ struct Msc313BachState {
 #define MSTAR_EMAC_ALT_BASE     (MSTAR_RIU_BASE + 0x343c00)
 
 /*
- * The integrated Ethernet PHY register block (phys 0x1f006000). The vendor
+ * The integrated Ethernet PHY register block (phys 0x1f006200). The vendor
  * camera kernel does not do real MDIO for the internal PHY: it reads each PHY
- * register directly from a table at offset 0x200 + reg*4 (writing bit2 of
- * 0x204 to refresh), so the PHY has to appear here for the driver's PHY scan
+ * register directly from a table at the block base + reg*4 (writing bit2 of
+ * +0x04 to refresh), so the PHY has to appear here for the driver's PHY scan
  * (which looks for a non-zero, non-0xffff BMSR) to find it.
+ *
+ * This block sits above the watchdog (+0x000) and the PIT timers (+0x040) in
+ * the 0x1f006000 bank; each is its own non-overlapping region.
  */
-#define MSTAR_EMACPHY_BASE      (MSTAR_RIU_BASE + 0x006000)
-#define MSTAR_EMACPHY_SIZE      0x1000
-#define MSTAR_EMACPHY_TABLE     0x200   /* PHY register table: reg N at +N*4 */
+#define MSTAR_EMACPHY_BASE      (MSTAR_RIU_BASE + 0x006200)
+#define MSTAR_EMACPHY_SIZE      0x600
+#define MSTAR_EMACPHY_TABLE     0x0     /* PHY register table: reg N at +N*4 */
+
+/*
+ * The watchdog (watchdog@1f006000, "mstar,msc313e-wdt"): its own region at the
+ * bottom of the 0x1f006000 bank (0x1f006000..0x1f00603f, below the timers at
+ * +0x040 and the emac-phy at +0x200). Pre-timeout interrupt on the "fiq"
+ * mst-intc, line 2 (per mstar-v7.dtsi).
+ */
+#define MSTAR_WDT_BASE          (MSTAR_RIU_BASE + 0x006000)
+#define MSTAR_WDT_SIZE          0x40
+#define MSTAR_WDT_HWIRQ         2
+
+/*
+ * Read-only fuse array (efuse@4000, "mstar,msc313-efuse"): the guest only reads
+ * it (chip straps/calibration); modelled as a read-only regbank (0 = no fuses
+ * blown), ready to hold a real fuse dump.
+ */
+#define MSTAR_EFUSE_BASE        (MSTAR_RIU_BASE + 0x004000)
+#define MSTAR_EFUSE_SIZE        0x100
+
+/* Passive syscon/simple-mfd register bank (syscon@226600). */
+#define MSTAR_SYSCON_BASE       (MSTAR_RIU_BASE + 0x226600)
+#define MSTAR_SYSCON_SIZE       0x200
 
 /* The "clkgen" clock mux/gate block (reg = <0x207000 0x200>). */
 #define MSTAR_CLKGEN_BASE           (MSTAR_RIU_BASE + 0x207000)
@@ -624,6 +689,7 @@ struct Msc313BachState {
 #define MSTAR_DISP_DSI_SIZE         0x400
 #define MSTAR_DISP_HWIRQ            50      /* display-top vsync (SPI 82), "irq" intc */
 #define MSTAR_DISP_GOP_HWIRQ       20      /* GOP/fbdev vsync (SPI 52), "irq" intc */
+#define MSTAR_ISP_IMG_HWIRQ        25      /* image-ISP frame-done (GIC 89), "irq" intc */
 
 /* The "bach" audio controller + its "audiotop" syscon (mstar,msc313-bach). */
 #define MSTAR_BACH_BASE            (MSTAR_RIU_BASE + 0x2a0400)

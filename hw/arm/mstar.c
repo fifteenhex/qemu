@@ -465,6 +465,9 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "sdio", &s->sdio, TYPE_MSC313_SDIO);
     object_initialize_child(obj, "bach", &s->bach, TYPE_MSC313_BACH);
     object_initialize_child(obj, "emac", &s->emac, TYPE_MSTAR_EMAC);
+    object_initialize_child(obj, "wdt", &s->wdt, TYPE_MSTAR_WDT);
+    object_initialize_child(obj, "efuse", &s->efuse, TYPE_MSTAR_REGBANK);
+    object_initialize_child(obj, "syscon", &s->syscon, TYPE_MSTAR_REGBANK);
     for (i = 0; i < MSTAR_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
     }
@@ -709,6 +712,44 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         memory_region_add_subregion(get_system_memory(), MSTAR_EMAC_ALT_BASE,
                                     alias);
     }
+
+    /*
+     * Watchdog (watchdog@6000), common to all these SoCs. Its own region at the
+     * bottom of the 0x1f006000 bank (0x6000..0x603f), below the timers (+0x40)
+     * and the emac-phy (+0x200). Its pre-timeout interrupt is "fiq" mst-intc
+     * line 2.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt), 0, MSTAR_WDT_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->wdt), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_fiq), MSTAR_WDT_HWIRQ));
+
+    /*
+     * Passive register banks common to the family (RAM-backed, read-after-write
+     * consistent): the read-only fuse array (efuse@4000) and the syscon/
+     * simple-mfd bank (syscon@226600). Modelled so the firmware sees consistent
+     * read-back rather than the catch-all's 0.
+     */
+    object_property_set_uint(OBJECT(&s->efuse), "size", MSTAR_EFUSE_SIZE,
+                             &error_abort);
+    object_property_set_bool(OBJECT(&s->efuse), "readonly", true, &error_abort);
+    object_property_set_str(OBJECT(&s->efuse), "name", "mstar.efuse",
+                            &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->efuse), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->efuse), 0, MSTAR_EFUSE_BASE);
+
+    object_property_set_uint(OBJECT(&s->syscon), "size", MSTAR_SYSCON_SIZE,
+                             &error_abort);
+    object_property_set_str(OBJECT(&s->syscon), "name", "mstar.syscon",
+                            &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->syscon), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->syscon), 0, MSTAR_SYSCON_BASE);
 
     /*
      * SoC PIT timers (timer@6040, free-running counters). Their input clock is

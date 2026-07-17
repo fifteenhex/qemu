@@ -297,7 +297,7 @@ static const MemoryRegionOps mstar_emac_ops = {
 };
 
 /*
- * Integrated-PHY register block (phys 0x1f006000). The vendor kernel reads the
+ * Integrated-PHY register block (phys 0x1f006200). The vendor kernel reads the
  * internal PHY's registers straight out of the table at MSTAR_EMACPHY_TABLE
  * (reg N at +N*4) rather than doing MDIO, so present the PHY here too. Only the
  * standard MDIO register table matters for link bring-up; the analog-config

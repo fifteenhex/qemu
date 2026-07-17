@@ -71,6 +71,19 @@ static const MemoryRegionOps mstar_scldma_ops = {
 #define ISP_BASE_OFF   0x2000               /* 0x1f242000 within this region */
 #define ISP_FRAMECNT   (0x3050 - ISP_BASE_OFF)  /* 0x1050 */
 static uint16_t mstar_isppoll_regs[0x4000 / 2];
+/*
+ * Image-ISP frame-done interrupt (GIC 89), fired by the frame tick when
+ * MSTAR_ISP_IRQ is set. This runs the real kernel ISP ISR cleanly, but the ISR
+ * then reads three interrupt-status registers and, finding them 0, logs
+ * "[ISP] False interrupt?" and drops the frame. Decoded from vmlinux:
+ *   THalISPGetIntStatus1 = ldrb [base+0x14] & 1   (status 1, bit0)
+ *   THalISPGetIntStatus2 = ldrh [base+0x60] | ldrh[base+0x64]<<16
+ *   THalISPGetIntStatus3 = ldr  [base3+0]
+ * where "base" is *(global 0xc03fc018 + 0x28) - an ioremap set up by
+ * THal_PQ_init_riu_base, NOT plain 0x1f242000 (setting 0x1f242014 had no
+ * effect). To make a frame register we must map that bank and set the
+ * frame-done status bit; that is the remaining ISP-modelling work (task #15).
+ */
 
 static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -147,29 +160,40 @@ static void mstar_scldma_tick(void *opaque)
 {
     MStarSoCState *s = opaque;
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-    static bool asserted;
 
     /*
-     * Advance the captured-frame counter. The interrupt path is left off by
-     * default: the vendor ISR indexes hardware structures from the scaler
-     * interrupt-status registers, which this stub does not fully model, so
-     * firing it faults. The capture app's poll()/select() path is driven by
-     * the frame counter + SCLDMA status instead. Set MSTAR_SCLDMA_IRQ=1 to
-     * also pulse the frame-done IRQ (for experimenting with the ISR path).
+     * Two-phase ~25fps frame pulse. Phase 0 (frame boundary): advance the
+     * captured-frame counter, mark the SCLDMA double-buffer ready, and raise
+     * whichever frame-done interrupt lines are enabled. Phase 1 (~1ms later):
+     * lower them again - the mst-intc is level-triggered, so we keep the high
+     * window short to bound ISR re-entry while still not being a lost 0-width
+     * pulse. Then wait ~39ms for the next frame.
+     *
+     * Interrupt lines (opt-in via env, for experimenting with the ISR paths):
+     *   MSTAR_SCLDMA_IRQ - SCLINTR / scaler-DMA done  ("irq" line 20, GIC 84)
+     *   MSTAR_ISP_IRQ    - image-ISP frame-done       ("irq" line 25, GIC 89),
+     *                      the line that drives the vendor ISP IntCount.
+     * The frame counter + SCLDMA status also drive the app's poll() path with
+     * no interrupt at all (default).
      */
-    s->frame_count++;
-    mstar_scldma_status = 0xffff;
-    if (getenv("MSTAR_SCLDMA_IRQ")) {
-        if (!asserted) {
+    if (s->frame_phase == 0) {
+        s->frame_count++;
+        mstar_scldma_status = 0xffff;
+        if (getenv("MSTAR_SCLDMA_IRQ")) {
             qemu_set_irq(s->scldma_irq, 1);
-            asserted = true;
-            timer_mod(s->scldma_timer, now + 2);
-            return;
         }
-        qemu_set_irq(s->scldma_irq, 0);
-        asserted = false;
+        if (getenv("MSTAR_ISP_IRQ")) {
+            qemu_set_irq(s->isp_img_irq, 1);
+        }
+        s->frame_phase = 1;
+        timer_mod(s->scldma_timer, now + 1);
+        return;
     }
-    timer_mod(s->scldma_timer, now + 31);
+
+    qemu_set_irq(s->scldma_irq, 0);
+    qemu_set_irq(s->isp_img_irq, 0);
+    s->frame_phase = 0;
+    timer_mod(s->scldma_timer, now + 39);
 }
 
 /* ------------------------------------------------------------------ SoC */
@@ -206,6 +230,9 @@ static void mstar_infinity3_soc_realize(DeviceState *dev, Error **errp)
     /* SCLDMA frame-done IRQ shares the "irq" mst-intc line 20 (SPI 52). */
     s->scldma_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                      MSTAR_DISP_GOP_HWIRQ);
+    /* Image-ISP frame-done IRQ: "irq" mst-intc line 25 (GIC 89). */
+    s->isp_img_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                      MSTAR_ISP_IMG_HWIRQ);
     s->scldma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mstar_scldma_tick, s);
 }
 

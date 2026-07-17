@@ -89,6 +89,9 @@ struct MStarSoCState {
     MstarDphyState dphy;
     Msc313BachState bach;
     MstarEmacState emac;
+    MstarWdtState wdt;
+    MstarRegbankState efuse;
+    MstarRegbankState syscon;
     Msc313I2cState i2c[MSTAR_NUM_I2C];
     MemoryRegion imi;
     MemoryRegion smpctrl;   /* secondary-CPU boot mailbox (multi-core SoCs) */
@@ -105,8 +108,10 @@ struct MStarSoCState {
     MemoryRegion isppoll;   /* camera ISP frame-counter poll */
     MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
     QEMUTimer *scldma_timer;
-    qemu_irq scldma_irq;
+    qemu_irq scldma_irq;    /* SCLINTR / scaler-DMA frame-done (line 20) */
+    qemu_irq isp_img_irq;   /* image-ISP frame-done (line 25, GIC 89) */
     uint32_t frame_count;   /* advanced once per fake captured frame */
+    int frame_phase;        /* 0 = raise IRQs, 1 = lower IRQs */
 };
 
 struct MStarSoCClass {
