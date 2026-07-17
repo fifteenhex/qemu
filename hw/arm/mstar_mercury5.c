@@ -26,14 +26,18 @@
  *   0x1f001c00  pmsleep; 0x1f200800 boot mailbox/scratch
  *   0x1f206000  mpll/miupll/lpll (clock+DRAM PLL setup)
  *   0x1f226xxx  MIU DDR-PHY DQS calibration
- *   0x1f221000  pm_uart (IPL console); 0x1f221200 uart1 (kernel console)
- * These are all currently served by the catch-all (reads 0/writes dropped),
- * which is enough for the IPL; a full kernel boot will need uart1 + a DTB.
+ *   0x1f221000  pm_uart (IPL console); 0x1f221200 uart1 (RTOS/CLI console)
+ * uart1 is modelled below (a MStar-native UART, not a plain 16550); the rest of
+ * these are served by the catch-all (reads 0/writes dropped), which is enough
+ * for the IPL and the RTOS to boot to its serial CLI.
  */
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
+#include "system/system.h"
+#include "chardev/char-fe.h"
+#include "hw/core/irq.h"
 #include "mstar-soc.h"
 
 /*
@@ -48,12 +52,11 @@
  *    with the chip-id at 0x1f003d98: 0xee("M5U")+0xb -> MIU profile 0x31,
  *    0xd9("M5")+2 -> 4, else "Unknown BoundID to Miu [HALT]". 70mai (SSC8336N)
  *    is M5U, so report 0xb (chip 0xee is set via MStarSoCInfo).
- *  - uart1 status (0x1f221238 = serial@221200 + 0x38): the firmware's UART putc
- *    polls this MStar-native status reg - bit2 before programming the baud
- *    divisor, bit1 before each char - which QEMU's 16550 leaves at 0 (scratch
- *    reg). Report both set; chars still flow through the 16550 THR underneath.
  *  - dsi cmd-done (0x1f34420c = dsi@1f344200 + 0x0c): the firmware sends the
  *    ST7701S panel init commands over MIPI-DSI, spinning on bit1 for "sent".
+ *
+ * The uart1 status register (serial@221200 + 0x38) is handled separately below
+ * because it needs to reflect the live RX state, not a constant.
  */
 typedef struct Mercury5Shim {
     const char *name;
@@ -63,9 +66,8 @@ typedef struct Mercury5Shim {
 } Mercury5Shim;
 
 static const Mercury5Shim mercury5_shims[] = {
-    { "mstar.mercury5-bound",        MSTAR_RIU_BASE + 0x207818, 4, 0x0b },
-    { "mstar.mercury5-uart1-status", MSTAR_RIU_BASE + 0x221238, 8, 0x06 },
-    { "mstar.mercury5-dsi-done",     MSTAR_RIU_BASE + 0x34420c, 4, 0x02 },
+    { "mstar.mercury5-bound",    MSTAR_RIU_BASE + 0x207818, 4, 0x0b },
+    { "mstar.mercury5-dsi-done", MSTAR_RIU_BASE + 0x34420c, 4, 0x02 },
 };
 
 static uint64_t mercury5_shim_read(void *opaque, hwaddr addr, unsigned size)
@@ -86,10 +88,107 @@ static const MemoryRegionOps mercury5_shim_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * uart1 (serial@221200): the mercury5 RTOS console. The firmware drives it as a
+ * MStar-native UART, not a plain 16550, so we model it directly instead of using
+ * serial_mm_init. What the firmware actually uses:
+ *   +0x00  RBR/THR  - read a received byte / write a byte to transmit
+ *          (also DLL when DLAB is set during baud programming; ignored)
+ *   +0x18  LCR      - bit7 = DLAB (the only bit we track)
+ *   +0x38  status   - bit1 "TX ready" (per char), bit2 "ok to set baud",
+ *                     bit3 "RX data available" (the getchar/ISR test this)
+ * The console CLI reads keystrokes from an RX interrupt (mst-intc "irq" line 35,
+ * = uart1's GIC_SPI 35), so a received byte raises the IRQ; reading the RBR
+ * clears it. This is what makes the interactive CLI (rr/wr register access,
+ * sensor/LCD register R/W, memory dump, ...) usable.
+ */
+typedef struct Mercury5Uart {
+    MemoryRegion mr;
+    CharFrontend chr;
+    qemu_irq irq;
+    uint8_t rx;
+    bool rx_valid;
+    bool dlab;
+} Mercury5Uart;
+
+#define M5UART_ST_TXRDY   0x06     /* bit1 (per char) | bit2 (baud program) */
+#define M5UART_ST_RXAVAIL 0x08     /* bit3: a byte is waiting in the RBR */
+
+static uint64_t mercury5_uart_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Mercury5Uart *u = opaque;
+
+    switch (addr) {
+    case 0x00:                                  /* RBR (DLAB clear) */
+        if (!u->dlab) {
+            u->rx_valid = false;
+            qemu_set_irq(u->irq, 0);
+            qemu_chr_fe_accept_input(&u->chr);
+            return u->rx;
+        }
+        return 0;                               /* DLL */
+    case 0x28:                                  /* 16550-style LSR, for probers */
+        return (u->rx_valid ? 0x01 : 0) | 0x60; /* DR | THRE | TEMT */
+    case 0x38:                                  /* MStar-native status */
+        return M5UART_ST_TXRDY | (u->rx_valid ? M5UART_ST_RXAVAIL : 0);
+    }
+    return 0;
+}
+
+static void mercury5_uart_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    Mercury5Uart *u = opaque;
+    uint8_t ch;
+
+    switch (addr) {
+    case 0x00:                                  /* THR (DLAB clear) */
+        if (!u->dlab) {
+            ch = val;
+            qemu_chr_fe_write_all(&u->chr, &ch, 1);
+        }
+        break;
+    case 0x18:                                  /* LCR */
+        u->dlab = !!(val & 0x80);
+        break;
+    }
+}
+
+static const MemoryRegionOps mercury5_uart_ops = {
+    .read = mercury5_uart_read,
+    .write = mercury5_uart_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static int mercury5_uart_can_rx(void *opaque)
+{
+    Mercury5Uart *u = opaque;
+
+    return !u->rx_valid;                         /* single-byte holding register */
+}
+
+static void mercury5_uart_rx(void *opaque, const uint8_t *buf, int size)
+{
+    Mercury5Uart *u = opaque;
+
+    if (size > 0) {
+        u->rx = buf[0];
+        u->rx_valid = true;
+        qemu_set_irq(u->irq, 1);                 /* wake the console RX ISR */
+    }
+}
+
+static void mercury5_uart_event(void *opaque, QEMUChrEvent event)
+{
+}
+
 static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
 {
     MStarSoCState *s = MSTAR_SOC(dev);
     MStarSoCClass *sc = MSTAR_SOC_GET_CLASS(dev);
+    Mercury5Uart *uart;
     unsigned int i;
 
     sc->parent_realize(dev, errp);
@@ -106,6 +205,16 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
         memory_region_add_subregion_overlap(get_system_memory(), sh->addr,
                                             mr, 10);
     }
+
+    uart = g_new0(Mercury5Uart, 1);
+    uart->irq = qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_UART1_HWIRQ);
+    qemu_chr_fe_init(&uart->chr, serial_hd(1), &error_abort);
+    qemu_chr_fe_set_handlers(&uart->chr, mercury5_uart_can_rx, mercury5_uart_rx,
+                             mercury5_uart_event, NULL, uart, NULL, true);
+    memory_region_init_io(&uart->mr, OBJECT(s), &mercury5_uart_ops, uart,
+                          "mstar.mercury5-uart1", 0x100);
+    memory_region_add_subregion_overlap(get_system_memory(), MSTAR_UART1_BASE,
+                                        &uart->mr, 10);
 }
 
 static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)

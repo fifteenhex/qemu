@@ -947,18 +947,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                                             MSTAR_RIU_BASE, log, -1);
     }
 
-    /* "pm" UART - the infinity/IPL console, its IRQ routed through "irq" intc. */
+    /* "pm" UART - the infinity/IPL console, its IRQ routed through "irq" intc.
+     * (uart1 @0x1f221200 is the mercury5 RTOS console and is modelled by the
+     * mercury5 SoC itself, since that firmware drives it as a MStar-native UART
+     * with an RX interrupt rather than a plain 16550.) */
     serial_mm_init(get_system_memory(), MSTAR_PM_UART_BASE,
                    MSTAR_PM_UART_REGSHIFT,
                    qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_PM_UART_HWIRQ),
                    MSTAR_PM_UART_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
-
-    /* uart1 (serial@221200): second dw-apb-uart, on the second -serial. The
-     * mercury5 kernel uses this as its console/earlyprintk. */
-    serial_mm_init(get_system_memory(), MSTAR_UART1_BASE,
-                   MSTAR_PM_UART_REGSHIFT,
-                   qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_UART1_HWIRQ),
-                   MSTAR_PM_UART_CLK / 16, serial_hd(1), DEVICE_LITTLE_ENDIAN);
 }
 
 static void mstar_soc_class_init(ObjectClass *oc, const void *data)
