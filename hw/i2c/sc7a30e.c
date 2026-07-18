@@ -23,7 +23,13 @@
 #include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
-#define SC7A30E_WHOAMI      0x39
+/*
+ * WHO_AM_I: the 70mai firmware's Gsensor_Module_Init reads register 0x0f and
+ * accepts the chip only if it reads back 0x11 (RTOS: read fn 0x2000b06c forces
+ * reg=0x0f, checked by "cmp #0x11" at 0x2000c054, else "Wrong G-Sensor ID for
+ * SC7A30E"). Was mistakenly 0x39, so the probe always failed.
+ */
+#define SC7A30E_WHOAMI      0x0f
 #define SC7A30E_WHOAMI_VAL  0x11
 #define SC7A30E_INT1_SRC    0x31        /* LIS2DH INT1 source (motion) */
 #define SC7A30E_MOVE_INT    0x0a        /* value ApkIsMoveBoot wants (?= 10) */
