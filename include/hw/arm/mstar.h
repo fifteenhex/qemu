@@ -646,6 +646,20 @@ struct MstarSecElemState {
  * file with the handful of status bits the firmware's APK_IP6303_* HAL polls
  * (power key level, battery OK, charge state, VBAT ADC); see hw/i2c/ip6303.c.
  */
+#define TYPE_SC7A30E "sc7a30e"
+OBJECT_DECLARE_SIMPLE_TYPE(Sc7a30eState, SC7A30E)
+
+struct Sc7a30eState {
+    /*< private >*/
+    I2CSlave parent_obj;
+    /*< public >*/
+    uint8_t regs[128];
+    uint8_t ptr;                        /* register pointer (auto-increments) */
+    bool have_ptr;
+    bool motion;                        /* a motion/impact interrupt is pending */
+    bool move_boot;                     /* property: arm motion at reset */
+};
+
 #define TYPE_IP6303 "ip6303"
 OBJECT_DECLARE_SIMPLE_TYPE(Ip6303State, IP6303)
 

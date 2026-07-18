@@ -21,8 +21,15 @@ static void mai70_board_init(MStarSoCState *soc)
      * APK_IP6303_* read NAKs and the app believes the power key is held down. */
     i2c_slave_create_simple(soc->i2c[0].bus, TYPE_IP6303, 0x30);
 
-    /* TODO: wire the board's image sensor / peripherals once the firmware is
-     * available (mirrors mstar_msc313e_cam.c: attach the sensor on its bus). */
+    /*
+     * SC7A30E G-sensor (accelerometer) on i2c0, 7-bit address 0x1d (the firmware
+     * probes bus byte 0x3a for WHO_AM_I == 0x11). This is the dashcam's impact/
+     * motion sensor; a motion-triggered power-on ("move boot") is what starts
+     * event recording (ApkIsMoveBoot wants its boot int-status == 0x0a).
+     */
+    i2c_slave_create_simple(soc->i2c[0].bus, TYPE_SC7A30E, 0x1d);
+
+    /* TODO: image sensor (IMX307) once the record pipeline reaches capture. */
 }
 
 static void mai70_machine_class_init(ObjectClass *oc, const void *data)
