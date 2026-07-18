@@ -207,6 +207,8 @@ static uint64_t mercury5_uart_read(void *opaque, hwaddr addr, unsigned size)
 {
     Mercury5Uart *u = opaque;
 
+    if (getenv("M5UART_TRACE"))
+        fprintf(stderr, "[m5uart] R +0x%02x (rx_valid=%d)\n", (unsigned)addr, u->rx_valid);
     switch (addr) {
     case 0x00:                                  /* RBR (DLAB clear) */
         if (!u->dlab) {
@@ -266,6 +268,8 @@ static void mercury5_uart_rx(void *opaque, const uint8_t *buf, int size)
         u->rx = buf[0];
         u->rx_valid = true;
         qemu_set_irq(u->irq, 1);                 /* wake the console RX ISR */
+        if (getenv("M5UART_TRACE"))
+            fprintf(stderr, "[m5uart] RX byte 0x%02x latched, irq raised\n", buf[0]);
     }
 }
 
