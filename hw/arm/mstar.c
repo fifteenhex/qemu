@@ -886,9 +886,11 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sdio), errp)) {
         return;
     }
-    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdio), 0, MSTAR_SDIO_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sdio), 0,
+                    sc->info.sdio_base ? sc->info.sdio_base : MSTAR_SDIO_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdio), 0,
-                       qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_SDIO_HWIRQ));
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                       sc->info.sdio_irq ? sc->info.sdio_irq : MSTAR_SDIO_HWIRQ));
     {
         DriveInfo *di = drive_get(IF_SD, 0, 0);
 

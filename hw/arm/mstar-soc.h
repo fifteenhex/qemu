@@ -71,6 +71,10 @@ typedef struct MStarSoCInfo {
                                  * strap the mask ROM reads (0 = default NOR) */
     uint8_t wdt_hwirq;          /* watchdog pre-timeout "fiq" mst-intc line
                                  * (0 = infinity default 2; mercury5 uses 34) */
+    uint32_t sdio_base;         /* FCIE SD/MMC host base (0 = MSTAR_SDIO_BASE
+                                 * 0x1f282000; mercury5 sd@1f282600) */
+    uint8_t sdio_irq;           /* sdio "irq" mst-intc line (0 = MSTAR_SDIO_HWIRQ;
+                                 * mercury5 dts = GIC_SPI 60) */
 } MStarSoCInfo;
 
 struct MStarSoCState {

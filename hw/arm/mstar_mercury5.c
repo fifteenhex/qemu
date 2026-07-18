@@ -407,6 +407,15 @@ static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)
      */
     sc->info.clkgen_type = TYPE_MSC313_CLKGEN;
     sc->info.pinctrl_type = TYPE_MSC313_PINCTRL;
+    /*
+     * SD/MMC host: mercury5 places the FCIE at sd@1f282600 (6.5 dtsi
+     * mstar-mercury5.dtsi) - 0x600 above the SSD20xD base - on GIC_SPI 60
+     * (mst-intc "irq" line 60). The card-detect (PM-GPIO SD_SDZ @0x1f001f1c bit2,
+     * active-low) is already modelled at the shared PM_GPIO base; attach a card
+     * with -drive if=sd.
+     */
+    sc->info.sdio_base = MSTAR_RIU_BASE + 0x282600;
+    sc->info.sdio_irq = 60;
 
     /* Chain the common realize, then add the mercury5-specific blocks. */
     device_class_set_parent_realize(dc, mstar_mercury5_soc_realize,
