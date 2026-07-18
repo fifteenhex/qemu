@@ -80,6 +80,8 @@ typedef struct MStarSoCInfo {
                                  * trigger / CTRL0 bit0,2,4); see mstar_bach.c */
     bool has_rtcpwc;            /* rtcpwc RTC power/wake controller @0x1f006800
                                  * (infinity2m/SSD20xD + mercury5) */
+    uint8_t num_i2c;            /* number of HWI2C masters (0 => default 2;
+                                 * mercury5 = 4, adds i2c@222a00/222c00) */
 } MStarSoCInfo;
 
 struct MStarSoCState {

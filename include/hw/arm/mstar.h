@@ -611,7 +611,12 @@ struct MstarDphyState {
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313I2cState, MSC313_I2C)
 
 #define MSTAR_I2C_NUM_REGS (0x200 / 4)
-#define MSTAR_NUM_I2C 2
+/*
+ * Array size / maximum number of HWI2C masters. msc313/ssd202 populate 2
+ * (i2c@223000/223200); mercury5 has 4 (adds i2c@222a00/222c00). The actual
+ * count per SoC is MStarSoCInfo.num_i2c (0 => the default 2).
+ */
+#define MSTAR_NUM_I2C 4
 
 struct Msc313I2cState {
     /*< private >*/
@@ -877,9 +882,14 @@ struct Msc313BachState {
 #define MSTAR_DPHY_BASE             (MSTAR_RIU_BASE + 0x2a5000)
 #define MSTAR_DPHY_SIZE             0x200
 
-/* The two HWI2C masters (i2c@223000 / i2c@223200); MSTAR_NUM_I2C is above. */
+/*
+ * HWI2C masters. i2c@223000/223200 exist on all SoCs; mercury5 adds
+ * i2c@222a00/222c00 (the DrvI2c "channels" 2/3 the camera sensor uses).
+ */
 #define MSTAR_I2C0_BASE             (MSTAR_RIU_BASE + 0x223000)
 #define MSTAR_I2C1_BASE             (MSTAR_RIU_BASE + 0x223200)
+#define MSTAR_I2C2_BASE             (MSTAR_RIU_BASE + 0x222a00)
+#define MSTAR_I2C3_BASE             (MSTAR_RIU_BASE + 0x222c00)
 #define MSTAR_I2C_SIZE              0x200
 
 /* GIC (arm,cortex-a7-gic), with 128 SPIs. */

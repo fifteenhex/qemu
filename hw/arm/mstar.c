@@ -486,7 +486,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "syscon", &s->syscon, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "cmdq", &s->cmdq, TYPE_MSTAR_CMDQ);
-    for (i = 0; i < MSTAR_NUM_I2C; i++) {
+    for (i = 0; i < (sc->info.num_i2c ? sc->info.num_i2c : 2); i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSC313_I2C);
     }
     if (sc->info.has_display) {
@@ -970,9 +970,10 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /* HWI2C masters (transfers NAK until a slave is attached to the bus). */
-    for (i = 0; i < MSTAR_NUM_I2C; i++) {
+    for (i = 0; i < (sc->info.num_i2c ? sc->info.num_i2c : 2); i++) {
         static const hwaddr i2c_base[MSTAR_NUM_I2C] = {
             MSTAR_I2C0_BASE, MSTAR_I2C1_BASE,
+            MSTAR_I2C2_BASE, MSTAR_I2C3_BASE,
         };
 
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->i2c[i]), errp)) {

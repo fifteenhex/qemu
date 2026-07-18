@@ -474,6 +474,9 @@ static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.bach_mercury5 = true;
     /* rtcpwc RTC power/wake controller @0x1f006800 (subsumes the pwrsrc shim). */
     sc->info.has_rtcpwc = true;
+    /* mercury5 has 4 HWI2C masters (adds i2c@222a00/222c00 = DrvI2c channels
+     * 2/3, where the camera sensor lives). */
+    sc->info.num_i2c = 4;
 
     /* Chain the common realize, then add the mercury5-specific blocks. */
     device_class_set_parent_realize(dc, mstar_mercury5_soc_realize,
