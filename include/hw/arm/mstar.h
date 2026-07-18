@@ -35,6 +35,9 @@
  */
 void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size);
 
+/* Returns true the first time (addr, write) is seen, for one-shot tracing. */
+bool mstar_iolog_first(hwaddr addr, bool write);
+
 /*
  * SNAPSHOT / MIGRATION SUPPORT
  *
@@ -278,6 +281,41 @@ struct MstarVifState {
 };
 
 void mstar_vif_frame_irq(MstarVifState *s, unsigned bits);
+
+/*
+ * On-die camera capture pipeline (scaler-DMA + ISP + HVSP scaler) with a timer
+ * that fakes ~25fps frame delivery. Shared by infinity3 (MSC313E) and mercury5;
+ * the three block base offsets (for the RIU tracer) and the ISP frame-counter
+ * offset are properties since they differ between families. See
+ * hw/misc/mstar_camcap.c. MMIO regions: 0 = scldma, 1 = isppoll, 2 = hvsp.
+ * IRQs: 0 = scaler-DMA frame-done, 1 = image-ISP frame-done.
+ */
+#define TYPE_MSTAR_CAMCAP "mstar-camcap"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarCamCapState, MSTAR_CAMCAP)
+
+struct MstarCamCapState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion scldma;        /* scaler-DMA capture      (0x200) */
+    MemoryRegion isppoll;       /* ISP frame-counter poll  (0x4000) */
+    MemoryRegion hvsp;          /* HVSP/SCL scaler         (0x2000) */
+    qemu_irq scldma_irq;        /* SCLINTR / scaler-DMA frame-done */
+    qemu_irq isp_img_irq;       /* image-ISP frame-done */
+    QEMUTimer *timer;
+    uint32_t scldma_base;       /* RIU offsets for the tracer (properties) */
+    uint32_t isppoll_base;
+    uint32_t hvsp_base;
+    uint32_t framecnt_off;      /* isppoll offset of the frame counter */
+    uint16_t scldma_regs[0x100];
+    uint16_t isppoll_regs[0x2000];
+    uint16_t hvsp_regs[0x1000];
+    uint16_t scldma_status;
+    uint16_t hvsp_hb;
+    bool isp_frame_pending;
+    uint32_t frame_count;       /* advanced once per fake captured frame */
+    int frame_phase;            /* 0 = raise IRQs, 1 = lower IRQs */
+};
 
 #define TYPE_MSC313_GPIO "mstar-msc313-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)

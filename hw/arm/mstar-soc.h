@@ -120,14 +120,7 @@ struct MStarSoCState {
      */
     MstarCmdqState cmdq;    /* command-queue engine (0x1f224000), all SoCs */
     MstarVifState vif;      /* camera sensor video-input front-end (csi@1f240800) */
-    MemoryRegion scldma;    /* camera scaler-DMA capture */
-    MemoryRegion isppoll;   /* camera ISP frame-counter poll */
-    MemoryRegion hvsp;      /* camera HVSP/SCL scaler */
-    QEMUTimer *scldma_timer;
-    qemu_irq scldma_irq;    /* SCLINTR / scaler-DMA frame-done (line 20) */
-    qemu_irq isp_img_irq;   /* image-ISP frame-done (line 25, GIC 89) */
-    uint32_t frame_count;   /* advanced once per fake captured frame */
-    int frame_phase;        /* 0 = raise IRQs, 1 = lower IRQs */
+    MstarCamCapState camcap; /* scaler-DMA + ISP + HVSP capture (fake frames) */
 };
 
 struct MStarSoCClass {

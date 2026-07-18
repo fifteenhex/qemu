@@ -1001,8 +1001,6 @@ static const VMStateDescription vmstate_mstar_soc = {
         VMSTATE_UINT32(smp_bootaddr, MStarSoCState),
         VMSTATE_UINT16_ARRAY(smpctrl_regs, MStarSoCState,
                              MSTAR_SMPCTRL_SIZE / 4),
-        VMSTATE_UINT32(frame_count, MStarSoCState),
-        VMSTATE_INT32(frame_phase, MStarSoCState),
         VMSTATE_END_OF_LIST()
     },
 };

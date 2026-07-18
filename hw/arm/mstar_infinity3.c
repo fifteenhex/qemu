@@ -22,269 +22,6 @@
 #include "qemu/timer.h"
 #include "mstar-soc.h"
 
-/* ------------------------------------------------------- camera capture */
-
-/*
- * SCLDMA - the scaler output DMA that writes captured frames to DRAM on the
- * MSC313 camera pipeline (sensor -> CSI -> ISP -> HVSP scaler -> SCLDMA; see
- * the linux-chenxing camera page). The IP-camera firmware busy-polls the
- * double-buffer / frame-done status at offset 0xfc waiting for a completed
- * frame. There is no real sensor in the model, so toggle that status on each
- * read to let the capture "request controller" advance past the poll; other
- * registers just store/read back.
- */
-static uint16_t mstar_scldma_regs[0x200 / 2];
-static uint16_t mstar_scldma_status;
-
-/*
- * Debug: while an ISP frame-done IRQ is pending (between the tick raising and
- * lowering it), MSTAR_ISP_TRACE logs every read the ISP/HVSP/SCLDMA regions
- * see - i.e. exactly the registers the kernel ISP ISR reads for its status
- * snapshot. This is how we locate the frame-done status registers.
- */
-static bool mstar_isp_in_irq;
-static bool mstar_scl_in_irq;           /* window while the SCLDMA IRQ is pending */
-static bool mstar_isp_frame_pending;    /* frame-done status latched, one-shot */
-
-/*
- * The CMDQ block (msc313-cmdq at 0x1f224000) is modelled generically in
- * hw/misc/mstar_cmdq.c (shared with infinity2m). It carries the SCL capture
- * frame interrupt (SCLIRQ IST tSCLIRQ_DazaIST reads a flag at phys 0x1f224110,
- * bit2 = frame end -> T_Drv_SCLIRQ_SetFrmEndEvent), but the streaming capture
- * path never reads that flag - frame delivery is a software state machine over
- * the SCLDMA driver context (see the mstar-riu-inventory memory). So the flag
- * model was moot; the block is now just a named region being mapped.
- */
-
-static inline void isp_trace(hwaddr absaddr, unsigned size)
-{
-    if ((mstar_isp_in_irq || mstar_scl_in_irq) && getenv("MSTAR_ISP_TRACE")) {
-        fprintf(stderr, "[%s] R %08x sz%u\n", mstar_scl_in_irq ? "scltrace" : "isptrace",
-                (unsigned)(MSTAR_RIU_BASE + absaddr), size);
-    }
-}
-
-static unsigned long cam_dbg_scldma_poll, cam_dbg_framecnt_poll, cam_dbg_ticks;
-
-static uint64_t mstar_scldma_read(void *opaque, hwaddr addr, unsigned size)
-{
-    if (mstar_iolog_first(0x280400 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, false, 0, size);
-    isp_trace(0x280400 + addr, size);
-    if (addr == 0xfc) {
-        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_scldma_poll % 200 == 1))
-            fprintf(stderr, "[camdbg] SCLDMA status poll #%lu\n", cam_dbg_scldma_poll);
-        return mstar_scldma_status ^= 0xffff;   /* double-buffer status */
-    }
-    return mstar_scldma_regs[(addr >> 1) & 0xff];
-}
-
-static void mstar_scldma_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
-{
-    if (mstar_iolog_first(0x280400 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x280400 + addr, true, val, size);
-    mstar_scldma_regs[(addr >> 1) & 0xff] = val;
-}
-
-static const MemoryRegionOps mstar_scldma_ops = {
-    .read = mstar_scldma_read,
-    .write = mstar_scldma_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * ISP core (0x1f242000..0x1f246000). The camera firmware verifies most of its
- * ISP config by writing then reading back, so a plain store/read-back keeps
- * those loops happy. Two special cases:
- *  - the frame-counter triple at 0x1f24304c/50/54 (region offset 0x104c/50/54)
- *    returns the fake captured-frame counter, and reaching it means capture is
- *    set up, so we start delivering frames.
- */
-#define ISP_BASE_OFF   0x2000               /* 0x1f242000 within this region */
-#define ISP_FRAMECNT   (0x3050 - ISP_BASE_OFF)  /* 0x1050 */
-static uint16_t mstar_isppoll_regs[0x4000 / 2];
-/*
- * Image-ISP frame-done interrupt (GIC 89), fired by the frame tick when
- * MSTAR_ISP_IRQ is set. This runs the real kernel ISP ISR cleanly, but the ISR
- * then reads three interrupt-status registers and, finding them 0, logs
- * "[ISP] False interrupt?" and drops the frame. Decoded from vmlinux:
- *   THalISPGetIntStatus1 = ldrb [base+0x14] & 1   (status 1, bit0)
- *   THalISPGetIntStatus2 = ldrh [base+0x60] | ldrh[base+0x64]<<16
- *   THalISPGetIntStatus3 = ldr  [base3+0]
- * where "base" is *(global 0xc03fc018 + 0x28) - an ioremap set up by
- * THal_PQ_init_riu_base, NOT plain 0x1f242000 (setting 0x1f242014 had no
- * effect). To make a frame register we must map that bank and set the
- * frame-done status bit; that is the remaining ISP-modelling work (task #15).
- */
-
-/* Sequential trace of the ISP-internal i2c master (0x1f244d00..0x1f244dff =
- * region offset 0x2d00..). Env MSTAR_ISPI2C_TRACE logs every access in order so
- * the byte-level i2c command protocol can be decoded from a live sensor probe. */
-static inline void ispi2c_trace(hwaddr addr, uint64_t val, unsigned size, bool w)
-{
-    if ((addr & ~0xff) == 0x2d00 && getenv("MSTAR_ISPI2C_TRACE")) {
-        fprintf(stderr, "[ispi2c] %c %04x sz%u = %04x\n", w ? 'W' : 'R',
-                (unsigned)(0x244d00 + (addr & 0xff)), size, (unsigned)val);
-        fflush(stderr);
-    }
-}
-
-static uint64_t mstar_isppoll_read(void *opaque, hwaddr addr, unsigned size)
-{
-    MStarSoCState *s = opaque;
-
-    if (mstar_iolog_first(0x242000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, false, 0, size);
-    isp_trace(0x242000 + addr, size);
-    ispi2c_trace(addr, mstar_isppoll_regs[(addr >> 1) & 0x1fff], size, false);
-    if (addr == ISP_FRAMECNT || addr == ISP_FRAMECNT - 4 ||
-        addr == ISP_FRAMECNT + 4) {
-        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_framecnt_poll % 200 == 1))
-            fprintf(stderr, "[camdbg] ISP framecnt poll #%lu (cnt=%u)\n",
-                    cam_dbg_framecnt_poll, s->frame_count);
-        if (!timer_pending(s->scldma_timer)) {
-            timer_mod(s->scldma_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 33);
-        }
-        return s->frame_count;
-    }
-    return mstar_isppoll_regs[(addr >> 1) & 0x1fff];
-}
-
-static void mstar_isppoll_write(void *opaque, hwaddr addr, uint64_t val,
-                                unsigned size)
-{
-    if (mstar_iolog_first(0x242000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x242000 + addr, true, val, size);
-    ispi2c_trace(addr, val, size, true);
-    mstar_isppoll_regs[(addr >> 1) & 0x1fff] = val;
-}
-
-static const MemoryRegionOps mstar_isppoll_ops = {
-    .read = mstar_isppoll_read,
-    .write = mstar_isppoll_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * HVSP / SCL scaler (0x1f260000..0x1f262000). Store/read-back for config, and
- * report the scaler/idclk clock-ready status (polled at 0x1f2605e8 by
- * Hal_HVSP_SetIdclkOnOff / Hal_SCLDMA_CLKInit) as always ready.
- */
-static uint16_t mstar_hvsp_regs[0x2000 / 2];
-
-static uint64_t mstar_hvsp_read(void *opaque, hwaddr addr, unsigned size)
-{
-    MStarSoCState *s = opaque;
-
-    if (mstar_iolog_first(0x260000 + addr, false)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, false, 0, size);
-    isp_trace(0x260000 + addr, size);
-    /*
-     * SCL/ISP frame-done interrupt status (base 0x1f260400). The kernel ISP ISR
-     * computes three masks as (status & ~intmask) and drops the IRQ as
-     * "[ISP] False interrupt?" if all three are 0. Decoded from vmlinux:
-     *   mask1 = u16[0x4ac] & ~u16[0x4a0]
-     *   mask2 = (u8[0x4bc]&0xf) & ~(u8[0x4b4]&0xf)
-     *   mask3 = u16[0x534] & ~u16[0x528]
-     * The frame-complete handler runs on mask1 bit 14 (0x4000): it advances the
-     * ISP frame counter and pulls the captured frame via THalISPGetVDOSData.
-     * So while an ISP frame IRQ is pending report status1 bit14 set, unmasked,
-     * and one-shot (cleared once the ISR reads it) to avoid a re-entry storm.
-     * Experimental (MSTAR_ISP_IRQ).
-     */
-    if (mstar_isp_frame_pending) {
-        switch (addr) {
-        case 0x4ac:                             /* int status 1: frame-done */
-            /* One-shot ack: clear pending and deassert the level line now that
-             * the ISR has taken the frame, so it does not re-enter and storm. */
-            mstar_isp_frame_pending = false;
-            mstar_isp_in_irq = false;
-            qemu_set_irq(s->isp_img_irq, 0);
-            return 0x4000;
-        case 0x4a0: case 0x4b4: case 0x528:     /* int-mask regs: unmasked */
-        case 0x4bc: case 0x534:                 /* status 2/3: idle */
-            return 0x0000;
-        }
-    }
-    if (addr == 0x5e8) {
-        /* SCLDMA/HVSP clock heartbeat: toggle so a "clock is running" wait
-         * (Hal_SCLDMA_CLKInit / Hal_HVSP_SetIdclkOnOff) sees it change. */
-        static uint16_t hb;
-        return hb ^= 0xffff;
-    }
-    return mstar_hvsp_regs[(addr >> 1) & 0xfff];
-}
-
-static void mstar_hvsp_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
-{
-    if (mstar_iolog_first(0x260000 + addr, true)) mstar_iolog(MSTAR_RIU_BASE + 0x260000 + addr, true, val, size);
-    mstar_hvsp_regs[(addr >> 1) & 0xfff] = val;
-}
-
-static const MemoryRegionOps mstar_hvsp_ops = {
-    .read = mstar_hvsp_read,
-    .write = mstar_hvsp_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-};
-
-/*
- * Fake a captured video frame: the MSC313 camera scaler-DMA raises its
- * frame-done interrupt (GIC SPI 52 = "irq" mst-intc line 20) ~30x/s. Raise the
- * line, then lower it shortly after (the mst-intc is level-triggered, so a
- * zero-width pulse is lost); the driver ISR then dequeues a buffer.
- */
-static void mstar_scldma_tick(void *opaque)
-{
-    MStarSoCState *s = opaque;
-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-
-    /*
-     * Two-phase ~25fps frame pulse. Phase 0 (frame boundary): advance the
-     * captured-frame counter, mark the SCLDMA double-buffer ready, and raise
-     * whichever frame-done interrupt lines are enabled. Phase 1 (~1ms later):
-     * lower them again - the mst-intc is level-triggered, so we keep the high
-     * window short to bound ISR re-entry while still not being a lost 0-width
-     * pulse. Then wait ~39ms for the next frame.
-     *
-     * Interrupt lines (opt-in via env, for experimenting with the ISR paths):
-     *   MSTAR_SCLDMA_IRQ - SCLINTR / scaler-DMA done  ("irq" line 20, GIC 84)
-     *   MSTAR_ISP_IRQ    - image-ISP frame-done       ("irq" line 25, GIC 89),
-     *                      the line that drives the vendor ISP IntCount.
-     * The frame counter + SCLDMA status also drive the app's poll() path with
-     * no interrupt at all (default).
-     */
-    if (s->frame_phase == 0) {
-        s->frame_count++;
-        if (getenv("MSTAR_CAM_DBG") && (++cam_dbg_ticks % 25 == 1))
-            fprintf(stderr, "[camdbg] frame tick #%lu (count=%u)\n",
-                    cam_dbg_ticks, s->frame_count);
-        mstar_scldma_status = 0xffff;
-        if (getenv("MSTAR_SCLDMA_IRQ")) {
-            mstar_scl_in_irq = true;        /* window for MSTAR_ISP_TRACE */
-            qemu_set_irq(s->scldma_irq, 1);
-        }
-        if (getenv("MSTAR_ISP_IRQ")) {
-            mstar_isp_in_irq = true;        /* window for MSTAR_ISP_TRACE */
-            mstar_isp_frame_pending = true; /* latch a frame-done status */
-            qemu_set_irq(s->isp_img_irq, 1);
-        }
-        s->frame_phase = 1;
-        timer_mod(s->scldma_timer, now + 1);
-        return;
-    }
-
-    qemu_set_irq(s->scldma_irq, 0);
-    qemu_set_irq(s->isp_img_irq, 0);
-    mstar_isp_in_irq = false;
-    mstar_scl_in_irq = false;
-    s->frame_phase = 0;
-    timer_mod(s->scldma_timer, now + 39);
-}
-
 /* ------------------------------------------------------------------ SoC */
 
 /*
@@ -304,25 +41,25 @@ static void mstar_infinity3_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    memory_region_init_io(&s->scldma, OBJECT(s), &mstar_scldma_ops, s,
-                          "mstar.scldma", 0x200);
-    memory_region_add_subregion(get_system_memory(),
-                                MSTAR_RIU_BASE + 0x280400, &s->scldma);
-    memory_region_init_io(&s->isppoll, OBJECT(s), &mstar_isppoll_ops, s,
-                          "mstar.isppoll", 0x4000);
-    memory_region_add_subregion(get_system_memory(),
-                                MSTAR_RIU_BASE + 0x242000, &s->isppoll);
-    memory_region_init_io(&s->hvsp, OBJECT(s), &mstar_hvsp_ops, s,
-                          "mstar.hvsp", 0x2000);
-    memory_region_add_subregion(get_system_memory(),
-                                MSTAR_RIU_BASE + 0x260000, &s->hvsp);
-    /* SCLDMA frame-done IRQ shares the "irq" mst-intc line 20 (SPI 52). */
-    s->scldma_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
-                                     MSTAR_DISP_GOP_HWIRQ);
-    /* Image-ISP frame-done IRQ: "irq" mst-intc line 25 (GIC 89). */
-    s->isp_img_irq = qdev_get_gpio_in(DEVICE(&s->intc_irq),
-                                      MSTAR_ISP_IMG_HWIRQ);
-    s->scldma_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mstar_scldma_tick, s);
+    /*
+     * The scaler-DMA + ISP + HVSP capture pipeline (shared TYPE_MSTAR_CAMCAP).
+     * infinity3 layout: scldma@1f280400, isppoll@1f242000, hvsp@1f260000, ISP
+     * frame-counter at isppoll+0x1050. Frame-done IRQs share the "irq" mst-intc
+     * lines 20 (scaler-DMA, SPI 52) and 25 (image-ISP, GIC 89).
+     */
+    object_initialize_child(OBJECT(s), "camcap", &s->camcap, TYPE_MSTAR_CAMCAP);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->camcap), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->camcap), 0, MSTAR_RIU_BASE + 0x280400);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->camcap), 1, MSTAR_RIU_BASE + 0x242000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->camcap), 2, MSTAR_RIU_BASE + 0x260000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->camcap), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTAR_DISP_GOP_HWIRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->camcap), 1,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTAR_ISP_IMG_HWIRQ));
 
     /*
      * VIF: the sensor video-input front-end (csi@1f240800). Modelled as a proper
