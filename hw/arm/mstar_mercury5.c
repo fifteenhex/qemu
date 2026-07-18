@@ -128,10 +128,22 @@ static const MemoryRegionOps mercury5_shim_ops = {
  */
 #define M5_HVSP1_QSTAT_BASE (MSTAR_RIU_BASE + 0x2423e8)
 #define M5_HVSP1_QSTAT_SIZE 0x18
+/*
+ * HVSP2 (scaler engine 2, @0x1f244000) has the same DrvSclHvsp completion-poll
+ * window as HVSP1 (same accessor code 0x20237fa8/fb4), at 0x1f2441e0..0x1f2441ff.
+ * The firmware writes a command/index into a channel register and polls the same
+ * register for the completed count to echo it; unlike HVSP1 it does not use the
+ * indirect cmd/wdata/readback ports, so plain per-register store+echo is enough.
+ * Without it the display pipeline re-polls it ~4357x/boot (non-fatal but wasteful).
+ */
+#define M5_HVSP2_QSTAT_BASE (MSTAR_RIU_BASE + 0x2441e0)
+#define M5_HVSP2_QSTAT_SIZE 0x20
 
 typedef struct Mercury5HvspQstat {
     MemoryRegion mr;
-    uint16_t regs[M5_HVSP1_QSTAT_SIZE / 4];
+    hwaddr base;                /* RIU base of this window (for iolog) */
+    bool readback_ports;        /* HVSP1: +0x08/+0x14 echo the +0x04/+0x10 wdata */
+    uint16_t regs[M5_HVSP2_QSTAT_SIZE / 4];
     uint16_t count[2];          /* per-channel fake completed-frame counter */
 } Mercury5HvspQstat;
 
@@ -143,21 +155,24 @@ static uint64_t mercury5_hvsp_qstat_read(void *opaque, hwaddr addr,
     uint64_t val = q->regs[addr / 4];
 
     /*
-     * Each channel is an indirect access port into engine-internal state:
-     * command reg = entry select (+0x800 prepare, +0x1000 latch), +0x04 =
-     * write data, +0x08 = readback. The firmware writes a value, latches, and
+     * On HVSP1 each channel is an indirect access port into engine-internal
+     * state: command reg = entry select (+0x800 prepare, +0x1000 latch), +0x04
+     * = write data, +0x08 = readback. The firmware writes a value, latches, and
      * spins until the readback matches (RTOS 0x20235ff8..0x20236074). With no
      * engine behind it, reflect the last written data so the verify passes.
+     * HVSP2 polls the command register directly, so its reads just echo (below).
      */
-    switch (addr) {
-    case 0x08:                                  /* ch0 readback */
-        val = q->regs[0x04 / 4];
-        break;
-    case 0x14:                                  /* ch1 readback */
-        val = q->regs[0x10 / 4];
-        break;
+    if (q->readback_ports) {
+        switch (addr) {
+        case 0x08:                              /* ch0 readback */
+            val = q->regs[0x04 / 4];
+            break;
+        case 0x14:                              /* ch1 readback */
+            val = q->regs[0x10 / 4];
+            break;
+        }
     }
-    mstar_iolog(M5_HVSP1_QSTAT_BASE + addr, false, val, size);
+    mstar_iolog(q->base + addr, false, val, size);
     return val;
 }
 
@@ -166,7 +181,7 @@ static void mercury5_hvsp_qstat_write(void *opaque, hwaddr addr, uint64_t val,
 {
     Mercury5HvspQstat *q = opaque;
 
-    mstar_iolog(M5_HVSP1_QSTAT_BASE + addr, true, val, size);
+    mstar_iolog(q->base + addr, true, val, size);
     q->regs[addr / 4] = val;
 }
 
@@ -184,7 +199,7 @@ static const VMStateDescription vmstate_mercury5_hvsp_qstat = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT16_ARRAY(regs, Mercury5HvspQstat, M5_HVSP1_QSTAT_SIZE / 4),
+        VMSTATE_UINT16_ARRAY(regs, Mercury5HvspQstat, M5_HVSP2_QSTAT_SIZE / 4),
         VMSTATE_UINT16_ARRAY(count, Mercury5HvspQstat, 2),
         VMSTATE_END_OF_LIST()
     },
@@ -326,13 +341,30 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
     }
 
     {
-        Mercury5HvspQstat *q = g_new0(Mercury5HvspQstat, 1);
+        static const struct {
+            const char *name;
+            hwaddr base;
+            uint64_t size;
+            bool readback_ports;
+        } hvsps[] = {
+            { "mstar.mercury5-hvsp1-qstat", M5_HVSP1_QSTAT_BASE,
+              M5_HVSP1_QSTAT_SIZE, true },
+            { "mstar.mercury5-hvsp2-qstat", M5_HVSP2_QSTAT_BASE,
+              M5_HVSP2_QSTAT_SIZE, false },
+        };
+        unsigned j;
 
-        memory_region_init_io(&q->mr, OBJECT(s), &mercury5_hvsp_qstat_ops, q,
-                              "mstar.mercury5-hvsp1-qstat", M5_HVSP1_QSTAT_SIZE);
-        memory_region_add_subregion_overlap(get_system_memory(),
-                                            M5_HVSP1_QSTAT_BASE, &q->mr, 10);
-        vmstate_register(NULL, 0, &vmstate_mercury5_hvsp_qstat, q);
+        for (j = 0; j < ARRAY_SIZE(hvsps); j++) {
+            Mercury5HvspQstat *q = g_new0(Mercury5HvspQstat, 1);
+
+            q->base = hvsps[j].base;
+            q->readback_ports = hvsps[j].readback_ports;
+            memory_region_init_io(&q->mr, OBJECT(s), &mercury5_hvsp_qstat_ops, q,
+                                  hvsps[j].name, hvsps[j].size);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                hvsps[j].base, &q->mr, 10);
+            vmstate_register(NULL, j, &vmstate_mercury5_hvsp_qstat, q);
+        }
     }
 
     uart = g_new0(Mercury5Uart, 1);
