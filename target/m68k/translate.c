@@ -110,6 +110,8 @@ typedef struct DisasContext {
     int writeback_mask;
     TCGv writeback[8];
     bool ss_active;
+    /* k-factor for a packed decimal fmove out, set before gen_ea_fp */
+    TCGv pk_k;
 } DisasContext;
 
 static TCGv get_areg(DisasContext *s, unsigned regno)
@@ -970,11 +972,24 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
         break;
     case OS_PACKED:
-        /*
-         * unimplemented data type on 68040/ColdFire
-         * FIXME if needed for another FPU
-         */
-        gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        if (m68k_feature(s->env, M68K_FEATURE_M68040) ||
+            m68k_feature(s->env, M68K_FEATURE_CF_FPU)) {
+            /* unimplemented data type on 68040/ColdFire */
+            gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+            break;
+        }
+        {
+            /* 68881/68882 handle packed decimal in hardware */
+            TCGv t2 = tcg_temp_new();
+            TCGv t3 = tcg_temp_new();
+            TCGv addr2 = tcg_temp_new();
+            tcg_gen_qemu_ld_i32(tmp, addr, index, MO_TEUL);
+            tcg_gen_addi_i32(addr2, addr, 4);
+            tcg_gen_qemu_ld_i32(t2, addr2, index, MO_TEUL);
+            tcg_gen_addi_i32(addr2, addr, 8);
+            tcg_gen_qemu_ld_i32(t3, addr2, index, MO_TEUL);
+            gen_helper_extpk(tcg_env, fp, tmp, t2, t3);
+        }
         break;
     default:
         g_assert_not_reached();
@@ -1017,11 +1032,15 @@ static void gen_store_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         tcg_gen_qemu_st_i64(t64, tmp, index, MO_TEUQ);
         break;
     case OS_PACKED:
-        /*
-         * unimplemented data type on 68040/ColdFire
-         * FIXME if needed for another FPU
-         */
-        gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        if (m68k_feature(s->env, M68K_FEATURE_M68040) ||
+            m68k_feature(s->env, M68K_FEATURE_CF_FPU)) {
+            /* unimplemented data type on 68040/ColdFire */
+            gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+            break;
+        }
+        /* 68881/68882 handle packed decimal in hardware */
+        gen_helper_redpk(tcg_env, fp, addr,
+                         s->pk_k ? s->pk_k : tcg_constant_i32(17));
         break;
     default:
         g_assert_not_reached();
@@ -1149,11 +1168,18 @@ static int gen_ea_mode_fp(CPUM68KState *env, DisasContext *s, int mode,
                 tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
                 break;
             case OS_PACKED:
-                /*
-                 * unimplemented data type on 68040/ColdFire
-                 * FIXME if needed for another FPU
-                 */
-                gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+                if (m68k_feature(s->env, M68K_FEATURE_M68040) ||
+                    m68k_feature(s->env, M68K_FEATURE_CF_FPU)) {
+                    /* unimplemented data type on 68040/ColdFire */
+                    gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+                    break;
+                }
+                {
+                    TCGv t1 = tcg_constant_i32(read_im32(env, s));
+                    TCGv t2 = tcg_constant_i32(read_im32(env, s));
+                    TCGv t3 = tcg_constant_i32(read_im32(env, s));
+                    gen_helper_extpk(tcg_env, fp, t1, t2, t3);
+                }
                 break;
             default:
                 g_assert_not_reached();
@@ -4821,7 +4847,7 @@ static void gen_load_fcr(DisasContext *s, TCGv res, int reg)
 {
     switch (reg) {
     case M68K_FPIAR:
-        tcg_gen_movi_i32(res, 0);
+        tcg_gen_ld_i32(res, tcg_env, offsetof(CPUM68KState, fpiar));
         break;
     case M68K_FPSR:
         gen_helper_get_fpsr(res, tcg_env);
@@ -4836,6 +4862,7 @@ static void gen_store_fcr(DisasContext *s, TCGv val, int reg)
 {
     switch (reg) {
     case M68K_FPIAR:
+        tcg_gen_st_i32(val, tcg_env, offsetof(CPUM68KState, fpiar));
         break;
     case M68K_FPSR:
         gen_helper_set_fpsr(tcg_env, val);
@@ -4934,25 +4961,30 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
      *
      */
 
+    /*
+     * The registers always transfer in the memory order FPCR, FPSR,
+     * FPIAR from the lowest address up (FPCR is mask bit 2).
+     */
     if (is_write && mode == 4) {
-        for (i = 2; i >= 0; i--, mask >>= 1) {
-            if (mask & 1) {
+        /* predecrement: highest register first */
+        for (i = 0; i < 3; i++) {
+            if (mask & (1 << i)) {
                 gen_qemu_store_fcr(s, addr, 1 << i);
-                if (mask != 1) {
+                if (mask >> (i + 1)) {
                     tcg_gen_subi_i32(addr, addr, opsize_bytes(OS_LONG));
                 }
             }
-       }
-       tcg_gen_mov_i32(AREG(insn, 0), addr);
+        }
+        tcg_gen_mov_i32(AREG(insn, 0), addr);
     } else {
-        for (i = 0; i < 3; i++, mask >>= 1) {
-            if (mask & 1) {
+        for (i = 2; i >= 0; i--) {
+            if (mask & (1 << i)) {
                 if (is_write) {
                     gen_qemu_store_fcr(s, addr, 1 << i);
                 } else {
                     gen_qemu_load_fcr(s, addr, 1 << i);
                 }
-                if (mask != 1 || mode == 3) {
+                if ((mask & ((1 << i) - 1)) || mode == 3) {
                     tcg_gen_addi_i32(addr, addr, opsize_bytes(OS_LONG));
                 }
             }
@@ -5036,6 +5068,19 @@ DISAS_INSN(fpu)
 
     ext = read_im16(env, s);
     opmode = ext & 0x7f;
+    if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+        /*
+         * All FP instructions except FMOVEM (of data or of multiple
+         * control registers), FSAVE and FRESTORE report pending 6888x
+         * exceptions before executing.
+         */
+        int group = (ext >> 13) & 7;
+        int cmask = (ext >> 10) & 7;
+        if (group <= 3 ||
+            ((group == 4 || group == 5) && (cmask & (cmask - 1)) == 0)) {
+            gen_helper_fp_pretrap(tcg_env);
+        }
+    }
     switch ((ext >> 13) & 7) {
     case 0:
         break;
@@ -5052,7 +5097,18 @@ DISAS_INSN(fpu)
         break;
     case 3: /* fmove out */
         cpu_src = gen_fp_ptr(REG(ext, 7));
-        opsize = ext_opsize(ext, 10);
+        if (((ext >> 10) & 7) == 7) {
+            /* packed decimal with dynamic k-factor in Dn bits 6-0 */
+            opsize = OS_PACKED;
+            s->pk_k = tcg_temp_new();
+            tcg_gen_sextract_i32(s->pk_k, DREG(ext, 4), 0, 7);
+        } else {
+            opsize = ext_opsize(ext, 10);
+            if (opsize == OS_PACKED) {
+                /* static k-factor in the extension word */
+                s->pk_k = tcg_constant_i32(sextract32(ext, 0, 7));
+            }
+        }
         if (gen_ea_fp(env, s, insn, opsize, cpu_src,
                       EA_STORE, IS_USER(s)) == -1) {
             gen_addr_fault(s);
@@ -5088,7 +5144,12 @@ DISAS_INSN(fpu)
     cpu_dest = gen_fp_ptr(REG(ext, 7));
     switch (opmode) {
     case 0: /* fmove */
-        gen_fp_move(cpu_dest, cpu_src);
+        if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+            /* moving a denormal or SNaN raises UNFL/SNAN on 6888x */
+            gen_helper_fmv(tcg_env, cpu_dest, cpu_src);
+        } else {
+            gen_fp_move(cpu_dest, cpu_src);
+        }
         break;
     case 0x40: /* fsmove */
         gen_helper_fsround(tcg_env, cpu_dest, cpu_src);
@@ -5400,6 +5461,15 @@ DISAS_INSN(fbcc)
         offset = (offset << 16) | read_im16(env, s);
     }
 
+    if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+        /* FBcc (and thus FNOP) reports pending 6888x exceptions */
+        gen_helper_fp_pretrap(tcg_env);
+        if (insn & 0x10) {
+            /* IEEE nonaware condition: BSUN on unordered */
+            gen_helper_fbcc_bsun(tcg_env);
+        }
+    }
+
     l1 = gen_new_label();
     update_cc_op(s);
     gen_fjmpcc(s, insn & 0x3f, l1);
@@ -5467,10 +5537,24 @@ DISAS_INSN(frestore)
         /* FIXME: check the state frame */
     } else if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
         /*
-         * 68881/68882: we always save a NULL frame, so accept anything
-         * here and reset the FPU to its null (reset) state.
+         * 68881/68882: the consumed frame size depends on the frame
+         * version, so the postincrement writeback comes from the
+         * helper's return value.
          */
-        SRC_EA(env, addr, OS_LONG, 0, NULL);
+        int mode = extract32(insn, 3, 3);
+        TCGv size = tcg_temp_new();
+
+        if (mode == 3) { /* (An)+ */
+            gen_helper_frestore_6888x(size, tcg_env, AREG(insn, 0));
+            tcg_gen_add_i32(AREG(insn, 0), AREG(insn, 0), size);
+        } else {
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+            gen_helper_frestore_6888x(size, tcg_env, addr);
+        }
     } else {
         disas_undef(env, s, insn);
     }
@@ -5489,11 +5573,25 @@ DISAS_INSN(fsave)
         DEST_EA(env, insn, OS_LONG, idle, NULL);
     } else if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
         /*
-         * 68881/68882: always write a NULL frame (version byte 0),
-         * meaning the coprocessor has no internal state to restore.
+         * 68881/68882: a NULL frame in the reset state, else an idle
+         * frame carrying the registers.  The frame size depends on
+         * the state, so the predecrement writeback comes from the
+         * helper's return value.
          */
-        TCGv null = tcg_constant_i32(0x00000000);
-        DEST_EA(env, insn, OS_LONG, null, NULL);
+        int mode = extract32(insn, 3, 3);
+        TCGv size = tcg_temp_new();
+
+        if (mode == 4) { /* -(An) */
+            gen_helper_fsave_6888x_predec(size, tcg_env, AREG(insn, 0));
+            tcg_gen_sub_i32(AREG(insn, 0), AREG(insn, 0), size);
+        } else {
+            TCGv addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+            gen_helper_fsave_6888x(size, tcg_env, addr);
+        }
     } else {
         disas_undef(env, s, insn);
     }
@@ -6138,6 +6236,7 @@ static void m68k_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->cc_op_synced = 1;
     dc->done_mac = 0;
     dc->writeback_mask = 0;
+    dc->pk_k = NULL;
 
     dc->ss_active = (M68K_SR_TRACE(env->sr) == M68K_SR_TRACE_ANY_INS);
     /* If architectural single step active, limit to 1 */

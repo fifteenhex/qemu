@@ -27,6 +27,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "hw/char/escc.h"
 #include "hw/misc/mvme147_pcc.h"
 #include "hw/misc/mvme147_vmechip.h"
@@ -91,6 +92,14 @@ void ledma_memory_read(void *opaque, hwaddr addr,
     }
 }
 
+/* PCC interrupt output, encoded as (level << 8) | vector */
+static void mvme147_pcc_irq(void *opaque, int n, int value)
+{
+    M68kCPU *cpu = opaque;
+
+    m68k_set_irq_level(cpu, value >> 8, value & 0xff);
+}
+
 static void main_cpu_reset(void *opaque)
 {
     M68kCPU *cpu = opaque;
@@ -149,6 +158,8 @@ static void mvme147_init(MachineState *machine)
     pcc_dev = qdev_new(TYPE_MVME147_PCC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(pcc_dev), 0, MVME147_PCC);
+    sysbus_connect_irq(SYS_BUS_DEVICE(pcc_dev), 0,
+                       qemu_allocate_irq(mvme147_pcc_irq, cpu, 0));
 
     /* LANCE */
     lance_dev = qdev_new(TYPE_LANCE);

@@ -107,6 +107,11 @@ typedef struct CPUArchState {
     FPReg fp_result;
     uint32_t fpcr;
     uint32_t fpsr;
+    uint32_t fpiar;
+    /* accrued FPSR AEXC bits; host float flags are cleared at each sync */
+    uint32_t fp_aexc;
+    /* a 6888x exception trap request is pending delivery */
+    uint32_t fp_trap_armed;
     float_status fp_status;
 
     uint64_t mactmp;
