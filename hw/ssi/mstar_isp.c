@@ -20,6 +20,7 @@
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "qemu/datadir.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------- isp (spi) */
@@ -319,6 +320,25 @@ static void msc313_isp_realize(DeviceState *dev, Error **errp)
     s->cs = qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0);
 }
 
+/* flash_cache is NOT migrated: realize refills it from the block backend,
+ * which loadvm reverts to the same snapshot instant. */
+static const VMStateDescription vmstate_mstar_msc313_isp = {
+    .name = "mstar-msc313-isp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(cs_asserted, Msc313IspState),
+        VMSTATE_UINT16(rdata, Msc313IspState),
+        VMSTATE_UINT16(password, Msc313IspState),
+        VMSTATE_UINT16(clkdiv, Msc313IspState),
+        VMSTATE_UINT16(trigger, Msc313IspState),
+        VMSTATE_UINT16(rst, Msc313IspState),
+        VMSTATE_UINT16_ARRAY(qspi_regs, Msc313IspState, MSTAR_ISP_QSPI_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(fsp_regs, Msc313IspState, MSTAR_ISP_FSP_NUM_REGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_isp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -326,6 +346,7 @@ static void msc313_isp_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_isp_realize;
     rc->phases.hold = msc313_isp_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_isp;
 }
 
 static const TypeInfo mstar_isp_types[] = {

@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -982,11 +983,34 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                    MSTAR_PM_UART_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
 }
 
+/*
+ * SoC-container state: the smpctrl boot mailbox and the infinity3 fake camera
+ * capture counters. (The scldma_timer is only created on infinity3 and
+ * re-arms itself each frame, so it is deliberately not migrated: after a
+ * restore the next frame tick restarts it via the running timer state of the
+ * devices that were migrated. The chipid/miu/cpupll/l3bridge regions are
+ * stateless shims.)
+ */
+static const VMStateDescription vmstate_mstar_soc = {
+    .name = "mstar-soc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(smp_bootaddr, MStarSoCState),
+        VMSTATE_UINT16_ARRAY(smpctrl_regs, MStarSoCState,
+                             MSTAR_SMPCTRL_SIZE / 4),
+        VMSTATE_UINT32(frame_count, MStarSoCState),
+        VMSTATE_INT32(frame_phase, MStarSoCState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = mstar_soc_realize;
+    dc->vmsd = &vmstate_mstar_soc;
     /* SoCs are instantiated by their board, not directly by the user. */
     dc->user_creatable = false;
 }

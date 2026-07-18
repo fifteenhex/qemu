@@ -36,6 +36,7 @@
 #include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/display/mstar_gop.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 #define GOP_STRETCH_W       0xc0        /* bits 0-11 = crtc_w >> 1 */
@@ -289,6 +290,7 @@ static void mstar_gop_realize(DeviceState *dev, Error **errp)
         return;
     }
     s->regs = g_malloc0(s->regsize / 4 * sizeof(uint16_t));
+    s->nregs = s->regsize / 4;
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &mstar_gop_ops, s,
                           "mstar.gop", s->regsize);
@@ -310,6 +312,35 @@ static const Property mstar_gop_props[] = {
                      TYPE_MSC313_PWM, Msc313PwmState *),
 };
 
+/*
+ * The framebuffer MemoryRegionSection and the QemuConsole are not migrated:
+ * post_load just flags a full invalidate so the next gfx_update re-derives
+ * the section from the migrated registers and repaints.
+ */
+static int mstar_gop_post_load(void *opaque, int version_id)
+{
+    MStarGopState *s = opaque;
+
+    s->invalidate = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_mstar_gop = {
+    .name = "mstar-gop",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = mstar_gop_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_VARRAY_UINT32(regs, MStarGopState, nregs, 0,
+                              vmstate_info_uint16, uint16_t),
+        VMSTATE_UINT32(width, MStarGopState),
+        VMSTATE_UINT32(height, MStarGopState),
+        VMSTATE_TIMER_PTR(vblank, MStarGopState),
+        VMSTATE_TIMER_PTR(gop_off, MStarGopState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_gop_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -318,6 +349,7 @@ static void mstar_gop_class_init(ObjectClass *oc, const void *data)
     dc->realize = mstar_gop_realize;
     device_class_set_props(dc, mstar_gop_props);
     rc->phases.hold = mstar_gop_reset_hold;
+    dc->vmsd = &vmstate_mstar_gop;
 }
 
 static const TypeInfo mstar_gop_types[] = {

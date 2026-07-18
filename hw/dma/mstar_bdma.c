@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------------ bdma */
@@ -212,6 +213,27 @@ static void msc313_bdma_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static const VMStateDescription vmstate_mstar_bdma_chan = {
+    .name = "mstar-msc313-bdma-chan",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313BdmaChan, MSTAR_BDMA_CHAN_NREGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_mstar_bdma = {
+    .name = "mstar-msc313-bdma",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(chans, Msc313BdmaState, MSTAR_BDMA_NUM_CHANNELS, 1,
+                             vmstate_mstar_bdma_chan, Msc313BdmaChan),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_bdma_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -219,6 +241,7 @@ static void msc313_bdma_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_bdma_realize;
     rc->phases.hold = msc313_bdma_reset_hold;
+    dc->vmsd = &vmstate_mstar_bdma;
 }
 
 static const TypeInfo mstar_bdma_types[] = {

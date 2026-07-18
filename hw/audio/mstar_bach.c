@@ -42,6 +42,7 @@
 #include "qemu/timer.h"
 #include "qemu/audio.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* MIU address/size granularity for the msc313-bach variant (addr_sz_shift=3). */
@@ -388,6 +389,38 @@ static const Property mstar_bach_properties[] = {
     DEFINE_AUDIO_PROPERTIES(Msc313BachState, audio_be),
 };
 
+/*
+ * The audio voice and the snapshotted-PCM FIFO are transient: on restore the
+ * pending samples are dropped (an at-most one-sound glitch) and the voice
+ * activity is re-derived from the migrated channel state.
+ */
+static int mstar_bach_post_load(void *opaque, int version_id)
+{
+    Msc313BachState *s = opaque;
+
+    g_byte_array_set_size(s->pcm, 0);
+    s->pcm_rdpos = 0;
+    s->voice_on = false;
+    mstar_bach_update_voice(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_mstar_bach = {
+    .name = "mstar-msc313-bach",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = mstar_bach_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313BachState, MSTAR_BACH_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(atopregs, Msc313BachState, MSTAR_AUDIOTOP_NUM_REGS),
+        VMSTATE_BOOL(play_active, Msc313BachState),
+        VMSTATE_UINT32(play_wptr, Msc313BachState),
+        VMSTATE_BOOL(irq_pending, Msc313BachState),
+        VMSTATE_BOOL(irq_armed, Msc313BachState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_bach_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -395,6 +428,7 @@ static void mstar_bach_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mstar_bach_realize;
     rc->phases.hold = mstar_bach_reset_hold;
+    dc->vmsd = &vmstate_mstar_bach;
     device_class_set_props(dc, mstar_bach_properties);
 }
 

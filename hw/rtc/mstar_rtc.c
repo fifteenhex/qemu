@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ----------------------------------------------------------- msc313-rtc */
@@ -167,6 +168,23 @@ static void msc313_rtc_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
+static const VMStateDescription vmstate_mstar_msc313_rtc = {
+    .name = "mstar-msc313-rtc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(ctrl, Msc313RtcState),
+        VMSTATE_UINT16(status, Msc313RtcState),
+        VMSTATE_UINT32(freq_cw, Msc313RtcState),
+        VMSTATE_UINT32(load_val, Msc313RtcState),
+        VMSTATE_UINT32(match_val, Msc313RtcState),
+        VMSTATE_UINT32(cnt_latch, Msc313RtcState),
+        VMSTATE_INT64(base_ns, Msc313RtcState),
+        VMSTATE_UINT32(base_count, Msc313RtcState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_rtc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -174,6 +192,7 @@ static void msc313_rtc_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_rtc_realize;
     rc->phases.hold = msc313_rtc_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_rtc;
 }
 
 static const TypeInfo mstar_rtc_types[] = {

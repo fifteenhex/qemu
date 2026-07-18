@@ -45,6 +45,7 @@ struct MStarGopState {
     uint32_t winoff;            /* property: byte offset of the window regs */
     bool flip;                  /* property: rotate output 180deg */
     uint16_t *regs;             /* regsize/4 entries (16-bit lanes, 4-byte stride) */
+    uint32_t nregs;             /* regsize/4, for migration of regs[] */
     unsigned int brightness;
     uint32_t width, height;
     bool invalidate;

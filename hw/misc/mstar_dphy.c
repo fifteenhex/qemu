@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------- dphy (MIPI) */
@@ -95,6 +96,16 @@ static void mstar_dphy_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
+static const VMStateDescription vmstate_mstar_dphy = {
+    .name = "mstar-ssd20xd-dphy",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, MstarDphyState, MSTAR_DPHY_NUM_REGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_dphy_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -102,6 +113,7 @@ static void mstar_dphy_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mstar_dphy_realize;
     rc->phases.hold = mstar_dphy_reset_hold;
+    dc->vmsd = &vmstate_mstar_dphy;
 }
 
 static const TypeInfo mstar_dphy_types[] = {

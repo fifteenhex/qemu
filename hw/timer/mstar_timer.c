@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* --------------------------------------------------------- msc313e-timer */
@@ -191,6 +192,23 @@ static const Property msc313e_timer_properties[] = {
     DEFINE_PROP_UINT32("freq", Msc313eTimerState, freq, MSTAR_TIMER_FREQ),
 };
 
+static const VMStateDescription vmstate_mstar_msc313e_timer = {
+    .name = "mstar-msc313e-timer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(ctrl, Msc313eTimerState),
+        VMSTATE_UINT16(divide, Msc313eTimerState),
+        VMSTATE_UINT32(max, Msc313eTimerState),
+        VMSTATE_INT64(base_ns, Msc313eTimerState),
+        VMSTATE_UINT64(base_count, Msc313eTimerState),
+        VMSTATE_UINT32(latch, Msc313eTimerState),
+        VMSTATE_BOOL(int_pending, Msc313eTimerState),
+        VMSTATE_TIMER_PTR(hrtimer, Msc313eTimerState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313e_timer_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -198,6 +216,7 @@ static void msc313e_timer_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313e_timer_realize;
     rc->phases.hold = msc313e_timer_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313e_timer;
     device_class_set_props(dc, msc313e_timer_properties);
 }
 

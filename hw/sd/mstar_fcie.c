@@ -19,6 +19,7 @@
 #include "system/address-spaces.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* -------------------------------------------------------------- sdio (FCIE) */
@@ -299,6 +300,18 @@ static void msc313_sdio_realize(DeviceState *dev, Error **errp)
     qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_MSC313_SDIO_BUS, dev, "sd-bus");
 }
 
+static const VMStateDescription vmstate_mstar_msc313_sdio = {
+    .name = "mstar-msc313-sdio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313SdioState, MSTAR_SDIO_NUM_REGS),
+        VMSTATE_UINT8_ARRAY(fifo, Msc313SdioState, MSTAR_SDIO_FIFO_BYTES),
+        VMSTATE_UINT8(last_cmd, Msc313SdioState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_sdio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -306,6 +319,7 @@ static void msc313_sdio_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_sdio_realize;
     rc->phases.hold = msc313_sdio_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_sdio;
 }
 
 static const TypeInfo mstar_fcie_types[] = {

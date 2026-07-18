@@ -31,6 +31,7 @@
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "system/blockdev.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 #define PM_GPIO_SD_CDZ      0x11c   /* bank register 0x47 */
@@ -137,6 +138,16 @@ static void mstar_pm_gpio_realize(DeviceState *dev, Error **errp)
                         NULL, NULL);
 }
 
+static const VMStateDescription vmstate_mstar_pm_gpio = {
+    .name = "mstar-pm-gpio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, MstarPmGpioState, MSTAR_PM_GPIO_NUM_REGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_pm_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -144,6 +155,7 @@ static void mstar_pm_gpio_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mstar_pm_gpio_realize;
     rc->phases.hold = mstar_pm_gpio_reset_hold;
+    dc->vmsd = &vmstate_mstar_pm_gpio;
 }
 
 static const TypeInfo mstar_pm_gpio_types[] = {

@@ -20,6 +20,7 @@
 #include "system/address-spaces.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/bitbang_i2c.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /*
@@ -224,6 +225,20 @@ static void msc313_gpio_realize(DeviceState *dev, Error **errp)
     }
 }
 
+/* NB: the bit-bang SCCB helper (bbi2c) keeps no migrated state; a
+ * snapshot taken mid-bitbanged-transfer would resume mid-byte (camera
+ * boards only - take snapshots at idle). */
+static const VMStateDescription vmstate_mstar_msc313_gpio = {
+    .name = "mstar-msc313-gpio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(regs, Msc313GpioState, MSTAR_GPIO_NUM_REGS),
+        VMSTATE_INT32_ARRAY(sda_level, Msc313GpioState, MSTAR_GPIO_NUM_I2C),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -231,6 +246,7 @@ static void msc313_gpio_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_gpio_realize;
     rc->phases.hold = msc313_gpio_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_gpio;
 }
 
 static const TypeInfo mstar_gpio_types[] = {

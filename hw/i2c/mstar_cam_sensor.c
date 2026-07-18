@@ -25,6 +25,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
+#include "migration/vmstate.h"
 
 #define TYPE_MSTAR_CAM_SENSOR "mstar-cam-sensor"
 #define TYPE_IMX323 "imx323"        /* Sony IMX323 preset (also in mstar.h) */
@@ -132,6 +133,21 @@ static const Property mstar_cam_sensor_props[] = {
     DEFINE_PROP_UINT32("id-val", MstarCamSensorState, id_val, 0),
 };
 
+static const VMStateDescription vmstate_mstar_cam_sensor = {
+    .name = "mstar-cam-sensor",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, MstarCamSensorState),
+        VMSTATE_BUFFER_POINTER_UNSAFE(regs, MstarCamSensorState, 0,
+                                      SENSOR_REGSPACE),
+        VMSTATE_UINT32(ptr, MstarCamSensorState),
+        VMSTATE_INT32(addr_pos, MstarCamSensorState),
+        VMSTATE_UINT32(addr_acc, MstarCamSensorState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_cam_sensor_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -141,6 +157,7 @@ static void mstar_cam_sensor_class_init(ObjectClass *oc, const void *data)
     dc->realize = mstar_cam_sensor_realize;
     device_class_set_props(dc, mstar_cam_sensor_props);
     rc->phases.hold = mstar_cam_sensor_reset_hold;
+    dc->vmsd = &vmstate_mstar_cam_sensor;
     sc->event = mstar_cam_sensor_event;
     sc->send = mstar_cam_sensor_send;
     sc->recv = mstar_cam_sensor_recv;

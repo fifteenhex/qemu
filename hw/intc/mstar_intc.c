@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------- mst-intc */
@@ -122,6 +123,18 @@ static const Property mst_intc_properties[] = {
     DEFINE_PROP_UINT32("num-irqs", MstIntcState, num_irqs, 0),
 };
 
+static const VMStateDescription vmstate_mstar_mst_intc = {
+    .name = "mstar-mst-intc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(mask, MstIntcState, MST_INTC_MAX_IRQS / 16),
+        VMSTATE_UINT16_ARRAY(polarity, MstIntcState, MST_INTC_MAX_IRQS / 16),
+        VMSTATE_UINT64(level, MstIntcState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mst_intc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -129,6 +142,7 @@ static void mst_intc_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mst_intc_realize;
     rc->phases.hold = mst_intc_reset_hold;
+    dc->vmsd = &vmstate_mstar_mst_intc;
     device_class_set_props(dc, mst_intc_properties);
 }
 

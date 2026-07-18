@@ -17,6 +17,10 @@
 
 static void mai70_board_init(MStarSoCState *soc)
 {
+    /* Injoinic IP6303 PMIC on i2c0 @ 0x30 (custom address). Without it every
+     * APK_IP6303_* read NAKs and the app believes the power key is held down. */
+    i2c_slave_create_simple(soc->i2c[0].bus, TYPE_IP6303, 0x30);
+
     /* TODO: wire the board's image sensor / peripherals once the firmware is
      * available (mirrors mstar_msc313e_cam.c: attach the sensor on its bus). */
 }

@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------- sar (ADC) */
@@ -154,6 +155,17 @@ static void msc313_sar_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
+static const VMStateDescription vmstate_mstar_msc313_sar = {
+    .name = "mstar-msc313-sar",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313SarState, MSTAR_SAR_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(chan_input, Msc313SarState, MSTAR_SAR_CHANNELS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_sar_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -161,6 +173,7 @@ static void msc313_sar_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_sar_realize;
     rc->phases.hold = msc313_sar_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_sar;
 }
 
 static const TypeInfo mstar_sar_types[] = {

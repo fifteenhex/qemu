@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------------- pwm */
@@ -96,6 +97,16 @@ static void msc313_pwm_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
+static const VMStateDescription vmstate_mstar_msc313_pwm = {
+    .name = "mstar-msc313-pwm",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313PwmState, MSTAR_PWM_NUM_REGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_pwm_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -103,6 +114,7 @@ static void msc313_pwm_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_pwm_realize;
     rc->phases.hold = msc313_pwm_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_pwm;
 }
 
 static const TypeInfo mstar_pwm_types[] = {

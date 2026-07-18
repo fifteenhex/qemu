@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
 /* ------------------------------------------------------------ clkgen tables */
@@ -224,6 +225,16 @@ static void mstar_regprobe_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
+static const VMStateDescription vmstate_mstar_regprobe = {
+    .name = "mstar-regprobe",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, MstarRegProbeState, MSTAR_REGPROBE_MAX_REGS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_regprobe_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -231,6 +242,7 @@ static void mstar_regprobe_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = mstar_regprobe_realize;
     rc->phases.hold = mstar_regprobe_reset_hold;
+    dc->vmsd = &vmstate_mstar_regprobe;
 }
 
 /* Fill in a concrete (block, SoC) type's table/size/label. */

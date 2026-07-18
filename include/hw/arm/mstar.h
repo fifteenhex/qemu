@@ -36,6 +36,34 @@
 void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size);
 
 /*
+ * SNAPSHOT / MIGRATION SUPPORT
+ *
+ * Every stateful device in this inventory carries a VMStateDescription so a
+ * running machine can be snapshotted and fully restored - the firmware boots
+ * take 45-120s of wall clock, so experiments restart from a snapshot instead:
+ *
+ *   qemu-img create -f qcow2 -b flash.bin -F raw overlay.qcow2
+ *   qemu-system-arm -M miyoomini -drive if=mtd,format=qcow2,file=overlay.qcow2 ...
+ *   (monitor) savevm booted          # after the firmware reaches the state
+ *   ... later runs:  -loadvm booted  # or (monitor) loadvm booted
+ *
+ * The qcow2 overlay is required: savevm stores the VM state *and* the block
+ * state as an internal snapshot, so every loadvm restores DRAM, devices and
+ * flash to the same instant (raw + snapshot=on cannot do this). RAM regions
+ * (DRAM, IMI, boot ROM) migrate automatically; only device structs need
+ * descriptions.
+ *
+ * Rules when touching device state:
+ *  - New state field => add it to the device's vmsd and bump version_id
+ *    (old snapshots become invalid; that is expected and fine here).
+ *  - Derived/transient state (consoles, framebuffer sections, audio voices,
+ *    the ISP flash_cache) is NOT migrated: re-derive it in post_load (see
+ *    mstar_gop.c / mstar_bach.c for the pattern).
+ *  - Helper blocks that are not QOM devices (the mercury5 uart1/shim overlays
+ *    in mstar_mercury5.c) use vmstate_register() with a fixed instance id.
+ */
+
+/*
  * The "mst-intc" (also on MediaTek chips): a hierarchical interrupt
  * controller sitting between the peripherals and the GIC. It adds a per-line
  * mask and forwards each input to a GIC SPI (irq_start + line).
@@ -570,6 +598,23 @@ struct MstarSecElemState {
     uint8_t tgt_87[8];                  /* captured arg0 from the 0x87 write */
     uint8_t resp[16];                   /* prepared response for the next read */
     unsigned resp_len;
+};
+
+/*
+ * Injoinic IP6303 PMIC (70mai dashcam, i2c0 address 0x30). A byte register
+ * file with the handful of status bits the firmware's APK_IP6303_* HAL polls
+ * (power key level, battery OK, charge state, VBAT ADC); see hw/i2c/ip6303.c.
+ */
+#define TYPE_IP6303 "ip6303"
+OBJECT_DECLARE_SIMPLE_TYPE(Ip6303State, IP6303)
+
+struct Ip6303State {
+    /*< private >*/
+    I2CSlave parent_obj;
+    /*< public >*/
+    uint8_t regs[256];
+    uint8_t ptr;                        /* register pointer (auto-increments) */
+    bool have_ptr;                      /* pointer byte seen this transfer */
 };
 
 /*

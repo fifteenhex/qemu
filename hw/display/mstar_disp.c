@@ -19,6 +19,7 @@
 #include "system/address-spaces.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 #include "trace.h"
 
@@ -575,6 +576,32 @@ static void msc313_disp_realize(DeviceState *dev, Error **errp)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MSTAR_DISP_REFRESH_NS);
 }
 
+/* The console is re-derived: zapping width/height makes the next scanout
+ * call qemu_console_resize() and repaint from the migrated registers. */
+static int msc313_disp_post_load(void *opaque, int version_id)
+{
+    Msc313DispState *s = opaque;
+
+    s->width = 0;
+    s->height = 0;
+    return 0;
+}
+
+static const VMStateDescription vmstate_mstar_disp = {
+    .name = "mstar-msc313-disp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = msc313_disp_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(topregs, Msc313DispState, MSTAR_DISP_TOP_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(mopregs, Msc313DispState, MSTAR_DISP_MOP_NUM_REGS),
+        VMSTATE_UINT32_ARRAY(dsiregs, Msc313DispState, MSTAR_DISP_DSI_NUM_REGS),
+        VMSTATE_UINT16_ARRAY(geregs, Msc313DispState, MSTAR_DISP_GE_NUM_REGS),
+        VMSTATE_TIMER_PTR(vblank, Msc313DispState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_disp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -582,6 +609,7 @@ static void msc313_disp_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_disp_realize;
     rc->phases.hold = msc313_disp_reset_hold;
+    dc->vmsd = &vmstate_mstar_disp;
 }
 
 static const TypeInfo mstar_disp_types[] = {

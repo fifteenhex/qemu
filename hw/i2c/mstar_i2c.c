@@ -17,6 +17,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 #include "trace.h"
 
@@ -147,6 +148,10 @@ static uint64_t msc313_i2c_read(void *opaque, hwaddr addr, unsigned size)
     case I2C_WDATA:
         /* "WDATA_GET" ack lives in the high byte: bit8 set => slave NAKed. */
         return s->nak ? I2C_WDATA_NAK : 0;
+    case I2C_WDATA + 1:
+        /* The mercury5 RTOS HAL reads the ack flag as a byte (strb/ldrb HAL);
+         * serve the NAK bit for a byte read of the high half too. */
+        return s->nak ? 1 : 0;
     case I2C_RDATA:
         return s->rdata;
     case I2C_CUR_STATE:
@@ -273,6 +278,22 @@ static void msc313_i2c_realize(DeviceState *dev, Error **errp)
     s->bus = i2c_init_bus(dev, "i2c");
 }
 
+static const VMStateDescription vmstate_mstar_msc313_i2c = {
+    .name = "mstar-msc313-i2c",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Msc313I2cState, MSTAR_I2C_NUM_REGS),
+        VMSTATE_BOOL(int_pending, Msc313I2cState),
+        VMSTATE_BOOL(nak, Msc313I2cState),
+        VMSTATE_BOOL(active, Msc313I2cState),
+        VMSTATE_BOOL(start_pending, Msc313I2cState),
+        VMSTATE_UINT8(rdata, Msc313I2cState),
+        VMSTATE_BOOL(dma_done, Msc313I2cState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void msc313_i2c_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -280,6 +301,7 @@ static void msc313_i2c_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = msc313_i2c_realize;
     rc->phases.hold = msc313_i2c_reset_hold;
+    dc->vmsd = &vmstate_mstar_msc313_i2c;
 }
 
 static const TypeInfo mstar_i2c_types[] = {

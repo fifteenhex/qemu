@@ -46,6 +46,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/i2c/i2c.h"
+#include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 #include "trace.h"
 
@@ -304,12 +305,34 @@ static void mstar_secelem_reset(DeviceState *dev)
     s->have_e9 = s->have_87 = false;
 }
 
+static const VMStateDescription vmstate_mstar_secelem = {
+    .name = "mstar-secelem",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, MstarSecElemState),
+        VMSTATE_BOOL(reading, MstarSecElemState),
+        VMSTATE_UINT32(cmd_len, MstarSecElemState),
+        VMSTATE_UINT8_ARRAY(cmd, MstarSecElemState, MSTAR_SECELEM_BUFSZ),
+        VMSTATE_UINT32(resp_pos, MstarSecElemState),
+        VMSTATE_UINT8(ac1, MstarSecElemState),
+        VMSTATE_BOOL(have_e9, MstarSecElemState),
+        VMSTATE_BOOL(have_87, MstarSecElemState),
+        VMSTATE_UINT8_ARRAY(tgt_e9, MstarSecElemState, 8),
+        VMSTATE_UINT8_ARRAY(tgt_87, MstarSecElemState, 8),
+        VMSTATE_UINT8_ARRAY(resp, MstarSecElemState, 16),
+        VMSTATE_UINT32(resp_len, MstarSecElemState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mstar_secelem_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     I2CSlaveClass *sc = I2C_SLAVE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, mstar_secelem_reset);
+    dc->vmsd = &vmstate_mstar_secelem;
     sc->event = mstar_secelem_event;
     sc->send = mstar_secelem_send;
     sc->recv = mstar_secelem_recv;

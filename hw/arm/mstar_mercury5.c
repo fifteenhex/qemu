@@ -39,7 +39,9 @@
 #include "chardev/char-fe.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "hw/display/mstar_gop.h"
+#include "hw/display/mstar_sctop.h"
 #include "mstar-soc.h"
 
 /*
@@ -70,6 +72,13 @@ typedef struct Mercury5Shim {
 static const Mercury5Shim mercury5_shims[] = {
     { "mstar.mercury5-bound",    MSTAR_RIU_BASE + 0x207818, 4, 0x0b },
     { "mstar.mercury5-dsi-done", MSTAR_RIU_BASE + 0x34420c, 4, 0x02 },
+    /*
+     * Boot/power-source status (read at RTOS 0x200a1b18): bit2 = external
+     * power (car ACC/DC-in) present. The app's boot gate powers straight off
+     * unless a boot reason exists (power key down, or this bit); the normal
+     * dashcam flow - and the auto-record UI path - keys off external power.
+     */
+    { "mstar.mercury5-pwrsrc",   MSTAR_RIU_BASE + 0x006848, 1, 0x04 },
 };
 
 static uint64_t mercury5_shim_read(void *opaque, hwaddr addr, unsigned size)
@@ -88,6 +97,84 @@ static const MemoryRegionOps mercury5_shim_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
+};
+
+/*
+ * HVSP1 (scaler engine 1, SDK bank 0x121100) queue-status window,
+ * 0x1f2423e8..0x1f2423ff. The display/JPG_PB pipeline pushes frames through the
+ * scaler and waits for completion by writing an index query + kick (bit12) into
+ * a channel's command register and polling its status register until the
+ * hardware's completed-frame counter echoes the requested index (RTOS wait loop
+ * at 0x20236404; accessors read reg16 tokens 0x1211f4..0x1211fe). There is no
+ * scaler here, so complete instantly: the status register echoes the last
+ * command (kick bit stripped). Without this the pipeline re-kicks forever and
+ * the boot screen never advances.
+ *
+ *   +0x00 ch0 command   +0x08 ch0 status (echo)
+ *   +0x0c ch1 command   +0x14 ch1 status (echo)
+ */
+#define M5_HVSP1_QSTAT_BASE (MSTAR_RIU_BASE + 0x2423e8)
+#define M5_HVSP1_QSTAT_SIZE 0x18
+
+typedef struct Mercury5HvspQstat {
+    MemoryRegion mr;
+    uint16_t regs[M5_HVSP1_QSTAT_SIZE / 4];
+    uint16_t count[2];          /* per-channel fake completed-frame counter */
+} Mercury5HvspQstat;
+
+static uint64_t mercury5_hvsp_qstat_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    Mercury5HvspQstat *q = opaque;
+
+    uint64_t val = q->regs[addr / 4];
+
+    /*
+     * Each channel is an indirect access port into engine-internal state:
+     * command reg = entry select (+0x800 prepare, +0x1000 latch), +0x04 =
+     * write data, +0x08 = readback. The firmware writes a value, latches, and
+     * spins until the readback matches (RTOS 0x20235ff8..0x20236074). With no
+     * engine behind it, reflect the last written data so the verify passes.
+     */
+    switch (addr) {
+    case 0x08:                                  /* ch0 readback */
+        val = q->regs[0x04 / 4];
+        break;
+    case 0x14:                                  /* ch1 readback */
+        val = q->regs[0x10 / 4];
+        break;
+    }
+    mstar_iolog(M5_HVSP1_QSTAT_BASE + addr, false, val, size);
+    return val;
+}
+
+static void mercury5_hvsp_qstat_write(void *opaque, hwaddr addr, uint64_t val,
+                                      unsigned size)
+{
+    Mercury5HvspQstat *q = opaque;
+
+    mstar_iolog(M5_HVSP1_QSTAT_BASE + addr, true, val, size);
+    q->regs[addr / 4] = val;
+}
+
+static const MemoryRegionOps mercury5_hvsp_qstat_ops = {
+    .read = mercury5_hvsp_qstat_read,
+    .write = mercury5_hvsp_qstat_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+
+static const VMStateDescription vmstate_mercury5_hvsp_qstat = {
+    .name = "mstar.mercury5-hvsp1-qstat",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16_ARRAY(regs, Mercury5HvspQstat, M5_HVSP1_QSTAT_SIZE / 4),
+        VMSTATE_UINT16_ARRAY(count, Mercury5HvspQstat, 2),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 /*
@@ -182,6 +269,19 @@ static void mercury5_uart_rx(void *opaque, const uint8_t *buf, int size)
     }
 }
 
+
+static const VMStateDescription vmstate_mercury5_uart = {
+    .name = "mstar.mercury5-uart1",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(rx, Mercury5Uart),
+        VMSTATE_BOOL(rx_valid, Mercury5Uart),
+        VMSTATE_BOOL(dlab, Mercury5Uart),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void mercury5_uart_event(void *opaque, QEMUChrEvent event)
 {
 }
@@ -208,6 +308,16 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
                                             mr, 10);
     }
 
+    {
+        Mercury5HvspQstat *q = g_new0(Mercury5HvspQstat, 1);
+
+        memory_region_init_io(&q->mr, OBJECT(s), &mercury5_hvsp_qstat_ops, q,
+                              "mstar.mercury5-hvsp1-qstat", M5_HVSP1_QSTAT_SIZE);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                            M5_HVSP1_QSTAT_BASE, &q->mr, 10);
+        vmstate_register(NULL, 0, &vmstate_mercury5_hvsp_qstat, q);
+    }
+
     uart = g_new0(Mercury5Uart, 1);
     uart->irq = qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_UART1_HWIRQ);
     qemu_chr_fe_init(&uart->chr, serial_hd(1), &error_abort);
@@ -217,6 +327,7 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
                           "mstar.mercury5-uart1", 0x100);
     memory_region_add_subregion_overlap(get_system_memory(), MSTAR_UART1_BASE,
                                         &uart->mr, 10);
+    vmstate_register(NULL, 0, &vmstate_mercury5_uart, uart);
 
     /*
      * GOP (graphics output plane) - the 70mai composites its UI through it (SDK
@@ -239,6 +350,22 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
         qdev_prop_set_uint32(gop, "winoff", 0xc00);   /* DEC_GOP2 @0x1f246e00 */
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gop), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gop), 0, MSTAR_RIU_BASE + 0x246200);
+    }
+
+    /*
+     * SC_TOP - the SCL/display-top interrupt bank (RIU bank 0x1218). The RTOS
+     * registers its display ISR at GIC INTID 84 (= SPI 20, vendor
+     * INT_IRQ_SC_TOP) and unmasks only the frame/vsync bit; the display task's
+     * frame heartbeat comes from this interrupt.
+     */
+    {
+        DeviceState *sctop = qdev_new(TYPE_MSTAR_SCTOP);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sctop), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sctop), 0, MSTAR_RIU_BASE + 0x243000);
+        /* mst-intc "irq" line 20 -> GIC INTID 84 (vendor INT_IRQ_SC_TOP). */
+        sysbus_connect_irq(SYS_BUS_DEVICE(sctop), 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq), 20));
     }
 }
 
