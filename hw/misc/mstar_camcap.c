@@ -27,11 +27,11 @@
 #include "migration/vmstate.h"
 #include "hw/arm/mstar.h"
 
-/* SCLDMA: double-buffer / frame-done status register (byte offset). */
-#define CAMCAP_SCLDMA_STATUS    0xfc
-/* HVSP: ISP frame-done interrupt status window (see the read handler). */
-#define CAMCAP_HVSP_ISTAT1      0x4ac       /* int status 1 (bit14 = frame) */
-#define CAMCAP_HVSP_CLKHB       0x5e8       /* scaler/idclk clock heartbeat */
+/*
+ * The register offsets of the SCLDMA status, the HVSP frame-done interrupt
+ * status window and the scaler clock heartbeat are properties (defaults are the
+ * infinity3/MSC313E values), since the mercury5 SCL/ISP layout differs.
+ */
 
 static inline void camcap_iolog(MstarCamCapState *s, uint32_t base, hwaddr addr,
                                 bool w, uint64_t val, unsigned size)
@@ -48,7 +48,7 @@ static uint64_t camcap_scldma_read(void *opaque, hwaddr addr, unsigned size)
     MstarCamCapState *s = opaque;
 
     camcap_iolog(s, s->scldma_base, addr, false, 0, size);
-    if (addr == CAMCAP_SCLDMA_STATUS) {
+    if (addr == s->scldma_status_off) {
         return s->scldma_status ^= 0xffff;      /* double-buffer status */
     }
     return s->scldma_regs[(addr >> 1) & 0xff];
@@ -126,17 +126,22 @@ static uint64_t camcap_hvsp_read(void *opaque, hwaddr addr, unsigned size)
      * pending (cleared when the ISR reads it, to avoid a re-entry storm).
      */
     if (s->isp_frame_pending) {
-        switch (addr) {
-        case CAMCAP_HVSP_ISTAT1:
+        if (addr == s->hvsp_istat1_off) {
             s->isp_frame_pending = false;
             qemu_set_irq(s->isp_img_irq, 0);
             return 0x4000;
-        case 0x4a0: case 0x4b4: case 0x528:     /* int-mask regs: unmasked */
-        case 0x4bc: case 0x534:                 /* status 2/3: idle */
+        }
+        /* int-mask regs (unmasked) + status 2/3 (idle): the ISR reads these
+         * alongside status1, offset from it by the vmlinux-decoded deltas. */
+        if (addr == s->hvsp_istat1_off - 0xc ||     /* mask1 (0x4a0) */
+            addr == s->hvsp_istat1_off + 0x8 ||     /* mask2 (0x4b4) */
+            addr == s->hvsp_istat1_off + 0x10 ||    /* status2 (0x4bc) */
+            addr == s->hvsp_istat1_off + 0x7c ||    /* mask3 (0x528) */
+            addr == s->hvsp_istat1_off + 0x88) {    /* status3 (0x534) */
             return 0x0000;
         }
     }
-    if (addr == CAMCAP_HVSP_CLKHB) {
+    if (addr == s->hvsp_clkhb_off) {
         return s->hvsp_hb ^= 0xffff;            /* "clock is running" heartbeat */
     }
     return s->hvsp_regs[(addr >> 1) & 0xfff];
@@ -261,6 +266,10 @@ static const Property mstar_camcap_props[] = {
     DEFINE_PROP_UINT32("isppoll-base", MstarCamCapState, isppoll_base, 0x242000),
     DEFINE_PROP_UINT32("hvsp-base", MstarCamCapState, hvsp_base, 0x260000),
     DEFINE_PROP_UINT32("framecnt-off", MstarCamCapState, framecnt_off, 0x1050),
+    DEFINE_PROP_UINT32("scldma-status-off", MstarCamCapState,
+                       scldma_status_off, 0xfc),
+    DEFINE_PROP_UINT32("hvsp-istat1-off", MstarCamCapState, hvsp_istat1_off, 0x4ac),
+    DEFINE_PROP_UINT32("hvsp-clkhb-off", MstarCamCapState, hvsp_clkhb_off, 0x5e8),
 };
 
 static void mstar_camcap_class_init(ObjectClass *oc, const void *data)

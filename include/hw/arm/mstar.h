@@ -307,6 +307,9 @@ struct MstarCamCapState {
     uint32_t isppoll_base;
     uint32_t hvsp_base;
     uint32_t framecnt_off;      /* isppoll offset of the frame counter */
+    uint32_t scldma_status_off; /* scldma double-buffer status reg offset */
+    uint32_t hvsp_istat1_off;   /* hvsp ISP frame-done status1 reg offset */
+    uint32_t hvsp_clkhb_off;    /* hvsp scaler clock heartbeat reg offset */
     uint16_t scldma_regs[0x100];
     uint16_t isppoll_regs[0x2000];
     uint16_t hvsp_regs[0x1000];
