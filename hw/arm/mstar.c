@@ -51,11 +51,17 @@ static FILE *mstar_iolog_fp;
 
 void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size)
 {
-    if (mstar_iolog_fp) {
+    FILE *fp = mstar_iolog_fp;
+
+    /* stderr fallback: qemu's fopen() to a file can be sandbox-blocked. */
+    if (!fp && getenv("MSTAR_IOLOG_STDERR")) {
+        fp = stderr;
+    }
+    if (fp) {
         uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
-        fprintf(mstar_iolog_fp, "%c %08x %u %0*x %08x\n", write ? 'W' : 'R',
+        fprintf(fp, "%c %08x %u %0*x %08x\n", write ? 'W' : 'R',
                 (uint32_t)phys, size, size * 2, (uint32_t)val, pc);
-        fflush(mstar_iolog_fp);
+        fflush(fp);
     }
 }
 
@@ -937,12 +943,16 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->i2c[i]), 0, i2c_base[i]);
     }
 
-    /* Optional RIU I/O tracer (MSTAR_IOLOG=<file>): see mstar_iolog(). */
-    if (getenv("MSTAR_IOLOG") && !mstar_iolog_fp) {
+    /* Optional RIU I/O tracer (MSTAR_IOLOG=<file>, or MSTAR_IOLOG_STDERR=1 when
+     * a file cannot be opened under a sandbox): see mstar_iolog(). */
+    if ((getenv("MSTAR_IOLOG") || getenv("MSTAR_IOLOG_STDERR")) &&
+        !mstar_iolog_fp) {
         MemoryRegion *log = g_new(MemoryRegion, 1);
 
-        mstar_iolog_fp = fopen(getenv("MSTAR_IOLOG"), "w");
-        if (getenv("MSTAR_IOLOG_UNIQUE")) {
+        if (getenv("MSTAR_IOLOG")) {
+            mstar_iolog_fp = fopen(getenv("MSTAR_IOLOG"), "w");
+        }
+        if (getenv("MSTAR_IOLOG_UNIQUE") || getenv("MSTAR_IOLOG_STDERR")) {
             mstar_iolog_seen = g_malloc0(0x100000);   /* 0x400000/4 entries */
         }
         memory_region_init_io(log, OBJECT(s), &mstar_iolog_catchall_ops, s,
