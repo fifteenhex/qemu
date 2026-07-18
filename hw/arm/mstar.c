@@ -489,6 +489,7 @@ static void mstar_soc_init(Object *obj)
     }
     if (sc->info.has_display) {
         object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSC313_PWM);
+        object_initialize_child(obj, "gop", &s->gop, TYPE_MSTAR_GOP);
         object_initialize_child(obj, "disp", &s->disp, TYPE_MSC313_DISP);
         object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
     }
@@ -908,27 +909,37 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm), 0, MSTAR_PWM_BASE);
     }
 
-    /* "disp" GOP/display-top pipeline, scanned out to a QEMU console. */
+    /*
+     * "gop" RGB primary plane (standalone, shared with mercury5) + the rest of
+     * the "disp" pipeline (display-top vsync, mopg video plane, DSI, GE). The
+     * GOP is realized first so its console is index 0 (the one screendump/
+     * -display shows); the disp's console carries the mopg overlay/bootlogo.
+     */
     if (sc->info.has_display) {
-        s->disp.backlight = &s->pwm;
+        s->gop.backlight = &s->pwm;
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->gop), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->gop), 0, MSTAR_DISP_GOP_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gop), 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTAR_DISP_GOP_HWIRQ));
+
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp), errp)) {
             return;
         }
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 0, MSTAR_DISP_GOP_BASE);
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTAR_DISP_TOP_BASE);
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTAR_DISP_MOP_BASE);
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 3, MSTAR_DISP_DSI_BASE);
-        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 4, MSTAR_DISP_GE_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 0, MSTAR_DISP_TOP_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTAR_DISP_MOP_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTAR_DISP_DSI_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 3, MSTAR_DISP_GE_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTAR_DISP_HWIRQ));
+
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->dphy), errp)) {
             return;
         }
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->dphy), 0, MSTAR_DPHY_BASE);
-        sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
-                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
-                                            MSTAR_DISP_HWIRQ));
-        sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 1,
-                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
-                                            MSTAR_DISP_GOP_HWIRQ));
     }
 
     /* HWI2C masters (transfers NAK until a slave is attached to the bus). */

@@ -143,4 +143,4 @@ endif
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 modules += { 'hw-display': hw_display_modules }
-system_ss.add(when: 'CONFIG_MSTAR', if_true: files('mstar_disp.c'))
+system_ss.add(when: 'CONFIG_MSTAR', if_true: files('mstar_disp.c', 'mstar_gop.c'))

@@ -17,6 +17,7 @@
 #include "net/net.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
+#include "hw/display/mstar_gop.h"
 
 /*
  * This header is the SoC's device inventory: the per-block QOM types and state
@@ -459,15 +460,15 @@ struct Msc313PwmState {
 unsigned int msc313_pwm_brightness(Msc313PwmState *s, unsigned int ch);
 
 /*
- * The "disp": enough of the SSD20xD display pipeline to scan out to a QEMU
- * console and drive DRM vblank (gop1 primary plane, display-top vsync, the
- * mopg overlay/video plane and the MIPI DSI controller). Register layout is
- * from the mstar DRM driver (drivers/gpu/drm/mstar/mstar_{gop,top,mop,dsi}.c).
+ * The "disp": the rest of the SSD20xD display pipeline around the GOP plane
+ * (which is now the standalone TYPE_MSTAR_GOP device): the display-top vsync,
+ * the mopg overlay/video plane, the MIPI DSI controller and the GE 2D engine.
+ * Register layout is from the mstar DRM driver (drivers/gpu/drm/mstar/
+ * mstar_{top,mop,dsi}.c).
  */
 #define TYPE_MSC313_DISP "mstar-msc313-disp"
 OBJECT_DECLARE_SIMPLE_TYPE(Msc313DispState, MSC313_DISP)
 
-#define MSTAR_DISP_GOP_NUM_REGS (0x400 / 4)
 #define MSTAR_DISP_TOP_NUM_REGS (0x200 / 4)
 #define MSTAR_DISP_MOP_NUM_REGS (0x600 / 4)
 #define MSTAR_DISP_DSI_NUM_REGS (0x400 / 4)
@@ -477,26 +478,18 @@ struct Msc313DispState {
     /*< private >*/
     SysBusDevice parent_obj;
     /*< public >*/
-    MemoryRegion gop;       /* gop1 primary plane registers @0x1f246800 */
     MemoryRegion top;       /* display-top registers        @0x1f225000 */
     MemoryRegion mop;       /* mopg overlay (video) plane   @0x1f280a00 */
     MemoryRegion dsi;       /* MIPI DSI controller          @0x1f345200 */
     MemoryRegion ge;        /* GE 2D graphics engine        @0x1f281200 */
     qemu_irq irq;           /* display-top vsync interrupt (SPI 82) */
-    qemu_irq gop_irq;       /* GOP/fbdev vsync interrupt (SPI 52) */
     QemuConsole *con;
     QEMUTimer *vblank;
-    QEMUTimer *gop_off;     /* lowers gop_irq shortly after each vblank pulse */
-    MemoryRegionSection fbsection;
-    Msc313PwmState *backlight;   /* PWM whose channel 0 dims the panel */
-    unsigned int brightness;     /* backlight level, 0..256 */
-    uint16_t gopregs[MSTAR_DISP_GOP_NUM_REGS];
     uint16_t topregs[MSTAR_DISP_TOP_NUM_REGS];
     uint16_t mopregs[MSTAR_DISP_MOP_NUM_REGS];
     uint32_t dsiregs[MSTAR_DISP_DSI_NUM_REGS];
     uint16_t geregs[MSTAR_DISP_GE_NUM_REGS];
     uint32_t width, height;
-    bool invalidate;
     bool flip;              /* panel mounted 180deg (Miyoo Mini): rotate output */
 };
 

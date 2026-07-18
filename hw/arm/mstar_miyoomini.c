@@ -25,7 +25,9 @@
 static void miyoomini_board_init(MStarSoCState *soc)
 {
     i2c_slave_create_simple(soc->i2c[1].bus, TYPE_MSTAR_SECELEM, 0x3d);
-    soc->disp.flip = true;      /* the panel is mounted 180deg */
+    /* The panel is mounted 180deg: flip both the GOP (RGB) and mopg (video). */
+    soc->gop.flip = true;
+    soc->disp.flip = true;
 }
 
 static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)

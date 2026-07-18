@@ -38,6 +38,8 @@
 #include "system/system.h"
 #include "chardev/char-fe.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/display/mstar_gop.h"
 #include "mstar-soc.h"
 
 /*
@@ -215,6 +217,29 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
                           "mstar.mercury5-uart1", 0x100);
     memory_region_add_subregion_overlap(get_system_memory(), MSTAR_UART1_BASE,
                                         &uart->mr, 10);
+
+    /*
+     * GOP (graphics output plane) - the 70mai composites its UI through it (SDK
+     * gop_hal.lib). The region spans the SCL_GOP + DEC_GOP1..3 instances
+     * (0x1f246200..0x1f2479ff, SDK REG_GOP_00/10/20/30_BASE); the whole region
+     * is store/read-back (so HalGopGetStrechWinSize reads the sizes the firmware
+     * wrote, clearing the "over Stretch window" spam). The instance the firmware
+     * actually enables for the OSD is DEC_GOP2 (main @0x1f246e00, GWIN bank
+     * @0x1f247000 with bit0 set + format ARGB8888); its window register layout
+     * (GWIN enable/addr at bank+0x00/0x04/0x08, stretch at main+0xc0/0xc4)
+     * matches the SSD20xD GOP, so it is scanned out to the console. The OSD
+     * pixels themselves are drawn by the GE 2D blitter (not yet modelled), so
+     * the buffer stays blank for now. Its vsync IRQ is left unconnected (the
+     * RTOS doesn't use fbdev).
+     */
+    {
+        DeviceState *gop = qdev_new(TYPE_MSTAR_GOP);
+
+        qdev_prop_set_uint32(gop, "regsize", 0x1800);
+        qdev_prop_set_uint32(gop, "winoff", 0xc00);   /* DEC_GOP2 @0x1f246e00 */
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gop), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gop), 0, MSTAR_RIU_BASE + 0x246200);
+    }
 }
 
 static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)

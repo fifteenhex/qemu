@@ -18,21 +18,11 @@
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "ui/console.h"
-#include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/arm/mstar.h"
 #include "trace.h"
 
-/* ------------------------------------------------------------- disp (GOP) */
-
-/* gop1 primary-plane registers (drivers/gpu/drm/mstar/mstar_gop.c). */
-#define GOP_STRETCH_W       0xc0        /* bits 0-11 = crtc_w >> 1 */
-#define GOP_STRETCH_H       0xc4        /* bits 0-11 = crtc_h */
-#define GOP_WIN0            0x200       /* bit0 = enable, bits 4-7 = format */
-#define GOP_WIN0_ADDRL      0x204       /* bits 0-15 */
-#define GOP_WIN0_ADDRH      0x208       /* bits 0-11 */
-#define GOP_WIN0_PITCH      0x224       /* bits 0-10, in addr_shift units */
-#define GOP_ADDR_SHIFT      4
+/* --------------------------------------------------------- disp (top/vsync) */
 
 /* display-top registers (drivers/gpu/drm/mstar/mstar_top.c). */
 #define TOP_VSYNC_FLAG      0x08        /* bit3, write-1-to-clear */
@@ -101,13 +91,6 @@ static void msc313_disp_update_irq(Msc313DispState *s)
     qemu_set_irq(s->irq, flag && !masked);
 }
 
-static void msc313_disp_gop_off(void *opaque)
-{
-    Msc313DispState *s = opaque;
-
-    qemu_set_irq(s->gop_irq, 0);
-}
-
 static void msc313_disp_vblank(void *opaque)
 {
     Msc313DispState *s = opaque;
@@ -118,39 +101,8 @@ static void msc313_disp_vblank(void *opaque)
         msc313_disp_update_irq(s);
     }
 
-    /*
-     * The GOP/fbdev vsync is a distinct disp interrupt (the vendor DT's first
-     * disp interrupt, GIC SPI 52). The fbdev driver's ISR (_sstar_FB_VsyncISR)
-     * has no status register - it just bumps a counter and wakes its vsync
-     * waitqueue - so opening /dev/fb0 (sstar_FB_WaitForVsync) blocks until it
-     * fires. It is edge-like (the oneshot threaded handler acks via mask), so
-     * pulse it once per frame. The mst-intc is level-based, so assert it and
-     * lower it a short while later (long enough for the CPU to latch it, short
-     * enough not to storm the level-shared, un-acked handler).
-     */
-    qemu_set_irq(s->gop_irq, 1);
-    timer_mod(s->gop_off,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200 * 1000);
-
     timer_mod(s->vblank,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MSTAR_DISP_REFRESH_NS);
-}
-
-static uint64_t msc313_disp_gop_read(void *opaque, hwaddr addr, unsigned size)
-{
-    Msc313DispState *s = opaque;
-
-    mstar_iolog(MSTAR_DISP_GOP_BASE + addr, false, s->gopregs[addr / 4], size);
-    return s->gopregs[addr / 4];
-}
-
-static void msc313_disp_gop_write(void *opaque, hwaddr addr, uint64_t val,
-                                  unsigned size)
-{
-    Msc313DispState *s = opaque;
-
-    mstar_iolog(MSTAR_DISP_GOP_BASE + addr, true, val, size);
-    s->gopregs[addr / 4] = val;
 }
 
 static uint64_t msc313_disp_top_read(void *opaque, hwaddr addr, unsigned size)
@@ -307,7 +259,11 @@ static void msc313_disp_ge_bitblt(Msc313DispState *s)
         address_space_write(&address_space_memory, drow, MEMTXATTRS_UNSPECIFIED,
                             dbuf, w * dbpp);
     }
-    s->invalidate = true;
+    /*
+     * The blit lands in DRAM; the GOP device that scans that framebuffer out
+     * picks the change up through the framebuffer dirty-page tracking, so there
+     * is nothing to flag here.
+     */
 }
 
 static uint64_t msc313_disp_ge_read(void *opaque, hwaddr addr, unsigned size)
@@ -339,14 +295,6 @@ static void msc313_disp_ge_write(void *opaque, hwaddr addr, uint64_t val,
 static const MemoryRegionOps msc313_disp_ge_ops = {
     .read = msc313_disp_ge_read,
     .write = msc313_disp_ge_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 2,
-    .valid.max_access_size = 4,
-};
-
-static const MemoryRegionOps msc313_disp_gop_ops = {
-    .read = msc313_disp_gop_read,
-    .write = msc313_disp_gop_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 2,
     .valid.max_access_size = 4,
@@ -449,70 +397,6 @@ static const MemoryRegionOps msc313_disp_dsi_ops = {
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
 };
-
-/*
- * Convert one GOP source row to the console surface. The source pixel format is
- * taken from the WIN0 format field (drm_color_to_gop): 0x1 = RGB565 (mainline
- * DRM fbcon), 0x5 = ARGB8888, 0x7 = ABGR8888 (the vendor mi_disp/SDL fbdev runs
- * the primary plane as 32bpp ARGB8888). Other 16bpp codes decode as RGB565.
- */
-static void msc313_disp_draw_row(void *opaque, uint8_t *dst, const uint8_t *src,
-                                 int width, int deststep)
-{
-    Msc313DispState *s = opaque;
-    DisplaySurface *surface = qemu_console_surface(s->con);
-    int bpp = surface_bits_per_pixel(surface);
-    unsigned int bl = s->brightness;
-    unsigned int fmt = (s->gopregs[GOP_WIN0 / 4] >> 4) & 0xf;
-    bool is32 = (fmt == 0x5 || fmt == 0x7);     /* ARGB8888 / ABGR8888 */
-    bool bgr = (fmt == 0x7);
-
-    while (width--) {
-        uint8_t r, g, b;
-
-        if (is32) {
-            uint32_t px = ldl_le_p(src);
-            uint8_t c0 = px & 0xff, c1 = (px >> 8) & 0xff, c2 = (px >> 16) & 0xff;
-
-            /* ARGB8888 stores B,G,R,A in memory; ABGR8888 stores R,G,B,A. */
-            if (bgr) {
-                r = c0; g = c1; b = c2;
-            } else {
-                b = c0; g = c1; r = c2;
-            }
-            src += 4;
-        } else {
-            uint16_t px = lduw_le_p(src);
-
-            r = ((px >> 11) & 0x1f) << 3;
-            g = ((px >> 5) & 0x3f) << 2;
-            b = (px & 0x1f) << 3;
-            src += 2;
-        }
-        r = r * bl >> 8;
-        g = g * bl >> 8;
-        b = b * bl >> 8;
-        switch (bpp) {
-        case 16:
-            *(uint16_t *)dst = rgb_to_pixel16(r, g, b);
-            dst += 2;
-            break;
-        case 32:
-            *(uint32_t *)dst = rgb_to_pixel32(r, g, b);
-            dst += 4;
-            break;
-        default:
-            return;
-        }
-    }
-}
-
-static void msc313_disp_invalidate(void *opaque)
-{
-    Msc313DispState *s = opaque;
-
-    s->invalidate = true;
-}
 
 static inline uint8_t msc313_clamp_u8(int v)
 {
@@ -635,77 +519,21 @@ static void msc313_disp_apply_flip(Msc313DispState *s)
 static bool msc313_disp_gfx_update(void *opaque)
 {
     Msc313DispState *s = opaque;
-    DisplaySurface *surface = qemu_console_surface(s->con);
-    uint32_t win = s->gopregs[GOP_WIN0 / 4];
-    uint32_t w = (s->gopregs[GOP_STRETCH_W / 4] & 0xfff) << 1;
-    uint32_t h = s->gopregs[GOP_STRETCH_H / 4] & 0xfff;
-    uint32_t addrl = s->gopregs[GOP_WIN0_ADDRL / 4];
-    uint32_t addrh = s->gopregs[GOP_WIN0_ADDRH / 4] & 0xfff;
-    unsigned int fmt = (win >> 4) & 0xf;
-    bool is32 = (fmt == 0x5 || fmt == 0x7);
-    /*
-     * The GOP address register holds the DRAM-relative (MIU) address of the
-     * framebuffer (drm_gem_dma dma_addr, i.e. phys - MSTAR_DRAM_BASE), so add
-     * the DRAM base to reach it in system memory.
-     */
-    hwaddr fbaddr = MSTAR_DRAM_BASE +
-                    (((hwaddr)((addrh << 16) | addrl)) << GOP_ADDR_SHIFT);
-    uint32_t pitch = (s->gopregs[GOP_WIN0_PITCH / 4] & 0x7ff) << GOP_ADDR_SHIFT;
-    unsigned int bl = s->backlight ? msc313_pwm_brightness(s->backlight, 0) : 256;
-    int first = 0, last = 0;
-
-    /* A backlight change needs a full redraw even if the framebuffer didn't. */
-    if (bl != s->brightness) {
-        s->brightness = bl;
-        s->invalidate = true;
-    }
-    /* The flip rotates the whole surface, so it needs the full frame each time. */
-    if (s->flip) {
-        s->invalidate = true;
-    }
 
     /*
-     * The vendor u-boot bootlogo drives the MOP video plane (YUV420); the
-     * mainline DRM fbcon drives the GOP plane (RGB). Scan out whichever is
-     * enabled, MOP taking priority when it is active.
+     * The RGB primary plane is scanned out by the standalone TYPE_MSTAR_GOP
+     * device (its own console). This "disp" console shows the mopg overlay
+     * (video) plane: the vendor u-boot bootlogo decodes its JPEG splash into a
+     * YUV420 surface and points this plane at it. Scan it out while enabled.
      */
     if (s->mopregs[MOP_REG(MOP_WIN0, MOP_WIN_EN)] & 1) {
         msc313_disp_scanout_mop(s);
         msc313_disp_apply_flip(s);
-        return true;
     }
-
-    /* Nothing to show until the plane is enabled and sized by the driver. */
-    if (!(win & 1) || w == 0 || h == 0) {
-        return true;
-    }
-    if (pitch == 0) {
-        pitch = w * (is32 ? 4 : 2);
-    }
-    if (w != s->width || h != s->height) {
-        qemu_console_resize(s->con, w, h);
-        surface = qemu_console_surface(s->con);
-        s->width = w;
-        s->height = h;
-        s->invalidate = true;
-    }
-    if (s->invalidate) {
-        framebuffer_update_memory_section(&s->fbsection, get_system_memory(),
-                                          fbaddr, h, pitch);
-    }
-    framebuffer_update_display(surface, &s->fbsection, w, h, pitch,
-                               surface_stride(surface), 0, s->invalidate,
-                               msc313_disp_draw_row, s, &first, &last);
-    if (first >= 0) {
-        qemu_console_update(s->con, 0, first, w, last - first + 1);
-    }
-    s->invalidate = false;
-    msc313_disp_apply_flip(s);
     return true;
 }
 
 static const GraphicHwOps msc313_disp_gfx_ops = {
-    .invalidate = msc313_disp_invalidate,
     .gfx_update = msc313_disp_gfx_update,
 };
 
@@ -713,15 +541,12 @@ static void msc313_disp_reset_hold(Object *obj, ResetType type)
 {
     Msc313DispState *s = MSC313_DISP(obj);
 
-    memset(s->gopregs, 0, sizeof(s->gopregs));
     memset(s->topregs, 0, sizeof(s->topregs));
     memset(s->mopregs, 0, sizeof(s->mopregs));
     memset(s->dsiregs, 0, sizeof(s->dsiregs));
     memset(s->geregs, 0, sizeof(s->geregs));
     s->width = 0;
     s->height = 0;
-    s->brightness = 256;
-    s->invalidate = true;
     s->topregs[TOP_VSYNC_MASK / 4] = TOP_VSYNC_BIT;     /* vblank starts masked */
     qemu_set_irq(s->irq, 0);
 }
@@ -730,9 +555,6 @@ static void msc313_disp_realize(DeviceState *dev, Error **errp)
 {
     Msc313DispState *s = MSC313_DISP(dev);
 
-    memory_region_init_io(&s->gop, OBJECT(dev), &msc313_disp_gop_ops, s,
-                          "mstar.disp-gop", MSTAR_DISP_GOP_SIZE);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->gop);
     memory_region_init_io(&s->top, OBJECT(dev), &msc313_disp_top_ops, s,
                           "mstar.disp-top", MSTAR_DISP_TOP_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->top);
@@ -746,10 +568,8 @@ static void msc313_disp_realize(DeviceState *dev, Error **errp)
                           "mstar.disp-ge", MSTAR_DISP_GE_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->ge);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
-    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->gop_irq);
 
     s->con = qemu_graphic_console_create(dev, 0, &msc313_disp_gfx_ops, s);
-    s->gop_off = timer_new_ns(QEMU_CLOCK_VIRTUAL, msc313_disp_gop_off, s);
     s->vblank = timer_new_ns(QEMU_CLOCK_VIRTUAL, msc313_disp_vblank, s);
     timer_mod(s->vblank,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MSTAR_DISP_REFRESH_NS);

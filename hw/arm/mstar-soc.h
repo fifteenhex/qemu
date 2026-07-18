@@ -94,6 +94,7 @@ struct MStarSoCState {
     MstarRegProbeState pinctrl;
     Msc313SdioState sdio;
     Msc313PwmState pwm;
+    MStarGopState gop;
     Msc313DispState disp;
     MstarDphyState dphy;
     Msc313BachState bach;
