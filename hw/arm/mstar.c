@@ -624,6 +624,19 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         qdev_connect_gpio_out(cpudev, GTIMER_VIRT,
                               qdev_get_gpio_in(gicdev,
                                        ppibase + MSTAR_GIC_PPI_VIRTTIMER));
+        /*
+         * The mercury5 RTOS runs Secure and drives its scheduler tick from the
+         * secure physical timer (GIC PPI 13 = INTID 29). Without this wire the
+         * CPU generates the timer output but it is never delivered to the GIC,
+         * so INTID 29 never fires and the main flow stalls on any timed wait.
+         * Wire the hyp timer too for completeness.
+         */
+        qdev_connect_gpio_out(cpudev, GTIMER_HYP,
+                              qdev_get_gpio_in(gicdev,
+                                       ppibase + MSTAR_GIC_PPI_HYPTIMER));
+        qdev_connect_gpio_out(cpudev, GTIMER_SEC,
+                              qdev_get_gpio_in(gicdev,
+                                       ppibase + MSTAR_GIC_PPI_SECTIMER));
 
         /* GIC outputs -> CPU interrupt inputs */
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->gic), i,
