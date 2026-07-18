@@ -79,6 +79,14 @@ static const Mercury5Shim mercury5_shims[] = {
      * dashcam flow - and the auto-record UI path - keys off external power.
      */
     { "mstar.mercury5-pwrsrc",   MSTAR_RIU_BASE + 0x006848, 1, 0x04 },
+    /*
+     * USB UTMI0 PHY calibration done (0x1f004478 bit1). The USB host bring-up
+     * (MDrv_Usb_Init, after "1 [cfg bl:0]") programs the PHY at 0x1f004400 and
+     * busy-waits on bit1 of 0x1f004478 for calibration-done (RTOS 0x2014bfb4);
+     * with no PHY modelled the catch-all returns 0 and the boot hangs there.
+     * Report done so the USB init - and the boot sequence past it - proceeds.
+     */
+    { "mstar.mercury5-usbphy-done", MSTAR_RIU_BASE + 0x004478, 4, 0x02 },
 };
 
 static uint64_t mercury5_shim_read(void *opaque, hwaddr addr, unsigned size)
