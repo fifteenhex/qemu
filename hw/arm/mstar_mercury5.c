@@ -73,12 +73,10 @@ static const Mercury5Shim mercury5_shims[] = {
     { "mstar.mercury5-bound",    MSTAR_RIU_BASE + 0x207818, 4, 0x0b },
     { "mstar.mercury5-dsi-done", MSTAR_RIU_BASE + 0x34420c, 4, 0x02 },
     /*
-     * Boot/power-source status (read at RTOS 0x200a1b18): bit2 = external
-     * power (car ACC/DC-in) present. The app's boot gate powers straight off
-     * unless a boot reason exists (power key down, or this bit); the normal
-     * dashcam flow - and the auto-record UI path - keys off external power.
+     * NB the boot/power-source status at 0x1f006848 (bit2 = external DC/ACC
+     * power) used to be shimmed here; it lives inside the rtcpwc bank
+     * (0x1f006800) and is now served by TYPE_MSTAR_RTCPWC.
      */
-    { "mstar.mercury5-pwrsrc",   MSTAR_RIU_BASE + 0x006848, 1, 0x04 },
     /*
      * USB UTMI PHY calibration done (CA_END). The Mstar USB host bring-up polls
      * "UTMI_base + 0x3c*2" (= +0x78) bit1 == CA_END and spins until set (see the
@@ -474,6 +472,8 @@ static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)
      * completion event. Layout captured from the 70mai firmware (MSTAR_IOLOG).
      */
     sc->info.bach_mercury5 = true;
+    /* rtcpwc RTC power/wake controller @0x1f006800 (subsumes the pwrsrc shim). */
+    sc->info.has_rtcpwc = true;
 
     /* Chain the common realize, then add the mercury5-specific blocks. */
     device_class_set_parent_realize(dc, mstar_mercury5_soc_realize,

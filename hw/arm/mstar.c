@@ -474,6 +474,7 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSC313_SAR);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_MSC313_GPIO);
     object_initialize_child(obj, "pm-gpio", &s->pm_gpio, TYPE_MSTAR_PM_GPIO);
+    object_initialize_child(obj, "rtcpwc", &s->rtcpwc, TYPE_MSTAR_RTCPWC);
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, sc->info.clkgen_type);
@@ -851,6 +852,14 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_gpio), 0, MSTAR_PM_GPIO_BASE);
+
+    /* rtcpwc: RTC power/wake controller (infinity2m/SSD20xD + mercury5). */
+    if (sc->info.has_rtcpwc) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->rtcpwc), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtcpwc), 0, MSTAR_RTCPWC_BASE);
+    }
 
     /* ISP SPI-NOR controller (core regs, qspi config, XIP window). */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->isp), errp)) {

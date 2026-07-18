@@ -369,6 +369,27 @@ struct MstarPmGpioState {
 };
 
 /*
+ * rtcpwc: RTC power/wake controller (DT sstar,infinity-rtcpwc). The RTC counter
+ * is in an always-on domain read across an ISO handshake; see hw/rtc/mstar_rtcpwc.c.
+ */
+#define TYPE_MSTAR_RTCPWC "mstar-rtcpwc"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarRtcpwcState, MSTAR_RTCPWC)
+
+#define MSTAR_RTCPWC_BASE (MSTAR_RIU_BASE + 0x006800)
+#define MSTAR_RTCPWC_SIZE 0x200
+
+struct MstarRtcpwcState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    uint16_t regs[MSTAR_RTCPWC_SIZE / 4];
+    bool iso_ack;           /* current DIG2RTC/RTC2DIG ISO handshake ack */
+    uint32_t base_seconds;  /* wall-clock seconds at reset */
+    int64_t reset_ns;       /* virtual-clock ns at reset (counter epoch) */
+};
+
+/*
  * The "isp" SPI-NOR controller (mstar,msc313-isp): a byte-at-a-time SPI
  * master plus a memory-mapped XIP read window. It drives an m25p80 SPI-NOR
  * flash over an SSI bus.

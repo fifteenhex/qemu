@@ -78,6 +78,8 @@ typedef struct MStarSoCInfo {
     bool bach_mercury5;         /* bach reader uses the mercury5 (SSC833x) bit
                                  * layout instead of the msc313 one (EN bit12
                                  * trigger / CTRL0 bit0,2,4); see mstar_bach.c */
+    bool has_rtcpwc;            /* rtcpwc RTC power/wake controller @0x1f006800
+                                 * (infinity2m/SSD20xD + mercury5) */
 } MStarSoCInfo;
 
 struct MStarSoCState {
@@ -95,6 +97,7 @@ struct MStarSoCState {
     Msc313SarState sar;
     Msc313GpioState gpio;
     MstarPmGpioState pm_gpio;
+    MstarRtcpwcState rtcpwc;
     Msc313IspState isp;
     Msc313BdmaState bdma;
     MstarRegProbeState clkgen;

@@ -28,6 +28,7 @@ static void mstar_infinity2m_soc_class_init(ObjectClass *oc, const void *data)
     sc->info.chip_id = 0xf0;            /* SSD20xD */
     sc->info.clkgen_type = TYPE_SSD20XD_CLKGEN;
     sc->info.pinctrl_type = TYPE_SSD20XD_PINCTRL;
+    sc->info.has_rtcpwc = true;         /* rtcpwc @0x1f006800 */
 }
 
 static void mstar_ssd203d_soc_class_init(ObjectClass *oc, const void *data)
