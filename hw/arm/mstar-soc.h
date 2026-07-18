@@ -75,6 +75,9 @@ typedef struct MStarSoCInfo {
                                  * 0x1f282000; mercury5 sd@1f282600) */
     uint8_t sdio_irq;           /* sdio "irq" mst-intc line (0 = MSTAR_SDIO_HWIRQ;
                                  * mercury5 dts = GIC_SPI 60) */
+    bool bach_mercury5;         /* bach reader uses the mercury5 (SSC833x) bit
+                                 * layout instead of the msc313 one (EN bit12
+                                 * trigger / CTRL0 bit0,2,4); see mstar_bach.c */
 } MStarSoCInfo;
 
 struct MStarSoCState {

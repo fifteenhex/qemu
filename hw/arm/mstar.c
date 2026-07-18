@@ -872,6 +872,8 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_BDMA_CH1_HWIRQ));
 
     /* bach audio controller + its audiotop syscon (dummy, logs accesses). */
+    object_property_set_bool(OBJECT(&s->bach), "mercury5-reader",
+                             sc->info.bach_mercury5, &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->bach), errp)) {
         return;
     }

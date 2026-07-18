@@ -433,6 +433,15 @@ static void mstar_mercury5_soc_class_init(ObjectClass *oc, const void *data)
      */
     sc->info.sdio_base = MSTAR_RIU_BASE + 0x282600;
     sc->info.sdio_irq = 60;
+    /*
+     * The mercury5 bach reader uses a different control-bit layout than the
+     * msc313 one the base model assumes (queue/trigger on EN bit12 not bit13,
+     * no EN bit15 enable, CTRL0 int-clear/underrun-IE/empty-IE on bit0/2/4 not
+     * bit8/13/10). Without this the reader underrun IRQ (INTID 106) never fires
+     * and the audio-subsystem init - and thus APK_BeepTask - hangs on its
+     * completion event. Layout captured from the 70mai firmware (MSTAR_IOLOG).
+     */
+    sc->info.bach_mercury5 = true;
 
     /* Chain the common realize, then add the mercury5-specific blocks. */
     device_class_set_parent_realize(dc, mstar_mercury5_soc_realize,

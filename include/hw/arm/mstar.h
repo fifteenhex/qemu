@@ -706,6 +706,7 @@ struct Msc313BachState {
     unsigned pcm_rdpos;     /* consume offset into pcm */
     bool irq_pending;       /* reader underrun/empty IRQ asserted, awaiting ack */
     bool irq_armed;         /* level rose above threshold; a new IRQ may fire */
+    bool mercury5_reader;   /* use the mercury5 reader control-bit layout */
 };
 
 /*

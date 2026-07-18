@@ -73,6 +73,43 @@
 #define BACH_CTRL8_UNDERRUN_FLAG (1 << 2)
 #define BACH_CTRL8_EMPTY_FLAG    (1 << 4)
 
+/*
+ * mercury5 (SSC833x) reader bit layout, captured from the 70mai firmware
+ * register trace (MSTAR_IOLOG). The EN register keeps the msc313 meaning for
+ * bit15 (enable) and bit14 (init) - the firmware writes 0x8bc8/0x9bc8/0x4bc8 -
+ * but moves the per-period queue/trigger down to bit12 (0x1bc8) instead of the
+ * msc313 bit13. The interrupt-enable bits move too: steady CTRL0 is 0x16 with
+ * the underrun/empty IE at bit2/bit4 (msc313 uses bit13/bit10). The CTRL8 flag
+ * bits (bit2/bit4) and the INT_CLEAR ack (bit8) coincide with the msc313 ones -
+ * confirmed from the ISR trace: on the bach IRQ it reads CTRL8 (underrun flag
+ * bit2) then pulses CTRL0 bit8 (0x016 -> 0x116 -> 0x016). Selected per-SoC by
+ * the "mercury5-reader" property so the msc313/miyoo playback path is unchanged.
+ */
+#define BACH_M5_EN_TRIGGER       (1 << 12)
+#define BACH_M5_CTRL0_INT_CLEAR  (1 << 8)
+#define BACH_M5_CTRL0_UNDERRUN_IE (1 << 2)
+#define BACH_M5_CTRL0_EMPTY_IE   (1 << 4)
+
+static uint16_t bach_en_trigger_bit(Msc313BachState *s)
+{
+    return s->mercury5_reader ? BACH_M5_EN_TRIGGER : BACH_EN_TRIGGER;
+}
+
+static uint16_t bach_ctrl0_int_clear(Msc313BachState *s)
+{
+    return s->mercury5_reader ? BACH_M5_CTRL0_INT_CLEAR : BACH_CTRL0_INT_CLEAR;
+}
+
+static uint16_t bach_ctrl0_underrun_ie(Msc313BachState *s)
+{
+    return s->mercury5_reader ? BACH_M5_CTRL0_UNDERRUN_IE : BACH_CTRL0_UNDERRUN_IE;
+}
+
+static uint16_t bach_ctrl0_empty_ie(Msc313BachState *s)
+{
+    return s->mercury5_reader ? BACH_M5_CTRL0_EMPTY_IE : BACH_CTRL0_EMPTY_IE;
+}
+
 /* Playback format the Miyoo firmware programs (Ao Param: 44100, channel 2). */
 #define BACH_FREQ           44100
 #define BACH_CHANNELS       2
@@ -118,15 +155,26 @@ static void mstar_bach_update_irq(Msc313BachState *s)
     unsigned thresh = s->regs[BACH_RD_UNDERRUN / 4] & 0xffff;
     uint16_t flags = 0;
 
-    if (bach_level_miu(s) > thresh) {
-        s->irq_armed = true;            /* guest queued fresh data above thresh */
+    if (!s->mercury5_reader && bach_level_miu(s) > thresh) {
+        s->irq_armed = true;            /* msc313: level-driven (re)arm */
     }
 
     if (s->play_active && s->irq_armed && !s->irq_pending) {
-        if ((ctrl0 & BACH_CTRL0_UNDERRUN_IE) && bach_level_miu(s) <= thresh) {
+        /*
+         * msc313 fires on the falling edge across the underrun threshold and
+         * re-arms once the guest queues back above it. The mercury5 reader has
+         * no per-period TRIGGER count and re-arms only on the next queue pulse,
+         * so it is armed by the trigger (in rd_en) and fires exactly one
+         * underrun per armed period - the "period elapsed" its ISR waits on.
+         * Keying its arm on the trigger rather than the level avoids the ack's
+         * update re-raising the still-drained line into an interrupt storm.
+         */
+        if ((ctrl0 & bach_ctrl0_underrun_ie(s)) &&
+            (s->mercury5_reader || bach_level_miu(s) <= thresh)) {
             flags |= BACH_CTRL8_UNDERRUN_FLAG;
         }
-        if ((ctrl0 & BACH_CTRL0_EMPTY_IE) && bach_backlog(s) == 0) {
+        if (!s->mercury5_reader && (ctrl0 & bach_ctrl0_empty_ie(s)) &&
+            bach_backlog(s) == 0) {
             flags |= BACH_CTRL8_EMPTY_FLAG;
         }
         if (flags) {
@@ -234,13 +282,50 @@ static void mstar_bach_rd_en(Msc313BachState *s, uint16_t oldval, uint16_t val)
      * it high across the en/count writes of a period, so this is level- not
      * edge-triggered). Snapshot that PCM immediately.
      */
-    if (val & BACH_EN_TRIGGER) {
-        uint32_t add = (s->regs[BACH_RD_TRIGGER / 4] & 0xffff) << BACH_ADDR_SHIFT;
+    if (val & bach_en_trigger_bit(s)) {
+        uint32_t add;
+
+        if (s->mercury5_reader) {
+            /*
+             * mercury5 has no separate per-period TRIGGER count register (the
+             * firmware leaves 0x110 at 0); each trigger queues the whole
+             * programmed ring. Snapshot a bounded chunk that is comfortably
+             * above the underrun threshold so the reader arms and then drains
+             * across it, raising exactly one underrun IRQ - which is what the
+             * audio-init handshake waits on. Keeping it bounded avoids a slow
+             * (~seconds) drain of a large ring stalling the completion.
+             */
+            unsigned thresh = s->regs[BACH_RD_UNDERRUN / 4] & 0xffff;
+            uint32_t want = (thresh ? (thresh * 2) : 0x200) << BACH_ADDR_SHIFT;
+
+            add = MIN(want, bach_ring_size(s));
+            /*
+             * Completion is signalled by the per-period underrun IRQ, not by the
+             * FIFO draining (which an idle "-audio driver=none" backend never
+             * does). Keep only the latest period so the snapshot FIFO - and the
+             * LEVEL it would report - can't grow without bound and trip the
+             * firmware's overflow handling into wedging the stream.
+             */
+            g_byte_array_set_size(s->pcm, 0);
+            s->pcm_rdpos = 0;
+        } else {
+            add = (s->regs[BACH_RD_TRIGGER / 4] & 0xffff) << BACH_ADDR_SHIFT;
+        }
 
         mstar_bach_snapshot(s, add);
-        s->regs[BACH_RD_EN / 4] &= ~BACH_EN_TRIGGER;   /* auto-clear */
+        s->regs[BACH_RD_EN / 4] &= ~bach_en_trigger_bit(s);   /* auto-clear */
+        if (s->mercury5_reader) {
+            s->irq_armed = true;        /* one underrun per queued period */
+        }
     }
 
+    /*
+     * Both variants gate playback on EN bit15; mercury5 only moves the per-
+     * period trigger (bit12 vs bit13). Honouring bit15 is what stops the stream
+     * cleanly: when the firmware clears EN at the end of a sound the reader goes
+     * inactive so no further (spurious) underrun is raised while it polls the
+     * flags down.
+     */
     s->play_active = (val & BACH_EN_EN) != 0;
     mstar_bach_update_irq(s);        /* fresh data queued: re-arm / maybe fire */
     mstar_bach_update_voice(s);
@@ -251,9 +336,16 @@ static uint64_t mstar_bach_read(void *opaque, hwaddr addr, unsigned size)
     Msc313BachState *s = opaque;
     uint16_t val = s->regs[addr / 4];
 
-    /* Report the live FIFO fill level (in MIU units) as the DMA drains it. */
+    /*
+     * Report the live FIFO fill level (in MIU units) as the DMA drains it. The
+     * mercury5 reader signals period completion via the underrun IRQ and is not
+     * backed by a draining voice here, so report it as always drained - this is
+     * what its streaming logic expects to see after each underrun and stops the
+     * (non-draining) snapshot FIFO from reading back as an ever-growing level.
+     */
     if (addr == BACH_RD_LEVEL) {
-        val = (uint16_t)(bach_backlog(s) >> BACH_ADDR_SHIFT);
+        val = s->mercury5_reader ? 0
+                                 : (uint16_t)(bach_backlog(s) >> BACH_ADDR_SHIFT);
     }
 
     mstar_iolog(MSTAR_BACH_BASE + addr, false, val, size);
@@ -277,7 +369,7 @@ static void mstar_bach_write(void *opaque, hwaddr addr, uint64_t val,
          * and drop the line. Then re-evaluate (e.g. an interrupt was just
          * unmasked, or it is still under threshold and armed).
          */
-        if (val & BACH_CTRL0_INT_CLEAR) {
+        if (val & bach_ctrl0_int_clear(s)) {
             s->regs[BACH_RD_CTRL8 / 4] &=
                 ~(BACH_CTRL8_UNDERRUN_FLAG | BACH_CTRL8_EMPTY_FLAG);
             s->irq_pending = false;
@@ -387,6 +479,7 @@ static void mstar_bach_realize(DeviceState *dev, Error **errp)
 
 static const Property mstar_bach_properties[] = {
     DEFINE_AUDIO_PROPERTIES(Msc313BachState, audio_be),
+    DEFINE_PROP_BOOL("mercury5-reader", Msc313BachState, mercury5_reader, false),
 };
 
 /*
