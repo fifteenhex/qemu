@@ -24,6 +24,7 @@
 #include "hw/arm/ssd202d.h"
 #include "hw/display/dsi.h"
 #include "hw/i2c/alpu.h"
+#include "hw/sd/sd.h"
 
 #define TYPE_MIYOOMINI_MACHINE MACHINE_TYPE_NAME("miyoomini")
 OBJECT_DECLARE_SIMPLE_TYPE(MiyooMiniMachineState, MIYOOMINI_MACHINE)
@@ -106,6 +107,18 @@ static void miyoomini_init(MachineState *machine)
      * than in the SoC.
      */
     i2c_slave_create_simple(MSTARV7_SOC(&s->soc)->i2c[1].bus, TYPE_ALPU, 0x3d);
+
+    /* An SD card in the slot, if the user supplied one with -drive if=sd */
+    dinfo = drive_get(IF_SD, 0, 0);
+    if (dinfo) {
+        BusState *sdbus = qdev_get_child_bus(DEVICE(&MSTARV7_SOC(&s->soc)->fcie),
+                                             "sd-bus");
+        DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+        qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
+                                &error_fatal);
+        qdev_realize_and_unref(card, sdbus, &error_fatal);
+    }
 
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU0_BASE,
                                 machine->ram);
