@@ -110,6 +110,12 @@ config INFINITY2M
     bool
     select MSTARV7
 
+config MIYOOMINI
+    bool
+    default y
+    depends on TCG && ARM
+    select INFINITY2M
+
 config MUSICPAL
     bool
     default y

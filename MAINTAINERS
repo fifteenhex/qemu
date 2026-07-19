@@ -991,6 +991,7 @@ M: Daniel Palmer <daniel@thingy.jp>
 L: qemu-arm@nongnu.org
 S: Maintained
 F: hw/arm/infinity2m.c
+F: hw/arm/miyoomini.c
 F: hw/arm/mstarv7.c
 F: hw/arm/ssd202d.c
 F: include/hw/arm/infinity2m.h
