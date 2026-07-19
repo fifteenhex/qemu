@@ -32,6 +32,18 @@ static void mst_intc_set_irq(void *opaque, int n, int level)
     MstIntcState *s = opaque;
     bool masked = s->mask[n / 16] & (1u << (n % 16));
 
+    /* MSTAR_INTC_LOG: log the first time each line fires, so a profile can diff
+     * enabled-but-never-fired lines (the unmodelled interrupts). INTID = 32 +
+     * GIC SPI = 32 + irq_start + n. */
+    if (level && getenv("MSTAR_INTC_LOG")) {
+        static uint64_t seen[4];
+        unsigned k = ((uintptr_t)s >> 4) & 3;
+        if (!((seen[k] >> n) & 1)) {
+            seen[k] |= 1ULL << n;
+            fprintf(stderr, "[intc %p] FIRE line=%d spi=%d intid=%d masked=%d\n",
+                    (void *)s, n, s->irq_start + n, 32 + s->irq_start + n, masked);
+        }
+    }
     if (level) {
         s->level |= 1ULL << n;
     } else {
@@ -72,6 +84,18 @@ static void mst_intc_write(void *opaque, hwaddr addr, uint64_t val,
     unsigned int idx = (addr & 0xf) / 4;
 
     if (addr < INTC_REV_POLARITY) {
+        /* MSTAR_INTC_LOG: report lines this write ENABLES (mask bit 1->0). */
+        if (getenv("MSTAR_INTC_LOG")) {
+            uint16_t enabled = s->mask[idx] & ~(uint16_t)val;  /* went 1 -> 0 */
+            for (int b = 0; b < 16; b++) {
+                if (enabled & (1u << b)) {
+                    int n = idx * 16 + b;
+                    fprintf(stderr, "[intc %p] ENABLE line=%d spi=%d intid=%d\n",
+                            (void *)s, n, s->irq_start + n,
+                            32 + s->irq_start + n);
+                }
+            }
+        }
         s->mask[idx] = val;
         mst_intc_update(s);
     } else if (addr < INTC_EOI) {

@@ -38,6 +38,7 @@
 #include "system/system.h"
 #include "chardev/char-fe.h"
 #include "hw/core/irq.h"
+#include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/display/mstar_gop.h"
@@ -330,6 +331,92 @@ static void mercury5_uart_event(void *opaque, QEMUChrEvent event)
 {
 }
 
+/* DEBUG: square-wave a mst-intc "irq" line to test an unmodelled interrupt. */
+typedef struct {
+    MStarSoCState *s;
+    QEMUTimer *t;
+    int line;
+    int ms;
+    bool hi;
+} Mercury5Fire;
+
+static void mercury5_fire_cb(void *opaque)
+{
+    Mercury5Fire *f = opaque;
+
+    f->hi = !f->hi;
+    qemu_set_irq(qdev_get_gpio_in(DEVICE(&f->s->intc_irq), f->line), f->hi);
+    timer_mod(f->t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + f->ms);
+}
+
+static void mercury5_fire_arm(MStarSoCState *s)
+{
+    Mercury5Fire *f = g_new0(Mercury5Fire, 1);
+
+    f->s = s;
+    f->line = atoi(getenv("M5_FIRE_LINE"));
+    f->ms = getenv("M5_FIRE_MS") ? atoi(getenv("M5_FIRE_MS")) : 20;
+    f->t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mercury5_fire_cb, f);
+    fprintf(stderr, "[M5_FIRE] pulsing intc irq line %d every %d ms\n",
+            f->line, f->ms);
+    timer_mod(f->t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + f->ms);
+}
+
+/* DEBUG: periodically write a byte into DRAM (M5_POKE="addr:val[:ms]") to force
+ * a firmware flag/gate and see if the boot advances. A gdb-free memory poke. */
+typedef struct { uint32_t addr; uint32_t val; int ms; QEMUTimer *t; } Mercury5Poke;
+
+static void mercury5_poke_cb(void *opaque)
+{
+    Mercury5Poke *p = opaque;
+    uint8_t b = p->val;
+
+    address_space_write(&address_space_memory, p->addr, MEMTXATTRS_UNSPECIFIED,
+                        &b, 1);
+    timer_mod(p->t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + p->ms);
+}
+
+static void mercury5_poke_arm(void)
+{
+    Mercury5Poke *p = g_new0(Mercury5Poke, 1);
+    char *spec = g_strdup(getenv("M5_POKE"));
+    char *c1 = strchr(spec, ':');
+    char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+
+    if (c2) {
+        *c2 = 0;
+    }
+    if (c1) {
+        *c1 = 0;
+    }
+    p->addr = strtoul(spec, NULL, 0);
+    p->val = c1 ? strtoul(c1 + 1, NULL, 0) : 1;
+    p->ms = c2 ? atoi(c2 + 1) : 200;
+    p->t = timer_new_ms(QEMU_CLOCK_VIRTUAL, mercury5_poke_cb, p);
+    fprintf(stderr, "[M5_POKE] writing [%#x]=%#x every %d ms\n",
+            p->addr, p->val, p->ms);
+    timer_mod(p->t, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 8000);
+}
+
+/* DEBUG: MSTAR_GPIO_HIGH="ADDR[:VAL[:SIZE]]" forces a single MMIO word to read
+ * VAL (default 1, SIZE default 4) - to bisect which unmodelled GPIO INPUT (our
+ * stub returns 0) the firmware reads and expects non-zero at boot. */
+typedef struct { uint32_t val; } Mercury5Force;
+static uint64_t mercury5_force_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return ((Mercury5Force *)opaque)->val;
+}
+static void mercury5_force_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+}
+static const MemoryRegionOps mercury5_force_ops = {
+    .read = mercury5_force_read,
+    .write = mercury5_force_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+
 static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
 {
     MStarSoCState *s = MSTAR_SOC(dev);
@@ -340,6 +427,26 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
     sc->parent_realize(dev, errp);
     if (*errp) {
         return;
+    }
+    if (getenv("MSTAR_GPIO_HIGH")) {
+        char *spec = g_strdup(getenv("MSTAR_GPIO_HIGH"));
+        char *c1 = strchr(spec, ':');
+        char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        Mercury5Force *f = g_new0(Mercury5Force, 1);
+        MemoryRegion *mr = g_new0(MemoryRegion, 1);
+        hwaddr addr;
+        unsigned sz;
+
+        if (c2) { *c2 = 0; }
+        if (c1) { *c1 = 0; }
+        addr = strtoul(spec, NULL, 0);
+        f->val = c1 ? strtoul(c1 + 1, NULL, 0) : 1;
+        sz = c2 ? atoi(c2 + 1) : 4;
+        memory_region_init_io(mr, OBJECT(s), &mercury5_force_ops, f,
+                              "m5.gpio-force", sz);
+        memory_region_add_subregion_overlap(get_system_memory(), addr, mr, 20);
+        fprintf(stderr, "[MSTAR_GPIO_HIGH] force [%#" HWADDR_PRIx "]=%#x sz=%u\n",
+                addr, f->val, sz);
     }
 
     for (i = 0; i < ARRAY_SIZE(mercury5_shims); i++) {
@@ -442,6 +549,19 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
         /* mst-intc "irq" line 20 -> GIC INTID 84 (vendor INT_IRQ_SC_TOP). */
         sysbus_connect_irq(SYS_BUS_DEVICE(sctop), 0,
                            qdev_get_gpio_in(DEVICE(&s->intc_irq), 20));
+    }
+
+    /*
+     * DEBUG: periodic "irq" mst-intc line pulser to pin an unmodelled interrupt.
+     * M5_FIRE_LINE=<line> square-waves that line every M5_FIRE_MS ms (default
+     * 20) so a candidate completion IRQ can be tested against the boot profile.
+     * (line = INTID - 64 for the irq intc; e.g. INTID 105 -> line 41.)
+     */
+    if (getenv("M5_FIRE_LINE")) {
+        mercury5_fire_arm(s);
+    }
+    if (getenv("M5_POKE")) {
+        mercury5_poke_arm();
     }
 }
 

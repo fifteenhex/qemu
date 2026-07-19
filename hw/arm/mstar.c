@@ -60,8 +60,38 @@ void mstar_iolog(hwaddr phys, bool write, uint64_t val, unsigned size)
     }
     if (fp) {
         uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
-        fprintf(fp, "%c %08x %u %0*x %08x\n", write ? 'W' : 'R',
-                (uint32_t)phys, size, size * 2, (uint32_t)val, pc);
+        /* Also log the link register (caller) so a profiler can attribute I/O
+         * to the calling loop, not just the leaf RIU accessor it lands in. */
+        uint32_t lr = current_cpu ? ARM_CPU(current_cpu)->env.regs[14] : 0;
+        fprintf(fp, "%c %08x %u %0*x %08x %08x", write ? 'W' : 'R',
+                (uint32_t)phys, size, size * 2, (uint32_t)val, pc, lr);
+        /* MSTAR_IOLOG_STACK: append a heuristic call chain by scanning the
+         * stack for return addresses (in-DRAM word whose predecessor is a
+         * BL/BLX) - lets the profiler unwind past the deep RIU accessor chain
+         * to the task-level loop. Opt-in: it is slow (per-access MMU reads). */
+        if (current_cpu && getenv("MSTAR_IOLOG_STACK")) {
+            CPUState *cs = current_cpu;
+            uint32_t sp = ARM_CPU(cs)->env.regs[13];
+            int found = 0;
+            for (int i = 0; i < 160 && found < 14; i++) {
+                uint32_t w, instr;
+                if (cpu_memory_rw_debug(cs, sp + i * 4, (uint8_t *)&w, 4, false))
+                    break;
+                if (w < 0x20008000 || w >= 0x21000000 || (w & 1)) {
+                    continue;
+                }
+                if (cpu_memory_rw_debug(cs, (w - 4) & ~3u, (uint8_t *)&instr, 4,
+                                        false)) {
+                    continue;
+                }
+                uint32_t op = (instr >> 24) & 0xff;      /* BL=0x_b, BLX=0xfa/fb */
+                if ((op & 0x0f) == 0x0b || op == 0xfa || op == 0xfb) {
+                    fprintf(fp, " %08x", w);
+                    found++;
+                }
+            }
+        }
+        fprintf(fp, "\n");
         fflush(fp);
     }
 }
@@ -429,6 +459,10 @@ static uint64_t mstar_chiptop_read(void *opaque, hwaddr addr, unsigned size)
 
     if (addr == MSTAR_CHIPTOP_BOND) {
         return sc->info.bond;
+    }
+    if (getenv("MSTAR_GPIO_LOG")) {
+        uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+        fprintf(stderr, "[chiptop] R +0x%03x pc=%08x\n", (int)addr, pc);
     }
     return 0;
 }
