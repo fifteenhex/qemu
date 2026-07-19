@@ -95,6 +95,7 @@ Board-specific documentation
    arm/mcimx6ul-evk
    arm/mcimx7d-sabre
    arm/imx8m
+   arm/mstarv7
    arm/orangepi
    arm/raspi
    arm/collie

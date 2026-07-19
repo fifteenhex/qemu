@@ -990,6 +990,8 @@ MStar/SigmaStar ARMv7 SoCs
 M: Daniel Palmer <daniel@thingy.jp>
 L: qemu-arm@nongnu.org
 S: Maintained
+F: docs/system/arm/mstarv7.rst
+F: docs/system/arm/mstarv7/
 F: hw/arm/infinity2m.c
 F: hw/arm/miyoomini.c
 F: hw/arm/mstarv7.c
