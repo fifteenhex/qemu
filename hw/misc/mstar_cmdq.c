@@ -55,15 +55,55 @@ static uint64_t mstar_cmdq_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+/*
+ * Register layout per the mainline kernel driver (drivers/soc/mstar/
+ * mstar-msc313-cmdq.c), 16-bit regs on a 4-byte stride, replicated for each of
+ * the up-to-3 instances the SCL uses (bases 0x000/0x600/0x800 within this
+ * region). The firmware builds a descriptor list, points START/END_PTR at it
+ * and pulses TRIG1 bit0; the engine replays the writes and latches "done"
+ * (RAW_IRQ_FINAL_IRQ bit3), which the driver waits on / the ISR clears.
+ */
+#define CMDQ_REG_TRIG1          0x0c    /* bit0 = dma_trig (kick) */
+#define CMDQ_REG_RAW_IRQ        0x110   /* bit3 = cmdq_done */
+#define CMDQ_REG_IRQ_CLEAR      0x120
+#define CMDQ_DONE_BIT           (1 << 3)
+
+static void mstar_cmdq_setw(MstarCmdqState *s, hwaddr off, uint16_t v)
+{
+    if (off + 1 < s->size) {
+        s->store[off] = v & 0xff;
+        s->store[off + 1] = (v >> 8) & 0xff;
+    }
+}
+
+static uint16_t mstar_cmdq_getw(MstarCmdqState *s, hwaddr off)
+{
+    return (off + 1 < s->size) ? s->store[off] | (s->store[off + 1] << 8) : 0;
+}
+
 static void mstar_cmdq_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     MstarCmdqState *s = opaque;
+    hwaddr base = addr & ~0x1ffULL;     /* instance base 0x000/0x600/0x800 */
+    hwaddr reg = addr & 0x1ff;          /* register offset within the instance */
     unsigned i;
 
     mstar_cmdq_dbg("W", addr, val);
     for (i = 0; i < size && addr + i < s->size; i++) {
         s->store[addr + i] = (val >> (8 * i)) & 0xff;
+    }
+
+    /* Trigger: complete synchronously and latch "done" so the firmware's
+     * wait-for-completion (poll of RAW_IRQ bit3, or the SCLIRQ_CMDQIST ISR)
+     * proceeds instead of timing out. (Our memory is coherent, so the replayed
+     * register writes have effectively already happened.) */
+    if (reg == CMDQ_REG_TRIG1 && (val & 1)) {
+        mstar_cmdq_setw(s, base + CMDQ_REG_RAW_IRQ,
+                        mstar_cmdq_getw(s, base + CMDQ_REG_RAW_IRQ)
+                        | CMDQ_DONE_BIT);
+    } else if (reg == CMDQ_REG_IRQ_CLEAR && val) {
+        mstar_cmdq_setw(s, base + CMDQ_REG_RAW_IRQ, 0);
     }
 }
 
