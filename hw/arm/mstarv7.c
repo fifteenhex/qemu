@@ -192,6 +192,8 @@ static void mstarv7_soc_init(Object *obj)
     for (i = 0; i < MSTARV7_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSTAR_I2C);
     }
+
+    object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
 }
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
@@ -304,6 +306,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         }
         sysbus_mmio_map(sbd, 0, MSTARV7_I2C_BASE + i * MSTARV7_I2C_STRIDE);
     }
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->clkgen), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
 
     /* TODO: wire up the interrupt once the GIC is modelled */
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,

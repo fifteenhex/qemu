@@ -997,6 +997,7 @@ F: hw/arm/miyoomini.c
 F: hw/arm/mstarv7.c
 F: hw/adc/mstar_sar.c
 F: hw/i2c/mstar_i2c.c
+F: hw/misc/mstar_regbank.c
 F: hw/arm/ssd202d.c
 F: hw/dma/mstar_bdma.c
 F: hw/ssi/mstar_fsp.c
@@ -1006,6 +1007,7 @@ F: include/hw/arm/mstarv7.h
 F: include/hw/arm/ssd202d.h
 F: include/hw/adc/mstar_sar.h
 F: include/hw/i2c/mstar_i2c.h
+F: include/hw/misc/mstar_regbank.h
 F: include/hw/dma/mstar_bdma.h
 F: include/hw/ssi/mstar_fsp.h
 F: include/hw/timer/mstar_timer.h
