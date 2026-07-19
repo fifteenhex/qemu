@@ -45,9 +45,11 @@ environment. Known gaps at this point:
   u-boot complains and falls back to a default 16 MiB flash type.
 * Flash writes/erases are not modelled: the erase path and the BDMA
   "write to flash" port (``0xb``) are still unimplemented.
-* The keypad/SAR inputs read as zero, which u-boot takes as a held
-  button and enters its USB upgrade path instead of booting the
-  kernel.
+* With the SAR ADC reading idle, u-boot takes the normal boot path:
+  it JPEG-decodes the boot logo (the MIPI DSI panel writes time out,
+  no display yet), reads the kernel from flash, decompresses it and
+  jumps to it. The kernel is silent from there: the GIC and the
+  interrupt fabric are the next things to model.
 
 Booting
 -------
@@ -85,3 +87,4 @@ the same commit as the device model change it describes.
    mstarv7/timer
    mstarv7/isp
    mstarv7/bdma
+   mstarv7/sar

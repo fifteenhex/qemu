@@ -11,6 +11,7 @@
 
 #include "qemu/units.h"
 #include "system/memory.h"
+#include "hw/adc/mstar_sar.h"
 #include "hw/dma/mstar_bdma.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
@@ -53,6 +54,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_BOOT_MEDIA_SPI_NOR      0x20
 #define MSTARV7_BOOT_MEDIA_NAND         0x10
 #define MSTARV7_BOOT_MEDIA_SPI_NAND     0x08
+/* The SAR ADC; boards hang keypads off its input channels */
+#define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
 /*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
@@ -117,6 +120,7 @@ struct MStarV7SoCState {
     MemoryRegion l3bridge;
     MStarBdmaState bdma;
     MStarFspState fsp;
+    MStarSarState sar;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */

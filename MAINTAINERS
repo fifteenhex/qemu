@@ -995,6 +995,7 @@ F: docs/system/arm/mstarv7/
 F: hw/arm/infinity2m.c
 F: hw/arm/miyoomini.c
 F: hw/arm/mstarv7.c
+F: hw/adc/mstar_sar.c
 F: hw/arm/ssd202d.c
 F: hw/dma/mstar_bdma.c
 F: hw/ssi/mstar_fsp.c
@@ -1002,6 +1003,7 @@ F: hw/timer/mstar_timer.c
 F: include/hw/arm/infinity2m.h
 F: include/hw/arm/mstarv7.h
 F: include/hw/arm/ssd202d.h
+F: include/hw/adc/mstar_sar.h
 F: include/hw/dma/mstar_bdma.h
 F: include/hw/ssi/mstar_fsp.h
 F: include/hw/timer/mstar_timer.h

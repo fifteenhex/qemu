@@ -110,6 +110,11 @@ RIU blocks
      - ISP "FSP" flash sequencer; see :doc:`isp`
      - partly
      - ``prev``, ``rom``
+   * - ``0x1f002800``
+     - ``0x14``
+     - SAR ADC; see :doc:`sar`
+     - yes
+     - ``linux``, ``prev``, ``rom``
    * - ``0x1f002e00``
      - ``0x17``
      - ISP QSPI configuration
