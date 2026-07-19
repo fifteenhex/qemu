@@ -58,6 +58,11 @@ The infinity2m IMI SRAM is modelled as 64 KiB: the boot ROM uses
 addresses up to ``0xa000f8a5`` (``rom``) so it is at least that big,
 but the true size has not been confirmed.
 
+The RIU and PERIPHBASE regions are covered by low priority stub
+regions in the model: unmodelled registers read as zero, writes are
+ignored, and both are logged with ``-d unimp`` (``model``). On real
+hardware at least some unmodelled registers will behave differently.
+
 The Cortex-A7 CBAR reads back the PERIPHBASE value, ``0x16000000``.
 The GIC distributor is at offset ``0x1000`` and the CPU interface at
 offset ``0x2000`` from PERIPHBASE (``dts``).

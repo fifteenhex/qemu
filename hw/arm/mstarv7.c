@@ -16,6 +16,7 @@
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "hw/arm/mstarv7.h"
+#include "hw/misc/unimp.h"
 #include "target/arm/cpu-qom.h"
 
 static void mstarv7_soc_init(Object *obj)
@@ -60,6 +61,16 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     }
     memory_region_add_subregion(get_system_memory(), MSTARV7_IMI_BASE,
                                 &s->imi);
+
+    /*
+     * Cover the register regions with low priority stubs so that
+     * accesses to unmodelled registers read as zero and get logged
+     * instead of faulting. Real device models overlay these.
+     */
+    create_unimplemented_device("mstarv7.riu",
+                                MSTARV7_RIU_BASE, MSTARV7_RIU_SIZE);
+    create_unimplemented_device("mstarv7.periphbase",
+                                MSTARV7_PERIPHBASE, MSTARV7_PERIPHBASE_SIZE);
 }
 
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)

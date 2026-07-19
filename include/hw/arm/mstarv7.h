@@ -25,11 +25,16 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  * Source: mainline Linux arch/arm/boot/dts/mstar-v7.dtsi
  */
 /* Start of DRAM, the MIU0 address space */
-#define MSTARV7_MIU0_BASE   0x20000000
+#define MSTARV7_MIU0_BASE       0x20000000
+/* The RIU register bus, where almost all peripherals live */
+#define MSTARV7_RIU_BASE        0x1f000000
+#define MSTARV7_RIU_SIZE        0x00400000
 /* Cortex-A7 PERIPHBASE (read back via CBAR); the GIC lives in here */
-#define MSTARV7_PERIPHBASE  0x16000000
+#define MSTARV7_PERIPHBASE      0x16000000
+/* SCU/GIC/timer private region size, from the Cortex-A7 MPCore TRM */
+#define MSTARV7_PERIPHBASE_SIZE 0x8000
 /* IMI SRAM; the size varies between SoCs */
-#define MSTARV7_IMI_BASE    0xa0000000
+#define MSTARV7_IMI_BASE        0xa0000000
 
 struct MStarV7SoCState {
     /*< private >*/
