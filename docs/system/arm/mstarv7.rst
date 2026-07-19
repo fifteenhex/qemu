@@ -18,23 +18,36 @@ The QEMU models mirror that structure as a QOM class hierarchy:
 Emulated devices and known limitations
 --------------------------------------
 
-* Two Cortex-A7 cores. The secondary core is held in reset; the
-  register interface that releases it is not modelled yet, so SMP
-  kernels will only bring up the boot core.
-* 128 MiB of in-package DDR3 at the start of the MIU0 address space.
+* Two Cortex-A7 cores. The secondary core is modelled as powered
+  off; on real hardware it runs the mask ROM and parks in the
+  smpctrl mailbox loop, so SMP release is not modelled yet.
+* 128 MiB of in-package DDR3, mirrored through the MIU window so
+  the IPL's wrap-around size probe works.
 * 64 KiB of IMI SRAM.
 * The PM UART, on the first serial port. No interrupt yet.
-* The three timers, without their interrupts.
-* The DID boot-media strap, reporting SPI NOR boot.
-* The FSP flash sequencer (commands complete but do not touch a real
-  flash model yet) and the SPI NOR XIP window, filled from the
-  ``-drive if=mtd`` image.
-* The BDMA engine, without its interrupts.
+* The three timers, the DID boot-media strap (SPI NOR), the BDMA
+  engine, the FSP flash sequencer, the SPI NOR XIP window (filled
+  from the ``-drive if=mtd`` image), an MIU DDR controller stub and
+  the l3bridge barrier.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
-  image overrides it). With no IPL to load it prints
-  ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which
-  matches what the real ROM would do with nothing to boot.
-* No other peripherals are modelled yet.
+  image overrides it). With no flash image it prints
+  ``Check IPL Header failed! [HALT]`` and halts, matching the real
+  ROM with nothing to boot.
+* No GIC or interrupt delivery yet.
+
+With the Miyoo Mini firmware image attached the whole vendor boot
+chain runs: mask ROM, IPL (DRAM sizing and memory BIST pass),
+IPL_CUST (checksum passes, finds the MXP partition table), then
+u-boot 2015.01 decompresses, detects the flash and reads its
+environment. Known gaps at this point:
+
+* Flash JEDEC ID reads zero (no SPI flash model behind the FSP), so
+  u-boot complains and falls back to a default 16 MiB flash type.
+* Flash writes/erases are not modelled: the erase path and the BDMA
+  "write to flash" port (``0xb``) are still unimplemented.
+* The keypad/SAR inputs read as zero, which u-boot takes as a held
+  button and enters its USB upgrade path instead of booting the
+  kernel.
 
 Booting
 -------

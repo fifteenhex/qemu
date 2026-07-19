@@ -82,6 +82,14 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_MIU_DDFSET_L_VALUE      0x8000
 #define MSTARV7_MIU_DDFSET_H_VALUE      0x0029
 /*
+ * The l3bridge, used as a write barrier: software pokes the trigger
+ * and polls the flush done bit, per mainline's mstarv7 barrier code.
+ */
+#define MSTARV7_L3BRIDGE_BASE   (MSTARV7_RIU_BASE + 0x204400)
+#define MSTARV7_L3BRIDGE_SIZE   0x200
+#define MSTARV7_L3BRIDGE_STATUS 0x40
+#define MSTARV7_L3BRIDGE_STATUS_DONE (1 << 12)
+/*
  * The three timers (timer@6040/6080/60c0 in the device trees). The
  * boot ROM uses the first to time its flash operations.
  */
@@ -106,6 +114,7 @@ struct MStarV7SoCState {
     MemoryRegion imi;
     MemoryRegion did;
     MemoryRegion miu;
+    MemoryRegion l3bridge;
     MStarBdmaState bdma;
     MStarFspState fsp;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];

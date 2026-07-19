@@ -174,9 +174,11 @@ RIU blocks
      - ``prev``, ``rom``
    * - ``0x1f204400``
      - ``0x1022``
-     - "l3bridge" MIU write-flush barrier
-     - no
-     - ``prev``
+     - "l3bridge" MIU write-flush barrier: poke the trigger at
+       ``+0x14``, poll done (bit 12) at ``+0x40``. Modelled as always
+       flushed
+     - yes
+     - ``prev``, ``linux``, confirmed by the IPL's barrier polls
    * - ``0x1f206400``
      - ``0x1032``
      - CPU PLL

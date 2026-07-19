@@ -93,6 +93,32 @@ static const MemoryRegionOps mstarv7_miu_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The l3bridge write barrier: all writes are accepted and every
+ * flush reads as already complete, which is true for us since our
+ * memory accesses complete synchronously.
+ */
+static uint64_t mstarv7_l3bridge_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == MSTARV7_L3BRIDGE_STATUS) {
+        return MSTARV7_L3BRIDGE_STATUS_DONE;
+    }
+    return 0;
+}
+
+static void mstarv7_l3bridge_write(void *opaque, hwaddr addr, uint64_t val,
+                                   unsigned size)
+{
+}
+
+static const MemoryRegionOps mstarv7_l3bridge_ops = {
+    .read = mstarv7_l3bridge_read,
+    .write = mstarv7_l3bridge_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -163,6 +189,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.miu", MSTARV7_MIU_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU_BASE,
                                 &s->miu);
+
+    memory_region_init_io(&s->l3bridge, OBJECT(dev), &mstarv7_l3bridge_ops,
+                          s, "mstarv7.l3bridge", MSTARV7_L3BRIDGE_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTARV7_L3BRIDGE_BASE,
+                                &s->l3bridge);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->bdma), errp)) {
         return;
