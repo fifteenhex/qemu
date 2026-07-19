@@ -41,8 +41,8 @@ believed to share this layout.
    * - ``0x14000000``
      - ``0x1000000``
      - SPI NOR XIP read window (ISP/QSPI controller)
-     - no
-     - ``prev``
+     - yes
+     - ``prev``, ``rom``
    * - ``0x16000000``
      - ``0x8000``
      - Cortex-A7 PERIPHBASE (SCU, GIC, private timers)
@@ -104,9 +104,8 @@ RIU blocks
      - ``prev``
    * - ``0x1f002c00``
      - ``0x16``
-     - ISP "FSP" flash sequencer; the boot ROM polls ``0x1f002db8``
-       on its SPI NOR path
-     - no
+     - ISP "FSP" flash sequencer; see :doc:`isp`
+     - partly
      - ``prev``, ``rom``
    * - ``0x1f002e00``
      - ``0x17``

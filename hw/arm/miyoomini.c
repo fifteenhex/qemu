@@ -14,6 +14,9 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
+#include "system/blockdev.h"
+#include "system/block-backend-global-state.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/arm/boot.h"
@@ -56,6 +59,7 @@ static void miyoomini_init(MachineState *machine)
 {
     MiyooMiniMachineState *s = MIYOOMINI_MACHINE(machine);
     MStarV7SoCState *soc;
+    DriveInfo *dinfo;
 
     /* The DRAM is inside the SoC package so its size is fixed */
     if (machine->ram_size != SSD202D_DRAM_SIZE) {
@@ -66,6 +70,14 @@ static void miyoomini_init(MachineState *machine)
     }
 
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_SSD202D_SOC);
+
+    /* The SPI NOR image (-drive if=mtd) appears in the XIP window */
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive_err(DEVICE(&MSTARV7_SOC(&s->soc)->fsp), "drive",
+                                blk_by_legacy_dinfo(dinfo), &error_fatal);
+    }
+
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
 
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU0_BASE,

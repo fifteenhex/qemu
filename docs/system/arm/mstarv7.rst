@@ -26,6 +26,9 @@ Emulated devices and known limitations
 * The PM UART, on the first serial port. No interrupt yet.
 * The three timers, without their interrupts.
 * The DID boot-media strap, reporting SPI NOR boot.
+* The FSP flash sequencer (commands complete but do not touch a real
+  flash model yet) and the SPI NOR XIP window, filled from the
+  ``-drive if=mtd`` image.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no IPL to load it prints
   ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which
@@ -35,8 +38,15 @@ Emulated devices and known limitations
 Booting
 -------
 
-With no kernel argument the machine boots into the ROM. A kernel can
-also be loaded directly into DRAM with the usual options:
+With no kernel argument the machine boots into the ROM, and with a
+flash image attached the ROM finds and verifies the IPL in it:
+
+.. code-block:: bash
+
+  $ qemu-system-arm -M miyoomini -drive if=mtd,format=raw,file=nor.bin \
+      -nographic
+
+A kernel can also be loaded directly into DRAM with the usual options:
 
 .. code-block:: bash
 
@@ -59,3 +69,4 @@ the same commit as the device model change it describes.
    mstarv7/memory-map
    mstarv7/bootrom
    mstarv7/timer
+   mstarv7/isp

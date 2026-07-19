@@ -71,6 +71,8 @@ static void mstarv7_soc_init(Object *obj)
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_MSTAR_TIMER);
     }
+
+    object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
 }
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
@@ -118,6 +120,12 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.did", MSTARV7_DID_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_DID_BASE,
                                 &s->did);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->fsp), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->fsp), 0, MSTARV7_FSP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->fsp), 1, MSTARV7_ISP_XIP_BASE);
 
     /* TODO: wire up the interrupt once the GIC is modelled */
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,

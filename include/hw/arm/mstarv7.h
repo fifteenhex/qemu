@@ -9,7 +9,9 @@
 #ifndef HW_ARM_MSTARV7_H
 #define HW_ARM_MSTARV7_H
 
+#include "qemu/units.h"
 #include "system/memory.h"
+#include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
 #include "target/arm/cpu.h"
 #include "qom/object.h"
@@ -47,6 +49,12 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_BOOT_MEDIA_NAND         0x10
 #define MSTARV7_BOOT_MEDIA_SPI_NAND     0x08
 /*
+ * The ISP SPI NOR controller: the FSP command sequencer bank and the
+ * memory mapped XIP read window the flash contents appear in.
+ */
+#define MSTARV7_FSP_BASE        (MSTARV7_RIU_BASE + 0x2c00)
+#define MSTARV7_ISP_XIP_BASE    0x14000000
+/*
  * The three timers (timer@6040/6080/60c0 in the device trees). The
  * boot ROM uses the first to time its flash operations.
  */
@@ -70,6 +78,7 @@ struct MStarV7SoCState {
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     MemoryRegion imi;
     MemoryRegion did;
+    MStarFspState fsp;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */
