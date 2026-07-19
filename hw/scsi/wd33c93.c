@@ -12,6 +12,15 @@
 #include "hw/core/irq.h"
 #include "hw/scsi/wd33c93.h"
 #include "migration/vmstate.h"
+#include "qemu/timer.h"
+
+/*
+ * Command latency model: after a command is written the chip needs a
+ * short time before it reflects Command-In-Progress in its status
+ * (assertion latency), and a little longer before the command runs.
+ */
+#define WD33C93_CMD_ASSERT_NS 2000
+#define WD33C93_CMD_DELAY_NS  4000
 
 #define DPRINTF(...) do { \
     if (0) { \
@@ -32,6 +41,26 @@ static void wd33c93_do_int(WD33C93State *s, uint8_t scsi_stat)
 static uint8_t wd33c93_read_aux_stat(WD33C93State *s)
 {
 	uint8_t dbr = 0;
+
+	if (s->cmd_in_progress) {
+		int64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+		                  s->cmd_write_ns;
+
+		/*
+		 * A real WD33C93 does not update its status the instant a
+		 * command is written: for a short assertion latency it still
+		 * looks idle, then it reports Command-In-Progress / Busy
+		 * until the command actually runs.  A driver that samples the
+		 * status inside the assertion window (i.e. without the
+		 * inter-access delays the chip needs) sees a stale "idle"
+		 * status and races ahead.
+		 */
+		if (elapsed < WD33C93_CMD_ASSERT_NS) {
+			return s->auxstat;
+		}
+		return s->auxstat | WD33C93_REG_AUXILIARYSTAT_CIP |
+		       WD33C93_REG_AUXILIARYSTAT_BUSY;
+	}
 
 	switch (s->state) {
 	case WD33C93_TI_IN:
@@ -567,6 +596,23 @@ static void wd33c93_cmd_sel_atn_tfr(WD33C93State *s)
 	}
 }
 
+/*
+ * Nanoseconds the chip takes to accept and start a written command.
+ * A driver that polls the auxiliary status faster than this (i.e.
+ * without the inter-access delays real hardware needs) will observe
+ * Command-In-Progress and must wait; one that doesn't will race.
+ */
+
+static void wd33c93_do_cmd(WD33C93State *s, uint8_t cmd);
+
+static void wd33c93_cmd_timer(void *opaque)
+{
+	WD33C93State *s = opaque;
+
+	s->cmd_in_progress = false;
+	wd33c93_do_cmd(s, s->pending_cmd);
+}
+
 static void wd33c93_do_cmd(WD33C93State *s, uint8_t cmd)
 {
 	bool single = cmd & WD33C93_CMD_SBT;
@@ -714,7 +760,17 @@ static void wd33c93_write(void *opaque, hwaddr addr, uint64_t value,
     	case WD33C93_REG_SCSISTATUS:
     		break;
     	case WD33C93_REG_COMMAND:
-    		wd33c93_do_cmd(s, value);
+    		/*
+    		 * Model the real chip's command latency: report
+    		 * Command-In-Progress until the timer fires and the
+    		 * command actually runs.
+    		 */
+    		s->pending_cmd = value;
+    		s->cmd_in_progress = true;
+    		s->cmd_write_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    		timer_mod(s->cmd_timer,
+    		          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+    		          WD33C93_CMD_DELAY_NS);
     		break;
     	case WD33C93_REG_DATA:
     		wd33c93_handle_data_write(s, value);
@@ -744,6 +800,10 @@ static void wd33c93_reset(DeviceState *dev)
 	s->auxstat = 0;
 	s->scsistatus = 0;
 	s->cmdphase = 0;
+	s->cmd_in_progress = false;
+	if (s->cmd_timer) {
+		timer_del(s->cmd_timer);
+	}
 }
 
 static void wd33c93_transfer_data(SCSIRequest *req, uint32_t len)
@@ -838,6 +898,7 @@ static void wd33c93_init(Object *obj)
 	WD33C93State *s = WD33C93(obj);
 
 	fifo8_create(&s->fifo, WD33C93_REG_FIFO_SZ);
+	s->cmd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wd33c93_cmd_timer, s);
 }
 
 static void wd33c93_finalize(Object *obj)

@@ -62,6 +62,17 @@ struct WD33C93State {
     /* raised while a dma-mode transfer wants servicing */
     qemu_irq drq;
 
+    /*
+     * A written command is processed after a short delay, during which
+     * the chip reports Command-In-Progress / Busy, modelling the real
+     * WD33C93 so a driver that polls status faster than the chip
+     * updates it (i.e. without inter-access delays) misbehaves.
+     */
+    QEMUTimer *cmd_timer;
+    uint8_t pending_cmd;
+    bool cmd_in_progress;
+    int64_t cmd_write_ns;
+
     /* select-and-transfer runs the whole transaction on its own */
     bool sat_active;
     /* registers 0x03..0x0e double as the cdb for select-and-transfer */
@@ -135,6 +146,8 @@ struct WD33C93State {
 #define WD33C93_REG_DATA               0x19
 #define WD33C93_REG_AUXILIARYSTAT      0x1f
 #define WD33C93_REG_AUXILIARYSTAT_DBR  (1 << 0)
+#define WD33C93_REG_AUXILIARYSTAT_CIP  (1 << 4)
+#define WD33C93_REG_AUXILIARYSTAT_BUSY (1 << 5)
 #define WD33C93_REG_AUXILIARYSTAT_INT  (1 << 7)
 
 /* single byte transfer flag on transfer info */
