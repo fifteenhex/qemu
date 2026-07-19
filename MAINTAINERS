@@ -990,7 +990,9 @@ MStar/SigmaStar ARMv7 SoCs
 M: Daniel Palmer <daniel@thingy.jp>
 L: qemu-arm@nongnu.org
 S: Maintained
+F: hw/arm/infinity2m.c
 F: hw/arm/mstarv7.c
+F: include/hw/arm/infinity2m.h
 F: include/hw/arm/mstarv7.h
 
 Musicpal
