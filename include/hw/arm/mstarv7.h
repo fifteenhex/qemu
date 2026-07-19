@@ -9,6 +9,7 @@
 #ifndef HW_ARM_MSTARV7_H
 #define HW_ARM_MSTARV7_H
 
+#include "system/memory.h"
 #include "target/arm/cpu.h"
 #include "qom/object.h"
 
@@ -27,6 +28,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_MIU0_BASE   0x20000000
 /* Cortex-A7 PERIPHBASE (read back via CBAR); the GIC lives in here */
 #define MSTARV7_PERIPHBASE  0x16000000
+/* IMI SRAM; the size varies between SoCs */
+#define MSTARV7_IMI_BASE    0xa0000000
 
 struct MStarV7SoCState {
     /*< private >*/
@@ -34,6 +37,7 @@ struct MStarV7SoCState {
     /*< public >*/
 
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
+    MemoryRegion imi;
 };
 
 struct MStarV7SoCClass {
@@ -43,6 +47,8 @@ struct MStarV7SoCClass {
 
     /* Number of Cortex-A7 cores in this SoC */
     unsigned num_cpus;
+    /* Size of the IMI SRAM */
+    uint64_t imi_size;
 };
 
 #endif /* HW_ARM_MSTARV7_H */

@@ -9,6 +9,7 @@
 #ifndef HW_ARM_INFINITY2M_H
 #define HW_ARM_INFINITY2M_H
 
+#include "qemu/units.h"
 #include "hw/arm/mstarv7.h"
 
 #define TYPE_INFINITY2M_SOC "infinity2m-soc"
@@ -16,6 +17,12 @@ OBJECT_DECLARE_TYPE(Infinity2MSoCState, Infinity2MSoCClass, INFINITY2M_SOC)
 
 /* All infinity2m SoCs are dual core */
 #define INFINITY2M_NUM_CPUS 2
+
+/*
+ * The boot ROM uses IMI addresses up to 0xa000f8a5 so the SRAM is at
+ * least 64 KiB; the true size has not been confirmed.
+ */
+#define INFINITY2M_IMI_SIZE (64 * KiB)
 
 struct Infinity2MSoCState {
     /*< private >*/

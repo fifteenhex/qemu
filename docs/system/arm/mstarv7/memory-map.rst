@@ -14,6 +14,7 @@ trusted:
 * ``linux`` -- mainline Linux driver code
 * ``sdk`` -- vendor SDK sources or headers
 * ``hw`` -- verified against real hardware
+* ``rom`` -- derived from analysing a dump of the boot ROM
 * ``prev`` -- the previous QEMU branch; jumbled and known to contain
   mistakes, so treat as a hint only until confirmed elsewhere
 * ``model`` -- a choice made for the emulation, not a hardware fact
@@ -50,8 +51,12 @@ believed to share this layout.
    * - ``0xa0000000``
      - per SoC
      - IMI SRAM
-     - no
+     - yes
      - ``dts``
+
+The infinity2m IMI SRAM is modelled as 64 KiB: the boot ROM uses
+addresses up to ``0xa000f8a5`` (``rom``) so it is at least that big,
+but the true size has not been confirmed.
 
 The Cortex-A7 CBAR reads back the PERIPHBASE value, ``0x16000000``.
 The GIC distributor is at offset ``0x1000`` and the CPU interface at

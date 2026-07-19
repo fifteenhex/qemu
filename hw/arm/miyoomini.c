@@ -10,10 +10,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "hw/core/boards.h"
+#include "hw/core/loader.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/ssd202d.h"
@@ -29,6 +31,26 @@ struct MiyooMiniMachineState {
     SSD202DSoCState soc;
     struct arm_boot_info binfo;
 };
+
+static void miyoomini_load_bootrom(MachineState *machine, SSD202DSoCState *soc)
+{
+    const char *bios_name = machine->firmware ?: SSD202D_BOOTROM_FILENAME;
+    g_autofree char *filename = NULL;
+
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    if (!filename) {
+        error_report("Could not find boot ROM image '%s'", bios_name);
+        if (!machine->kernel_filename) {
+            /* Nothing to run without a boot ROM or a kernel */
+            exit(1);
+        }
+        return;
+    }
+    if (load_image_mr(filename, &soc->bootrom) < 0) {
+        error_report("Failed to load boot ROM image '%s'", filename);
+        exit(1);
+    }
+}
 
 static void miyoomini_init(MachineState *machine)
 {
@@ -48,6 +70,8 @@ static void miyoomini_init(MachineState *machine)
 
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU0_BASE,
                                 machine->ram);
+
+    miyoomini_load_bootrom(machine, &s->soc);
 
     soc = MSTARV7_SOC(&s->soc);
     s->binfo.loader_start = MSTARV7_MIU0_BASE;

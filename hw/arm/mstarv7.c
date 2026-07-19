@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "system/address-spaces.h"
 #include "hw/arm/mstarv7.h"
 #include "target/arm/cpu-qom.h"
 
@@ -31,6 +32,7 @@ static void mstarv7_soc_init(Object *obj)
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();
     MStarV7SoCState *s = MSTARV7_SOC(dev);
     MStarV7SoCClass *msc = MSTARV7_SOC_GET_CLASS(dev);
     int i;
@@ -50,6 +52,14 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
+
+    memory_region_init_ram(&s->imi, OBJECT(dev), "mstarv7.imi",
+                           msc->imi_size, errp);
+    if (*errp) {
+        return;
+    }
+    memory_region_add_subregion(get_system_memory(), MSTARV7_IMI_BASE,
+                                &s->imi);
 }
 
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)
