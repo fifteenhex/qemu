@@ -28,8 +28,12 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  *
  * Source: mainline Linux arch/arm/boot/dts/mstar-v7.dtsi
  */
-/* Start of DRAM, the MIU0 address space */
+/*
+ * Start of DRAM, the MIU0 address space. The window decodes 512 MiB;
+ * smaller DRAM wraps within it, which is how the IPL sizes memory.
+ */
 #define MSTARV7_MIU0_BASE       0x20000000
+#define MSTARV7_MIU0_WINDOW     (512 * MiB)
 /* The RIU register bus, where almost all peripherals live */
 #define MSTARV7_RIU_BASE        0x1f000000
 #define MSTARV7_RIU_SIZE        0x00400000

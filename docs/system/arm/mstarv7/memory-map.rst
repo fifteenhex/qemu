@@ -54,10 +54,13 @@ believed to share this layout.
      - no
      - ``dts``
    * - ``0x20000000``
-     - DRAM size
-     - DRAM (MIU0)
+     - ``0x20000000``
+     - DRAM (MIU0). The window decodes 512 MiB and smaller DRAM wraps
+       within it; the IPL sizes memory by writing markers and finding
+       where they alias, so the model mirrors DRAM through the window
      - yes
-     - ``dts``
+     - ``dts``; window size and wrapping ``prev``, confirmed by the
+       IPL detecting "128MB" under the model
    * - ``0xa0000000``
      - per SoC
      - IMI SRAM

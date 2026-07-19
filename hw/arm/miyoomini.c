@@ -60,6 +60,7 @@ static void miyoomini_init(MachineState *machine)
     MiyooMiniMachineState *s = MIYOOMINI_MACHINE(machine);
     MStarV7SoCState *soc;
     DriveInfo *dinfo;
+    uint64_t offset;
 
     /* The DRAM is inside the SoC package so its size is fixed */
     if (machine->ram_size != SSD202D_DRAM_SIZE) {
@@ -82,6 +83,21 @@ static void miyoomini_init(MachineState *machine)
 
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU0_BASE,
                                 machine->ram);
+
+    /*
+     * The DRAM wraps in the MIU window; the IPL sizes memory by
+     * writing markers and looking for where they alias back.
+     */
+    for (offset = machine->ram_size;
+         offset + machine->ram_size <= MSTARV7_MIU0_WINDOW;
+         offset += machine->ram_size) {
+        MemoryRegion *mirror = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(mirror, OBJECT(machine), "miyoomini.mirror",
+                                 machine->ram, 0, machine->ram_size);
+        memory_region_add_subregion(get_system_memory(),
+                                    MSTARV7_MIU0_BASE + offset, mirror);
+    }
 
     miyoomini_load_bootrom(machine, &s->soc);
 
