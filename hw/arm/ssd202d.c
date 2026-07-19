@@ -13,6 +13,9 @@
 #include "system/address-spaces.h"
 #include "hw/arm/ssd202d.h"
 
+/* The SSD202D's chiptop package bond strap value */
+#define SSD202D_BOND    0x1e
+
 static void ssd202d_soc_realize(DeviceState *dev, Error **errp)
 {
     ERRP_GUARD();
@@ -37,7 +40,9 @@ static void ssd202d_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     SSD202DSoCClass *sc = SSD202D_SOC_CLASS(oc);
+    MStarV7SoCClass *msc = MSTARV7_SOC_CLASS(oc);
 
+    msc->bond = SSD202D_BOND;
     device_class_set_parent_realize(dc, ssd202d_soc_realize,
                                     &sc->parent_realize);
 }

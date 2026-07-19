@@ -30,8 +30,11 @@ Emulated devices and known limitations
   from the ``-drive if=mtd`` image), an MIU DDR controller stub and
   the l3bridge barrier.
 * The two HWI2C masters, the SAR ADC (its channels the Miyoo Mini's
-  keypad), the clkgen readback register bank and, on the Miyoo Mini,
-  the board's ALPU-FA authentication chip (see :doc:`mstarv7/alpu`).
+  keypad) and, on the Miyoo Mini, the board's ALPU-FA authentication
+  chip (see :doc:`mstarv7/alpu`).
+* The clkgen clock block (see :doc:`mstarv7/clocks`) and the chiptop
+  pinctrl / strap block (see :doc:`mstarv7/pinctrl`), both readback
+  register banks, the chiptop also returning the package bond strap.
 * The MIPI DSI output path (see :doc:`mstarv7/dsi`): the DSI
   controller, the D-PHY and, on the board, the panel it drives.
 * The display controller (see :doc:`mstarv7/display`): the GOP
@@ -129,3 +132,5 @@ the same commit as the device model change it describes.
    mstarv7/alpu
    mstarv7/dsi
    mstarv7/display
+   mstarv7/clocks
+   mstarv7/pinctrl

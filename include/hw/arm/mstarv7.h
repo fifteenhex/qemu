@@ -81,6 +81,17 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  * is written; modelled as plain storage.
  */
 #define MSTARV7_CLKGEN_BASE     (MSTARV7_RIU_BASE + 0x207000)
+/*
+ * The "chiptop" block: the pin-mux (pinctrl) pad control together with
+ * the chip straps. The package "bond" strap at +0x120 identifies the
+ * package/DRAM variant (0x1d SSD201/64 MiB, 0x1e SSD202D/128 MiB).
+ * Software programs the pad-mux registers and reads them back, so the
+ * block is modelled as readback storage plus the read-only bond strap.
+ */
+#define MSTARV7_CHIPTOP_BASE    (MSTARV7_RIU_BASE + 0x203c00)
+#define MSTARV7_CHIPTOP_SIZE    0x200
+#define MSTARV7_CHIPTOP_NUM_REGS (MSTARV7_CHIPTOP_SIZE / 4)
+#define MSTARV7_CHIPTOP_BOND    0x120
 /* The two HWI2C masters (i2c@223000 and i2c@223200) */
 #define MSTARV7_NUM_I2C         2
 #define MSTARV7_I2C_BASE        (MSTARV7_RIU_BASE + 0x223000)
@@ -192,6 +203,8 @@ struct MStarV7SoCState {
     MStarSarState sar;
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
+    MemoryRegion chiptop;
+    uint16_t chiptop_regs[MSTARV7_CHIPTOP_NUM_REGS];
     MStarDsiState dsi;
     MStarDphyState dphy;
     MStarDispState disp;
@@ -212,6 +225,8 @@ struct MStarV7SoCClass {
     uint64_t imi_size;
     /* Input clock of the timers in Hz */
     uint32_t timer_freq;
+    /* Package "bond" strap value read back from the chiptop block */
+    uint16_t bond;
 };
 
 #endif /* HW_ARM_MSTARV7_H */

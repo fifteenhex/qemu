@@ -168,9 +168,9 @@ RIU blocks
      - ``prev``, ``rom`` (BIST poll seen from the IPL)
    * - ``0x1f203c00``
      - ``0x101e``
-     - "chiptop": package bond strap at ``+0x120`` (``0x1e`` =
-       SSD202D/128 MiB); the boot ROM pokes ``+0x140``/``+0x14c``
-     - no
+     - "chiptop" pinctrl / straps; bond strap at ``+0x120``
+       (``0x1e`` = SSD202D/128 MiB). See :doc:`pinctrl`
+     - yes
      - ``prev``, ``rom``
    * - ``0x1f204000``
      - ``0x1020``
@@ -192,6 +192,11 @@ RIU blocks
      - CPU PLL
      - no
      - ``prev``
+   * - ``0x1f207000``
+     - ``0x1038``
+     - clkgen clock mux/gate block; see :doc:`clocks`
+     - yes
+     - ``prev``, ``linux``
    * - ``0x1f225000``
      - ``0x1128``
      - Display top (frame timing, vsync); see :doc:`display`

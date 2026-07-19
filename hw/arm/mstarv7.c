@@ -167,6 +167,38 @@ static const MemoryRegionOps mstarv7_l3bridge_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The chiptop block: the pinctrl pad-mux plus the chip straps. The
+ * pad-mux registers read back what software writes; the package bond
+ * strap at +0x120 reads the SoC's bond value.
+ */
+static uint64_t mstarv7_chiptop_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarV7SoCState *s = MSTARV7_SOC(opaque);
+    MStarV7SoCClass *msc = MSTARV7_SOC_GET_CLASS(opaque);
+
+    if (addr == MSTARV7_CHIPTOP_BOND) {
+        return msc->bond;
+    }
+    return s->chiptop_regs[addr / 4];
+}
+
+static void mstarv7_chiptop_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    MStarV7SoCState *s = MSTARV7_SOC(opaque);
+
+    s->chiptop_regs[addr / 4] = val;
+}
+
+static const MemoryRegionOps mstarv7_chiptop_ops = {
+    .read = mstarv7_chiptop_read,
+    .write = mstarv7_chiptop_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -337,6 +369,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
+
+    memory_region_init_io(&s->chiptop, OBJECT(dev), &mstarv7_chiptop_ops, s,
+                          "mstarv7.chiptop", MSTARV7_CHIPTOP_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTARV7_CHIPTOP_BASE,
+                                &s->chiptop);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dsi), errp)) {
         return;
