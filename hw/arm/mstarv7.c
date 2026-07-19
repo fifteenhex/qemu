@@ -196,6 +196,8 @@ static void mstarv7_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
+    object_initialize_child(obj, "dsi", &s->dsi, TYPE_MSTAR_DSI);
+    object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
 }
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
@@ -334,6 +336,16 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dsi), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->dsi), 0, MSTARV7_DSI_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dphy), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->dphy), 0, MSTARV7_DPHY_BASE);
 
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
                    MSTARV7_PM_UART_REGSHIFT,

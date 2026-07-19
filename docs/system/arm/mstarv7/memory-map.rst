@@ -192,6 +192,16 @@ RIU blocks
      - CPU PLL
      - no
      - ``prev``
+   * - ``0x1f2a5000``
+     - ``0x152800``
+     - MIPI D-PHY; see :doc:`dsi`
+     - yes
+     - ``prev``
+   * - ``0x1f345200``
+     - ``0x1a290``
+     - MIPI DSI controller (MediaTek clone); see :doc:`dsi`
+     - yes
+     - ``linux``, ``prev``, ``rom``
    * - ``0x1f221000``
      - ``0x1108``
      - PM UART, 16550 compatible, registers on an 8 byte stride

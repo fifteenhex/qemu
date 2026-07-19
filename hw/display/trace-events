@@ -226,3 +226,9 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# mstar_dsi.c
+mstar_dsi_packet(const char *kind, uint8_t data_type, uint8_t cmd, uint32_t arg) "%s dt=0x%02x cmd=0x%02x arg=%u"
+
+# dsi_panel.c
+dsi_dcs_panel_cmd(uint8_t data_type, uint8_t cmd, uint32_t len) "dt=0x%02x cmd=0x%02x len=%u"

@@ -32,6 +32,10 @@ Emulated devices and known limitations
 * The two HWI2C masters, the SAR ADC (its channels the Miyoo Mini's
   keypad), the clkgen readback register bank and, on the Miyoo Mini,
   the board's ALPU-FA authentication chip (see :doc:`mstarv7/alpu`).
+* The MIPI DSI output path (see :doc:`mstarv7/dsi`): the DSI
+  controller, the D-PHY and, on the board, the panel it drives. The
+  GOP/framebuffer front end that feeds pixels into it is not modelled
+  yet, so nothing is scanned out.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
@@ -52,9 +56,10 @@ environment. Known gaps at this point:
 * Flash writes/erases are not modelled: the erase path and the BDMA
   "write to flash" port (``0xb``) are still unimplemented.
 * With the SAR ADC reading idle, u-boot takes the normal boot path:
-  it JPEG-decodes the boot logo (the MIPI DSI panel writes time out,
-  no display yet), reads the kernel from flash, decompresses it and
-  jumps to it.
+  it JPEG-decodes the boot logo and sends the panel its DCS init
+  sequence over the modelled DSI link (no more command timeout,
+  though nothing is scanned out yet), reads the kernel from flash,
+  decompresses it and jumps to it.
 
 The vendor 4.9 kernel then boots to userspace: it brings CPU1 online
 through the smpctrl mailbox, mounts the squashfs root filesystem,
@@ -71,9 +76,11 @@ kernel log, dump DRAM from the monitor (``pmemsave 0x20000000
 0x8000000 mem.bin``) and read the printk ring buffer out of it. Why
 the vendor driver rejects the UART has not been run down.
 
-Remaining gaps on the way to a usable system: no display/GOP or MIPI
-DSI (MainUI blocks on it), no SD/FCIE controller (the vendor driver
-retries it throughout boot) and no SPI flash write/erase path.
+Remaining gaps on the way to a usable system: the DSI output path is
+modelled but the GOP/framebuffer front end that feeds it is not, so
+MainUI has no scanout to draw to; no SD/FCIE controller (the vendor
+driver retries it throughout boot); and no SPI flash write/erase
+path.
 
 Booting
 -------
@@ -113,3 +120,4 @@ the same commit as the device model change it describes.
    mstarv7/bdma
    mstarv7/sar
    mstarv7/alpu
+   mstarv7/dsi

@@ -1001,6 +1001,9 @@ F: hw/i2c/mstar_i2c.c
 F: hw/intc/mstar_intc.c
 F: hw/misc/mstar_regbank.c
 F: hw/arm/ssd202d.c
+F: hw/display/dsi_panel.c
+F: hw/display/mstar_dphy.c
+F: hw/display/mstar_dsi.c
 F: hw/dma/mstar_bdma.c
 F: hw/ssi/mstar_fsp.c
 F: hw/timer/mstar_timer.c
@@ -1012,6 +1015,9 @@ F: include/hw/i2c/alpu.h
 F: include/hw/i2c/mstar_i2c.h
 F: include/hw/intc/mstar_intc.h
 F: include/hw/misc/mstar_regbank.h
+F: include/hw/display/dsi.h
+F: include/hw/display/mstar_dphy.h
+F: include/hw/display/mstar_dsi.h
 F: include/hw/dma/mstar_bdma.h
 F: include/hw/ssi/mstar_fsp.h
 F: include/hw/timer/mstar_timer.h

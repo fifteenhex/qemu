@@ -22,6 +22,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/ssd202d.h"
+#include "hw/display/dsi.h"
 #include "hw/i2c/alpu.h"
 
 #define TYPE_MIYOOMINI_MACHINE MACHINE_TYPE_NAME("miyoomini")
@@ -61,6 +62,7 @@ static void miyoomini_init(MachineState *machine)
     MiyooMiniMachineState *s = MIYOOMINI_MACHINE(machine);
     MStarV7SoCState *soc;
     DriveInfo *dinfo;
+    DeviceState *panel;
     uint64_t offset;
 
     /* The DRAM is inside the SoC package so its size is fixed */
@@ -79,6 +81,17 @@ static void miyoomini_init(MachineState *machine)
         qdev_prop_set_drive_err(DEVICE(&MSTARV7_SOC(&s->soc)->fsp), "drive",
                                 blk_by_legacy_dinfo(dinfo), &error_fatal);
     }
+
+    /*
+     * The panel is board specific: it hangs off the SoC's DSI
+     * controller on the point-to-point MIPI link. Create it and link
+     * it to the controller before the SoC (and its DSI) is realized.
+     */
+    panel = qdev_new(TYPE_DSI_DCS_PANEL);
+    object_property_add_child(OBJECT(machine), "panel", OBJECT(panel));
+    qdev_realize_and_unref(panel, NULL, &error_fatal);
+    object_property_set_link(OBJECT(&MSTARV7_SOC(&s->soc)->dsi), "panel",
+                             OBJECT(panel), &error_fatal);
 
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
 
