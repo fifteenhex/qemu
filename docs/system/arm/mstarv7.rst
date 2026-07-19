@@ -29,14 +29,17 @@ Emulated devices and known limitations
   engine, the FSP flash sequencer, the SPI NOR XIP window (filled
   from the ``-drive if=mtd`` image), an MIU DDR controller stub and
   the l3bridge barrier.
+* The two HWI2C masters, the SAR ADC (its channels the Miyoo Mini's
+  keypad), the clkgen readback register bank and, on the Miyoo Mini,
+  the board's ALPU-FA authentication chip (see :doc:`mstarv7/alpu`).
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
   ROM with nothing to boot.
 * The GIC-400 and the Cortex-A7 generic timers, so the kernel gets
-  timer interrupts. Peripheral interrupts still go nowhere: the two
-  mst-intc instances between the peripherals and the GIC are not
-  modelled yet.
+  timer interrupts, and the two mst-intc instances that funnel the
+  peripheral interrupts onto GIC SPIs (the PM UART's line is routed
+  through them).
 
 With the Miyoo Mini firmware image attached the whole vendor boot
 chain runs: mask ROM, IPL (DRAM sizing and memory BIST pass),
@@ -51,10 +54,26 @@ environment. Known gaps at this point:
 * With the SAR ADC reading idle, u-boot takes the normal boot path:
   it JPEG-decodes the boot logo (the MIPI DSI panel writes time out,
   no display yet), reads the kernel from flash, decompresses it and
-  jumps to it. The kernel comes up silently (no console output yet),
-  brings CPU1 online through the smpctrl mailbox and starts probing:
-  it currently parks polling the HWI2C master at ``0x1f223200``,
-  which is the next thing to model.
+  jumps to it.
+
+The vendor 4.9 kernel then boots to userspace: it brings CPU1 online
+through the smpctrl mailbox, mounts the squashfs root filesystem,
+loads the Sigmastar vendor modules, and its init scripts run through
+to launching the MainUI application (which then waits on the
+unmodelled display).
+
+The kernel's own log (dmesg) does not reach the serial port: the
+vendor kernel's 8250 driver probes the PM UART, reports its type as
+"unknown" and never attaches its printk console to it. Userspace,
+however, opens the tty normally, so all of init's output and an
+interactive shell **do** appear on the first serial port. To see the
+kernel log, dump DRAM from the monitor (``pmemsave 0x20000000
+0x8000000 mem.bin``) and read the printk ring buffer out of it. Why
+the vendor driver rejects the UART has not been run down.
+
+Remaining gaps on the way to a usable system: no display/GOP or MIPI
+DSI (MainUI blocks on it), no SD/FCIE controller (the vendor driver
+retries it throughout boot) and no SPI flash write/erase path.
 
 Booting
 -------
