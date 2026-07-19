@@ -90,6 +90,17 @@ static const Mercury5Shim mercury5_shims[] = {
      */
     { "mstar.mercury5-utmi0-caend", MSTAR_RIU_BASE + 0x004478, 4, 0x02 },
     { "mstar.mercury5-utmi1-caend", MSTAR_RIU_BASE + 0x285278, 4, 0x02 },
+    /*
+     * Trigger/done handshake block at 0x1f004a00 (RTOS setup at 0x201fe8a0): the
+     * firmware arms it (saves 0x4a30, clears bit0 of 0x4a20) then spins on
+     * "0x1f004a28 & BIT12 == done" (poll at 0x201fe8f0). With the block unmodelled
+     * the catch-all returns 0, so the awaited bit never sets and the owning RTOS
+     * task blocks - the single hottest unmodelled access, ~18k reads/boot (it
+     * yields each spin, so other tasks keep running). Report the done bit set so
+     * it proceeds. The block sits in the 0x1f004xxx USB/PM region; the exact
+     * subsystem is not yet identified (the function has no A32 callers).
+     */
+    { "mstar.mercury5-4a28-done", MSTAR_RIU_BASE + 0x004a28, 4, 0x1000 },
 };
 
 static uint64_t mercury5_shim_read(void *opaque, hwaddr addr, unsigned size)
