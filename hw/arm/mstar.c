@@ -850,12 +850,29 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, MSTAR_GPIO_BASE);
+    /*
+     * The four interrupt-capable spi0 pads drive "fiq" mst-intc lines 28..31
+     * (kernel gpio-msc313: interrupt-parent = <&intc_fiq>, hwirq ((off-0x1c0)>>2)
+     * + 28). The block has no interrupt registers; the intc does the masking.
+     */
+    for (i = 0; i < MSC313_GPIO_NUM_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), i,
+                           qdev_get_gpio_in(DEVICE(&s->intc_fiq),
+                                            MSTAR_GPIO_SPI0_FIQ_LINE + i));
+    }
 
     /* PM-domain GPIO bank (carries the SD card-detect). */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->pm_gpio), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_gpio), 0, MSTAR_PM_GPIO_BASE);
+    /*
+     * The PM-bank pads route through the "pm-intc" (each pad -> line (off>>2)+2)
+     * which funnels to the "irq" mst-intc; model that aggregate as a single line.
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->pm_gpio), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTAR_PM_GPIO_IRQ_LINE));
 
     /* rtcpwc: RTC power/wake controller (infinity2m/SSD20xD + mercury5). */
     if (sc->info.has_rtcpwc) {

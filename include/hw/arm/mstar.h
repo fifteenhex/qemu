@@ -352,6 +352,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Msc313GpioState, MSC313_GPIO)
 
 #define MSTAR_GPIO_NUM_REGS 0x200
 
+/*
+ * Only the four spi0 pads (spi0_cz/ck/di/do) are interrupt-capable on the
+ * msc313e/ssc8336 GPIO controller; the kernel gpio-msc313 hierarchical irqchip
+ * (msc313e_gpio_child_to_parent_hwirq) maps them to the "fiq" mst-intc lines
+ * 28..31. The block itself has no interrupt registers - the pad edge drives the
+ * parent intc line, which does the masking. These are our IRQ output lines.
+ */
+#define MSC313_GPIO_NUM_IRQS 4
+
 struct Msc313GpioState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -359,6 +368,8 @@ struct Msc313GpioState {
     MemoryRegion iomem;
     uint8_t regs[MSTAR_GPIO_NUM_REGS];
     uint32_t buttons;       /* bitmask of pressed board buttons (QOM property) */
+    uint32_t spi0;          /* injected input level of the 4 spi0 IRQ pads */
+    qemu_irq irq[MSC313_GPIO_NUM_IRQS];     /* spi0 pads -> "fiq" intc 28..31 */
     bool gpioi2c;           /* enable the bit-banged SCCB bus (camera SoCs) */
     /*
      * The camera firmware bit-bangs one Linux i2c-gpio bus on this pad bank
@@ -393,6 +404,15 @@ struct MstarPmGpioState {
     uint16_t regs[MSTAR_PM_GPIO_NUM_REGS];
     bool card_present;      /* an SD card is inserted (drives SD_CDZ low) */
     uint32_t buttons;       /* pressed PM-bank buttons: bit0 down, bit1 left */
+    /*
+     * Unlike the main GPIO block, the PM-domain pads have per-pad interrupt bits
+     * (mainline gpio-msc313-pm.c: IRQ_MASK bit4, IRQ_CLEAR bit6, IRQ_TYPE bit7).
+     * Each pad maps to a "pm-intc" line ((off>>2)+2) that funnels to the "irq"
+     * mst-intc; we model the per-pad pending latch and a single aggregate output.
+     */
+    uint8_t pending[MSTAR_PM_GPIO_NUM_REGS];    /* per-pad latched interrupt */
+    uint8_t in_last[MSTAR_PM_GPIO_NUM_REGS];    /* last sampled input level */
+    qemu_irq irq;           /* aggregate pm-gpio interrupt -> "irq" intc line 2 */
 };
 
 /*
@@ -1001,10 +1021,14 @@ struct Msc313BachState {
 /* The "msc313-gpio" pad register bank (reg = <0x207800 0x200>). */
 #define MSTAR_GPIO_BASE             (MSTAR_RIU_BASE + 0x207800)
 #define MSTAR_GPIO_SIZE             MSTAR_GPIO_NUM_REGS
+/* spi0 pads' first "fiq" mst-intc line (spi0_cz..spi0_do -> 28..31). */
+#define MSTAR_GPIO_SPI0_FIQ_LINE    28
 
 /* The "pm_gpio" bank (gpio_pm@1e00): PM-domain pads incl. the SD card-detect. */
 #define MSTAR_PM_GPIO_BASE          (MSTAR_RIU_BASE + 0x001e00)
 #define MSTAR_PM_GPIO_SIZE          0x200
+/* Aggregate PM-bank interrupt: the pm-intc funnels to "irq" mst-intc line 2. */
+#define MSTAR_PM_GPIO_IRQ_LINE      2
 
 /* The "fsp" flash controller (the ISP block's second register window). */
 #define MSTAR_FSP_BASE          (MSTAR_RIU_BASE + 0x2c00)

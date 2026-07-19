@@ -51,6 +51,56 @@
 #define PM_GPIO_KEY_LEFT    0x12c
 #define PM_GPIO_IN          (1 << 2)
 
+/*
+ * Per-pad interrupt control bits (mainline gpio-msc313-pm.c). The pad's edge is
+ * latched here and reported through a single aggregate output: the hardware
+ * routes each pad to a "pm-intc" line ((off>>2)+2) that funnels to the "irq"
+ * mst-intc, so at the delivery level the whole bank is one interrupt.
+ */
+#define PM_GPIO_IRQ_MASK    (1 << 4)
+#define PM_GPIO_IRQ_CLEAR   (1 << 6)
+#define PM_GPIO_IRQ_TYPE    (1 << 7)
+
+/* The current input level (0/1) of a pad register, from its board signal. */
+static int mstar_pm_gpio_in_level(MstarPmGpioState *s, unsigned int reg)
+{
+    hwaddr addr = reg * 4;
+
+    if (addr == PM_GPIO_SD_CDZ) {
+        return s->card_present ? 0 : 1;         /* active low */
+    } else if (addr == PM_GPIO_KEY_DOWN) {
+        return (s->buttons & 1u) ? 0 : 1;       /* active low */
+    } else if (addr == PM_GPIO_KEY_LEFT) {
+        return (s->buttons & 2u) ? 0 : 1;
+    }
+    return (s->regs[reg] & PM_GPIO_IN) ? 1 : 0;
+}
+
+/*
+ * Re-sample every pad, latch a pending interrupt on the falling (assert) edge of
+ * an unmasked pad (the board signals here are all active-low), and drive the
+ * aggregate output = OR of the unmasked pending pads.
+ */
+static void mstar_pm_gpio_update(MstarPmGpioState *s)
+{
+    unsigned int reg;
+    int active = 0;
+
+    for (reg = 0; reg < MSTAR_PM_GPIO_NUM_REGS; reg++) {
+        int level = mstar_pm_gpio_in_level(s, reg);
+        bool masked = s->regs[reg] & PM_GPIO_IRQ_MASK;
+
+        if (level == 0 && s->in_last[reg] == 1 && !masked) {
+            s->pending[reg] = 1;
+        }
+        s->in_last[reg] = level;
+        if (s->pending[reg] && !masked) {
+            active = 1;
+        }
+    }
+    qemu_set_irq(s->irq, active);
+}
+
 static uint64_t mstar_pm_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
     MstarPmGpioState *s = opaque;
@@ -80,6 +130,13 @@ static void mstar_pm_gpio_write(void *opaque, hwaddr addr, uint64_t val,
     MstarPmGpioState *s = opaque;
 
     s->regs[addr / 4] = val;
+
+    /* A write with IRQ_CLEAR set acknowledges/clears that pad's pending edge. */
+    if (val & PM_GPIO_IRQ_CLEAR) {
+        s->pending[addr / 4] = 0;
+    }
+    /* Re-evaluate: an (un)mask or clear changes the aggregate output. */
+    mstar_pm_gpio_update(s);
 }
 
 static const MemoryRegionOps mstar_pm_gpio_ops = {
@@ -93,8 +150,16 @@ static const MemoryRegionOps mstar_pm_gpio_ops = {
 static void mstar_pm_gpio_reset_hold(Object *obj, ResetType type)
 {
     MstarPmGpioState *s = MSTAR_PM_GPIO(obj);
+    unsigned int reg;
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->pending, 0, sizeof(s->pending));
+    /* Sample the initial input levels so a present card / held key isn't
+     * mistaken for an edge at the first poll. */
+    for (reg = 0; reg < MSTAR_PM_GPIO_NUM_REGS; reg++) {
+        s->in_last[reg] = mstar_pm_gpio_in_level(s, reg);
+    }
+    qemu_set_irq(s->irq, 0);
 }
 
 static void mstar_pm_gpio_get_buttons(Object *obj, Visitor *v, const char *name,
@@ -116,6 +181,8 @@ static void mstar_pm_gpio_set_buttons(Object *obj, Visitor *v, const char *name,
         return;
     }
     s->buttons = value;
+    /* A press/release can be an interrupt edge on a key pad. */
+    mstar_pm_gpio_update(s);
 }
 
 static void mstar_pm_gpio_realize(DeviceState *dev, Error **errp)
@@ -128,6 +195,9 @@ static void mstar_pm_gpio_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &mstar_pm_gpio_ops, s,
                           "mstar.pm-gpio", MSTAR_PM_GPIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /* Aggregate PM-bank interrupt (wired to the "irq" mst-intc pm-intc line). */
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
     /*
      * Live-settable bitmask of the pressed PM-bank buttons (bit0 = down,
@@ -144,6 +214,8 @@ static const VMStateDescription vmstate_mstar_pm_gpio = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16_ARRAY(regs, MstarPmGpioState, MSTAR_PM_GPIO_NUM_REGS),
+        VMSTATE_UINT8_ARRAY(pending, MstarPmGpioState, MSTAR_PM_GPIO_NUM_REGS),
+        VMSTATE_UINT8_ARRAY(in_last, MstarPmGpioState, MSTAR_PM_GPIO_NUM_REGS),
         VMSTATE_END_OF_LIST()
     },
 };

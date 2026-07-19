@@ -42,6 +42,40 @@ static const struct { uint8_t sda, scl; } gpio_i2c_pads[MSTAR_GPIO_NUM_I2C] = {
 #define GPIO_OEN    (1 << 5)
 
 /*
+ * The four spi0 pads are the only interrupt-capable pins (kernel
+ * msc313e_gpio_child_to_parent_hwirq: pads at offsets 0x1c0..0x1cc -> parent
+ * "fiq" mst-intc line ((off-0x1c0)>>2)+28). The GPIO block has no interrupt
+ * enable/type/status of its own; the pad level feeds the intc line directly and
+ * the intc does the masking. So each output IRQ just follows its pad's input.
+ * The pad input is injected via the "spi0" property (bit i = pad i level).
+ */
+static const uint16_t msc313_gpio_irq_off[MSC313_GPIO_NUM_IRQS] = {
+    0x1c0, 0x1c4, 0x1c8, 0x1cc,     /* spi0_cz, spi0_ck, spi0_di, spi0_do */
+};
+
+/* If addr is one of the spi0 IRQ pads, return its index, else -1. */
+static int msc313_gpio_irq_index(hwaddr addr)
+{
+    unsigned int i;
+
+    for (i = 0; i < MSC313_GPIO_NUM_IRQS; i++) {
+        if (msc313_gpio_irq_off[i] == addr) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void msc313_gpio_update_irq(Msc313GpioState *s)
+{
+    unsigned int i;
+
+    for (i = 0; i < MSC313_GPIO_NUM_IRQS; i++) {
+        qemu_set_irq(s->irq[i], (s->spi0 >> i) & 1);
+    }
+}
+
+/*
  * The board buttons wired to this pad bank (Miyoo Mini, from the 6.5 device
  * tree gpio-keys node; confirmed against the running firmware, which polls
  * exactly these pad offsets). Each button pulls its pad to the active level
@@ -107,6 +141,12 @@ static uint64_t msc313_gpio_read(void *opaque, hwaddr addr, unsigned size)
         }
     }
 
+    /* An spi0 IRQ pad: its input bit reflects the injected level. */
+    level = msc313_gpio_irq_index(addr);
+    if (level >= 0) {
+        return ((s->spi0 >> level) & 1) ? (v | GPIO_IN) : (v & ~GPIO_IN);
+    }
+
     level = msc313_gpio_button_level(s, addr);
     if (level >= 0) {
         /* A button pad: its input bit reflects the (physical) button level. */
@@ -170,6 +210,8 @@ static void msc313_gpio_reset_hold(Object *obj, ResetType type)
 
     memset(s->regs, 0, sizeof(s->regs));
     s->buttons = 0;
+    s->spi0 = 0;
+    msc313_gpio_update_irq(s);
 }
 
 static void msc313_gpio_get_buttons(Object *obj, Visitor *v, const char *name,
@@ -193,13 +235,42 @@ static void msc313_gpio_set_buttons(Object *obj, Visitor *v, const char *name,
     s->buttons = value;
 }
 
+static void msc313_gpio_get_spi0(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Msc313GpioState *s = MSC313_GPIO(obj);
+    uint32_t value = s->spi0;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void msc313_gpio_set_spi0(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    Msc313GpioState *s = MSC313_GPIO(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    s->spi0 = value;
+    msc313_gpio_update_irq(s);
+}
+
 static void msc313_gpio_realize(DeviceState *dev, Error **errp)
 {
     Msc313GpioState *s = MSC313_GPIO(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    unsigned int i;
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &msc313_gpio_ops, s,
                           "mstar.msc313-gpio", MSTAR_GPIO_SIZE);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_mmio(sbd, &s->iomem);
+
+    /* One output per interrupt-capable spi0 pad (wired to "fiq" intc 28..31). */
+    for (i = 0; i < MSC313_GPIO_NUM_IRQS; i++) {
+        sysbus_init_irq(sbd, &s->irq[i]);
+    }
 
     /*
      * A live-settable bitmask of the pressed board buttons (see mstar_buttons);
@@ -210,12 +281,21 @@ static void msc313_gpio_realize(DeviceState *dev, Error **errp)
                         NULL, NULL);
 
     /*
+     * Injected input level of the four interrupt-capable spi0 pads (bit i = pad
+     * i); setting it drives the corresponding "fiq" mst-intc line 28+i, e.g.
+     * `qom-set /machine/soc/gpio spi0=1` raises spi0_cz's interrupt.
+     */
+    object_property_add(OBJECT(dev), "spi0", "uint32",
+                        msc313_gpio_get_spi0, msc313_gpio_set_spi0,
+                        NULL, NULL);
+
+    /*
      * Bit-banged SCCB (camera SoCs): create both i2c-gpio buses + their bit-bang
      * engines so the board can attach the module EEPROM (bus 0) and the sensor
      * (bus 1). See gpio_i2c_pads[] for the pads.
      */
     if (s->gpioi2c) {
-        for (unsigned int i = 0; i < MSTAR_GPIO_NUM_I2C; i++) {
+        for (i = 0; i < MSTAR_GPIO_NUM_I2C; i++) {
             g_autofree char *name = g_strdup_printf("gpioi2c%u", i);
             s->i2c_bus[i] = i2c_init_bus(dev, name);
             s->bbi2c[i] = g_new0(bitbang_i2c_interface, 1);
@@ -235,6 +315,7 @@ static const VMStateDescription vmstate_mstar_msc313_gpio = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, Msc313GpioState, MSTAR_GPIO_NUM_REGS),
         VMSTATE_INT32_ARRAY(sda_level, Msc313GpioState, MSTAR_GPIO_NUM_I2C),
+        VMSTATE_UINT32(spi0, Msc313GpioState),
         VMSTATE_END_OF_LIST()
     },
 };
