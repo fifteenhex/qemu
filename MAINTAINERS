@@ -999,6 +999,7 @@ F: hw/arm/ssd202d.c
 F: include/hw/arm/infinity2m.h
 F: include/hw/arm/mstarv7.h
 F: include/hw/arm/ssd202d.h
+F: pc-bios/ssd202d_bootrom.bin
 
 Musicpal
 M: Jan Kiszka <jan.kiszka@web.de>
