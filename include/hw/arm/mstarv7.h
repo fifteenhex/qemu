@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "system/memory.h"
 #include "hw/adc/mstar_sar.h"
+#include "hw/cpu/a15mpcore.h"
 #include "hw/dma/mstar_bdma.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
@@ -42,6 +43,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_PERIPHBASE      0x16000000
 /* SCU/GIC/timer private region size, from the Cortex-A7 MPCore TRM */
 #define MSTARV7_PERIPHBASE_SIZE 0x8000
+/* GIC-400 SPI count, from the previous branch */
+#define MSTARV7_GIC_NUM_SPI     128
 /* IMI SRAM; the size varies between SoCs */
 #define MSTARV7_IMI_BASE        0xa0000000
 /*
@@ -114,6 +117,7 @@ struct MStarV7SoCState {
     /*< public >*/
 
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
+    A15MPPrivState a7mpcore;
     MemoryRegion imi;
     MemoryRegion did;
     MemoryRegion miu;

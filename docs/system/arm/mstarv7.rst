@@ -33,7 +33,10 @@ Emulated devices and known limitations
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
   ROM with nothing to boot.
-* No GIC or interrupt delivery yet.
+* The GIC-400 and the Cortex-A7 generic timers, so the kernel gets
+  timer interrupts. Peripheral interrupts still go nowhere: the two
+  mst-intc instances between the peripherals and the GIC are not
+  modelled yet.
 
 With the Miyoo Mini firmware image attached the whole vendor boot
 chain runs: mask ROM, IPL (DRAM sizing and memory BIST pass),

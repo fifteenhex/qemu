@@ -105,6 +105,7 @@ config MARVELL_88W8618
 
 config MSTARV7
     bool
+    select A15MPCORE
     select MSTAR_SAR
     select MSTAR_BDMA
     select MSTAR_FSP

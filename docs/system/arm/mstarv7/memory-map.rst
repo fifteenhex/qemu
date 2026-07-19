@@ -46,7 +46,7 @@ believed to share this layout.
    * - ``0x16000000``
      - ``0x8000``
      - Cortex-A7 PERIPHBASE (SCU, GIC, private timers)
-     - no
+     - yes
      - ``dts``
    * - ``0x1f000000``
      - ``0x400000``

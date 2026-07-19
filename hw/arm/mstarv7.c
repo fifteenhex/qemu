@@ -18,6 +18,7 @@
 #include "system/address-spaces.h"
 #include "hw/arm/mstarv7.h"
 #include "hw/char/serial-mm.h"
+#include "hw/intc/arm_gic_common.h"
 #include "hw/misc/unimp.h"
 #include "hw/core/qdev-properties.h"
 #include "system/system.h"
@@ -135,6 +136,8 @@ static void mstarv7_soc_init(Object *obj)
                                 TYPE_MSTAR_TIMER);
     }
 
+    object_initialize_child(obj, "a7mpcore", &s->a7mpcore,
+                            TYPE_A15MPCORE_PRIV);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSTAR_BDMA);
     object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSTAR_SAR);
@@ -161,6 +164,30 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         if (!qdev_realize(DEVICE(cpu), NULL, errp)) {
             return;
         }
+    }
+
+    /*
+     * The Cortex-A7 MPCore private region: SCU, GIC-400 distributor
+     * at +0x1000 and CPU interface at +0x2000, and the timer PPIs.
+     */
+    qdev_prop_set_uint32(DEVICE(&s->a7mpcore), "num-cpu", msc->num_cpus);
+    qdev_prop_set_uint32(DEVICE(&s->a7mpcore), "num-irq",
+                         MSTARV7_GIC_NUM_SPI + GIC_INTERNAL);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->a7mpcore), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->a7mpcore), 0, MSTARV7_PERIPHBASE);
+    for (i = 0; i < msc->num_cpus; i++) {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->a7mpcore);
+        DeviceState *cpu = DEVICE(&s->cpus[i]);
+
+        sysbus_connect_irq(sbd, i, qdev_get_gpio_in(cpu, ARM_CPU_IRQ));
+        sysbus_connect_irq(sbd, i + msc->num_cpus,
+                           qdev_get_gpio_in(cpu, ARM_CPU_FIQ));
+        sysbus_connect_irq(sbd, i + 2 * msc->num_cpus,
+                           qdev_get_gpio_in(cpu, ARM_CPU_VIRQ));
+        sysbus_connect_irq(sbd, i + 3 * msc->num_cpus,
+                           qdev_get_gpio_in(cpu, ARM_CPU_VFIQ));
     }
 
     memory_region_init_ram(&s->imi, OBJECT(dev), "mstarv7.imi",
