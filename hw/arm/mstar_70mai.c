@@ -13,6 +13,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qapi/error.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/i2c/i2c.h"
 #include "mstar-soc.h"
 
 static void mai70_board_init(MStarSoCState *soc)
@@ -29,7 +32,22 @@ static void mai70_board_init(MStarSoCState *soc)
      */
     i2c_slave_create_simple(soc->i2c[0].bus, TYPE_SC7A30E, 0x1d);
 
-    /* TODO: image sensor (IMX307) once the record pipeline reaches capture. */
+    /*
+     * Sony IMX307 (IMX307LEF) MIPI image sensor - the camera front-end. It sits
+     * on the mercury5 camera i2c masters (i2c@222a00/222c00 = DrvI2c channels
+     * 2/3); 16-bit register addressing (I2C_FMT_A16D8). The firmware's
+     * DrvSensorIFGetSensorID only logs the id (no hard chip-id compare), so the
+     * generic cam-sensor model (ACK + register readback) is enough to make the
+     * sensor "present" so its blind init table applies without NAKing. Attach to
+     * both channels since the firmware picks the channel per config.
+     * NB not exercised yet: the camera path is only entered at VID_PREVIEW.
+     */
+    for (int ch = 2; ch <= 3; ch++) {
+        I2CSlave *snr = i2c_slave_new(TYPE_MSTAR_CAM_SENSOR, 0x1a);
+
+        qdev_prop_set_uint8(DEVICE(snr), "reg-bytes", 2);
+        i2c_slave_realize_and_unref(snr, soc->i2c[ch].bus, &error_abort);
+    }
 }
 
 static void mai70_machine_class_init(ObjectClass *oc, const void *data)
