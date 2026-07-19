@@ -16,7 +16,9 @@
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "hw/arm/mstarv7.h"
+#include "hw/char/serial-mm.h"
 #include "hw/misc/unimp.h"
+#include "system/system.h"
 #include "target/arm/cpu-qom.h"
 
 static void mstarv7_soc_init(Object *obj)
@@ -71,6 +73,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                                 MSTARV7_RIU_BASE, MSTARV7_RIU_SIZE);
     create_unimplemented_device("mstarv7.periphbase",
                                 MSTARV7_PERIPHBASE, MSTARV7_PERIPHBASE_SIZE);
+
+    /* TODO: wire up the interrupt once the GIC is modelled */
+    serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
+                   MSTARV7_PM_UART_REGSHIFT, NULL, MSTARV7_PM_UART_BAUDBASE,
+                   serial_hd(0), DEVICE_LITTLE_ENDIAN);
 }
 
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)

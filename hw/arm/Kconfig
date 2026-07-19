@@ -105,6 +105,7 @@ config MARVELL_88W8618
 
 config MSTARV7
     bool
+    select SERIAL_MM
     select UNIMP
 
 config INFINITY2M

@@ -67,6 +67,26 @@ The Cortex-A7 CBAR reads back the PERIPHBASE value, ``0x16000000``.
 The GIC distributor is at offset ``0x1000`` and the CPU interface at
 offset ``0x2000`` from PERIPHBASE (``dts``).
 
+RIU blocks
+----------
+
+.. list-table::
+   :header-rows: 1
+
+   * - Address
+     - Bank
+     - Block
+     - Modelled
+     - Source
+   * - ``0x1f221000``
+     - ``0x1108``
+     - PM UART, 16550 compatible, registers on an 8 byte stride
+     - yes
+     - ``dts``, ``rom``
+
+The interrupt routing of the PM UART is not known yet; the model does
+not raise an interrupt (``model``).
+
 RIU addressing
 --------------
 

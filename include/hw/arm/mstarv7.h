@@ -35,6 +35,14 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_PERIPHBASE_SIZE 0x8000
 /* IMI SRAM; the size varies between SoCs */
 #define MSTARV7_IMI_BASE        0xa0000000
+/*
+ * The PM UART, a 16550 with the registers on an 8 byte stride. The
+ * boot ROM prints its messages here.
+ */
+#define MSTARV7_PM_UART_BASE    (MSTARV7_RIU_BASE + 0x221000)
+#define MSTARV7_PM_UART_REGSHIFT 3
+/* The real UART clock is unknown; this only affects the reported baud */
+#define MSTARV7_PM_UART_BAUDBASE 115200
 
 struct MStarV7SoCState {
     /*< private >*/

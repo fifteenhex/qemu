@@ -22,7 +22,9 @@ Emulated devices and known limitations
   register interface that releases it is not modelled yet, so SMP
   kernels will only bring up the boot core.
 * 128 MiB of in-package DDR3 at the start of the MIU0 address space.
-* No peripherals are modelled yet, not even a UART.
+* 64 KiB of IMI SRAM.
+* The PM UART, on the first serial port. No interrupt yet.
+* No other peripherals are modelled yet.
 
 Booting
 -------
