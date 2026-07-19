@@ -55,3 +55,4 @@ the same commit as the device model change it describes.
    :maxdepth: 1
 
    mstarv7/memory-map
+   mstarv7/bootrom

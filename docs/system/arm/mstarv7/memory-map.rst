@@ -38,6 +38,11 @@ believed to share this layout.
      - Boot ROM (see note below)
      - yes
      - ``rom``
+   * - ``0x14000000``
+     - ``0x1000000``
+     - SPI NOR XIP read window (ISP/QSPI controller)
+     - no
+     - ``prev``
    * - ``0x16000000``
      - ``0x8000``
      - Cortex-A7 PERIPHBASE (SCU, GIC, private timers)
@@ -77,8 +82,9 @@ ignored, and both are logged with ``-d unimp`` (``model``). On real
 hardware at least some unmodelled registers will behave differently.
 
 The Cortex-A7 CBAR reads back the PERIPHBASE value, ``0x16000000``.
-The GIC distributor is at offset ``0x1000`` and the CPU interface at
-offset ``0x2000`` from PERIPHBASE (``dts``).
+The GIC is a GIC-400 (GICv2): distributor at ``0x16001000``, CPU
+interface at ``0x16002000`` (``dts``), hypervisor and virtual CPU
+interfaces at ``0x16004000``/``0x16006000``, 128 SPIs (``prev``).
 
 RIU blocks
 ----------
@@ -91,6 +97,75 @@ RIU blocks
      - Block
      - Modelled
      - Source
+   * - ``0x1f001000``
+     - ``0x08``
+     - ISP SPI NOR controller, core registers
+     - no
+     - ``prev``
+   * - ``0x1f002c00``
+     - ``0x16``
+     - ISP "FSP" flash sequencer; the boot ROM polls ``0x1f002db8``
+       on its SPI NOR path
+     - no
+     - ``prev``, ``rom``
+   * - ``0x1f002e00``
+     - ``0x17``
+     - ISP QSPI configuration
+     - no
+     - ``prev``
+   * - ``0x1f003c00``
+     - ``0x1e``
+     - CHIPID; reads ``0xf0`` on SSD20xD
+     - no
+     - ``prev``
+   * - ``0x1f006040``
+     - ``0x30``
+     - Timer 0: the boot ROM programs it and times its SPI NOR
+       timeouts on the counter at ``+0x10``/``+0x14``
+     - no
+     - ``dts``, ``rom``
+   * - ``0x1f007000``
+     - ``0x38``
+     - "DID": boot-media strap in ``DID_KEY`` at ``+0x1c0``
+       (see below)
+     - no
+     - ``prev``, ``rom``
+   * - ``0x1f201310``
+     - ``0x1009``
+     - "FIQ" mst-intc, 32 lines onto GIC SPI 96+
+     - no
+     - ``prev``
+   * - ``0x1f201350``
+     - ``0x1009``
+     - "IRQ" mst-intc, 64 lines onto GIC SPI 32+
+     - no
+     - ``prev``
+   * - ``0x1f202000``
+     - ``0x1010``
+     - MIU DDR controller
+     - no
+     - ``prev``
+   * - ``0x1f203c00``
+     - ``0x101e``
+     - "chiptop": package bond strap at ``+0x120`` (``0x1e`` =
+       SSD202D/128 MiB); the boot ROM pokes ``+0x140``/``+0x14c``
+     - no
+     - ``prev``, ``rom``
+   * - ``0x1f204000``
+     - ``0x1020``
+     - "smpctrl" CPU1 boot mailbox (see the boot ROM page)
+     - no
+     - ``prev``, ``rom``
+   * - ``0x1f204400``
+     - ``0x1022``
+     - "l3bridge" MIU write-flush barrier
+     - no
+     - ``prev``
+   * - ``0x1f206400``
+     - ``0x1032``
+     - CPU PLL
+     - no
+     - ``prev``
    * - ``0x1f221000``
      - ``0x1108``
      - PM UART, 16550 compatible, registers on an 8 byte stride
@@ -98,7 +173,18 @@ RIU blocks
      - ``dts``, ``rom``
 
 The interrupt routing of the PM UART is not known yet; the model does
-not raise an interrupt (``model``).
+not raise an interrupt (``model``). The previous branch has it on
+"IRQ" mst-intc line 34 with a 172 MHz clock (``prev``).
+
+The boot-media strap in ``DID_KEY`` (``0x1f0071c0``, vendor register
+``0x70``) bits[5:2] selects where the boot ROM loads the IPL from:
+``0x20`` SPI NOR, ``0x10`` NAND, ``0x08`` SPI NAND/eMMC (``prev``).
+Forcing ``0x20`` in the model sends our SSD202D ROM down the SPI NOR
+path (``model``), confirming the strap register for infinity2m.
+
+The previous branch also claims the boot ROM window is 32 KiB and the
+IMI SRAM is 128 KiB (``prev``); neither is confirmed and the model
+currently uses the 16 KiB dump size and 64 KiB respectively.
 
 RIU addressing
 --------------
