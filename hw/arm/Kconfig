@@ -103,6 +103,9 @@ config MUSCA
 config MARVELL_88W8618
     bool
 
+config MSTARV7
+    bool
+
 config MUSICPAL
     bool
     default y

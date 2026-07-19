@@ -986,6 +986,13 @@ S: Odd Fixes
 F: hw/arm/musca.c
 F: docs/system/arm/musca.rst
 
+MStar/SigmaStar ARMv7 SoCs
+M: Daniel Palmer <daniel@thingy.jp>
+L: qemu-arm@nongnu.org
+S: Maintained
+F: hw/arm/mstarv7.c
+F: include/hw/arm/mstarv7.h
+
 Musicpal
 M: Jan Kiszka <jan.kiszka@web.de>
 M: Peter Maydell <peter.maydell@linaro.org>
