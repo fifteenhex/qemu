@@ -252,6 +252,13 @@ static const FlashPartInfo known_devices[] = {
     /* Micron */
     { INFO("n25q032a11",  0x20bb16,      0,  64 << 10,  64, ER_4K) },
     { INFO("n25q032a13",  0x20ba16,      0,  64 << 10,  64, ER_4K) },
+    /*
+     * 4MB SPI-NOR on the SigmaStar mirrorcam (Micron mfr 0x20, non-standard
+     * clone type byte 0x40). Its RTOS keys its flash-descriptor table on this
+     * exact JEDEC id; n25q032a13's 0x20ba16 is absent from that table, so it
+     * boot-loops with "ConstDescriptor=NULL, pls check fms_cas_Descriptors".
+     */
+    { INFO("mstar-nor-32m", 0x204016, 0, 64 << 10,  64, ER_4K) },
     { INFO("n25q064a11",  0x20bb17,      0,  64 << 10, 128, ER_4K) },
     { INFO("n25q064a13",  0x20ba17,      0,  64 << 10, 128, ER_4K) },
     { INFO("n25q128a11",  0x20bb18,      0,  64 << 10, 256, ER_4K) },

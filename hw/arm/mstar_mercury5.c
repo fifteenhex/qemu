@@ -70,7 +70,10 @@ typedef struct Mercury5Shim {
 } Mercury5Shim;
 
 static const Mercury5Shim mercury5_shims[] = {
-    { "mstar.mercury5-bound",    MSTAR_RIU_BASE + 0x207818, 4, 0x0b },
+    /*
+     * The BOND strap (0x1f207818) is created separately in realize because its
+     * value is per-SoC (M5U 0x0b vs M5 0x01); see MStarSoCInfo::bound_id.
+     */
     { "mstar.mercury5-dsi-done", MSTAR_RIU_BASE + 0x34420c, 4, 0x02 },
     /*
      * NB the boot/power-source status at 0x1f006848 (bit2 = external DC/ACC
@@ -349,6 +352,21 @@ static void mstar_mercury5_soc_realize(DeviceState *dev, Error **errp)
                                             mr, 10);
     }
 
+    /* Per-SoC BOND strap shim (M5U 0x0b, M5 0x01) at 0x1f207818. */
+    {
+        Mercury5Shim *bound = g_new0(Mercury5Shim, 1);
+        MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+        bound->name = "mstar.mercury5-bound";
+        bound->addr = MSTAR_RIU_BASE + 0x207818;
+        bound->size = 4;
+        bound->val = sc->info.bound_id ? sc->info.bound_id : 0x0b;
+        memory_region_init_io(mr, OBJECT(s), &mercury5_shim_ops, bound,
+                              bound->name, bound->size);
+        memory_region_add_subregion_overlap(get_system_memory(), bound->addr,
+                                            mr, 10);
+    }
+
     {
         static const struct {
             const char *name;
@@ -503,6 +521,23 @@ static void mstar_ssc8336_soc_class_init(ObjectClass *oc, const void *data)
      */
 }
 
+static void mstar_ssc8336_m5_soc_class_init(ObjectClass *oc, const void *data)
+{
+    MStarSoCClass *sc = MSTAR_SOC_CLASS(oc);
+
+    /*
+     * The mercury5 "M5" (chip 0xd9) variant of the SSC8336, as used by the
+     * mirrorcam - vs the 70mai's "M5U" (0xee) above. The IPL identifies the chip
+     * at 0x1f003d98 and maps chip 0xd9 + BOND 0x01 to its MIU/DRAM profile - the
+     * real device's IPL prints "Chip:M5 Bound:0001 ... RAM Size 64MB" (0xd9 with
+     * the M5U BOND 0x0b would "Unknown BoundID to Miu [HALT]"). It also carries a
+     * smaller 4MB SPI-NOR (flash ID 0x204016) instead of 16MB.
+     */
+    sc->info.chip_id = 0xd9;
+    sc->info.bound_id = 0x01;
+    sc->info.flash_model = "mstar-nor-32m";  /* 4MB, JEDEC 0x204016 */
+}
+
 static const TypeInfo mstar_mercury5_types[] = {
     {
         .name           = TYPE_MSTAR_MERCURY5_SOC,
@@ -514,6 +549,11 @@ static const TypeInfo mstar_mercury5_types[] = {
         .name           = TYPE_MSTAR_SSC8336_SOC,
         .parent         = TYPE_MSTAR_MERCURY5_SOC,
         .class_init     = mstar_ssc8336_soc_class_init,
+    },
+    {
+        .name           = TYPE_MSTAR_SSC8336_M5_SOC,
+        .parent         = TYPE_MSTAR_MERCURY5_SOC,
+        .class_init     = mstar_ssc8336_m5_soc_class_init,
     },
 };
 

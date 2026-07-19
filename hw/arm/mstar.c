@@ -865,7 +865,13 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtcpwc), 0, MSTAR_RTCPWC_BASE);
     }
 
-    /* ISP SPI-NOR controller (core regs, qspi config, XIP window). */
+    /* ISP SPI-NOR controller (core regs, qspi config, XIP window). The SoC
+     * picks the attached flash chip model (default 16MB; the 4MB M5 mirrorcam
+     * overrides it) so the -drive if=mtd image size matches the chip. */
+    if (sc->info.flash_model) {
+        qdev_prop_set_string(DEVICE(&s->isp), "flash-model",
+                             sc->info.flash_model);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->isp), errp)) {
         return;
     }

@@ -46,6 +46,8 @@ OBJECT_DECLARE_TYPE(MStarSoCState, MStarSoCClass, MSTAR_SOC)
 /* mercury5 family (dual Cortex-A7 camera/dashcam SoCs) + the SSC8336. */
 #define TYPE_MSTAR_MERCURY5_SOC "mstar-mercury5-soc"
 #define TYPE_MSTAR_SSC8336_SOC "mstar-ssc8336-soc"
+/* SSC8336 "M5" (chip 0xd9) variant used by the mirrorcam (70mai is "M5U"). */
+#define TYPE_MSTAR_SSC8336_M5_SOC "mstar-ssc8336-m5-soc"
 
 #define MSTAR_SOC_MAX_CPUS 2
 
@@ -82,6 +84,12 @@ typedef struct MStarSoCInfo {
                                  * (infinity2m/SSD20xD + mercury5) */
     uint8_t num_i2c;            /* number of HWI2C masters (0 => default 2;
                                  * mercury5 = 4, adds i2c@222a00/222c00) */
+    const char *flash_model;    /* m25p80 SPI-NOR chip model attached to the ISP
+                                 * (NULL => "n25q128a13", 16MB; the SSC8336 M5
+                                 * mirrorcam uses a 4MB "mstar-nor-32m") */
+    uint16_t bound_id;          /* mercury5 GPIO-pad BOND value served at
+                                 * 0x1f207818 (0 => 0x0b for M5U; M5 = 0x01).
+                                 * Distinct from .bond (infinity chiptop strap) */
 } MStarSoCInfo;
 
 struct MStarSoCState {

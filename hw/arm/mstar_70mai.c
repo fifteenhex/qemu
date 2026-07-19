@@ -56,7 +56,7 @@ static void mai70_machine_class_init(ObjectClass *oc, const void *data)
     MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
 
     mc->desc = "70mai dashcam (SigmaStar mercury5/SSC8336)";
-    mc->default_ram_size = 128 * MiB;   /* TODO: confirm from the boot ROM/DTB */
+    mc->default_ram_size = 64 * MiB;    /* mercury5 chips have 64MB DRAM */
     mc->min_cpus = 2;
     mc->default_cpus = 2;
     mc->max_cpus = 2;
@@ -64,11 +64,45 @@ static void mai70_machine_class_init(ObjectClass *oc, const void *data)
     mmc->board_init = mai70_board_init;
 }
 
+/*
+ * mirrorcam: a mercury5 mirror-dashcam on the SSC8336 "M5" (chip 0xd9) - the
+ * sibling of the 70mai's "M5U" (0xee). It carries a 4MB SPI-NOR (set by the
+ * SSC8336_M5 SoC, so the -drive if=mtd image is 4MB, not the 70mai's 16MB) and
+ * 64MB DRAM. The IPL boots ("Chip:M5 Bound:0001 ... Size:04000000") to the RTOS,
+ * which reaches its CLI + FDTC_Task stall. The board's SC7A30E G-sensor is on
+ * i2c0; its SC2363 (MIPI) + RN6752M (AHD) camera sensors are not modelled yet.
+ */
+static void mirrorcam_board_init(MStarSoCState *soc)
+{
+    /* SC7A30E G-sensor on i2c0 (the mirrorcam probes it at bus byte 0x3a/0x32);
+     * present so its init does not NAK the whole bus. */
+    i2c_slave_create_simple(soc->i2c[0].bus, TYPE_SC7A30E, 0x1d);
+}
+
+static void mirrorcam_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    MStarMachineClass *mmc = MSTAR_MACHINE_CLASS(oc);
+
+    mc->desc = "mirrorcam dashcam (SigmaStar mercury5/SSC8336 M5)";
+    mc->default_ram_size = 64 * MiB;    /* mercury5 chips have 64MB DRAM */
+    mc->min_cpus = 2;
+    mc->default_cpus = 2;
+    mc->max_cpus = 2;
+    mmc->soc_type = TYPE_MSTAR_SSC8336_M5_SOC;
+    mmc->board_init = mirrorcam_board_init;
+}
+
 static const TypeInfo mstar_70mai_types[] = {
     {
         .name           = MACHINE_TYPE_NAME("70mai"),
         .parent         = TYPE_MSTAR_MACHINE,
         .class_init     = mai70_machine_class_init,
+    },
+    {
+        .name           = MACHINE_TYPE_NAME("mirrorcam"),
+        .parent         = TYPE_MSTAR_MACHINE,
+        .class_init     = mirrorcam_machine_class_init,
     },
 };
 

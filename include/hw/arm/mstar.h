@@ -440,6 +440,7 @@ struct Msc313IspState {
     bool cs_asserted;
     uint16_t rdata;         /* last byte clocked in from the flash */
     uint8_t *flash_cache;   /* in-memory copy of the flash for XIP reads */
+    char *flash_model;      /* m25p80 chip model (property; def "n25q128a13") */
     uint16_t password;
     uint16_t clkdiv;
     uint16_t trigger;

@@ -299,8 +299,13 @@ static void msc313_isp_realize(DeviceState *dev, Error **errp)
 
     s->spi = ssi_create_bus(dev, "spi");
 
-    /* Attach a 16 MiB SPI-NOR flash, backed by "-drive if=mtd" if given. */
-    flash = qdev_new("n25q128a13");
+    /* Attach the SPI-NOR flash (model set by the SoC; default 16 MiB
+     * n25q128a13, the SSC8336 M5/mirrorcam overrides to its 4 MiB part),
+     * backed by "-drive if=mtd" if given. */
+    if (!s->flash_model) {
+        s->flash_model = g_strdup("n25q128a13");
+    }
+    flash = qdev_new(s->flash_model);
     dinfo = drive_get(IF_MTD, 0, 0);
     s->flash_cache = g_malloc(MSTAR_ISP_XIP_SIZE);
     memset(s->flash_cache, 0xff, MSTAR_ISP_XIP_SIZE);
@@ -339,6 +344,10 @@ static const VMStateDescription vmstate_mstar_msc313_isp = {
     },
 };
 
+static const Property msc313_isp_properties[] = {
+    DEFINE_PROP_STRING("flash-model", Msc313IspState, flash_model),
+};
+
 static void msc313_isp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -347,6 +356,7 @@ static void msc313_isp_class_init(ObjectClass *oc, const void *data)
     dc->realize = msc313_isp_realize;
     rc->phases.hold = msc313_isp_reset_hold;
     dc->vmsd = &vmstate_mstar_msc313_isp;
+    device_class_set_props(dc, msc313_isp_properties);
 }
 
 static const TypeInfo mstar_isp_types[] = {
