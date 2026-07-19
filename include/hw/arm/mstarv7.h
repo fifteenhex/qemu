@@ -14,6 +14,7 @@
 #include "hw/adc/mstar_sar.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/dma/mstar_bdma.h"
+#include "hw/i2c/mstar_i2c.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
 #include "target/arm/cpu.h"
@@ -57,6 +58,10 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_BOOT_MEDIA_SPI_NOR      0x20
 #define MSTARV7_BOOT_MEDIA_NAND         0x10
 #define MSTARV7_BOOT_MEDIA_SPI_NAND     0x08
+/* The two HWI2C masters (i2c@223000 and i2c@223200) */
+#define MSTARV7_NUM_I2C         2
+#define MSTARV7_I2C_BASE        (MSTARV7_RIU_BASE + 0x223000)
+#define MSTARV7_I2C_STRIDE      0x200
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
 /*
@@ -143,6 +148,7 @@ struct MStarV7SoCState {
     MStarBdmaState bdma;
     MStarFspState fsp;
     MStarSarState sar;
+    MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */

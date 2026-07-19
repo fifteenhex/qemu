@@ -188,6 +188,10 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSTAR_BDMA);
     object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSTAR_SAR);
+
+    for (i = 0; i < MSTARV7_NUM_I2C; i++) {
+        object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSTAR_I2C);
+    }
 }
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
@@ -291,6 +295,15 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sar), 0, MSTARV7_SAR_BASE);
+
+    for (i = 0; i < MSTARV7_NUM_I2C; i++) {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->i2c[i]);
+
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, MSTARV7_I2C_BASE + i * MSTARV7_I2C_STRIDE);
+    }
 
     /* TODO: wire up the interrupt once the GIC is modelled */
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
