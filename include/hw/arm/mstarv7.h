@@ -15,6 +15,7 @@
 #include "hw/cpu/a15mpcore.h"
 #include "hw/dma/mstar_bdma.h"
 #include "hw/i2c/mstar_i2c.h"
+#include "hw/intc/mstar_intc.h"
 #include "hw/misc/mstar_regbank.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
@@ -59,6 +60,18 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_BOOT_MEDIA_SPI_NOR      0x20
 #define MSTARV7_BOOT_MEDIA_NAND         0x10
 #define MSTARV7_BOOT_MEDIA_SPI_NAND     0x08
+/*
+ * The two mst-intc instances between the peripherals and the GIC:
+ * "IRQ" lines land on GIC SPI 32 up, "FIQ" lines on SPI 96 up.
+ */
+#define MSTARV7_INTC_IRQ_BASE   (MSTARV7_RIU_BASE + 0x201350)
+#define MSTARV7_INTC_IRQ_NUM    64
+#define MSTARV7_INTC_IRQ_START  32
+#define MSTARV7_INTC_FIQ_BASE   (MSTARV7_RIU_BASE + 0x201310)
+#define MSTARV7_INTC_FIQ_NUM    32
+#define MSTARV7_INTC_FIQ_START  96
+/* The PM UART's line on the "IRQ" mst-intc */
+#define MSTARV7_PM_UART_INTC_IRQ 34
 /*
  * The clkgen bank. Software programs clock gates/muxes here and
  * derives clock rates from reading them back, so it must retain what
@@ -146,6 +159,8 @@ struct MStarV7SoCState {
 
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     A15MPPrivState a7mpcore;
+    MStarIntcState intc_irq;
+    MStarIntcState intc_fiq;
     MemoryRegion imi;
     MemoryRegion did;
     MemoryRegion miu;

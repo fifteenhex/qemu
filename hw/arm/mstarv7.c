@@ -185,6 +185,8 @@ static void mstarv7_soc_init(Object *obj)
 
     object_initialize_child(obj, "a7mpcore", &s->a7mpcore,
                             TYPE_A15MPCORE_PRIV);
+    object_initialize_child(obj, "intc-irq", &s->intc_irq, TYPE_MSTAR_INTC);
+    object_initialize_child(obj, "intc-fiq", &s->intc_fiq, TYPE_MSTAR_INTC);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSTAR_BDMA);
     object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSTAR_SAR);
@@ -242,6 +244,27 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                            qdev_get_gpio_in(cpu, ARM_CPU_VIRQ));
         sysbus_connect_irq(sbd, i + 3 * msc->num_cpus,
                            qdev_get_gpio_in(cpu, ARM_CPU_VFIQ));
+    }
+
+    for (i = 0; i < 2; i++) {
+        MStarIntcState *intc = i ? &s->intc_fiq : &s->intc_irq;
+        unsigned int num = i ? MSTARV7_INTC_FIQ_NUM : MSTARV7_INTC_IRQ_NUM;
+        unsigned int start = i ? MSTARV7_INTC_FIQ_START
+                               : MSTARV7_INTC_IRQ_START;
+        hwaddr base = i ? MSTARV7_INTC_FIQ_BASE : MSTARV7_INTC_IRQ_BASE;
+        unsigned int line;
+
+        qdev_prop_set_uint32(DEVICE(intc), "num-irqs", num);
+        if (!sysbus_realize(SYS_BUS_DEVICE(intc), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(intc), 0, base);
+        for (line = 0; line < num; line++) {
+            /* The a7mpcore GPIO inputs are numbered by GIC SPI */
+            sysbus_connect_irq(SYS_BUS_DEVICE(intc), line,
+                               qdev_get_gpio_in(DEVICE(&s->a7mpcore),
+                                                start + line));
+        }
     }
 
     memory_region_init_ram(&s->imi, OBJECT(dev), "mstarv7.imi",
@@ -312,10 +335,12 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
 
-    /* TODO: wire up the interrupt once the GIC is modelled */
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
-                   MSTARV7_PM_UART_REGSHIFT, NULL, MSTARV7_PM_UART_BAUDBASE,
-                   serial_hd(0), DEVICE_LITTLE_ENDIAN);
+                   MSTARV7_PM_UART_REGSHIFT,
+                   qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                    MSTARV7_PM_UART_INTC_IRQ),
+                   MSTARV7_PM_UART_BAUDBASE, serial_hd(0),
+                   DEVICE_LITTLE_ENDIAN);
 
     for (i = 0; i < MSTARV7_NUM_TIMERS; i++) {
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->timer[i]);
