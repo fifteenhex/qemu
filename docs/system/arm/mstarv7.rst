@@ -35,6 +35,8 @@ Emulated devices and known limitations
 * The clkgen clock block (see :doc:`mstarv7/clocks`) and the chiptop
   pinctrl / strap block (see :doc:`mstarv7/pinctrl`), both readback
   register banks, the chiptop also returning the package bond strap.
+* The FCIE SD/MMC host controller (see :doc:`mstarv7/fcie`), with a
+  standard SD bus; attach a card with ``-drive if=sd``.
 * The MIPI DSI output path (see :doc:`mstarv7/dsi`): the DSI
   controller, the D-PHY and, on the board, the panel it drives.
 * The display controller (see :doc:`mstarv7/display`): the GOP
@@ -84,13 +86,15 @@ the vendor driver rejects the UART has not been run down.
 The display path now scans out: the vendor u-boot decodes its JPEG
 boot logo into the MOP video plane and the model renders it (visible
 with a ``screendump`` during the u-boot window). MainUI's own UI does
-not appear because it composites through the unmodelled GE 2D engine,
-and it is in any case blocked on the unmodelled FCIE/SD controller
-(at ``0x1f282000``), which its threads busy-poll throughout boot.
+not appear: it reaches its display and framebuffer setup (fb0 comes
+up, the GOP plane is configured) but then stalls, so the GOP plane
+stays blank. The 2D composition it does through the GE engine is not
+reached, and the GE is not modelled.
 
-Remaining gaps on the way to a usable system: the GE 2D engine
-(MainUI draws through it), the FCIE/SD controller, and the SPI flash
-write/erase path.
+Remaining gaps on the way to a usable system: whatever MainUI stalls
+on after framebuffer setup, the GE 2D engine (MainUI draws through
+it), and the SPI flash write/erase path. The FCIE/SD controller is
+now modelled, so its driver no longer busy-loops the CPU.
 
 Booting
 -------
@@ -134,3 +138,4 @@ the same commit as the device model change it describes.
    mstarv7/display
    mstarv7/clocks
    mstarv7/pinctrl
+   mstarv7/fcie

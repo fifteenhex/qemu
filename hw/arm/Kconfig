@@ -107,6 +107,7 @@ config MSTARV7
     bool
     select A15MPCORE
     select MSTAR_DISP
+    select MSTAR_FCIE
     select MSTAR_I2C
     select MSTAR_INTC
     select MSTAR_REGBANK

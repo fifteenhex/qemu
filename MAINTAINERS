@@ -1000,6 +1000,7 @@ F: hw/i2c/alpu.c
 F: hw/i2c/mstar_i2c.c
 F: hw/intc/mstar_intc.c
 F: hw/misc/mstar_regbank.c
+F: hw/sd/mstar_fcie.c
 F: hw/arm/ssd202d.c
 F: hw/display/dsi_panel.c
 F: hw/display/mstar_disp.c
@@ -1016,6 +1017,7 @@ F: include/hw/i2c/alpu.h
 F: include/hw/i2c/mstar_i2c.h
 F: include/hw/intc/mstar_intc.h
 F: include/hw/misc/mstar_regbank.h
+F: include/hw/sd/mstar_fcie.h
 F: include/hw/display/dsi.h
 F: include/hw/display/mstar_disp.h
 F: include/hw/display/mstar_dphy.h

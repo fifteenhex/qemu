@@ -20,6 +20,7 @@
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
 #include "hw/misc/mstar_regbank.h"
+#include "hw/sd/mstar_fcie.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
 #include "target/arm/cpu.h"
@@ -98,6 +99,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_I2C_STRIDE      0x200
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
+/* The FCIE SD/MMC host controller */
+#define MSTARV7_FCIE_BASE       (MSTARV7_RIU_BASE + 0x282000)
 /*
  * The display output path to the panel: the MIPI DSI controller and
  * the analog D-PHY it drives. The rest of the display pipe (GOP, the
@@ -208,6 +211,7 @@ struct MStarV7SoCState {
     MStarDsiState dsi;
     MStarDphyState dphy;
     MStarDispState disp;
+    MStarFcieState fcie;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */

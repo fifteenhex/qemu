@@ -212,6 +212,11 @@ RIU blocks
      - MOP video plane; see :doc:`display`
      - yes
      - ``prev``, ``rom``
+   * - ``0x1f282000``
+     - ``0x1410``
+     - FCIE SD/MMC host controller; see :doc:`fcie`
+     - yes
+     - ``linux``, ``rom``
    * - ``0x1f2a5000``
      - ``0x152800``
      - MIPI D-PHY; see :doc:`dsi`
