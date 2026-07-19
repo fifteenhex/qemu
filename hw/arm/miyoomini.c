@@ -22,6 +22,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/arm/ssd202d.h"
+#include "hw/i2c/alpu.h"
 
 #define TYPE_MIYOOMINI_MACHINE MACHINE_TYPE_NAME("miyoomini")
 OBJECT_DECLARE_SIMPLE_TYPE(MiyooMiniMachineState, MIYOOMINI_MACHINE)
@@ -80,6 +81,14 @@ static void miyoomini_init(MachineState *machine)
     }
 
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
+
+    /*
+     * The Miyoo Mini carries a Neowine ALPU-FA copy-protection chip on
+     * i2c bus 1 at 0x3d; the vendor kernel and MainUI refuse to run
+     * without it. It is board specific, so it is wired here rather
+     * than in the SoC.
+     */
+    i2c_slave_create_simple(MSTARV7_SOC(&s->soc)->i2c[1].bus, TYPE_ALPU, 0x3d);
 
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU0_BASE,
                                 machine->ram);

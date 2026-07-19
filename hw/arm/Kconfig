@@ -124,6 +124,7 @@ config MIYOOMINI
     bool
     default y
     depends on TCG && ARM
+    select ALPU
     select INFINITY2M
 
 config MUSICPAL

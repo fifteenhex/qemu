@@ -93,3 +93,4 @@ the same commit as the device model change it describes.
    mstarv7/isp
    mstarv7/bdma
    mstarv7/sar
+   mstarv7/alpu

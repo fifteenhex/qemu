@@ -58,3 +58,7 @@ config BCM2835_I2C
 config MSTAR_I2C
     bool
     select I2C
+
+config ALPU
+    bool
+    depends on I2C
