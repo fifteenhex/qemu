@@ -154,9 +154,13 @@ RIU blocks
      - ``prev``
    * - ``0x1f202000``
      - ``0x1010``
-     - MIU DDR controller
-     - no
-     - ``prev``
+     - MIU DDR controller: analog block at ``+0x000`` (DDR PLL
+       frequency-set pair at ``+0x60``/``+0x64``), arbiter at
+       ``+0x200``, digital block at ``+0x400`` (init done bit 15 of
+       ``+0x400``, BIST start/status at ``+0x5c0`` with done bit 15).
+       Modelled as training/BIST always complete
+     - partly
+     - ``prev``, ``rom`` (BIST poll seen from the IPL)
    * - ``0x1f203c00``
      - ``0x101e``
      - "chiptop": package bond strap at ``+0x120`` (``0x1e`` =

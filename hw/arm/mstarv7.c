@@ -56,6 +56,43 @@ static const MemoryRegionOps mstarv7_did_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The MIU DDR controller. The IPL's DDR bring-up is fire and forget
+ * for almost every register; the exceptions are the completion gates
+ * (training, BIST) which read as done, and the DDR PLL frequency-set
+ * pair which reads back what the IPL programs on real hardware.
+ */
+static uint64_t mstarv7_miu_read(void *opaque, hwaddr addr, unsigned size)
+{
+    switch (addr) {
+    case MSTARV7_MIU_DIG_CNTRL0:
+        return MSTARV7_MIU_DIG_CNTRL0_INITDONE;
+    case MSTARV7_MIU_DIG_BIST_CTRL:
+        /* Self test done, no error; emulated DRAM never fails */
+        return MSTARV7_MIU_DIG_BIST_DONE;
+    case MSTARV7_MIU_ANA_DDFSET_L:
+        return MSTARV7_MIU_DDFSET_L_VALUE;
+    case MSTARV7_MIU_ANA_DDFSET_H:
+        return MSTARV7_MIU_DDFSET_H_VALUE;
+    default:
+        return 0;
+    }
+}
+
+static void mstarv7_miu_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    /* No DRAM PHY to program; training writes are no-ops */
+}
+
+static const MemoryRegionOps mstarv7_miu_ops = {
+    .read = mstarv7_miu_read,
+    .write = mstarv7_miu_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -121,6 +158,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.did", MSTARV7_DID_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_DID_BASE,
                                 &s->did);
+
+    memory_region_init_io(&s->miu, OBJECT(dev), &mstarv7_miu_ops, s,
+                          "mstarv7.miu", MSTARV7_MIU_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTARV7_MIU_BASE,
+                                &s->miu);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->bdma), errp)) {
         return;

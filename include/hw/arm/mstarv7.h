@@ -62,6 +62,26 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 /* The BDMA engine; the boot ROM DMAs the IPL from flash into IMI */
 #define MSTARV7_BDMA_BASE       (MSTARV7_RIU_BASE + 0x200400)
 /*
+ * The MIU DDR controller: an analog block (PLL/PHY), an arbiter and
+ * a digital block. Modelled just enough for the IPL's DDR bring-up:
+ * training and the memory BIST complete instantly.
+ */
+#define MSTARV7_MIU_BASE        (MSTARV7_RIU_BASE + 0x202000)
+#define MSTARV7_MIU_SIZE        0x1000
+#define MSTARV7_MIU_ANA_DDFSET_L        0x060
+#define MSTARV7_MIU_ANA_DDFSET_H        0x064
+#define MSTARV7_MIU_DIG_CNTRL0          0x400
+#define MSTARV7_MIU_DIG_CNTRL0_INITDONE (1 << 15)
+#define MSTARV7_MIU_DIG_BIST_CTRL       0x5c0
+#define MSTARV7_MIU_DIG_BIST_DONE       (1 << 15)
+/*
+ * What the vendor IPL programs into the DDR PLL frequency-set pair;
+ * reported back so the kernel's MIU clock driver computes a sane
+ * DDR rate instead of dividing by zero.
+ */
+#define MSTARV7_MIU_DDFSET_L_VALUE      0x8000
+#define MSTARV7_MIU_DDFSET_H_VALUE      0x0029
+/*
  * The three timers (timer@6040/6080/60c0 in the device trees). The
  * boot ROM uses the first to time its flash operations.
  */
@@ -85,6 +105,7 @@ struct MStarV7SoCState {
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     MemoryRegion imi;
     MemoryRegion did;
+    MemoryRegion miu;
     MStarBdmaState bdma;
     MStarFspState fsp;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
