@@ -474,7 +474,11 @@ static void mstar_soc_init(Object *obj)
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSC313_SAR);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_MSC313_GPIO);
     object_initialize_child(obj, "pm-gpio", &s->pm_gpio, TYPE_MSTAR_PM_GPIO);
-    object_initialize_child(obj, "rtcpwc", &s->rtcpwc, TYPE_MSTAR_RTCPWC);
+    /* rtcpwc only exists on the SoCs that set has_rtcpwc; initialise it there
+     * too so it is not left as an unrealized child (see the gated realize). */
+    if (sc->info.has_rtcpwc) {
+        object_initialize_child(obj, "rtcpwc", &s->rtcpwc, TYPE_MSTAR_RTCPWC);
+    }
     object_initialize_child(obj, "isp", &s->isp, TYPE_MSC313_ISP);
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSC313_BDMA);
     object_initialize_child(obj, "clkgen", &s->clkgen, sc->info.clkgen_type);
@@ -1008,6 +1012,28 @@ static void mstar_soc_realize(DeviceState *dev, Error **errp)
                    MSTAR_PM_UART_REGSHIFT,
                    qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_PM_UART_HWIRQ),
                    MSTAR_PM_UART_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    /*
+     * FUART (serial@220400): the family-wide "fast UART", a plain dw-apb-uart
+     * (16550, reg-shift 3) on "irq" mst-intc line 47. The mercury5 dashcam RTOS
+     * programmes it (LCR/DLL/FCR/IER) but never touches the URDMA, so a plain
+     * 16550 on the third serial backend is enough. serial_mm_init tolerates a
+     * NULL backend when no third -serial is supplied.
+     */
+    serial_mm_init(get_system_memory(), MSTAR_FUART_BASE, MSTAR_FUART_REGSHIFT,
+                   qdev_get_gpio_in(DEVICE(&s->intc_irq), MSTAR_FUART_HWIRQ),
+                   MSTAR_FUART_CLK / 16, serial_hd(2), DEVICE_LITTLE_ENDIAN);
+
+    /* URDMA (urdma@220600): the FUART's RX/TX ring DMA, "irq" line 48. */
+    {
+        DeviceState *urdma = qdev_new(TYPE_MSTAR_URDMA);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(urdma), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(urdma), 0, MSTAR_URDMA_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(urdma), 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTAR_URDMA_HWIRQ));
+    }
 }
 
 /*

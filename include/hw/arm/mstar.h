@@ -15,6 +15,7 @@
 #include "hw/sd/sd.h"
 #include "hw/i2c/i2c.h"
 #include "net/net.h"
+#include "chardev/char-fe.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
 #include "hw/display/mstar_gop.h"
@@ -215,6 +216,32 @@ struct MstarWdtState {
     uint16_t intr;              /* WDT_INT: pre-timeout threshold (top 16 bits) */
     uint16_t prd_l;             /* WDT_MAX_PRD_L */
     uint16_t prd_h;             /* WDT_MAX_PRD_H (period 0 = stopped) */
+};
+
+/*
+ * URDMA (urdma@220600): the FUART's UART RX/TX ring-buffer DMA engine
+ * (mstar,msc313-urdma). See hw/dma/mstar_urdma.c. Present family-wide but the
+ * dashcam RTOS drives the FUART in plain-16550 PIO mode and never enables it;
+ * this models the register/reset/interrupt semantics of the 6.5 kernel driver
+ * plus a functional TX/RX ring data path (against its own optional chardev).
+ */
+#define TYPE_MSTAR_URDMA "mstar-urdma"
+OBJECT_DECLARE_SIMPLE_TYPE(MstarUrdmaState, MSTAR_URDMA)
+
+struct MstarUrdmaState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq irq;
+    CharFrontend chr;           /* optional UART backend for the DMA data path */
+    uint16_t ctrl;             /* REG_CTRL   (0x00) */
+    uint16_t threshold;        /* REG_INTR_THRESHOLD (0x04) */
+    uint16_t tx_base_h, tx_base_l, tx_size, tx_rptr, tx_wptr, tx_timeout;
+    uint16_t rx_base_h, rx_base_l, rx_size, rx_wptr, rx_timeout;
+    uint16_t status;           /* REG_STATUS (0x34) */
+    uint8_t rx_pending;        /* a byte latched from the backend, not yet DMAd */
+    uint8_t rx_byte;
 };
 
 /*
@@ -749,6 +776,23 @@ struct Msc313BachState {
 /* uart1 (serial@221200): second dw-apb-uart, the mercury5 kernel console. */
 #define MSTAR_UART1_BASE        (MSTAR_RIU_BASE + 0x221200)
 #define MSTAR_UART1_HWIRQ       35      /* line on the "irq" mst-intc */
+
+/*
+ * FUART (serial@220400): the "fast UART", a third dw-apb-uart (snps,dw-apb-uart,
+ * reg-shift 3) present on every MStar variant. The mercury5 dashcam RTOS drives
+ * it as a plain 16550 (it programmes LCR/DLL/FCR/IER and never touches the URDMA
+ * below), so it is modelled with serial_mm on the third serial backend. Its
+ * companion RX/TX ring-DMA engine is the URDMA at +0x200 (urdma@220600).
+ */
+#define MSTAR_FUART_BASE        (MSTAR_RIU_BASE + 0x220400)
+#define MSTAR_FUART_REGSHIFT    3
+#define MSTAR_FUART_CLK         172000000
+#define MSTAR_FUART_HWIRQ       47      /* "irq" mst-intc line (DT: GIC_SPI 47) */
+
+/* URDMA (urdma@220600): the FUART's RX/TX ring-buffer DMA engine. */
+#define MSTAR_URDMA_BASE        (MSTAR_RIU_BASE + 0x220600)
+#define MSTAR_URDMA_SIZE        0x100
+#define MSTAR_URDMA_HWIRQ       48      /* "irq" mst-intc line (DT: GIC_SPI 48) */
 
 #define MSTAR_DRAM_BASE         0x20000000
 
