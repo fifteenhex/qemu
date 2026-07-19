@@ -23,6 +23,7 @@
 #include "hw/core/qdev-properties.h"
 #include "system/system.h"
 #include "target/arm/cpu-qom.h"
+#include "target/arm/arm-powerctl.h"
 
 /*
  * The "DID" block at 0x1f007000. Only DID_KEY, holding the boot-media
@@ -95,6 +96,52 @@ static const MemoryRegionOps mstarv7_miu_ops = {
 };
 
 /*
+ * The smpctrl secondary-core boot mailbox; see mstarv7.h.
+ */
+static uint64_t mstarv7_smpctrl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarV7SoCState *s = MSTARV7_SOC(opaque);
+
+    return s->smpctrl[addr / 4];
+}
+
+static void mstarv7_smpctrl_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    MStarV7SoCState *s = MSTARV7_SOC(opaque);
+    MStarV7SoCClass *msc = MSTARV7_SOC_GET_CLASS(opaque);
+
+    s->smpctrl[addr / 4] = val;
+
+    if (addr == MSTARV7_SMPCTRL_UNLOCK &&
+        (val & 0xffff) == MSTARV7_SMPCTRL_UNLOCK_MAGIC &&
+        msc->num_cpus > 1) {
+        uint32_t entry = s->smpctrl[MSTARV7_SMPCTRL_BOOT_LOW / 4] |
+                ((uint32_t)s->smpctrl[MSTARV7_SMPCTRL_BOOT_HIGH / 4] << 16);
+        /*
+         * Real hardware releases CPU1 from the mask ROM in Secure
+         * state; enter at the highest exception level we have so the
+         * Secure-only setup the kernel does on it works.
+         */
+        uint32_t el = arm_feature(&s->cpus[1].env, ARM_FEATURE_EL3) ? 3 : 1;
+        int ret = arm_set_cpu_on(s->cpus[1].mp_affinity, entry, 0, el, false);
+
+        if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "mstarv7-smpctrl: failed to start CPU1 (%d)\n", ret);
+        }
+    }
+}
+
+static const MemoryRegionOps mstarv7_smpctrl_ops = {
+    .read = mstarv7_smpctrl_read,
+    .write = mstarv7_smpctrl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/*
  * The l3bridge write barrier: all writes are accepted and every
  * flush reads as already complete, which is true for us since our
  * memory accesses complete synchronously.
@@ -156,8 +203,9 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         object_property_set_int(cpu, "reset-cbar", MSTARV7_PERIPHBASE,
                                 &error_abort);
         /*
-         * Secondary cores are held in reset until released by software,
-         * only the boot core comes out of reset running.
+         * On hardware every core runs the mask ROM and the
+         * secondaries park in its smpctrl wait loop; the model keeps
+         * them powered off until the mailbox posts an entry address.
          */
         object_property_set_bool(cpu, "start-powered-off", i > 0,
                                  &error_abort);
@@ -217,6 +265,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.miu", MSTARV7_MIU_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_MIU_BASE,
                                 &s->miu);
+
+    memory_region_init_io(&s->smpctrl_mr, OBJECT(dev), &mstarv7_smpctrl_ops,
+                          s, "mstarv7.smpctrl", MSTARV7_SMPCTRL_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTARV7_SMPCTRL_BASE,
+                                &s->smpctrl_mr);
 
     memory_region_init_io(&s->l3bridge, OBJECT(dev), &mstarv7_l3bridge_ops,
                           s, "mstarv7.l3bridge", MSTARV7_L3BRIDGE_SIZE);

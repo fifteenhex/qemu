@@ -18,9 +18,9 @@ The QEMU models mirror that structure as a QOM class hierarchy:
 Emulated devices and known limitations
 --------------------------------------
 
-* Two Cortex-A7 cores. The secondary core is modelled as powered
-  off; on real hardware it runs the mask ROM and parks in the
-  smpctrl mailbox loop, so SMP release is not modelled yet.
+* Two Cortex-A7 cores. The secondary is modelled as powered off and
+  comes on when the kernel posts its entry address to the smpctrl
+  mailbox (on real hardware it parks in the mask ROM instead).
 * 128 MiB of in-package DDR3, mirrored through the MIU window so
   the IPL's wrap-around size probe works.
 * 64 KiB of IMI SRAM.
@@ -51,8 +51,10 @@ environment. Known gaps at this point:
 * With the SAR ADC reading idle, u-boot takes the normal boot path:
   it JPEG-decodes the boot logo (the MIPI DSI panel writes time out,
   no display yet), reads the kernel from flash, decompresses it and
-  jumps to it. The kernel is silent from there: the GIC and the
-  interrupt fabric are the next things to model.
+  jumps to it. The kernel comes up silently (no console output yet),
+  brings CPU1 online through the smpctrl mailbox and starts probing:
+  it currently parks polling the HWI2C master at ``0x1f223200``,
+  which is the next thing to model.
 
 Booting
 -------

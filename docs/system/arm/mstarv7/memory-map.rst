@@ -174,9 +174,12 @@ RIU blocks
      - ``prev``, ``rom``
    * - ``0x1f204000``
      - ``0x1020``
-     - "smpctrl" CPU1 boot mailbox (see the boot ROM page)
-     - no
-     - ``prev``, ``rom``
+     - "smpctrl" CPU1 boot mailbox (see the boot ROM page): entry
+       address as halfwords at ``+0x50``/``+0x4c``, then ``0xbabe``
+       to ``+0x58``. A readback register file; software spins reading
+       back what it writes here
+     - yes
+     - ``prev``, ``linux``, ``rom``
    * - ``0x1f204400``
      - ``0x1022``
      - "l3bridge" MIU write-flush barrier: poke the trigger at

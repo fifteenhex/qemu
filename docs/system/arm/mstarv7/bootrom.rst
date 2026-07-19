@@ -94,8 +94,10 @@ address to ``+0x50`` (low half) and ``+0x4c`` (high half) and then
 ``0xbabe`` to ``+0x58`` (``linux``, ``prev``). So CPU1 is not held
 in reset by hardware as first assumed: it runs the mask ROM too and
 spins in this loop until the kernel posts an address. The model
-currently keeps CPU1 powered off instead; that is wrong in detail
-and needs revisiting when SMP is tackled (``model``).
+keeps CPU1 powered off and instead powers it on at the posted
+address when the unlock magic is written; that matches what software
+observes, but not the mechanism - there is no parked core executing
+ROM code in the model (``model``).
 
 Boot-media strap
 ----------------

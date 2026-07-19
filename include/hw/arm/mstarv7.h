@@ -88,6 +88,22 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_MIU_DDFSET_L_VALUE      0x8000
 #define MSTARV7_MIU_DDFSET_H_VALUE      0x0029
 /*
+ * The smpctrl secondary-core boot mailbox. On real hardware CPU1
+ * runs the mask ROM and parks polling UNLOCK for the magic, then
+ * jumps to the address in BOOT_LOW/HIGH; mainline and the vendor
+ * kernel both post the entry address this way. In the model CPU1 is
+ * powered off instead and the unlock powers it on at that address.
+ * Software also spins reading back what it wrote here, so the bank
+ * is a plain register file.
+ */
+#define MSTARV7_SMPCTRL_BASE        (MSTARV7_RIU_BASE + 0x204000)
+#define MSTARV7_SMPCTRL_SIZE        0x200
+#define MSTARV7_SMPCTRL_NUM_REGS    (MSTARV7_SMPCTRL_SIZE / 4)
+#define MSTARV7_SMPCTRL_BOOT_HIGH   0x4c
+#define MSTARV7_SMPCTRL_BOOT_LOW    0x50
+#define MSTARV7_SMPCTRL_UNLOCK      0x58
+#define MSTARV7_SMPCTRL_UNLOCK_MAGIC 0xbabe
+/*
  * The l3bridge, used as a write barrier: software pokes the trigger
  * and polls the flush done bit, per mainline's mstarv7 barrier code.
  */
@@ -122,6 +138,8 @@ struct MStarV7SoCState {
     MemoryRegion did;
     MemoryRegion miu;
     MemoryRegion l3bridge;
+    MemoryRegion smpctrl_mr;
+    uint16_t smpctrl[MSTARV7_SMPCTRL_NUM_REGS];
     MStarBdmaState bdma;
     MStarFspState fsp;
     MStarSarState sar;
