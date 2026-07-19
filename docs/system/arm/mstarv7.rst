@@ -24,12 +24,17 @@ Emulated devices and known limitations
 * 128 MiB of in-package DDR3 at the start of the MIU0 address space.
 * 64 KiB of IMI SRAM.
 * The PM UART, on the first serial port. No interrupt yet.
+* The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
+  image overrides it). With no IPL to load it prints
+  ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which
+  matches what the real ROM would do with nothing to boot.
 * No other peripherals are modelled yet.
 
 Booting
 -------
 
-A kernel can be loaded into DRAM with the usual options:
+With no kernel argument the machine boots into the ROM. A kernel can
+also be loaded directly into DRAM with the usual options:
 
 .. code-block:: bash
 

@@ -33,6 +33,11 @@ believed to share this layout.
      - Block
      - Modelled
      - Source
+   * - ``0x00000000``
+     - ``0x4000``
+     - Boot ROM (see note below)
+     - yes
+     - ``rom``
    * - ``0x16000000``
      - ``0x8000``
      - Cortex-A7 PERIPHBASE (SCU, GIC, private timers)
@@ -53,6 +58,14 @@ believed to share this layout.
      - IMI SRAM
      - yes
      - ``dts``
+
+The boot ROM contents are a 16 KiB dump taken from an SSD202D
+(``hw``); the tail carries an ``I2m_ROM`` signature so it may be
+common to the whole infinity2m family, but for now it is wired into
+the SSD202D model only. The boot core comes out of reset executing
+it, so it is modelled at the Cortex-A7 reset vector; whether the ROM
+really sits at ``0x00000000`` or is aliased there from somewhere else
+has not been confirmed (``model``).
 
 The infinity2m IMI SRAM is modelled as 64 KiB: the boot ROM uses
 addresses up to ``0xa000f8a5`` (``rom``) so it is at least that big,
