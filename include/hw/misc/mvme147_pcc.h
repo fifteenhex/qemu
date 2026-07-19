@@ -7,6 +7,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/ptimer.h"
+#include "hw/scsi/wd33c93.h"
 #include "qom/object.h"
 
 #define TYPE_MVME147_PCC "mvme147.pcc"
@@ -26,9 +27,16 @@ struct MVME147PCCState {
     /* encodes (level << 8) | vector towards the board */
     qemu_irq irq;
 
+    /* scsi controller served by the dma engine */
+    WD33C93State *sbic;
+    bool dma_drq;
+
     uint32_t table_address;
     uint32_t data_address;
+    /* dma byte count, flags in the top byte */
     uint32_t link;
+    uint8_t dma_ctrl;
+    uint8_t dma_int_ctrl;
 
     uint16_t timerN_preload[2];
     uint8_t timerN_int_ctrl[2];
@@ -71,6 +79,7 @@ struct MVME147PCCState {
 #define MVME147_PCC_DMA_INT_CTRL             0x20
 #define MVME147_PCC_DMA_CTRL_STAT            0x21
 #define MVME147_PCC_DMA_CTRL_STAT_ENABLE	 (1 << 0)
+#define MVME147_PCC_DMA_CTRL_STAT_DONE       (1 << 7)
 #define MVME147_PCC_BUS_ERROR_INT_CTRL       0x22
 #define MVME147_PCC_DMA_STATUS               0x23
 #define MVME147_PCC_ABORT_INT_CTRL           0x24
