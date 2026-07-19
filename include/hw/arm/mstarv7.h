@@ -13,6 +13,7 @@
 #include "system/memory.h"
 #include "hw/adc/mstar_sar.h"
 #include "hw/cpu/a15mpcore.h"
+#include "hw/display/mstar_disp.h"
 #include "hw/display/mstar_dphy.h"
 #include "hw/display/mstar_dsi.h"
 #include "hw/dma/mstar_bdma.h"
@@ -93,6 +94,16 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  */
 #define MSTARV7_DSI_BASE        (MSTARV7_RIU_BASE + 0x345200)
 #define MSTARV7_DPHY_BASE       (MSTARV7_RIU_BASE + 0x2a5000)
+/*
+ * The display controller front end: the GOP framebuffer scanout and
+ * the display top (frame timing and vsync). Their vsync interrupts
+ * land on the "IRQ" mst-intc.
+ */
+#define MSTARV7_DISP_GOP_BASE   (MSTARV7_RIU_BASE + 0x246800)
+#define MSTARV7_DISP_TOP_BASE   (MSTARV7_RIU_BASE + 0x225000)
+#define MSTARV7_DISP_MOP_BASE   (MSTARV7_RIU_BASE + 0x280a00)
+#define MSTARV7_DISP_TOP_INTC_IRQ 50
+#define MSTARV7_DISP_GOP_INTC_IRQ 20
 /*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
@@ -183,6 +194,7 @@ struct MStarV7SoCState {
     MStarRegbankState clkgen;
     MStarDsiState dsi;
     MStarDphyState dphy;
+    MStarDispState disp;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */

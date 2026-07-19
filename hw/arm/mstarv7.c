@@ -198,6 +198,7 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "dsi", &s->dsi, TYPE_MSTAR_DSI);
     object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
+    object_initialize_child(obj, "disp", &s->disp, TYPE_MSTAR_DISP);
 }
 
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
@@ -346,6 +347,19 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dphy), 0, MSTARV7_DPHY_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 0, MSTARV7_DISP_GOP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 1, MSTARV7_DISP_TOP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp), 2, MSTARV7_DISP_MOP_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTARV7_DISP_TOP_INTC_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 1,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTARV7_DISP_GOP_INTC_IRQ));
 
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
                    MSTARV7_PM_UART_REGSHIFT,

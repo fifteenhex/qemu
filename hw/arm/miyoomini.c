@@ -93,6 +93,10 @@ static void miyoomini_init(MachineState *machine)
     object_property_set_link(OBJECT(&MSTARV7_SOC(&s->soc)->dsi), "panel",
                              OBJECT(panel), &error_fatal);
 
+    /* The panel is mounted upside down on this board */
+    object_property_set_bool(OBJECT(&MSTARV7_SOC(&s->soc)->disp), "flip",
+                             true, &error_fatal);
+
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
 
     /*

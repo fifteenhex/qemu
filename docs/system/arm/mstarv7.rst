@@ -33,9 +33,11 @@ Emulated devices and known limitations
   keypad), the clkgen readback register bank and, on the Miyoo Mini,
   the board's ALPU-FA authentication chip (see :doc:`mstarv7/alpu`).
 * The MIPI DSI output path (see :doc:`mstarv7/dsi`): the DSI
-  controller, the D-PHY and, on the board, the panel it drives. The
-  GOP/framebuffer front end that feeds pixels into it is not modelled
-  yet, so nothing is scanned out.
+  controller, the D-PHY and, on the board, the panel it drives.
+* The display controller (see :doc:`mstarv7/display`): the GOP
+  graphics plane and MOP video plane, composited and scanned out to a
+  QEMU console, and the display-top and GOP/fbdev vsync interrupts.
+  The GE 2D engine is not modelled.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
@@ -56,10 +58,10 @@ environment. Known gaps at this point:
 * Flash writes/erases are not modelled: the erase path and the BDMA
   "write to flash" port (``0xb``) are still unimplemented.
 * With the SAR ADC reading idle, u-boot takes the normal boot path:
-  it JPEG-decodes the boot logo and sends the panel its DCS init
-  sequence over the modelled DSI link (no more command timeout,
-  though nothing is scanned out yet), reads the kernel from flash,
-  decompresses it and jumps to it.
+  it JPEG-decodes the boot logo, shows it on the display (see below)
+  and sends the panel its DCS init sequence over the modelled DSI
+  link, then reads the kernel from flash, decompresses it and jumps
+  to it.
 
 The vendor 4.9 kernel then boots to userspace: it brings CPU1 online
 through the smpctrl mailbox, mounts the squashfs root filesystem,
@@ -76,11 +78,16 @@ kernel log, dump DRAM from the monitor (``pmemsave 0x20000000
 0x8000000 mem.bin``) and read the printk ring buffer out of it. Why
 the vendor driver rejects the UART has not been run down.
 
-Remaining gaps on the way to a usable system: the DSI output path is
-modelled but the GOP/framebuffer front end that feeds it is not, so
-MainUI has no scanout to draw to; no SD/FCIE controller (the vendor
-driver retries it throughout boot); and no SPI flash write/erase
-path.
+The display path now scans out: the vendor u-boot decodes its JPEG
+boot logo into the MOP video plane and the model renders it (visible
+with a ``screendump`` during the u-boot window). MainUI's own UI does
+not appear because it composites through the unmodelled GE 2D engine,
+and it is in any case blocked on the unmodelled FCIE/SD controller
+(at ``0x1f282000``), which its threads busy-poll throughout boot.
+
+Remaining gaps on the way to a usable system: the GE 2D engine
+(MainUI draws through it), the FCIE/SD controller, and the SPI flash
+write/erase path.
 
 Booting
 -------
@@ -121,3 +128,4 @@ the same commit as the device model change it describes.
    mstarv7/sar
    mstarv7/alpu
    mstarv7/dsi
+   mstarv7/display

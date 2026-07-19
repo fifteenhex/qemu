@@ -192,6 +192,21 @@ RIU blocks
      - CPU PLL
      - no
      - ``prev``
+   * - ``0x1f225000``
+     - ``0x1128``
+     - Display top (frame timing, vsync); see :doc:`display`
+     - yes
+     - ``prev``, ``rom``
+   * - ``0x1f246800``
+     - ``0x1234``
+     - GOP graphics plane; see :doc:`display`
+     - yes
+     - ``prev``, ``linux``, ``rom``
+   * - ``0x1f280a00``
+     - ``0x1405``
+     - MOP video plane; see :doc:`display`
+     - yes
+     - ``prev``, ``rom``
    * - ``0x1f2a5000``
      - ``0x152800``
      - MIPI D-PHY; see :doc:`dsi`
