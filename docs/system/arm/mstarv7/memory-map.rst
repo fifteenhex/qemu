@@ -184,8 +184,9 @@ not raise an interrupt (``model``). The previous branch has it on
 The boot-media strap in ``DID_KEY`` (``0x1f0071c0``, vendor register
 ``0x70``) bits[5:2] selects where the boot ROM loads the IPL from:
 ``0x20`` SPI NOR, ``0x10`` NAND, ``0x08`` SPI NAND/eMMC (``prev``).
-Forcing ``0x20`` in the model sends our SSD202D ROM down the SPI NOR
-path (``model``), confirming the strap register for infinity2m.
+The model's DID block returns SPI NOR by default (the SoC's
+``did-key`` property), which sends the ROM down its SPI NOR path and
+confirmed the strap register for infinity2m (``model``).
 
 The previous branch also claims the boot ROM window is 32 KiB and the
 IMI SRAM is 128 KiB (``prev``); neither is confirmed and the model

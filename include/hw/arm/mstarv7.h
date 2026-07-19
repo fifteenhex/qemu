@@ -37,6 +37,16 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 /* IMI SRAM; the size varies between SoCs */
 #define MSTARV7_IMI_BASE        0xa0000000
 /*
+ * The "DID" block. The boot ROM reads the boot-media strap from
+ * DID_KEY bits[5:2] to decide where to load the IPL from.
+ */
+#define MSTARV7_DID_BASE        (MSTARV7_RIU_BASE + 0x7000)
+#define MSTARV7_DID_SIZE        0x200
+#define MSTARV7_DID_KEY         0x1c0
+#define MSTARV7_BOOT_MEDIA_SPI_NOR      0x20
+#define MSTARV7_BOOT_MEDIA_NAND         0x10
+#define MSTARV7_BOOT_MEDIA_SPI_NAND     0x08
+/*
  * The three timers (timer@6040/6080/60c0 in the device trees). The
  * boot ROM uses the first to time its flash operations.
  */
@@ -59,7 +69,11 @@ struct MStarV7SoCState {
 
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     MemoryRegion imi;
+    MemoryRegion did;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
+
+    /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */
+    uint16_t did_key;
 };
 
 struct MStarV7SoCClass {

@@ -25,6 +25,7 @@ Emulated devices and known limitations
 * 64 KiB of IMI SRAM.
 * The PM UART, on the first serial port. No interrupt yet.
 * The three timers, without their interrupts.
+* The DID boot-media strap, reporting SPI NOR boot.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no IPL to load it prints
   ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which

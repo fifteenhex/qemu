@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "hw/arm/mstarv7.h"
@@ -21,6 +22,39 @@
 #include "hw/core/qdev-properties.h"
 #include "system/system.h"
 #include "target/arm/cpu-qom.h"
+
+/*
+ * The "DID" block at 0x1f007000. Only DID_KEY, holding the boot-media
+ * strap, is understood so far; everything else reads as zero.
+ */
+static uint64_t mstarv7_did_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MStarV7SoCState *s = MSTARV7_SOC(opaque);
+
+    switch (addr) {
+    case MSTARV7_DID_KEY:
+        return s->did_key;
+    default:
+        qemu_log_mask(LOG_UNIMP, "mstarv7-did: unknown read 0x%"
+                      HWADDR_PRIx "\n", addr);
+        return 0;
+    }
+}
+
+static void mstarv7_did_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "mstarv7-did: unknown write 0x%" HWADDR_PRIx
+                  " = 0x%" PRIx64 "\n", addr, val);
+}
+
+static const MemoryRegionOps mstarv7_did_ops = {
+    .read = mstarv7_did_read,
+    .write = mstarv7_did_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
 
 static void mstarv7_soc_init(Object *obj)
 {
@@ -80,6 +114,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("mstarv7.periphbase",
                                 MSTARV7_PERIPHBASE, MSTARV7_PERIPHBASE_SIZE);
 
+    memory_region_init_io(&s->did, OBJECT(dev), &mstarv7_did_ops, s,
+                          "mstarv7.did", MSTARV7_DID_SIZE);
+    memory_region_add_subregion(get_system_memory(), MSTARV7_DID_BASE,
+                                &s->did);
+
     /* TODO: wire up the interrupt once the GIC is modelled */
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
                    MSTARV7_PM_UART_REGSHIFT, NULL, MSTARV7_PM_UART_BAUDBASE,
@@ -97,11 +136,17 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static const Property mstarv7_soc_properties[] = {
+    DEFINE_PROP_UINT16("did-key", MStarV7SoCState, did_key,
+                       MSTARV7_BOOT_MEDIA_SPI_NOR),
+};
+
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = mstarv7_soc_realize;
+    device_class_set_props(dc, mstarv7_soc_properties);
     /* Reason: SoCs are only useful wired up inside a board */
     dc->user_creatable = false;
 }
