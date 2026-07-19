@@ -11,6 +11,7 @@
 
 #include "qemu/units.h"
 #include "system/memory.h"
+#include "hw/dma/mstar_bdma.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
 #include "target/arm/cpu.h"
@@ -54,6 +55,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  */
 #define MSTARV7_FSP_BASE        (MSTARV7_RIU_BASE + 0x2c00)
 #define MSTARV7_ISP_XIP_BASE    0x14000000
+/* The BDMA engine; the boot ROM DMAs the IPL from flash into IMI */
+#define MSTARV7_BDMA_BASE       (MSTARV7_RIU_BASE + 0x200400)
 /*
  * The three timers (timer@6040/6080/60c0 in the device trees). The
  * boot ROM uses the first to time its flash operations.
@@ -78,6 +81,7 @@ struct MStarV7SoCState {
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     MemoryRegion imi;
     MemoryRegion did;
+    MStarBdmaState bdma;
     MStarFspState fsp;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 

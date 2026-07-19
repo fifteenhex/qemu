@@ -72,6 +72,7 @@ static void mstarv7_soc_init(Object *obj)
                                 TYPE_MSTAR_TIMER);
     }
 
+    object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSTAR_BDMA);
     object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
 }
 
@@ -120,6 +121,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.did", MSTARV7_DID_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_DID_BASE,
                                 &s->did);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->bdma), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->bdma), 0, MSTARV7_BDMA_BASE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->fsp), errp)) {
         return;

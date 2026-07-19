@@ -134,6 +134,11 @@ RIU blocks
        (see below)
      - no
      - ``prev``, ``rom``
+   * - ``0x1f200400``
+     - ``0x1002``
+     - BDMA engine, two channels; see :doc:`bdma`
+     - yes
+     - ``prev``, ``rom``
    * - ``0x1f201310``
      - ``0x1009``
      - "FIQ" mst-intc, 32 lines onto GIC SPI 96+

@@ -29,6 +29,7 @@ Emulated devices and known limitations
 * The FSP flash sequencer (commands complete but do not touch a real
   flash model yet) and the SPI NOR XIP window, filled from the
   ``-drive if=mtd`` image.
+* The BDMA engine, without its interrupts.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no IPL to load it prints
   ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which
@@ -39,7 +40,7 @@ Booting
 -------
 
 With no kernel argument the machine boots into the ROM, and with a
-flash image attached the ROM finds and verifies the IPL in it:
+flash image attached the ROM loads the IPL out of it and runs it:
 
 .. code-block:: bash
 
@@ -70,3 +71,4 @@ the same commit as the device model change it describes.
    mstarv7/bootrom
    mstarv7/timer
    mstarv7/isp
+   mstarv7/bdma

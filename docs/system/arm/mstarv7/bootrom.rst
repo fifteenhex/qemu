@@ -111,10 +111,14 @@ poll against the timer counter at ``0x1f006050``/``0x1f006054``
 string. With the strap reading zero the ROM instead falls through to
 the ``Check IPL Header failed! [HALT]`` outcome.
 
-On the SPI NOR path the previous branch describes the rest of the
-flow (``prev``, msc313e): the IPL is read through the XIP window at
-``0x14000000``, copied into IMI at ``0xa0000000``, its ``IPL_``
-magic at offset ``4`` is checked and the ROM jumps to it.
+On the SPI NOR path, confirmed under the model with a flash image
+attached (``rom``): the ROM checks the IPL header through the XIP
+window at ``0x14000000`` (progress ``0xb07``), fires the ``66 99``
+NOR reset at the FSP (``0x6000``/``0x6001``), then uses BDMA channel
+0 to copy header plus body from flash offset ``0`` into IMI at
+``0xa0000000``, re-checks the header and jumps to the IPL entry at
+``0xa0000000``. Without a flash image the header check fails
+(``0xbf7``) and it prints ``Check IPL Header failed! [HALT]``.
 
 Error strings
 -------------
