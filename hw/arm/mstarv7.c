@@ -18,6 +18,7 @@
 #include "hw/arm/mstarv7.h"
 #include "hw/char/serial-mm.h"
 #include "hw/misc/unimp.h"
+#include "hw/core/qdev-properties.h"
 #include "system/system.h"
 #include "target/arm/cpu-qom.h"
 
@@ -30,6 +31,11 @@ static void mstarv7_soc_init(Object *obj)
     for (i = 0; i < msc->num_cpus; i++) {
         object_initialize_child(obj, "cpu[*]", &s->cpus[i],
                                 ARM_CPU_TYPE_NAME("cortex-a7"));
+    }
+
+    for (i = 0; i < MSTARV7_NUM_TIMERS; i++) {
+        object_initialize_child(obj, "timer[*]", &s->timer[i],
+                                TYPE_MSTAR_TIMER);
     }
 }
 
@@ -78,6 +84,17 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
                    MSTARV7_PM_UART_REGSHIFT, NULL, MSTARV7_PM_UART_BAUDBASE,
                    serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    for (i = 0; i < MSTARV7_NUM_TIMERS; i++) {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->timer[i]);
+
+        qdev_prop_set_uint32(DEVICE(sbd), "freq", msc->timer_freq);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0,
+                        MSTARV7_TIMER_BASE + i * MSTARV7_TIMER_STRIDE);
+    }
 }
 
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)

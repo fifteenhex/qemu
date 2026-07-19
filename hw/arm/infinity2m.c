@@ -19,6 +19,7 @@ static void infinity2m_soc_class_init(ObjectClass *oc, const void *data)
 
     msc->num_cpus = INFINITY2M_NUM_CPUS;
     msc->imi_size = INFINITY2M_IMI_SIZE;
+    msc->timer_freq = INFINITY2M_TIMER_FREQ;
 }
 
 static const TypeInfo infinity2m_soc_types[] = {

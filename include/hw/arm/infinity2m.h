@@ -24,6 +24,12 @@ OBJECT_DECLARE_TYPE(Infinity2MSoCState, Infinity2MSoCClass, INFINITY2M_SOC)
  */
 #define INFINITY2M_IMI_SIZE (64 * KiB)
 
+/*
+ * clk_timer according to the previous QEMU branch; unconfirmed, only
+ * scales emulated timeout lengths until it is.
+ */
+#define INFINITY2M_TIMER_FREQ 432000000
+
 struct Infinity2MSoCState {
     /*< private >*/
     MStarV7SoCState parent_obj;

@@ -10,6 +10,7 @@
 #define HW_ARM_MSTARV7_H
 
 #include "system/memory.h"
+#include "hw/timer/mstar_timer.h"
 #include "target/arm/cpu.h"
 #include "qom/object.h"
 
@@ -36,6 +37,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 /* IMI SRAM; the size varies between SoCs */
 #define MSTARV7_IMI_BASE        0xa0000000
 /*
+ * The three timers (timer@6040/6080/60c0 in the device trees). The
+ * boot ROM uses the first to time its flash operations.
+ */
+#define MSTARV7_NUM_TIMERS      3
+#define MSTARV7_TIMER_BASE      (MSTARV7_RIU_BASE + 0x6040)
+#define MSTARV7_TIMER_STRIDE    0x40
+/*
  * The PM UART, a 16550 with the registers on an 8 byte stride. The
  * boot ROM prints its messages here.
  */
@@ -51,6 +59,7 @@ struct MStarV7SoCState {
 
     ARMCPU cpus[MSTARV7_SOC_MAX_CPUS];
     MemoryRegion imi;
+    MStarTimerState timer[MSTARV7_NUM_TIMERS];
 };
 
 struct MStarV7SoCClass {
@@ -62,6 +71,8 @@ struct MStarV7SoCClass {
     unsigned num_cpus;
     /* Size of the IMI SRAM */
     uint64_t imi_size;
+    /* Input clock of the timers in Hz */
+    uint32_t timer_freq;
 };
 
 #endif /* HW_ARM_MSTARV7_H */

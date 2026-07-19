@@ -76,7 +76,9 @@ Address                 Written     Guess
 ======================  ==========  ==================================
 
 Earlier in init the ROM also writes zero to ``0x1f006010`` and
-``0x1f006014``, in the same bank but before the timer block.
+``0x1f006014``: those are ``WDT_MAX_PRD_L``/``_H`` of the watchdog at
+``0x1f006000`` (``linux``, from the mainline ``msc313e_wdt`` driver),
+so this is the ROM disabling the watchdog.
 
 Secondary core mailbox (smpctrl)
 --------------------------------

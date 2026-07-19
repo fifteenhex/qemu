@@ -118,11 +118,16 @@ RIU blocks
      - CHIPID; reads ``0xf0`` on SSD20xD
      - no
      - ``prev``
+   * - ``0x1f006000``
+     - ``0x30``
+     - Watchdog; the boot ROM disables it by zeroing ``WDT_MAX_PRD``
+       at ``+0x10``/``+0x14``
+     - no
+     - ``dts``, ``linux``, ``rom``
    * - ``0x1f006040``
      - ``0x30``
-     - Timer 0: the boot ROM programs it and times its SPI NOR
-       timeouts on the counter at ``+0x10``/``+0x14``
-     - no
+     - Timers 0/1/2 on a ``0x40`` stride; see :doc:`timer`
+     - yes
      - ``dts``, ``rom``
    * - ``0x1f007000``
      - ``0x38``

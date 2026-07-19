@@ -24,6 +24,7 @@ Emulated devices and known limitations
 * 128 MiB of in-package DDR3 at the start of the MIU0 address space.
 * 64 KiB of IMI SRAM.
 * The PM UART, on the first serial port. No interrupt yet.
+* The three timers, without their interrupts.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no IPL to load it prints
   ``Check IPL Header failed! [HALT]`` on the PM UART and halts, which
@@ -56,3 +57,4 @@ the same commit as the device model change it describes.
 
    mstarv7/memory-map
    mstarv7/bootrom
+   mstarv7/timer
