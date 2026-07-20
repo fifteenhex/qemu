@@ -238,6 +238,14 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "fcie", &s->fcie, TYPE_MSTAR_FCIE);
 }
 
+/*
+ * The timers' counter-reached-MAX interrupts land on the "FIQ"
+ * mst-intc: timer@6040/6080/60c0 on lines 0, 1 and 12.
+ */
+static const unsigned int mstarv7_timer_intc_fiq[MSTARV7_NUM_TIMERS] = {
+    0, 1, 12
+};
+
 static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
 {
     ERRP_GUARD();
@@ -456,6 +464,9 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         }
         sysbus_mmio_map(sbd, 0,
                         MSTARV7_TIMER_BASE + i * MSTARV7_TIMER_STRIDE);
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_fiq),
+                                            mstarv7_timer_intc_fiq[i]));
     }
 }
 
