@@ -103,5 +103,6 @@ Rendering
 With the Miyoo Mini firmware, the vendor u-boot software-decodes its
 JPEG splash into the MOP plane and enables it; the model scans it out
 and the boot logo appears. The kernel later disables the MOP and
-MainUI takes over the GOP plane, compositing its UI through the
-:doc:`ge`.
+MainUI takes over the GOP plane: its SDL draws into ``/dev/fb0``
+(composited through the :doc:`ge`), the GOP scans the result out, and
+the MainUI menu appears on the console.

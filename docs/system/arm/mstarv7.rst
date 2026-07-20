@@ -76,8 +76,7 @@ environment. Known gaps at this point:
 The vendor 4.9 kernel then boots to userspace: it brings CPU1 online
 through the smpctrl mailbox, mounts the squashfs root filesystem,
 loads the Sigmastar vendor modules, and its init scripts run through
-to launching the MainUI application (which then waits on the
-unmodelled display).
+to launching the MainUI application.
 
 The kernel's own log (dmesg) does not reach the serial port: the
 vendor kernel's 8250 driver probes the PM UART, reports its type as
@@ -88,18 +87,16 @@ kernel log, dump DRAM from the monitor (``pmemsave 0x20000000
 0x8000000 mem.bin``) and read the printk ring buffer out of it. Why
 the vendor driver rejects the UART has not been run down.
 
-The display path now scans out: the vendor u-boot decodes its JPEG
-boot logo into the MOP video plane and the model renders it (visible
-with a ``screendump`` during the u-boot window). MainUI's own UI does
-not appear: it reaches its display and framebuffer setup (fb0 comes
-up, the GOP plane is configured) but then stalls, so the GOP plane
-stays blank. The 2D composition it does through the GE engine is not
-reached, and the GE is not modelled.
+The display renders end to end: the vendor u-boot decodes its JPEG
+boot logo into the MOP video plane (visible with a ``screendump``
+during the u-boot window), the boot chime plays through the BACH
+audio path, and MainUI comes up on the GOP plane - the full menu
+(Game / RetroArch / App / Setting, with its header and footer) is on
+the console about 90 seconds after power-on, with no extra options or
+environment needed.
 
-Remaining gaps on the way to a usable system: whatever MainUI stalls
-on after framebuffer setup, the GE 2D engine (MainUI draws through
-it), and the SPI flash write/erase path. The FCIE/SD controller is
-now modelled, so its driver no longer busy-loops the CPU.
+Remaining gaps on the way to a usable system: driving the menu (its
+buttons are not wired up yet) and the SPI flash write/erase path.
 
 Booting
 -------
