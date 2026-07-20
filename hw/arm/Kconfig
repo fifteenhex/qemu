@@ -111,6 +111,7 @@ config MSTARV7
     select MSTAR_FCIE
     select MSTAR_GPIO
     select MSTAR_I2C
+    select MSTAR_RTCPWC
     select MSTAR_INTC
     select MSTAR_REGBANK
     select MSTAR_SAR

@@ -23,6 +23,7 @@
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
 #include "hw/misc/mstar_regbank.h"
+#include "hw/rtc/mstar_rtcpwc.h"
 #include "hw/sd/mstar_fcie.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
@@ -143,6 +144,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_GPIO_BASE       (MSTARV7_RIU_BASE + 0x207800)
 #define MSTARV7_PM_GPIO_BASE    (MSTARV7_RIU_BASE + 0x1e00)
 /*
+ * The RTC power/wake controller (device tree "sstar,infinity-rtcpwc"). The
+ * vendor RTC driver reads the always-on RTC counter through it, and the
+ * firmware's power management reads its power-source status; without it the
+ * RTC bring-up fails and MainUI reboots thinking the system is unpowered.
+ */
+#define MSTARV7_RTCPWC_BASE     (MSTARV7_RIU_BASE + 0x006800)
+/*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
  */
@@ -238,6 +246,7 @@ struct MStarV7SoCState {
     MStarGeState ge;
     MStarBachState bach;
     MStarGpioState gpio;
+    MStarRtcpwcState rtcpwc;
     MStarFcieState fcie;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
