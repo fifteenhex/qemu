@@ -90,6 +90,14 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  */
 #define MSTARV7_CLKGEN_BASE     (MSTARV7_RIU_BASE + 0x207000)
 /*
+ * The PM-domain clkgen bank holds the always-on clock gates - CLK_pwm,
+ * CLK_spi, CLK_ir, CLK_rtc, CLK_sar and CLK_pm_sleep - plus the SAR
+ * conversion trigger the temperature read path pulses. Another plain
+ * readback bank: the busiest one after the flash write-protect, since
+ * every temperature sample pokes it.
+ */
+#define MSTARV7_PM_CLKGEN_BASE  (MSTARV7_RIU_BASE + 0x1c00)
+/*
  * The "chiptop" block: the pin-mux (pinctrl) pad control together with
  * the chip straps. The package "bond" strap at +0x120 identifies the
  * package/DRAM variant (0x1d SSD201/64 MiB, 0x1e SSD202D/128 MiB).
@@ -254,6 +262,7 @@ struct MStarV7SoCState {
     MStarSarState sar;
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
+    MStarRegbankState pm_clkgen;
     MStarCpupllState cpupll;
     MStarPwmState pwm;
     MStarWdtState wdt;

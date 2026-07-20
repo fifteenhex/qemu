@@ -62,3 +62,31 @@ layout is per the driver's ``MSC313_MUX_*`` macros.
      - mipi_tx_dsi
    * - ``0x1f8``
      - dec_bclk / dec_cclk
+
+PM-domain clkgen
+----------------
+
+A second readback bank at ``0x1f001c00`` holds the always-on clock
+gates. The device tree places these ``sstar,*-clock`` nodes in it
+(``dts``):
+
+.. list-table::
+   :header-rows: 1
+
+   * - Offset
+     - Clock
+   * - ``0x70``
+     - CLK_pwm
+   * - ``0x80``
+     - CLK_spi / CLK_spi_pm
+   * - ``0x84``
+     - CLK_ir
+   * - ``0x88``
+     - CLK_rtc / CLK_sar / CLK_pm_sleep
+
+The same bank also carries the SAR conversion trigger the kernel's
+temperature read path pulses (set bit ``0x400`` at ``0x190``, bit ``4``
+at ``0xbc``) before sampling the ADC in the SAR block at ``0x1f002800``;
+the formula is ``(1370 * (calib - raw) + 25000) / 1000`` (``obs``). This
+readback traffic is the busiest in the system after the flash
+write-protect - one pass per temperature sample.

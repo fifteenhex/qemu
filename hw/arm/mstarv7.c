@@ -228,6 +228,7 @@ static void mstarv7_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
+    object_initialize_child(obj, "pm-clkgen", &s->pm_clkgen, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "cpupll", &s->cpupll, TYPE_MSTAR_CPUPLL);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSTAR_PWM);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_MSTAR_WDT);
@@ -385,6 +386,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pm_clkgen), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_clkgen), 0, MSTARV7_PM_CLKGEN_BASE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cpupll), errp)) {
         return;
