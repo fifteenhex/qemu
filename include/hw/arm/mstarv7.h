@@ -22,6 +22,7 @@
 #include "hw/gpio/mstar_gpio.h"
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
+#include "hw/misc/mstar_pwm.h"
 #include "hw/misc/mstar_regbank.h"
 #include "hw/rtc/mstar_rtcpwc.h"
 #include "hw/sd/mstar_fcie.h"
@@ -103,6 +104,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_I2C_STRIDE      0x200
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
+/* The PWM controller; on the Miyoo Mini one channel is the LCD backlight */
+#define MSTARV7_PWM_BASE        (MSTARV7_RIU_BASE + 0x3400)
 /* The FCIE SD/MMC host controller */
 #define MSTARV7_FCIE_BASE       (MSTARV7_RIU_BASE + 0x282000)
 /*
@@ -245,6 +248,7 @@ struct MStarV7SoCState {
     MStarSarState sar;
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
+    MStarPwmState pwm;
     MemoryRegion chiptop;
     uint16_t chiptop_regs[MSTARV7_CHIPTOP_NUM_REGS];
     MStarDsiState dsi;

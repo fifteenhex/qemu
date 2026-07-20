@@ -259,5 +259,8 @@ config XLNX_ZYNQ_DDRC
 
 source macio/Kconfig
 
+config MSTAR_PWM
+    bool
+
 config MSTAR_REGBANK
     bool

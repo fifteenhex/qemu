@@ -228,6 +228,7 @@ static void mstarv7_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
+    object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSTAR_PWM);
     object_initialize_child(obj, "dsi", &s->dsi, TYPE_MSTAR_DSI);
     object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
     object_initialize_child(obj, "disp", &s->disp, TYPE_MSTAR_DISP);
@@ -382,6 +383,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->clkgen), 0, MSTARV7_CLKGEN_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwm), 0, MSTARV7_PWM_BASE);
 
     memory_region_init_io(&s->chiptop, OBJECT(dev), &mstarv7_chiptop_ops, s,
                           "mstarv7.chiptop", MSTARV7_CHIPTOP_SIZE);
