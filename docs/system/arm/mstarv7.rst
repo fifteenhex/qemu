@@ -45,6 +45,9 @@ Emulated devices and known limitations
 * The GE 2D graphics engine (see :doc:`mstarv7/ge`), which MainUI
   composites its UI through: bitblts with format conversion and
   180-degree rotation execute; blending, ROP and stretch do not.
+* The BACH audio controller (see :doc:`mstarv7/bach`): the playback
+  DMA sub-channel plays through QEMU's audio backend, with the
+  period/underrun interrupt handshake the vendor ALSA driver needs.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
@@ -139,6 +142,7 @@ the same commit as the device model change it describes.
    mstarv7/dsi
    mstarv7/display
    mstarv7/ge
+   mstarv7/bach
    mstarv7/clocks
    mstarv7/pinctrl
    mstarv7/fcie

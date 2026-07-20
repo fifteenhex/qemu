@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "system/memory.h"
 #include "hw/adc/mstar_sar.h"
+#include "hw/audio/mstar_bach.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/display/mstar_disp.h"
 #include "hw/display/mstar_dphy.h"
@@ -125,6 +126,15 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  */
 #define MSTARV7_DISP_GE_BASE    (MSTARV7_RIU_BASE + 0x281200)
 /*
+ * The "bach" audio controller and its "audiotop" codec syscon. The
+ * vendor MI_AO audio path (the chime the boot flow plays, MainUI's
+ * SDL audio) drives the reader DMA sub-channel here and waits on its
+ * underrun interrupt.
+ */
+#define MSTARV7_BACH_BASE       (MSTARV7_RIU_BASE + 0x2a0400)
+#define MSTARV7_AUDIOTOP_BASE   (MSTARV7_RIU_BASE + 0x206800)
+#define MSTARV7_BACH_INTC_IRQ   42
+/*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
  */
@@ -218,6 +228,7 @@ struct MStarV7SoCState {
     MStarDphyState dphy;
     MStarDispState disp;
     MStarGeState ge;
+    MStarBachState bach;
     MStarFcieState fcie;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 
