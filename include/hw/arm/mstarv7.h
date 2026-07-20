@@ -152,6 +152,14 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  */
 #define MSTARV7_DISP_GE_BASE    (MSTARV7_RIU_BASE + 0x281200)
 /*
+ * Display-pipeline configuration/timing banks that the panel bring-up
+ * programs and reads back but which do not feed the functional scanout
+ * (the disp model reads the framebuffer state directly). Modelled as
+ * plain readback banks; see docs/system/arm/mstarv7/display.rst for the
+ * per-bank register maps. The base of each is in mstarv7_disp_cfg_base[].
+ */
+#define MSTARV7_NUM_DISP_CFG    15
+/*
  * The "bach" audio controller and its "audiotop" codec syscon. The
  * vendor MI_AO audio path (the chime the boot flow plays, MainUI's
  * SDL audio) drives the reader DMA sub-channel here and waits on its
@@ -263,6 +271,7 @@ struct MStarV7SoCState {
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
     MStarRegbankState pm_clkgen;
+    MStarRegbankState disp_cfg[MSTARV7_NUM_DISP_CFG];
     MStarCpupllState cpupll;
     MStarPwmState pwm;
     MStarWdtState wdt;

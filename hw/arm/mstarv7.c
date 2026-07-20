@@ -199,6 +199,28 @@ static const MemoryRegionOps mstarv7_chiptop_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * Bases of the display-pipeline config/timing banks, with the role
+ * each was traced to (see display.rst). All plain readback banks.
+ */
+static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
+    MSTARV7_RIU_BASE + 0x224c00,    /* disp front: mux/enable, clip windows */
+    MSTARV7_RIU_BASE + 0x224e00,    /* disp front: continued */
+    MSTARV7_RIU_BASE + 0x225200,    /* panel (pnl) timing generator */
+    MSTARV7_RIU_BASE + 0x226600,    /* mipi_tx_dsi / hdmi clock gates */
+    MSTARV7_RIU_BASE + 0x246200,    /* GOP plane 0 config */
+    MSTARV7_RIU_BASE + 0x246400,    /* GOP plane 1 config */
+    MSTARV7_RIU_BASE + 0x281000,    /* GE front / display mux */
+    MSTARV7_RIU_BASE + 0x281a00,    /* MOP overlay windows */
+    MSTARV7_RIU_BASE + 0x283e00,    /* scaler front */
+    MSTARV7_RIU_BASE + 0x284200,    /* scaler / colour plane 0 */
+    MSTARV7_RIU_BASE + 0x284a00,    /* scaler / colour plane 1 */
+    MSTARV7_RIU_BASE + 0x285200,    /* scaler / colour plane 2 */
+    MSTARV7_RIU_BASE + 0x2a4a00,    /* mipi/dsi analog */
+    MSTARV7_RIU_BASE + 0x2a4c00,    /* mipi/dsi analog */
+    MSTARV7_RIU_BASE + 0x2a4e00,    /* mipi/dsi analog */
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -229,6 +251,10 @@ static void mstarv7_soc_init(Object *obj)
 
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
     object_initialize_child(obj, "pm-clkgen", &s->pm_clkgen, TYPE_MSTAR_REGBANK);
+    for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
+        object_initialize_child(obj, "disp-cfg[*]", &s->disp_cfg[i],
+                                TYPE_MSTAR_REGBANK);
+    }
     object_initialize_child(obj, "cpupll", &s->cpupll, TYPE_MSTAR_CPUPLL);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSTAR_PWM);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_MSTAR_WDT);
@@ -391,6 +417,14 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_clkgen), 0, MSTARV7_PM_CLKGEN_BASE);
+
+    for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp_cfg[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->disp_cfg[i]), 0,
+                        mstarv7_disp_cfg_base[i]);
+    }
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cpupll), errp)) {
         return;
