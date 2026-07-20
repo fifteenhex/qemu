@@ -95,8 +95,31 @@ audio path, and MainUI comes up on the GOP plane - the full menu
 the console about 90 seconds after power-on, with no extra options or
 environment needed.
 
-Remaining gaps on the way to a usable system: driving the menu (its
-buttons are not wired up yet) and the SPI flash write/erase path.
+The menu can be driven from the keyboard: the Miyoo Mini's buttons are
+wired to the SoC GPIO pads (see :doc:`mstarv7/gpio`), each mapped to a
+host key.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Button
+     - Key
+   * - D-pad
+     - arrow keys
+   * - A / B / X / Y
+     - ``A`` / ``B`` / ``X`` / ``Y``
+   * - Start / Select
+     - ``Enter`` / ``Right Shift``
+   * - Menu
+     - ``Esc``
+   * - L1 / R1
+     - ``Q`` / ``O``
+   * - L2 / R2
+     - ``W`` / ``P``
+
+Remaining gaps on the way to a usable system: the power key and the
+USB-plugged / charge state (the firmware's power-management daemon
+watches these), and the SPI flash write/erase path.
 
 Booting
 -------

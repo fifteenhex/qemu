@@ -24,10 +24,58 @@
 #include "hw/arm/ssd202d.h"
 #include "hw/display/dsi.h"
 #include "hw/i2c/alpu.h"
+#include "hw/core/irq.h"
 #include "hw/sd/sd.h"
+#include "ui/input.h"
+#include "standard-headers/linux/input-event-codes.h"
 
 #define TYPE_MIYOOMINI_MACHINE MACHINE_TYPE_NAME("miyoomini")
 OBJECT_DECLARE_SIMPLE_TYPE(MiyooMiniMachineState, MIYOOMINI_MACHINE)
+
+/*
+ * The board buttons, wired to SoC GPIO pads (from the mainline 6.5
+ * device tree's gpio-keys node and the vendor kernel's GPIO HAL pad
+ * table, which the polling gpio-keys driver reads at these offsets).
+ * Each is driven by one key on the QEMU keyboard. Every button idles
+ * high behind its pull-up and is pulled low when pressed. The dpad's
+ * down/left are on the PM pad bank, the rest on the main bank.
+ */
+typedef struct {
+    unsigned int key;       /* host key (Linux input-event code) */
+    bool pm_bank;           /* pad is in the PM bank, not the main bank */
+    uint16_t offset;        /* pad register offset within its bank */
+    const char *name;
+} MiyooMiniButton;
+
+static const MiyooMiniButton miyoomini_buttons[] = {
+    { KEY_UP,         false, 0x004, "up" },
+    { KEY_DOWN,       true,  0x128, "down" },
+    { KEY_LEFT,       true,  0x12c, "left" },
+    { KEY_RIGHT,      false, 0x014, "right" },
+    { KEY_A,          false, 0x01c, "a" },
+    { KEY_B,          false, 0x018, "b" },
+    { KEY_X,          false, 0x024, "x" },
+    { KEY_Y,          false, 0x020, "y" },
+    { KEY_ENTER,      false, 0x028, "start" },
+    { KEY_RIGHTSHIFT, false, 0x02c, "select" },
+    { KEY_ESC,        false, 0x030, "menu" },
+    { KEY_Q,          false, 0x038, "l1" },
+    { KEY_W,          false, 0x034, "l2" },
+    { KEY_O,          false, 0x060, "r1" },
+    { KEY_P,          false, 0x114, "r2" },
+};
+
+#define TYPE_MIYOOMINI_KEYS "miyoomini-keys"
+OBJECT_DECLARE_SIMPLE_TYPE(MiyooMiniKeysState, MIYOOMINI_KEYS)
+
+struct MiyooMiniKeysState {
+    /*< private >*/
+    DeviceState parent_obj;
+    /*< public >*/
+
+    QemuInputHandlerState *hs;
+    qemu_irq pads[ARRAY_SIZE(miyoomini_buttons)];
+};
 
 struct MiyooMiniMachineState {
     /*< private >*/
@@ -35,8 +83,55 @@ struct MiyooMiniMachineState {
     /*< public >*/
 
     SSD202DSoCState soc;
+    MiyooMiniKeysState keys;
     struct arm_boot_info binfo;
 };
+
+static void miyoomini_keys_event(DeviceState *dev, QemuConsole *src,
+                                 QemuInputEvent *evt)
+{
+    MiyooMiniKeysState *s = MIYOOMINI_KEYS(dev);
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(miyoomini_buttons); i++) {
+        const MiyooMiniButton *b = &miyoomini_buttons[i];
+
+        if (b->key == evt->key.key) {
+            /* active low: pressed pulls the pad to 0, released to 1 */
+            qemu_set_irq(s->pads[i], !evt->key.down);
+            break;
+        }
+    }
+}
+
+static const QemuInputHandler miyoomini_keys_handler = {
+    .name = "miyoomini-keys",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = miyoomini_keys_event,
+};
+
+static void miyoomini_keys_init(Object *obj)
+{
+    MiyooMiniKeysState *s = MIYOOMINI_KEYS(obj);
+
+    qdev_init_gpio_out(DEVICE(obj), s->pads, ARRAY_SIZE(miyoomini_buttons));
+}
+
+static void miyoomini_keys_realize(DeviceState *dev, Error **errp)
+{
+    MiyooMiniKeysState *s = MIYOOMINI_KEYS(dev);
+
+    s->hs = qemu_input_handler_register(dev, &miyoomini_keys_handler);
+}
+
+static void miyoomini_keys_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->realize = miyoomini_keys_realize;
+    /* Created by the machine, not -device */
+    dc->user_creatable = false;
+}
 
 static void miyoomini_load_bootrom(MachineState *machine, SSD202DSoCState *soc)
 {
@@ -65,6 +160,7 @@ static void miyoomini_init(MachineState *machine)
     DriveInfo *dinfo;
     DeviceState *panel;
     uint64_t offset;
+    int i;
 
     /* The DRAM is inside the SoC package so its size is fixed */
     if (machine->ram_size != SSD202D_DRAM_SIZE) {
@@ -107,6 +203,26 @@ static void miyoomini_init(MachineState *machine)
      * than in the SoC.
      */
     i2c_slave_create_simple(MSTARV7_SOC(&s->soc)->i2c[1].bus, TYPE_ALPU, 0x3d);
+
+    /*
+     * The board buttons: each drives its SoC GPIO pad from a key on
+     * the QEMU keyboard, and every active-low button's pad idles high
+     * behind its pull-up.
+     */
+    object_initialize_child(OBJECT(machine), "keys", &s->keys,
+                            TYPE_MIYOOMINI_KEYS);
+    qdev_realize(DEVICE(&s->keys), NULL, &error_fatal);
+    for (i = 0; i < ARRAY_SIZE(miyoomini_buttons); i++) {
+        const MiyooMiniButton *b = &miyoomini_buttons[i];
+        qemu_irq pad = qdev_get_gpio_in_named(DEVICE(&MSTARV7_SOC(&s->soc)->gpio),
+                                              b->pm_bank ? MSTAR_GPIO_PM_PAD
+                                                         : MSTAR_GPIO_MAIN_PAD,
+                                              b->offset / 4);
+
+        qdev_connect_gpio_out(DEVICE(&s->keys), i, pad);
+        /* Idle high behind the pull-up, until a press pulls it low */
+        qemu_irq_raise(pad);
+    }
 
     /* An SD card in the slot, if the user supplied one with -drive if=sd */
     dinfo = drive_get(IF_SD, 0, 0);
@@ -175,6 +291,13 @@ static const TypeInfo miyoomini_machine_types[] = {
         .instance_size  = sizeof(MiyooMiniMachineState),
         .class_init     = miyoomini_machine_class_init,
         .interfaces     = arm_machine_interfaces,
+    },
+    {
+        .name           = TYPE_MIYOOMINI_KEYS,
+        .parent         = TYPE_DEVICE,
+        .instance_size  = sizeof(MiyooMiniKeysState),
+        .instance_init  = miyoomini_keys_init,
+        .class_init     = miyoomini_keys_class_init,
     },
 };
 
