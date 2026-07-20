@@ -37,6 +37,8 @@ Emulated devices and known limitations
   register banks, the chiptop also returning the package bond strap.
 * The PWM controller (see :doc:`mstarv7/pwm`), one channel of which is
   the Miyoo Mini's LCD backlight.
+* The watchdog timer (see :doc:`mstarv7/watchdog`), left disabled by
+  the vendor firmware.
 * The FCIE SD/MMC host controller (see :doc:`mstarv7/fcie`), with a
   standard SD bus; attach a card with ``-drive if=sd``.
 * The MIPI DSI output path (see :doc:`mstarv7/dsi`): the DSI
@@ -169,4 +171,5 @@ the same commit as the device model change it describes.
    mstarv7/clocks
    mstarv7/pinctrl
    mstarv7/pwm
+   mstarv7/watchdog
    mstarv7/fcie

@@ -114,6 +114,7 @@ config MSTARV7
     select MSTAR_RTCPWC
     select MSTAR_INTC
     select MSTAR_PWM
+    select MSTAR_WDT
     select MSTAR_REGBANK
     select MSTAR_SAR
     select MSTAR_BDMA

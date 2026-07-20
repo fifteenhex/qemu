@@ -28,6 +28,7 @@
 #include "hw/sd/mstar_fcie.h"
 #include "hw/ssi/mstar_fsp.h"
 #include "hw/timer/mstar_timer.h"
+#include "hw/watchdog/mstar_wdt.h"
 #include "target/arm/cpu.h"
 #include "qom/object.h"
 
@@ -106,6 +107,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
 /* The PWM controller; on the Miyoo Mini one channel is the LCD backlight */
 #define MSTARV7_PWM_BASE        (MSTARV7_RIU_BASE + 0x3400)
+/* The watchdog timer (sstar,infinity-wdt) */
+#define MSTARV7_WDT_BASE        (MSTARV7_RIU_BASE + 0x6000)
 /* The FCIE SD/MMC host controller */
 #define MSTARV7_FCIE_BASE       (MSTARV7_RIU_BASE + 0x282000)
 /*
@@ -249,6 +252,7 @@ struct MStarV7SoCState {
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
     MStarPwmState pwm;
+    MStarWdtState wdt;
     MemoryRegion chiptop;
     uint16_t chiptop_regs[MSTARV7_CHIPTOP_NUM_REGS];
     MStarDsiState dsi;
