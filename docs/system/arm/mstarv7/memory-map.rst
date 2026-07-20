@@ -263,3 +263,59 @@ registers are 16 bits wide but sit on 32-bit boundaries, and a bank is
 
 Per-block register documentation will use the bank/register form
 alongside byte addresses so it can be checked against vendor sources.
+
+Unmodelled blocks
+-----------------
+
+What still reaches the RIU catch-all through a boot to the MainUI menu,
+after the flash, clocks and display banks are covered - about 200
+accesses. These were mapped by tracing the writer PC of each access (a
+probe overlay logging the ARM ``pc``/``lr``) and attributing it to the
+mask ROM, the IPL (running from IMI at ``0xa000xxxx``), the vendor
+u-boot (resident in DRAM at ``0x23fxxxxx``), the kernel or a module
+(via ``/proc/modules``), so the tags below are ``obs`` unless noted.
+None is a large new peripheral; they are the boot-time analog, PLL and
+security edges around blocks that are already modelled.
+
+Analog PLLs (``0x1f206000``-``0x1f206600``)
+    Programmed by the IPL (``0x206000``/``0x206200``, loop/divider
+    words) and the vendor u-boot (``0x206600``, ``0x2201``/``0x420``
+    ...) before Linux. These are the MPLL/UPLL-class PLLs of the clock
+    tree (:doc:`clocks`); like the DDR PLL they are set up in the boot
+    chain and not read back on a RIU bank, so the model does not need
+    them. The DT does not name them (driver-hardcoded bases).
+
+MIU / DDR calibration tail (``0x1f201800`` / ``0x1f201a00`` / ``0x1f004000``)
+    The kernel MIU driver (``0xc01cf5xx``, the same code that runs the
+    DQ training in :doc:`ddr`) reads back the trained per-byte delay
+    table at ``0x1f201a00``. ``0x1f004000`` is an IPL boot-status block
+    (``0xa00011cc``) - 51 mostly-read accesses polling ``+0xc`` bit
+    ``0x100`` for ready.
+
+LCD / MIPI display PLL (``0x1f006400``, ``0x1f006600``)
+    The *first* step of the kernel panel bring-up
+    (``0xc02f0cd6``, just before the enable routine in :doc:`display`):
+    it computes a pixel-clock divider and pulses the PLL power and lane
+    enables here (``|= 0x4000``, walking ``0x400/0x800/0x1000/0x2000``).
+    The device tree labels ``0x1f006200``-``0x67ff`` ``emac0``
+    (``dts``), but the runtime writer is unambiguously the display
+    path, so treat the DT name with suspicion here. ``0x1f003c00`` is a
+    related display/PM misc bank the same path reads.
+
+SPI-NOR ISP core (``0x1f001000``)
+    The ISP flash-controller core (see :doc:`isp`), poked by the vendor
+    u-boot on its flash-read path (values ``0x5555``/``0x40``).
+    ``0x1f000c00`` and ``0x1f001600`` are one-off mhal accesses nearby.
+
+RIU unlock handshake (``0x1f200800``)
+    Written very early from the mask ROM (return addresses in low
+    memory, ``pc`` ``0x2c``/``0x54``): a ``0xbabe`` password plus an
+    ``0xa01``/``0xa02``/``0xa03`` step sequence - the RIU/chiptop access
+    unlock. ``0x1f200200``/``0x1f200e00``/``0x1f201600`` are single
+    early chiptop/clkgen pokes from the mask ROM, IPL and kernel.
+
+Peripheral edges
+    ``0x1f221070`` is the MStar wrapper register just past the uart0
+    16550 window (the UART list above); ``0x1f002400`` is the
+    second RTC (``sstar,infinity-rtc``, distinct from the modelled
+    rtcpwc), read once at boot.
