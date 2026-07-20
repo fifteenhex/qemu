@@ -25,6 +25,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/blockdev.h"
+#include "hw/block/block.h"
 #include "hw/gpio/mstar_gpio.h"
 
 /*
@@ -38,6 +40,15 @@
 #define MSTAR_GPIO_PM_OEN    (1 << 0)
 #define MSTAR_GPIO_PM_OUT    (1 << 1)
 #define MSTAR_GPIO_PM_IN     (1 << 2)
+
+/*
+ * The SD card-detect (SD_CDZ) hangs off the PM bank, at register 0x47
+ * (byte offset 0x11c) bit 2, active low: a card in the slot pulls the
+ * pad low, an empty slot reads high behind its pull-up. The vendor
+ * sdmmc driver reads it here to decide whether to enumerate a card.
+ */
+#define MSTAR_GPIO_PM_SD_CDZ     0x11c
+#define MSTAR_GPIO_PM_SD_CDZ_BIT (1 << 2)
 
 static uint64_t mstar_gpio_bank_read(const uint8_t *regs, const uint32_t *ext,
                                      hwaddr addr, uint8_t in_bit,
@@ -83,10 +94,19 @@ static void mstar_gpio_main_write(void *opaque, hwaddr addr, uint64_t val,
 static uint64_t mstar_gpio_pm_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarGpioState *s = MSTAR_GPIO(opaque);
+    uint64_t v = mstar_gpio_bank_read(s->pm_regs, s->pm_ext, addr,
+                                      MSTAR_GPIO_PM_IN, MSTAR_GPIO_PM_OUT,
+                                      MSTAR_GPIO_PM_OEN);
 
-    return mstar_gpio_bank_read(s->pm_regs, s->pm_ext, addr,
-                                MSTAR_GPIO_PM_IN, MSTAR_GPIO_PM_OUT,
-                                MSTAR_GPIO_PM_OEN);
+    if (addr == MSTAR_GPIO_PM_SD_CDZ) {
+        /* Active low: a card present holds the pad low, empty reads high */
+        if (s->card_present) {
+            v &= ~(uint64_t)MSTAR_GPIO_PM_SD_CDZ_BIT;
+        } else {
+            v |= MSTAR_GPIO_PM_SD_CDZ_BIT;
+        }
+    }
+    return v;
 }
 
 static void mstar_gpio_pm_write(void *opaque, hwaddr addr, uint64_t val,
@@ -160,10 +180,19 @@ static void mstar_gpio_init(Object *obj)
                             MSTAR_GPIO_NUM_PADS);
 }
 
+static void mstar_gpio_realize(DeviceState *dev, Error **errp)
+{
+    MStarGpioState *s = MSTAR_GPIO(dev);
+
+    /* A card is present iff the machine was given one via -drive if=sd */
+    s->card_present = drive_get(IF_SD, 0, 0) != NULL;
+}
+
 static void mstar_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    dc->realize = mstar_gpio_realize;
     device_class_set_legacy_reset(dc, mstar_gpio_reset);
 }
 

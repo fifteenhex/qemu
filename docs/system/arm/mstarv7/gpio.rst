@@ -36,6 +36,13 @@ say) drives onto it. Each pad exposes one GPIO input line - named
 ``main-pad`` / ``pm-pad`` and indexed by the pad register offset / 4 -
 for a board to drive.
 
+One PM-bank pad is special-cased: the SD card-detect (``SD_CDZ``) sits
+at register ``0x47`` (byte offset ``0x11c``) bit 2, active low. A card
+in the slot holds the pad low and an empty slot reads high behind its
+pull-up, so the model forces that bit from whether the machine was
+given a card with ``-drive if=sd``. The FCIE host's sdmmc driver reads
+it to decide whether to enumerate a card.
+
 The pads are also interrupt sources on real hardware (through the
 "main" interrupt nexus). That is not modelled: the Miyoo Mini's
 buttons are the only consumers so far and its kernel polls them

@@ -35,6 +35,8 @@ struct MStarGpioState {
     /* External level driven onto each pad (buttons, straps, ...) */
     uint32_t main_ext[MSTAR_GPIO_NUM_PADS / 32];
     uint32_t pm_ext[MSTAR_GPIO_NUM_PADS / 32];
+
+    bool card_present;      /* an SD card is in the slot (drives PM SD_CDZ low) */
 };
 
 #endif /* HW_GPIO_MSTAR_GPIO_H */
