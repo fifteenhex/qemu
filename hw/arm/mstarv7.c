@@ -436,6 +436,9 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->fcie), 0, MSTARV7_FCIE_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->fcie), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTARV7_FCIE_INTC_IRQ));
 
     serial_mm_init(get_system_memory(), MSTARV7_PM_UART_BASE,
                    MSTARV7_PM_UART_REGSHIFT,

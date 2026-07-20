@@ -106,6 +106,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 /* The FCIE SD/MMC host controller */
 #define MSTARV7_FCIE_BASE       (MSTARV7_RIU_BASE + 0x282000)
 /*
+ * Its "MIE" (MStar interrupt-event) line, on which the sdmmc driver
+ * waits for command/data completion. The vendor kernel names it
+ * ms_sdmmc_mie and routes it through the main-intc as hwirq 51, i.e.
+ * "IRQ" mst-intc line 51 - INTC_IRQ_START.
+ */
+#define MSTARV7_FCIE_INTC_IRQ   (51 - MSTARV7_INTC_IRQ_START)
+/*
  * The display output path to the panel: the MIPI DSI controller and
  * the analog D-PHY it drives. The rest of the display pipe (GOP, the
  * display top and MOP overlay) is not modelled yet.
