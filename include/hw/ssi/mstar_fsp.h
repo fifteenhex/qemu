@@ -16,7 +16,12 @@
 #define TYPE_MSTAR_FSP "mstar-fsp"
 OBJECT_DECLARE_SIMPLE_TYPE(MStarFspState, MSTAR_FSP)
 
-#define MSTAR_FSP_REGION_SIZE 0x200
+/*
+ * Two RIU banks: the FSP flash sequencer at 0x1f002c00 and the QSPI
+ * config bank at 0x1f002e00, which carries the flash write-protect
+ * control the SERFLASH driver toggles around every transaction.
+ */
+#define MSTAR_FSP_REGION_SIZE 0x400
 #define MSTAR_FSP_NUM_REGS    (MSTAR_FSP_REGION_SIZE / 4)
 
 /* The size of the memory mapped XIP read window */

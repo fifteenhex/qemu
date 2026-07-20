@@ -73,6 +73,41 @@ reset command pair - then reads the IPL through the XIP window. This
 also explains the ``SPINOR reset timeout!`` string: the poll of
 DONE_FLAG is timed against timer 0.
 
+QSPI config bank
+----------------
+
+The second RIU bank at ``0x1f002e00`` carries the flash write-protect
+control. Register indices are relative to the FSP base ``0x1f002c00``
+(so bank 0x17 register ``n`` is index ``0x80 + n``); the behaviour was
+observed under the model by tracing the Linux SERFLASH driver
+(``obs``).
+
+.. list-table::
+   :header-rows: 1
+
+   * - Register
+     - Byte offset
+     - Name
+     - Notes
+     - Source
+   * - ``0xf1``
+     - ``0x3c4``
+     - WP_CFG
+     - written ``1``, ``0x10``, ``0x100`` once at init
+     - ``obs``
+   * - ``0xf2``
+     - ``0x3c8``
+     - WP_CTRL
+     - write protect: the driver writes ``0xa`` to unprotect before a
+       write/erase and ``1`` to protect after, reading it back each
+       time. By far the busiest register in the system - roughly 40000
+       accesses through boot to menu.
+     - ``obs``
+
+Both are modelled as readback storage: the driver only ever reads back
+what it wrote, so no side effects are needed. Covering them here stops
+that heavy traffic from drowning the ``-d unimp`` log.
+
 The model completes any fired sequence immediately and leaves the
 read buffer as it was (there is no SPI flash model behind it yet; the
 XIP window is filled from the ``-drive if=mtd`` image directly). The

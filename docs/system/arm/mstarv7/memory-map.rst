@@ -15,6 +15,9 @@ trusted:
 * ``sdk`` -- vendor SDK sources or headers
 * ``hw`` -- verified against real hardware
 * ``rom`` -- derived from analysing a dump of the boot ROM
+* ``obs`` -- observed by tracing the guest firmware's register accesses
+  running under the model (``-d unimp``); shows a register is used and
+  how, but not the underlying hardware semantics
 * ``prev`` -- the previous QEMU branch; jumbled and known to contain
   mistakes, so treat as a hint only until confirmed elsewhere
 * ``model`` -- a choice made for the emulation, not a hardware fact

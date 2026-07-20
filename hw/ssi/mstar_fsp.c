@@ -14,6 +14,14 @@
  * to march through its flash init; the data itself is fetched through
  * the XIP window, which is backed separately.
  *
+ * The region spans two RIU banks: the sequencer at 0x1f002c00 and the
+ * QSPI config bank at 0x1f002e00. The latter carries the flash write
+ * protect control (WP_CTRL): the Linux SERFLASH driver clears it before
+ * each write/erase and sets it again after, reading it back each time.
+ * That readback is the busiest access in the whole system, so covering
+ * it here keeps the unimplemented-access log usable. Both WP registers
+ * behave as plain readback storage, which the default handling gives.
+ *
  * Copyright (c) 2026 Daniel Palmer <daniel@thingy.jp>
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
