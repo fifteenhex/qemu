@@ -113,6 +113,7 @@ config MSTARV7
     select MSTAR_I2C
     select MSTAR_RTCPWC
     select MSTAR_INTC
+    select MSTAR_CPUPLL
     select MSTAR_PWM
     select MSTAR_WDT
     select MSTAR_REGBANK

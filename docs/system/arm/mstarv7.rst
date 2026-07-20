@@ -35,6 +35,9 @@ Emulated devices and known limitations
 * The clkgen clock block (see :doc:`mstarv7/clocks`) and the chiptop
   pinctrl / strap block (see :doc:`mstarv7/pinctrl`), both readback
   register banks, the chiptop also returning the package bond strap.
+* The analog CPU PLL (see :doc:`mstarv7/cpupll`), from which the
+  Cortex-A7 clock and the cpufreq driver derive - modelled so cpufreq
+  registers the 400-1200 MHz operating points.
 * The PWM controller (see :doc:`mstarv7/pwm`), one channel of which is
   the Miyoo Mini's LCD backlight.
 * The watchdog timer (see :doc:`mstarv7/watchdog`), left disabled by
@@ -170,6 +173,7 @@ the same commit as the device model change it describes.
    mstarv7/gpio
    mstarv7/clocks
    mstarv7/pinctrl
+   mstarv7/cpupll
    mstarv7/pwm
    mstarv7/watchdog
    mstarv7/fcie

@@ -22,6 +22,7 @@
 #include "hw/gpio/mstar_gpio.h"
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
+#include "hw/misc/mstar_cpupll.h"
 #include "hw/misc/mstar_pwm.h"
 #include "hw/misc/mstar_regbank.h"
 #include "hw/rtc/mstar_rtcpwc.h"
@@ -105,6 +106,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_I2C_STRIDE      0x200
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
+/* The analog CPU PLL; the Cortex-A7 clock (and cpufreq) derive from it */
+#define MSTARV7_CPUPLL_BASE     (MSTARV7_RIU_BASE + 0x206400)
 /* The PWM controller; on the Miyoo Mini one channel is the LCD backlight */
 #define MSTARV7_PWM_BASE        (MSTARV7_RIU_BASE + 0x3400)
 /* The watchdog timer (sstar,infinity-wdt) */
@@ -251,6 +254,7 @@ struct MStarV7SoCState {
     MStarSarState sar;
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
+    MStarCpupllState cpupll;
     MStarPwmState pwm;
     MStarWdtState wdt;
     MemoryRegion chiptop;
