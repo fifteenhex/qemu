@@ -160,6 +160,7 @@ the same commit as the device model change it describes.
    :maxdepth: 1
 
    mstarv7/memory-map
+   mstarv7/ddr
    mstarv7/bootrom
    mstarv7/timer
    mstarv7/isp
