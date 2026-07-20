@@ -109,6 +109,7 @@ config MSTARV7
     select MSTAR_BACH
     select MSTAR_DISP
     select MSTAR_FCIE
+    select MSTAR_GPIO
     select MSTAR_I2C
     select MSTAR_INTC
     select MSTAR_REGBANK

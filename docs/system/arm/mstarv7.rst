@@ -140,6 +140,7 @@ the same commit as the device model change it describes.
    mstarv7/display
    mstarv7/ge
    mstarv7/bach
+   mstarv7/gpio
    mstarv7/clocks
    mstarv7/pinctrl
    mstarv7/fcie

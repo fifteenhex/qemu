@@ -19,6 +19,7 @@
 #include "hw/display/mstar_dsi.h"
 #include "hw/display/mstar_ge.h"
 #include "hw/dma/mstar_bdma.h"
+#include "hw/gpio/mstar_gpio.h"
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
 #include "hw/misc/mstar_regbank.h"
@@ -135,6 +136,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_AUDIOTOP_BASE   (MSTARV7_RIU_BASE + 0x206800)
 #define MSTARV7_BACH_INTC_IRQ   42
 /*
+ * The GPIO pad banks: the main bank (gpio@207800 in the mainline
+ * device trees) and the PM bank in the always-on domain. Boards hang
+ * buttons off both.
+ */
+#define MSTARV7_GPIO_BASE       (MSTARV7_RIU_BASE + 0x207800)
+#define MSTARV7_PM_GPIO_BASE    (MSTARV7_RIU_BASE + 0x1e00)
+/*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
  */
@@ -229,6 +237,7 @@ struct MStarV7SoCState {
     MStarDispState disp;
     MStarGeState ge;
     MStarBachState bach;
+    MStarGpioState gpio;
     MStarFcieState fcie;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 

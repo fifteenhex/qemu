@@ -62,8 +62,3 @@ layout is per the driver's ``MSC313_MUX_*`` macros.
      - mipi_tx_dsi
    * - ``0x1f8``
      - dec_bclk / dec_cclk
-
-A further clock sub-block at ``0x1f207800``-``0x1f207954`` is polled
-periodically during boot (a background clock/frequency monitor). Its
-registers have not been decoded yet; they currently read as zero
-through the RIU catch-all, which the periodic poll tolerates.
