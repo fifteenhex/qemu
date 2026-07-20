@@ -16,6 +16,7 @@
 #include "hw/display/mstar_disp.h"
 #include "hw/display/mstar_dphy.h"
 #include "hw/display/mstar_dsi.h"
+#include "hw/display/mstar_ge.h"
 #include "hw/dma/mstar_bdma.h"
 #include "hw/i2c/mstar_i2c.h"
 #include "hw/intc/mstar_intc.h"
@@ -119,6 +120,11 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_DISP_TOP_INTC_IRQ 50
 #define MSTARV7_DISP_GOP_INTC_IRQ 20
 /*
+ * The GE 2D graphics engine. MI_GFX/MainUI composites the on-screen UI
+ * through it; its bitblts must run for anything to appear on the panel.
+ */
+#define MSTARV7_DISP_GE_BASE    (MSTARV7_RIU_BASE + 0x281200)
+/*
  * The ISP SPI NOR controller: the FSP command sequencer bank and the
  * memory mapped XIP read window the flash contents appear in.
  */
@@ -211,6 +217,7 @@ struct MStarV7SoCState {
     MStarDsiState dsi;
     MStarDphyState dphy;
     MStarDispState disp;
+    MStarGeState ge;
     MStarFcieState fcie;
     MStarTimerState timer[MSTARV7_NUM_TIMERS];
 

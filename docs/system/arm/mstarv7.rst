@@ -42,7 +42,9 @@ Emulated devices and known limitations
 * The display controller (see :doc:`mstarv7/display`): the GOP
   graphics plane and MOP video plane, composited and scanned out to a
   QEMU console, and the display-top and GOP/fbdev vsync interrupts.
-  The GE 2D engine is not modelled.
+* The GE 2D graphics engine (see :doc:`mstarv7/ge`), which MainUI
+  composites its UI through: bitblts with format conversion and
+  180-degree rotation execute; blending, ROP and stretch do not.
 * The boot ROM, loaded from ``ssd202d_bootrom.bin`` (a ``-bios``
   image overrides it). With no flash image it prints
   ``Check IPL Header failed! [HALT]`` and halts, matching the real
@@ -136,6 +138,7 @@ the same commit as the device model change it describes.
    mstarv7/alpu
    mstarv7/dsi
    mstarv7/display
+   mstarv7/ge
    mstarv7/clocks
    mstarv7/pinctrl
    mstarv7/fcie

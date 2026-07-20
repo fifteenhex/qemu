@@ -231,6 +231,7 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "dsi", &s->dsi, TYPE_MSTAR_DSI);
     object_initialize_child(obj, "dphy", &s->dphy, TYPE_MSTAR_DPHY);
     object_initialize_child(obj, "disp", &s->disp, TYPE_MSTAR_DISP);
+    object_initialize_child(obj, "ge", &s->ge, TYPE_MSTAR_GE);
     object_initialize_child(obj, "fcie", &s->fcie, TYPE_MSTAR_FCIE);
 }
 
@@ -398,6 +399,13 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->disp), 1,
                        qdev_get_gpio_in(DEVICE(&s->intc_irq),
                                         MSTARV7_DISP_GOP_INTC_IRQ));
+
+    object_property_set_uint(OBJECT(&s->ge), "dram-base", MSTARV7_MIU0_BASE,
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ge), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->ge), 0, MSTARV7_DISP_GE_BASE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->fcie), errp)) {
         return;

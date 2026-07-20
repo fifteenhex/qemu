@@ -18,9 +18,9 @@ byte at 0 on most pixels - compositing with per-pixel alpha makes
 most of MainUI invisible (``hw``).
 
 Only the primary window of each plane (WIN0) is modelled. MainUI
-composites its UI into the GOP framebuffer through the GE 2D engine,
-which is not modelled yet; the vendor u-boot boot logo is decoded to
-the MOP plane.
+composites its UI into the GOP framebuffer through the :doc:`ge` 2D
+engine before the GOP scans it out; the vendor u-boot boot logo is
+decoded to the MOP plane.
 
 GOP (graphics plane)
 --------------------
@@ -103,5 +103,5 @@ Rendering
 With the Miyoo Mini firmware, the vendor u-boot software-decodes its
 JPEG splash into the MOP plane and enables it; the model scans it out
 and the boot logo appears. The kernel later disables the MOP and
-MainUI takes over the GOP plane, but its UI is composited through the
-GE 2D engine, which is not modelled yet, so it does not appear.
+MainUI takes over the GOP plane, compositing its UI through the
+:doc:`ge`.
