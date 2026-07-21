@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """
-DDR (MIU) bring-up sequence for the MStar SSD202D on the Miyoo Mini.
+DDR (MIU) bring-up *register writes* for the MStar SSD202D, captured from
+the stock vendor IPL running under QEMU.
 
-Captured from the stock vendor IPL running under QEMU: the exact ordered
-list of 16-bit register writes the IPL makes to the MIU controller at
-MIU_BASE to bring up the in-package DDR3, plus the points at which it
-polls for completion. The writes are deterministic config values (not
-read-modify-write of live state), so replaying them over mstarpoker
-reproduces the IPL's DDR init on real silicon.
+WARNING - this is NOT a hardware-runnable DDR init, and replaying it does
+NOT train real DRAM. Phase 2 on real silicon proved this (see
+VALIDATION.md): the completion never asserts and DRAM stays dead. The IPL
+disassembly shows why:
 
-This is specific to this SSD202D + its bonded DRAM. Other ssd20x parts
-(or DRAM sizes) need their own sequence; capture it the same way.
+  * the init is interleaved with ~15 timer-based delays (the routine at
+    IPL 0x1cd4, busy-waiting on the PM timer at 0x1f006050), stripped out
+    by the write-only capture; and, more fundamentally,
+  * the PHY training phase is read-modify-write and data-dependent - it
+    reads back DQS / read-leveling / gate-training results from the PHY
+    and computes the next writes from them (e.g. `ldrh; and #0xff00; orr;
+    strh`, and polls like `ldrh; cmp #0x506` / `ldrh; ands #2; beq`).
+
+So the values here are whatever the IPL computed against QEMU's *stub*
+PHY; on real silicon both the values and the control-flow path differ.
+This list is still useful as documentation of which MIU registers the
+init touches and roughly in what order, and it is enough to exercise the
+flow under QEMU (where DRAM is plain mapped RAM). To bring DRAM up on
+hardware, the IPL's training code must actually be *run* on the target,
+not replayed. See VALIDATION.md.
+
+This is specific to this SSD202D + its bonded DRAM.
 """
 
 # MIU DDR controller base; register offsets below are relative to it.
@@ -65,9 +79,14 @@ INIT_SEQ = [
     (0x5c0, 0x0001), (0x5e0, 0x0000), (0x5c0, 0x0000),
 ]
 
-# After writing (offset, value) in INIT_SEQ, poll (offset, mask) until the
-# masked bits read non-zero (init/BIST completion). offset is MIU-relative.
+# Completion heuristic: after writing (offset, value), poll (offset, mask)
+# until the masked bits read non-zero. NB the real IPL does not gate on
+# these - it uses timed delays (above) - but bit 15 of CNTRL0 / BIST_CTRL
+# does read back set once DRAM is genuinely up. So this doubles as a
+# "did DRAM actually train?" check: it asserts under QEMU (DRAM is always
+# up) and stays clear on hardware when the replay fails to train, which is
+# exactly what ddr.init() needs to refuse to touch dead DRAM.
 POLL_AFTER = {
-    (0x400, 0x000f): (0x400, 0x8000),   # CNTRL0 kicked -> wait init done (bit15)
-    (0x5c0, 0x0001): (0x5c0, 0x8000),   # BIST started -> wait BIST done (bit15)
+    (0x400, 0x000f): (0x400, 0x8000),   # CNTRL0 kicked -> init done (bit15)
+    (0x5c0, 0x0001): (0x5c0, 0x8000),   # BIST started -> BIST done (bit15)
 }
