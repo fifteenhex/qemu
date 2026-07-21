@@ -33,6 +33,8 @@ TIMER_BASE = 0x1f006040
 TIMER_STRIDE = 0x40
 NUM_TIMERS = 3
 CTRL, MAX_L, MAX_H, CNT_L, CNT_H, DIV = 0x00, 0x08, 0x0c, 0x10, 0x14, 0x18
+CTRL_EN = 1 << 0
+CTRL_TRIG = 1 << 1
 
 # The model assumes the block is clocked off 432 MHz (infinity2m.h); the 12 MHz
 # crystal is the other candidate. rate*(DIVIDE+1) should reveal the source.
@@ -56,6 +58,17 @@ def measure(lk, base, secs):
     return ticks, dt
 
 
+def start_timer(lk, base, divide=None):
+    """Program a full-range free-running counter and (re)start it, applying
+    `divide` first if given. TRIG reloads the divider so a divide change on an
+    already-running timer actually takes effect."""
+    if divide is not None:
+        lk.write32(base + DIV, divide)
+    lk.write32(base + MAX_L, 0xffff)
+    lk.write32(base + MAX_H, 0xffff)
+    lk.write32(base + CTRL, CTRL_EN | CTRL_TRIG)
+
+
 def check_timer(lk, idx, secs, set_divide):
     base = TIMER_BASE + idx * TIMER_STRIDE
     print("=== timer[%d] @ 0x%08x ===" % (idx, base))
@@ -64,15 +77,19 @@ def check_timer(lk, idx, secs, set_divide):
         print("  %-6s 0x%08x = 0x%04x"
               % (name, base + off, lk.read32(base + off) & 0xffff))
 
-    if set_divide is not None:
-        lk.write32(base + DIV, set_divide)
-        print("  [set] DIVIDE = 0x%x" % set_divide)
+    running = counter(lk, base) != counter(lk, base)
+
+    # Enable a frozen timer, or (re)start with the new divider so it applies.
+    if not running or set_divide is not None:
+        start_timer(lk, base, set_divide)
+        print("  [start] MAX=0xffffffff, EN|TRIG%s"
+              % ("" if set_divide is None else ", DIVIDE=0x%x" % set_divide))
 
     c0 = counter(lk, base)
     c1 = counter(lk, base)
     running = c1 != c0
     print("  counter back-to-back: 0x%08x -> 0x%08x  (running: %s)"
-          % (c0, c1, "YES" if running else "NO - frozen"))
+          % (c0, c1, "YES" if running else "NO - still frozen (clock gated?)"))
     if not running:
         print()
         return
@@ -83,14 +100,14 @@ def check_timer(lk, idx, secs, set_divide):
         rates.append(ticks / dt if dt else 0)
     avg = sum(rates) / len(rates)
     div = lk.read32(base + DIV) & 0xffff
-    print("  rate: %.0f Hz (%.3f MHz), DIVIDE=0x%x" % (avg, avg / 1e6, div))
+    print("  RATE: %.0f Hz (%.3f MHz)  [DIVIDE=0x%x]" % (avg, avg / 1e6, div))
     if avg > 1000:
         pre = avg * (div + 1)
         best = min(SRC_CANDIDATES, key=lambda s: abs(s - pre))
-        print("  => rate*(DIVIDE+1) = %.3f MHz (nearest source: %d MHz)"
+        print("  source clock (rate*(DIVIDE+1)) = %.3f MHz (nearest: %d MHz)"
               % (pre / 1e6, best // 1000000))
         one = 0x2ee0 / avg
-        print("  => one 0x2ee0-tick delay here = %.3f ms" % (one * 1e3))
+        print("  one 0x2ee0-tick delay on this timer = %.3f ms" % (one * 1e3))
     print()
 
 
