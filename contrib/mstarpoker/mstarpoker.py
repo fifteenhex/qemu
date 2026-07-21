@@ -35,6 +35,8 @@ import time
 
 class Transport:
     """A byte pipe: send(bytes), recv(n) with a deadline, close()."""
+    verbose = False
+
     def send(self, data):
         raise NotImplementedError
 
@@ -44,6 +46,15 @@ class Transport:
     def close(self):
         pass
 
+    def _trace(self, arrow, data):
+        """Dump a frame to stderr when --verbose is on."""
+        if not self.verbose or not data:
+            return
+        hx = " ".join("%02x" % b for b in data)
+        # the first byte of a TX frame is the command letter
+        ann = " '%c'" % data[0] if arrow == "TX" and 32 <= data[0] < 127 else ""
+        sys.stderr.write("    %s %3d%-4s %s\n" % (arrow, len(data), ann, hx))
+
 
 class SocketTransport(Transport):
     def __init__(self, path):
@@ -52,6 +63,7 @@ class SocketTransport(Transport):
         self.s.settimeout(0.2)
 
     def send(self, data):
+        self._trace("TX", data)
         self.s.sendall(data)
 
     def recv(self, n, timeout=1.0):
@@ -64,6 +76,7 @@ class SocketTransport(Transport):
                     out += d
             except OSError:
                 pass
+        self._trace("RX", out)
         return out
 
     def close(self):
@@ -88,6 +101,7 @@ class SerialTransport(Transport):
         termios.tcflush(self.fd, termios.TCIOFLUSH)
 
     def send(self, data):
+        self._trace("TX", data)
         n = 0
         while n < len(data):
             try:
@@ -107,6 +121,7 @@ class SerialTransport(Transport):
                     time.sleep(0.001)
             except (BlockingIOError, OSError):
                 time.sleep(0.001)
+        self._trace("RX", out)
         return out
 
     def close(self):
@@ -240,6 +255,8 @@ def add_transport_args(ap):
     g.add_argument("--socket", help="QEMU unix serial socket")
     g.add_argument("--serial", help="serial device, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=38400)
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="dump every frame exchanged with the stub to stderr")
 
 
 def open_link(args):
@@ -248,6 +265,9 @@ def open_link(args):
         lk = Link.open_socket(args.socket)
     else:
         lk = Link.open_serial(args.serial, args.baud)
+    # set before sync() so the handshake itself is traced - that is exactly
+    # where a dead/absent stub shows up ("no response from stub").
+    lk.t.verbose = getattr(args, "verbose", False)
     lk.sync()
     return lk
 
