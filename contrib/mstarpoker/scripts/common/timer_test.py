@@ -66,17 +66,6 @@ def dump_regs(lk, base, tag):
               % (name, base + off, lk.read32(base + off) & 0xffff))
 
 
-def start_timer(lk, base, divide=None):
-    """Program a full-range free-running counter and (re)start it, applying
-    `divide` first if given. TRIG reloads the divider so a divide change on an
-    already-running timer actually takes effect."""
-    if divide is not None:
-        lk.write32(base + DIV, divide)
-    lk.write32(base + MAX_L, 0xffff)
-    lk.write32(base + MAX_H, 0xffff)
-    lk.write32(base + CTRL, CTRL_EN | CTRL_TRIG)
-
-
 def check_timer(lk, idx, secs, set_divide):
     base = TIMER_BASE + idx * TIMER_STRIDE
     print("=== timer[%d] @ 0x%08x ===" % (idx, base))
@@ -84,14 +73,20 @@ def check_timer(lk, idx, secs, set_divide):
 
     running = counter(lk, base) != counter(lk, base)
 
-    # Enable a frozen timer, or (re)start with the new divider so it applies.
-    if not running or set_divide is not None:
-        w = [("DIVIDE", base + DIV, set_divide)] if set_divide is not None else []
-        w += [("MAX_L", base + MAX_L, 0xffff), ("MAX_H", base + MAX_H, 0xffff),
-              ("CTRL", base + CTRL, CTRL_EN | CTRL_TRIG)]
+    # Build the write list. NB do NOT write the TRIG bit: on real hardware
+    # writing CTRL bit1 clears enable and stops the timer (unlike the model).
+    # The divider takes effect on a running timer with a bare DIVIDE write.
+    w = []
+    if set_divide is not None:
+        w.append((base + DIV, set_divide))
+    if not running:
+        # enable a frozen timer the way the ROM runs timer[0]: MAX + EN only
+        w += [(base + MAX_L, 0xffff), (base + MAX_H, 0xffff),
+              (base + CTRL, CTRL_EN)]
+    if w:
         print("  [writing] " + ", ".join("0x%08x <- 0x%x" % (a, v)
-                                         for _, a, v in w))
-        for _, a, v in w:
+                                         for a, v in w))
+        for a, v in w:
             lk.write32(a, v)
         dump_regs(lk, base, "after write (did they stick?)")
 
