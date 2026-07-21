@@ -23,6 +23,7 @@ all: flash.bin ddr
 # Build the DDR-init blob used by scripts/ssd20x/ddr.py to train real DRAM.
 ddr:
 	$(MAKE) -C scripts/ssd20x/ddr_c CROSS=$(CROSS)
+	$(MAKE) -C scripts/common/cpuspeed_c CROSS=$(CROSS)
 
 start.o: start.S
 	$(CC) $(CFLAGS) -c $< -o $@
