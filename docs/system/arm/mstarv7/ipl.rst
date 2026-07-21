@@ -33,7 +33,7 @@ the IPL enables it, by clearing the byte at ``0x1f206005`` (``hw``):
 * out of the ROM, ``0x1f206005`` reads ``0x0f``;
 * the IPL writes ``0x1f206005 = 0x00``, which enables the MPLL output.
 
-With the MPLL enabled it runs at **~448 MHz** measured on hardware
+With the MPLL enabled it runs at **432 MHz** measured on hardware
 (``hw``; ``scripts/ssd20x/mpll_test.py``). Until this write is done,
 selecting the MPLL as a clock source hangs the SoC - the clock is not
 yet there to switch onto.
@@ -52,8 +52,8 @@ IPL moves timer[0] onto the (much faster) MPLL and divides it back down
 Measured on hardware (``hw``; ``scripts/common/timer_test.py``):
 
 * with the source selected and no divider, timer[0] counts at the full
-  MPLL rate, **~448 MHz**;
-* with the ``/36`` divider it counts at **~12 MHz** (448 / 36), the rate
+  MPLL rate, **432 MHz**;
+* with the ``/36`` divider it counts at **~12 MHz** (432 / 36), the rate
   the IPL's delay loops assume.
 
 The order matters: the MPLL must be enabled (``0x1f206005 = 0``) before

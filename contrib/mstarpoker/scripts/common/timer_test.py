@@ -52,7 +52,7 @@ MPLL_EN = 0x1f206005
 # together with the clkgen source-select register value.
 KNOWN_SOURCES = [
     (12000000, "12 MHz crystal"),
-    (432000000, "MPLL (~448 MHz)"),
+    (432000000, "MPLL (432 MHz)"),
 ]
 SRC_TOLERANCE = 0.15            # +/- 15% (covers the 432-vs-448 spread + jitter)
 
@@ -167,7 +167,7 @@ def main():
     mpll = lk.read8(MPLL_EN)
     print("MPLL enable 0x%08x = 0x%02x -> %s\n"
           % (MPLL_EN, mpll,
-             "output enabled (running if a timer reads ~448 MHz)" if mpll == 0
+             "output enabled (running if a timer reads ~432 MHz)" if mpll == 0
              else "NOT enabled (ROM default 0x0f); the MPLL is off"))
 
     if args.clksrc is not None:
