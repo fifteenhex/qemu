@@ -34,6 +34,7 @@ typedef unsigned int   u32;
 #define TIMER     0x1f006050u   /* PM free-running counter: +0 low16, +4 high16 */
 #define DRAM_BASE 0x20000000u
 
+#define RW(a)   (*(volatile u32 *)(unsigned long)(a))
 #define RH(a)   (*(volatile u16 *)(unsigned long)(a))
 #define RB(a)   (*(volatile u8  *)(unsigned long)(a))
 
@@ -110,11 +111,12 @@ static void wdt_disarm(void)
  * The console UART writes (0x221xxx) the IPL makes here are deliberately
  * excluded - replicating them would reconfigure the UART and kill our link.
  */
-#define F_B   1                 /* byte write (else 16-bit) */
+#define F_B   1                 /* byte write */
 #define F_DLY 2                 /* delay after this write */
 #define F_ZQ  4                 /* run ZQ read/adjust after this write */
+#define F_W   8                 /* 32-bit write (default is 16-bit) */
 
-struct rw { u32 off; u16 val; u8 flags; };
+struct rw { u32 off; u32 val; u8 flags; };
 
 static const struct rw seq[] = {
 #include "ddr_table.inc"
@@ -238,8 +240,10 @@ void ddr_init(void)
 
         if (seq[i].flags & F_B)
             RB(a) = (u8)seq[i].val;
+        else if (seq[i].flags & F_W)
+            RW(a) = seq[i].val;
         else
-            RH(a) = seq[i].val;
+            RH(a) = (u16)seq[i].val;
 
         if (seq[i].flags & F_DLY)
             delay_ticks(DDR_DELAY);
