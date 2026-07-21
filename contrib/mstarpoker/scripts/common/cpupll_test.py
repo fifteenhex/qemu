@@ -53,22 +53,36 @@ def write_reg(lk, addr, val, width):
         lk.write8(addr + 1, (val >> 8) & 0xff)
 
 
+DONE = 0x600dcafe
+
+
 def run_measure(lk):
-    """Run the cpuspeed blob once; return (ticks, loops)."""
+    """Run the cpuspeed blob once; return (ticks, loops) or None if it did not
+    complete (loop outran the timeout / the link desynced)."""
+    lk.write32(RESULT_ADDR + 8, 0)      # clear the done marker
     lk.write32(RESULT_ADDR, 0)
-    lk.go(BLOB_ADDR, timeout=5.0)
+    lk.go(BLOB_ADDR, timeout=15.0)
+    if not lk.alive():                  # a very slow loop can overrun the FIFO
+        lk.sync()
+    if lk.read32(RESULT_ADDR + 8) != DONE:
+        return None
     ticks = lk.read32(RESULT_ADDR)
     loops = lk.read32(RESULT_ADDR + 4)
     return ticks, loops
 
 
-def report(tag, ticks, loops):
+def report(tag, res):
+    if res is None:
+        print("  %-8s did NOT complete (loop outran the timeout or the link "
+              "desynced) - CPU may be very slow" % tag)
+        return None
+    ticks, loops = res
     secs = ticks / TIMER_HZ
     ips = loops / secs if secs else 0
     # the subs/bne loop is ~1-2 cycles/iter on Cortex-A7, so the CPU clock is
     # (1-2)x the loop rate - i.e. loops/s is a lower bound on MHz. The
     # before/after ratio is exact regardless of the per-loop cycle count.
-    print("  %-8s %d loops in %d ticks = %.3f ms -> %.1f M loops/s "
+    print("  %-8s %d loops in %d ticks = %.3f ms -> %.2f M loops/s "
           "(CPU >= ~%.0f MHz)"
           % (tag, loops, ticks, secs * 1e3, ips / 1e6, ips / 1e6))
     return ips
@@ -89,7 +103,7 @@ def main():
     print("cpuspeed blob: %d bytes at 0x%08x\n" % (len(blob), BLOB_ADDR))
 
     print("CPU clock (loop timed against the 12 MHz PM timer):")
-    base = report("before", *run_measure(lk))
+    base = report("before", run_measure(lk))
 
     if args.set_cpupll:
         print("\n[set] programming the cpupll init sequence...")
@@ -98,8 +112,8 @@ def main():
         # the IPL waits ~3.6 ms (0x4b0 ticks at /36) for lock; be generous
         time.sleep(0.05)
         print("[set] done, re-measuring:")
-        after = report("after", *run_measure(lk))
-        if base:
+        after = report("after", run_measure(lk))
+        if base and after:
             print("\n=> cpupll changed the CPU clock by %.2fx" % (after / base))
     else:
         print("\n(run with --set-cpupll to program the PLL and see the change)")

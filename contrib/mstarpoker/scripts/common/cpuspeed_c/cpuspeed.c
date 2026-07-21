@@ -11,6 +11,9 @@
  * Result, written to SRAM at 0xa0009000 for the host to read:
  *   [0] = PM-timer ticks elapsed during the loop
  *   [1] = loop iteration count
+ *   [2] = done marker (0x600dcafe) - lets the host confirm the loop finished
+ *         (if the CPU is slow the loop can outlast the host's go() timeout;
+ *         the marker distinguishes "still running / desynced" from a real run)
  */
 
 typedef unsigned int   u32;
@@ -18,10 +21,11 @@ typedef unsigned short u16;
 
 #define TIMER  0x1f006050u      /* PM free-running counter: +0 low16, +4 high16 */
 #define RESULT 0xa0009000u
+#define DONE   0x600dcafeu
 
 #define RH(a)  (*(volatile u16 *)(unsigned long)(a))
 
-#define LOOPS  8000000u         /* fixed iteration count */
+#define LOOPS  1000000u         /* fixed iteration count (bounded even at a slow clock) */
 
 static u32 timer_now(void)
 {
@@ -47,4 +51,5 @@ void cpuspeed(void)
 
     out[0] = t1 - t0;
     out[1] = LOOPS;
+    out[2] = DONE;
 }
