@@ -64,6 +64,26 @@ static void delay_ticks(u32 ticks)
 
 #define DDR_DELAY 0x2ee0u       /* 12000 ticks - the IPL's DDR settle delay */
 
+/* ---- MIU (DDR) clock PLL ----
+ *
+ * The DDR controller needs its clock PLL brought up first. This lives in a
+ * DIFFERENT register block (0x1f206200, the miupll) from the MIU controller
+ * (0x1f202000), so the original MIU-only capture missed it entirely - the
+ * controller was being programmed against a dead clock. These are the IPL's
+ * 233 MHz miupll writes (byte-addressed, IPL 0x2000-0x201e). The DDR settle
+ * delays that follow in the config table give the PLL time to lock.
+ */
+static void miupll_init(void)
+{
+    RB(0x1f206205u) = 0x00;
+    RB(0x1f206208u) = 0x00;
+    RB(0x1f206209u) = 0x00;
+    RB(0x1f20620cu) = 0x1e;   /* loop divider (233 MHz) */
+    RB(0x1f20620du) = 0x01;
+    RB(0x1f206210u) = 0x10;
+    RB(0x1f206211u) = 0x00;
+}
+
 /* ---- deterministic config-write table ---- */
 
 #define F_B   1                 /* byte write (else 16-bit) */
@@ -186,6 +206,8 @@ __attribute__((section(".text.start"), used))
 void ddr_init(void)
 {
     unsigned i;
+
+    miupll_init();          /* bring up the DDR clock PLL first */
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
         u32 a = MIU + seq[i].off;
