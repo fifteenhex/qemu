@@ -3,6 +3,12 @@
 #ifndef IPL_RT_H
 #define IPL_RT_H
 
+/* Sized volatile RIU register access (keeps the compiler from reordering,
+ * merging or dropping the MMIO, and preserves each access width). */
+#define R8(a)  (*(volatile unsigned char  *)(a))
+#define R16(a) (*(volatile unsigned short *)(a))
+#define R32(a) (*(volatile unsigned int   *)(a))
+
 /* Boot-progress marker the mask ROM/IPL write to the SMP scratch register. */
 #define IPL_PROGRESS (*(volatile unsigned int *)0x1f200800)
 
