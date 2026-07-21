@@ -142,6 +142,15 @@ def main():
     else:
         before = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
         trained = ddr.init(lk)
+        # If the DDR self-test bus-hung, the stub is dead - don't try to read
+        # it back (that just short-reads); save the before-snapshot and stop.
+        if not lk.alive():
+            if args.json:
+                regdump.write_json(args.json, before=before)
+                print("[init] stub wedged; wrote before-snapshot to %s"
+                      % args.json)
+            sys.exit("[result] DDR did not train - the self-test bus-hung and "
+                     "wedged the target. Power-cycle before retrying.")
         after = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
         regdump.print_diff(before, after, "MIU registers around DDR init",
                            changed_only=True)
@@ -149,14 +158,13 @@ def main():
             regdump.write_json(args.json, before=before, after=after)
             print("[init] wrote MIU register table to %s" % args.json)
 
-    # A read of untrained DRAM bus-hangs the CPU with no recoverable abort,
-    # so never run the memory tests unless init-done/BIST actually asserted.
-    # The MIU before/after table is already saved above regardless.
+    # A read of untrained DRAM bus-hangs the CPU with no recoverable abort, so
+    # never run the memory tests unless the blob's self-test said DRAM is up.
     if not trained:
-        print("[test] SKIPPED - DDR init did not complete (see the poll "
-              "timeouts above); reading DRAM would hang the target.")
-        print("[result] DDR init FAILED on this target - the replayed "
-              "sequence did not train DRAM. Stub still alive; send hw_miu.json.")
+        print("[test] SKIPPED - the DDR self-test did not pass; reading DRAM "
+              "could hang the target.")
+        print("[result] DDR did not train on this target. Stub still alive; "
+              "send hw_miu.json.")
         sys.exit(2)
 
     print("[test] running...")
