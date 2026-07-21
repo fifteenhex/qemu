@@ -36,6 +36,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 from mstarpoker import add_transport_args, open_link, parse_int  # noqa: E402
+import regdump  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ddr  # noqa: E402
@@ -69,6 +70,21 @@ GOP_FMT_RGB565 = 0x1
 PWM_DUTY = 0x1f003408
 PWM_PERIOD = 0x1f003410
 PWM_ENABLE = 0x1f00341c
+
+
+# Registers this script writes, snapshotted before/after (all plain config,
+# none known to have read side effects).
+DISP_REGS = (
+    [(PNL_BASE + off, "pnl+0x%02x" % off) for off, _ in PNL_TIMING] +
+    [(PWM_PERIOD, "pwm_period"), (PWM_DUTY, "pwm_duty"), (PWM_ENABLE, "pwm_enable"),
+     (GOP_BASE + GOP_STRETCH_W, "gop_stretch_w"),
+     (GOP_BASE + GOP_STRETCH_H, "gop_stretch_h"),
+     (GOP_BASE + GOP_WIN0_ADDRL, "gop_win0_addrl"),
+     (GOP_BASE + GOP_WIN0_ADDRH, "gop_win0_addrh"),
+     (GOP_BASE + GOP_WIN0_PITCH, "gop_win0_pitch"),
+     (GOP_BASE + GOP_WIN0, "gop_win0")]
+)
+DISP_UNSAFE = ()
 
 
 def rgb565(r, g, b):
@@ -149,6 +165,8 @@ def main():
                     "(default: a generated test pattern)" % (WIDTH, HEIGHT))
     ap.add_argument("--no-ddr-init", action="store_true",
                     help="skip DDR init (DRAM already up)")
+    ap.add_argument("--json",
+                    help="write the display before/after register table here")
     args = ap.parse_args()
 
     if args.raw565:
@@ -165,8 +183,15 @@ def main():
         print("[ddr] skipped (--no-ddr-init)")
     else:
         ddr.init(lk)
+
+    before = regdump.snapshot(lk, DISP_REGS, DISP_UNSAFE)
     display_init(lk)
     show_image(lk, data, WIDTH, HEIGHT)
+    after = regdump.snapshot(lk, DISP_REGS, DISP_UNSAFE)
+    regdump.print_diff(before, after, "display registers around render")
+    if args.json:
+        regdump.write_json(args.json, before=before, after=after)
+        print("[disp] wrote display register table to %s" % args.json)
     print("[done] picture rendered")
 
 

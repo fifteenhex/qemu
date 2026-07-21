@@ -28,11 +28,22 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from mstarpoker import add_transport_args, open_link, parse_int  # noqa: E402
 import socid  # noqa: E402
+import regdump  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
 import ddr  # noqa: E402
+import ddr_seq_ssd202d as _seq  # noqa: E402
 
 DRAM_BASE = ddr.DRAM_BASE
+
+# The distinct MIU registers the init touches, snapshotted before/after.
+_MIU_NAMES = {0x060: "DDFSET_L", 0x064: "DDFSET_H",
+              0x400: "CNTRL0", 0x5c0: "BIST_CTRL"}
+MIU_REGS = [(_seq.MIU_BASE + off, _MIU_NAMES.get(off, ""))
+            for off in sorted({o for o, _ in _seq.INIT_SEQ})]
+# None of the MIU config registers are known to have read side effects;
+# add (MIU_BASE + offset) here if one is found on real hardware.
+MIU_UNSAFE = ()
 
 
 def dram_bytes(soc):
@@ -95,6 +106,7 @@ def main():
                     help="skip DDR init (DRAM already up)")
     ap.add_argument("--test-size", type=parse_int, default=0x10000,
                     help="pattern-test region in bytes (default 64 KiB)")
+    ap.add_argument("--json", help="write the MIU before/after table to this file")
     args = ap.parse_args()
 
     lk = open_link(args)
@@ -109,7 +121,14 @@ def main():
     if args.no_init:
         print("[init] skipped (--no-init)")
     else:
+        before = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
         ddr.init(lk)
+        after = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
+        regdump.print_diff(before, after, "MIU registers around DDR init",
+                           changed_only=True)
+        if args.json:
+            regdump.write_json(args.json, before=before, after=after)
+            print("[init] wrote MIU register table to %s" % args.json)
 
     print("[test] running...")
     tests = [
