@@ -40,6 +40,7 @@ RESULT_ADDR = 0xa0009000
 RESULT_PROBING = 0xd1900001      # reached the DRAM probe (a hang stops here)
 RESULT_PASS = 0xd1900a00         # DRAM read back correctly
 RESULT_FAIL = 0xd1900bad         # DRAM responded but data was wrong
+RESULT_NOTIMER = 0xd1900d1e      # the delay timer would not run - blob bailed
 
 
 def _poll(lk, off, mask, tries=2000):
@@ -90,6 +91,9 @@ def init_c(lk, verbose=True, blob=DDR_BLOB):
     if verbose:
         msg = {RESULT_FAIL: "DRAM responded but data was wrong (marginal)",
                RESULT_PROBING: "stopped at the DRAM probe",
+               RESULT_NOTIMER: "the delay timer would not run - check the timer "
+                               "source (a prior test may have left it on the "
+                               "MPLL); DDR sequence was not run",
                0: "blob did not reach the self-test"}.get(
                    verdict, "unexpected verdict 0x%08x" % verdict)
         print("[ddr] ddr_init done - DRAM self-test did NOT pass: %s" % msg)

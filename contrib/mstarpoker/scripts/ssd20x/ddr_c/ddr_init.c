@@ -288,6 +288,7 @@ static void zq_calibrate(void)
 #define RESULT_PROBING 0xd1900001u  /* about to touch DRAM */
 #define RESULT_PASS    0xd1900a00u  /* DRAM read back correctly */
 #define RESULT_FAIL    0xd1900badu  /* DRAM responded but data wrong */
+#define RESULT_NOTIMER 0xd1900d1eu  /* the delay timer would not run - bailed */
 
 static void dram_selftest(void)
 {
@@ -310,17 +311,52 @@ static void dram_selftest(void)
 /* ---- entry: bring DDR up, self-test it, then return to the stub monitor ---- */
 
 /*
- * The delay timer, timer[0]. The settle delays measure against its counter
- * (0x1f006050). The IPL switches this timer onto a fast clock source via clkgen
- * (0x1f207004) and then divides by 36 (TIMER_DIVIDE=0x23), landing at 12 MHz.
- * We must NOT do that source switch: the fast source needs a PLL that is not up
- * in this context, and selecting it hangs the SoC. Instead use the always-on
- * 12 MHz the ROM leaves the timer on (TIMER_DIVIDE=0) - the same effective rate
- * as the IPL - so 0x2ee0 ticks is ~1 ms exactly as the IPL intends. Ensure the
- * timer is enabled (EN, never TRIG - TRIG clears enable on real hardware).
+ * The delay timer, timer[0]. Every settle delay measures against its counter
+ * (0x1f006050) assuming the always-on 12 MHz crystal, so the whole sequence's
+ * timing hangs on this one timer being in the right state. It may not be: a
+ * prior test (e.g. mpll_test) can leave the source switched to the MPLL, or the
+ * timer disabled, or a divider set - any of which makes the delays wrong (on
+ * the ~432 MHz MPLL they would be 36x too short). So before the sequence, force
+ * it to the known-good state and confirm it is actually counting:
+ *
+ *   - clock source back to the crystal (0x1f207004 = its reset value 0x200).
+ *     This undoes an MPLL switch; selecting the crystal is always safe (it is
+ *     always on), unlike switching TO the MPLL which needs a PLL that is up.
+ *   - no divider (TIMER_DIVIDE = 0) -> the full 12 MHz, so 0x2ee0 ticks = ~1 ms.
+ *   - enabled (CTRL = EN; never TRIG - on real HW writing TRIG clears enable).
+ *
+ * Then check the counter advances across a fixed spin. If it does not, the
+ * clock is not reaching the timer and the delays would be meaningless, so we
+ * report RESULT_NOTIMER and bail rather than run the DDR sequence blind.
  */
-#define TIMER0_CTRL   0x1f006040u
-#define TIMER0_DIVIDE 0x1f006058u
+#define TIMER0_CTRL      0x1f006040u
+#define TIMER0_DIVIDE    0x1f006058u
+#define CLKGEN_TIMER_SRC 0x1f207004u   /* timer[0] clock-source select */
+#define TIMER_SRC_XTAL   0x0200u       /* reset value: always-on 12 MHz crystal */
+
+static int timer_counts(void)
+{
+    u32 t0 = timer_now();
+    volatile u32 i;
+    for (i = 0; i < 0x20000; i++)       /* let the 12 MHz counter tick */
+        ;
+    return timer_now() != t0;
+}
+
+static int timer_check(void)
+{
+    RW(CLKGEN_TIMER_SRC) = TIMER_SRC_XTAL;  /* undo any MPLL / source switch */
+    RW(TIMER0_DIVIDE) = 0;                   /* no divider -> full 12 MHz */
+    RW(TIMER0_CTRL) = 1;                     /* EN only (never TRIG) */
+
+    if (timer_counts())
+        return 1;
+
+    /* not counting: toggle enable off/on once and re-check */
+    RW(TIMER0_CTRL) = 0;
+    RW(TIMER0_CTRL) = 1;
+    return timer_counts();
+}
 
 __attribute__((section(".text.start"), used))
 void ddr_init(void)
@@ -329,8 +365,11 @@ void ddr_init(void)
 
     wdt_arm(WDT_TIMEOUT);       /* a hang from here on auto-resets the SoC */
 
-    RW(TIMER0_DIVIDE) = 0;      /* always-on 12 MHz, no divider */
-    RW(TIMER0_CTRL) = 1;        /* EN (in case a prior test disabled it) */
+    if (!timer_check()) {       /* delays depend on this - bail if it is dead */
+        *(volatile u32 *)(unsigned long)RESULT_ADDR = RESULT_NOTIMER;
+        wdt_disarm();
+        return;
+    }
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
         u32 a;
