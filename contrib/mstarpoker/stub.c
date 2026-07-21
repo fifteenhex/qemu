@@ -24,7 +24,7 @@ typedef unsigned int   u32;
  * registers (regshift): the data register (RBR/THR) is register 0 and the
  * line status register (LSR) is register 5. Current values target an
  * MStar/SigmaStar infinity2m SoC's uart0 (regshift 3 -> 8-byte stride);
- * the ROM has it configured at 115200 8N1, so we do not re-init it.
+ * the ROM has it configured at 38400 8N1, so we do not re-init it.
  */
 #define UART_BASE   0x1f221000u
 #define UART_STRIDE 8u

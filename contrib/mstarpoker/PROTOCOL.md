@@ -83,9 +83,12 @@ human/host can see it is alive, then enters the command loop.
   between registers is the SoC's regshift. On the current target this is
   uart0 at `0x1f221000` with an 8-byte stride (regshift 3) — the UART the
   mask ROM itself prints on.
-* **115200 8N1**, no flow control. The ROM has already configured it, so
-  the stub does not re-init it; connect at the same baud the ROM's own
-  messages appear at.
+* **38400 8N1**, no flow control. The mask ROM programs the UART with LCR
+  `0x03` (8N1) and divisor `0x14` (20) - i.e. 38400 baud - so the stub
+  inherits that and does not re-init it; connect at the same baud the
+  ROM's own messages appear at. (Note: the QEMU model's nominal
+  BAUDBASE says 115200; that is cosmetic over a socket, but 38400 is the
+  real rate.)
 
 ## 4. Liveness and fault recovery
 

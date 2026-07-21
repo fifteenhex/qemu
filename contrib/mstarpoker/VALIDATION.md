@@ -36,7 +36,7 @@ cd contrib/mstarpoker && make            # -> flash.bin
 #    programmer / CH341A clip, or any method that writes the NOR).
 #    This overwrites the stock firmware - use a device you can re-flash.
 
-# 3. Connect uart0 (115200 8N1) to the host, power on, and check the stub:
+# 3. Connect uart0 (38400 8N1) to the host, power on, and check the stub:
 export SER=/dev/ttyUSB0
 python3 mstarpoker.py --serial $SER ping           # -> pong
 python3 mstarpoker.py --serial $SER rd 0x1f206548  # cpupll loop div (sanity)
@@ -129,4 +129,4 @@ differences into model changes, updating this plan as we go.
 
 | Date | Item | Result | Action |
 |------|------|--------|--------|
-| | | | |
+| 2026-07-21 | uart0 baud | HW is 38400 8N1 (ROM sets LCR 0x03, divisor 0x14=20), not the model's nominal 115200 | client/docs default -> 38400; real baudbase ~768000 for the model doc |

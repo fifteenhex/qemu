@@ -5,7 +5,7 @@ mstarpoker.py - host-side client for the mstarpoker serial monitor.
 
 Talks the small binary protocol served by the stub (see PROTOCOL.md) over
 either a QEMU unix socket (``--socket``) or a real serial port
-(``--serial``, 115200 8N1). Uses only the standard library, so it runs on
+(``--serial``, 38400 8N1). Uses only the standard library, so it runs on
 the target host without pyserial.
 
 Library use:
@@ -72,7 +72,7 @@ class SocketTransport(Transport):
 
 class SerialTransport(Transport):
     """Raw serial via termios - no pyserial dependency."""
-    def __init__(self, dev, baud=115200):
+    def __init__(self, dev, baud=38400):
         import termios
         self.fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         attr = termios.tcgetattr(self.fd)
@@ -123,7 +123,7 @@ class Link:
         return cls(SocketTransport(path))
 
     @classmethod
-    def open_serial(cls, dev, baud=115200):
+    def open_serial(cls, dev, baud=38400):
         return cls(SerialTransport(dev, baud))
 
     # --- framing helpers -------------------------------------------------
@@ -229,7 +229,7 @@ def add_transport_args(ap):
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--socket", help="QEMU unix serial socket")
     g.add_argument("--serial", help="serial device, e.g. /dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=38400)
 
 
 def open_link(args):
