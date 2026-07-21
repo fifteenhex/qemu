@@ -11,17 +11,18 @@ the ROM base.
 Boot flow as observed under the model
 -------------------------------------
 
-The ROM masks interrupts, enables the I-cache, then works through its
-early init writing progress codes (see below) to ``0x1f200800``. It
-sets up the timer at ``0x1f006040``, does a read-modify-write of
-``0x1f203d40``, pokes what looks like pin or boot media setup
-(``0x1f2070c4``, ``0x1f203d4c``, ``0x1f001c24``), reads three
-registers that presumably describe the boot source (``0x1f0071c0``,
-``0x1f00700c``, ``0x1f004014``, all reading zero in the model), tries
-to load an IPL, then prints ``Check IPL Header failed! [HALT]`` on
-the PM UART and hangs. With nothing backing the boot media that is
-the correct outcome; on the real chip the strap registers will not
-read zero, so the path taken here is not necessarily the SPI NOR one.
+In ARM state the ROM masks interrupts, enables the I-cache, splits the
+cores off (below) and, on CPU0, sets up the watchdog and timer, then
+``blx``\ es into a Thumb loader (file offset ``0x2dc``). The loader
+brings up uart0 for its messages, sets pad-mux registers
+(``0x1f2070c4``, ``0x1f203d4c``, ``0x1f001c24``), reads the boot-media
+strap (``0x1f0071c0`` plus ``0x1f00700c`` / ``0x1f004014``), loads the
+IPL from the strapped medium, verifies (and optionally authenticates)
+it, and jumps to it at ``0xa0000000``. With the strap registers
+reading zero in the model no medium matches, so the loader falls
+through to ``Check IPL Header failed! [HALT]`` on uart0 - the correct
+outcome for nothing-attached; on the real chip the strap will select
+SPI NOR (``0x20``).
 
 Progress code register
 ----------------------
@@ -99,28 +100,133 @@ address when the unlock magic is written; that matches what software
 observes, but not the mechanism - there is no parked core executing
 ROM code in the model (``model``).
 
-Boot-media strap
-----------------
+The split between the two cores is right at the top of the ROM
+(``rom``): after the progress-code setup the reset path reads the core
+number from ``MPIDR`` (``mrc p15, 0, r0, c0, c0, 5``; ``r0 & 3``) at
+file offset ``0x64`` and branches on it. CPU0 (``r0 == 0``) continues
+to the watchdog/timer setup and the boot-media path; every other core
+falls through to its own parking code, which reports progress to a
+**separate** register at ``0x1f200808`` (not CPU0's ``0x1f200800``)
+and sleeps in ``wfi``/``wfe`` loops until it is released through the
+smpctrl bank above. So ``0x1f200808`` is the secondary-core progress
+register.
 
-The two reads of ``0x1f0071c0`` (``DID_KEY``, vendor register
-``0x70`` of the DID block) during the ``0xb..`` phase select the
-boot medium from bits[5:2]: ``0x20`` SPI NOR, ``0x10`` NAND,
-``0x08`` SPI NAND/eMMC (``prev``). Forcing the register to ``0x20``
-in the model was confirmed to send the ROM down its SPI NOR path: it
-starts polling the ISP flash sequencer at ``0x1f002db8``, timing the
-poll against the timer counter at ``0x1f006050``/``0x1f006054``
-(``model``) - which also explains the ``SPINOR reset timeout!``
-string. With the strap reading zero the ROM instead falls through to
-the ``Check IPL Header failed! [HALT]`` outcome.
+Early strap and config
+----------------------
 
-On the SPI NOR path, confirmed under the model with a flash image
-attached (``rom``): the ROM checks the IPL header through the XIP
-window at ``0x14000000`` (progress ``0xb07``), fires the ``66 99``
-NOR reset at the FSP (``0x6000``/``0x6001``), then uses BDMA channel
-0 to copy header plus body from flash offset ``0`` into IMI at
-``0xa0000000``, re-checks the header and jumps to the IPL entry at
-``0xa0000000``. Without a flash image the header check fails
-(``0xbf7``) and it prints ``Check IPL Header failed! [HALT]``.
+Before the core split, in the first dozen instructions after the
+cache setup, the ROM does two things not tied to any block modelled
+yet (``rom``):
+
+* It writes ``1`` to ``0x16001000`` and ``0xf0`` to ``0x16001004`` -
+  an address region outside the RIU (the RIU is ``0x1f000000``, the
+  flash XIP window ``0x14000000``); ``0x16000000`` is otherwise unseen
+  and its meaning is unknown.
+* It reads ``0x1f00401c`` and tests bit 6 (``& 0x40``). With the bit
+  set it goes on to write the ``0xaaaa`` smpctrl handshake; with it
+  clear it takes a different path. So ``0x1f00401c`` bit 6 is a
+  config/strap that gates the multi-core mailbox setup - it reads zero
+  in the model, so that path is skipped.
+
+ARM entry and the Thumb loader
+------------------------------
+
+The reset path up to here is 32-bit ARM code. At file offset ``0x290``,
+after setting the stack to IMI (``sp = 0xa000d000``) and zeroing the
+registers, CPU0 does ``blx 0x2dc`` - switching to **Thumb** for the
+whole boot-media loader (``rom``). This is why an ARM-only disassembly
+(and a literal-pool scan) sees none of the boot logic: the loader is
+Thumb, and it builds its register bases and constants with
+``movw``/``movt`` immediates rather than literal pools. If the loader
+ever returns, the ARM caller writes progress ``0xaff`` and spins.
+
+Console UART
+------------
+
+The loader's first act (its ``0x62c`` init, progress ``0xb01``) is to
+bring up **uart0** at ``0x1f221000`` for its messages (``rom``): it
+sets the UART pad-mux (writes ``9`` to ``0x1f2070c4`` and ``0x3210``
+to ``0x1f203d4c``), pokes ``0x1f001c24`` and the uart0 config
+registers ``0x1f221008``/``0x221038``/``0x221070``. The print routine
+at ``0x748`` polls the TX-ready bit (bit 5 of ``0x1f221028``) and
+writes each byte to the data register ``0x1f221000`` until the NUL.
+So the "PM UART" guess was wrong - it is uart0, and there is no banner
+simply because the routine is only ever called on a failure path. The
+UART is **output only**; nothing reads it back.
+
+Boot-media dispatch
+-------------------
+
+The loader reads ``DID_KEY`` (``0x1f0071c0``) and masks it with
+``0x24`` (bits 2 and 5), progress ``0xb04``/``0xb02`` (``rom``):
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``DID_KEY & 0x24``
+     - Medium
+     - Path
+   * - ``0x20``
+     - SPI NOR
+     - progress ``0xb07``; FSP reset then XIP load (below)
+   * - ``0x04``
+     - SPI NAND
+     - progress ``0xb0e``; SPI-NAND init at ``0xd2c`` (``0x1f00080c``
+       status, IMI ``0xa000c000`` buffer); on init failure prints
+       ``SPINAND init failed! [HALT]``
+   * - other
+     - none
+     - falls through to the common header check, which fails ->
+       ``0xbf7`` ``Check IPL Header failed! [HALT]``
+
+Only these two media exist in this ROM; the ``0x10``/``0x08`` variants
+the previous branch listed are not decoded here. The ROM also reads
+``0x1f00700c`` and bit 10 of ``0x1f004014`` at dispatch (they steer
+minor sub-paths).
+
+**SPI NOR** (``rom``): the IPL header magic ``"IPL_"``
+(``0x5f4c5049``) is checked at XIP ``0x14000004``; the FSP NOR reset
+(``66 99``) is fired (``0x1f200800`` scratch ``0x6000``/``0x6001``,
+FSP registers ``0x1f002d84``-``0x1f002dd8``, timed against the timer
+counter ``0x1f006050``/``0x006054`` - hence ``SPINOR reset
+timeout!``); the image is copied through BDMA (``0x1f200404``-``424``)
+into IMI at ``0xa0000000``. A bad magic gives ``Check Header
+failed!``; a failed load ``Load IPL from SPINOR failed!``.
+
+Common verify and authentication
+--------------------------------
+
+After the copy, all media converge (``0x424``) on the IPL header at
+IMI ``0xa0000000`` (``rom``): the ``"IPL_"`` magic is re-checked
+(fail -> ``0xbf7`` ``Check IPL Header failed!``), then a signed-image
+flag byte is tested (``== 0xfa``). If the image is marked signed, the
+ROM authenticates it **in hardware** using the crypto engine at
+``0x1f224400`` (see :doc:`vendor-modules`): SHA over the image
+(``0x1f224420`` control, ``0x224430`` length, ``0x22443c`` status,
+``0x224440`` data) and an RSA signature check (``0x1f224484``-
+``0x2244a4``), plus a chip-ID (CID) and magic-data check. Failures
+print ``Authenticate failed!`` / ``CID check failed!`` /
+``CHK_MAGICDATA_ERR`` and halt. (An earlier note here claimed the ROM
+never touches the crypto engine - that was from an ARM-only scan that
+missed the Thumb ``movw``/``movt`` constants; it does.) The Miyoo
+Mini's IPL is unsigned, so the ``0xfa`` test fails and the whole
+authentication path is skipped - which is why a crypto access is never
+*seen* at runtime even though the code is present.
+
+On success the ROM jumps to the IPL entry at ``0xa0000000``.
+
+No recovery / backup loader
+---------------------------
+
+This ROM has **no serial or USB download fallback** (``rom``). There
+is no USB-controller base (nothing in ``0x1f2c/0x1f2d``) anywhere in
+the image, the UART is output-only, and every failure path ends in a
+print followed by ``b .`` (spin). So a board that cannot load a valid,
+authenticated IPL from its strapped medium simply halts with the
+matching ``[HALT]`` message; there is no ROM-level recovery mode here.
+(A larger mask-ROM region, if one exists beyond this 16 KiB image,
+could hold one, but this dump does not - its code ends by ``0x1370``,
+the rest is zero padding.)
 
 Error strings
 -------------
@@ -138,20 +244,35 @@ ROM knows about (``rom``)::
   SPINOR reset timeout!
 
 together with ``MSTARSEMIUSFDCIS``, ``[ROM] SPINAND_ID`` and an
-``I2m_ROM`` signature at the end of the image.
+``I2m_ROM`` signature at the very end of the image (file offset
+``0x3fe0``): ``MVX4######g833de85I2m_ROM####XVM``. The ``g833de85``
+looks like the ROM's build/commit tag (``rom``).
+
+Each string is loaded with a ``movw`` immediate of its file offset
+(e.g. ``0x126c`` for ``SPINAND init failed!``) and passed to the
+uart0 print routine at ``0x748`` (see `Console UART`_), so the offsets
+map straight to the failure branches: ``0x124c`` NOR bad-magic,
+``0x126c`` SPI-NAND init, ``0x128c`` NOR load, ``0x12b4`` IPL header
+(``0xbf7``), ``0x12d8`` CID, ``0x12f4`` authenticate.
 
 Open questions
 --------------
 
+Resolved by the Thumb disassembly (``rom``): the ROM prints over
+**uart0** (``0x1f221000``), not a PM UART; ``0x1f2070c4``\ =\ ``9`` and
+``0x1f203d4c``\ =\ ``0x3210`` are its UART pad-mux; ``0x1f002d84``-
+``0x1f002dd8`` (including ``0x1f002db8``) are the FSP command/data
+registers of the NOR read; and the authentication *is* hardware
+(crypto engine), just gated behind the ``0xfa`` signed-image flag.
+
+Still open:
+
 * Where the ROM really lives in the address map (modelled at ``0x0``;
-  the previous branch used a 32 KiB window there, our dump is 16 KiB).
-* What the real chip reads in ``DID_KEY`` bits[5:2] (the Miyoo Mini
-  boots from SPI NOR so probably ``0x20``), and what ``0x1f00700c``
-  and ``0x1f004014`` hold.
-* What the chiptop pokes ``0x1f203d40``/``0x1f203d4c`` and
-  ``0x1f2070c4`` control.
-* Whether the ROM is identical across the infinity2m family.
-* The PM UART clock (172 MHz per ``prev``), and why no banner is
-  printed before the failure message.
-* Which FSP register/bit ``0x1f002db8`` is, and what the ROM needs
-  from it to move on to reading the XIP window.
+  code occupies only the first ``0x1370`` bytes of the 16 KiB image).
+* What ``0x16001000``/``0x16001004`` are (written ``1``/``0xf0`` at
+  the very start), what ``0x1f00401c`` bit 6 selects, and what the
+  dispatch reads in ``0x1f00700c`` / ``0x1f004014`` bit 10 steer.
+* What ``0x1f203d40`` bit 15 (cleared at progress ``0xa04``) controls.
+* Whether the ROM is identical across the infinity2m family, and
+  whether a larger mask-ROM region beyond this dump adds a download
+  mode (this 16 KiB image has none).
