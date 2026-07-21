@@ -43,9 +43,26 @@ CTRL_TRIG = 1 << 1
 CLKGEN_TIMER_SRC = 0x1f207004
 CLKGEN_TIMER_SRC_VAL = 0x30
 
-# The model assumes the block is clocked off 432 MHz (infinity2m.h); the 12 MHz
-# crystal is the other candidate. rate*(DIVIDE+1) should reveal the source.
-SRC_CANDIDATES = (432000000, 12000000)
+# The MPLL (main system PLL) enable byte: reads 0x0f out of the ROM, the IPL
+# clears it to 0 to enable the MPLL output. See scripts/ssd20x/mpll_test.py.
+MPLL_EN = 0x1f206005
+
+# Clock sources we have identified (source-clock Hz -> name). rate*(DIVIDE+1)
+# gives the source rate; anything not near one of these is reported as unknown
+# together with the clkgen source-select register value.
+KNOWN_SOURCES = [
+    (12000000, "12 MHz crystal"),
+    (432000000, "MPLL (~448 MHz)"),
+]
+SRC_TOLERANCE = 0.15            # +/- 15% (covers the 432-vs-448 spread + jitter)
+
+
+def classify_source(src_hz):
+    """Name the source clock, or None if we do not recognise the rate."""
+    for hz, name in KNOWN_SOURCES:
+        if abs(src_hz - hz) <= SRC_TOLERANCE * hz:
+            return name
+    return None
 
 
 def counter(lk, base):
@@ -114,10 +131,15 @@ def check_timer(lk, idx, secs, set_divide):
     div = lk.read32(base + DIV) & 0xffff
     print("  RATE: %.0f Hz (%.3f MHz)  [DIVIDE=0x%x]" % (avg, avg / 1e6, div))
     if avg > 1000:
-        pre = avg * (div + 1)
-        best = min(SRC_CANDIDATES, key=lambda s: abs(s - pre))
-        print("  source clock (rate*(DIVIDE+1)) = %.3f MHz (nearest: %d MHz)"
-              % (pre / 1e6, best // 1000000))
+        pre = avg * (div + 1)                       # the source-clock rate
+        name = classify_source(pre)
+        if name:
+            print("  source clock (rate*(DIVIDE+1)) = %.3f MHz -> %s"
+                  % (pre / 1e6, name))
+        else:
+            sel = lk.read32(CLKGEN_TIMER_SRC) & 0xffff
+            print("  source clock (rate*(DIVIDE+1)) = %.3f MHz -> UNKNOWN "
+                  "(clkgen 0x%08x = 0x%04x)" % (pre / 1e6, CLKGEN_TIMER_SRC, sel))
         one = 0x2ee0 / avg
         print("  one 0x2ee0-tick delay on this timer = %.3f ms" % (one * 1e3))
     print()
@@ -139,6 +161,15 @@ def main():
     args = ap.parse_args()
 
     lk = open_link(args)
+
+    # MPLL status: 0x1f206005 is the enable byte (0 = output enabled). If any
+    # timer below reads the MPLL rate that also confirms it is actually running.
+    mpll = lk.read8(MPLL_EN)
+    print("MPLL enable 0x%08x = 0x%02x -> %s\n"
+          % (MPLL_EN, mpll,
+             "output enabled (running if a timer reads ~448 MHz)" if mpll == 0
+             else "NOT enabled (ROM default 0x0f); the MPLL is off"))
+
     if args.clksrc is not None:
         print("[clksrc] WARNING: selecting the fast timer source needs its PLL "
               "up; without it this can hang the SoC (power-cycle to recover).")
