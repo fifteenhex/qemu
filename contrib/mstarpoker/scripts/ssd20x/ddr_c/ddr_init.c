@@ -343,6 +343,10 @@ void ddr_init(void)
             miu_phy_init();     /* MIU analog / PHY: reset pulse + timed power-up */
             continue;
         }
+        if (seq[i].flags & F_ZQ) {
+            zq_calibrate();     /* does its own 0x400c latch-clear; no table write */
+            continue;
+        }
 
         a = RIU + seq[i].off;
 
@@ -355,8 +359,6 @@ void ddr_init(void)
 
         if (seq[i].flags & F_DLY)
             delay_ticks(DDR_DELAY);
-        if (seq[i].flags & F_ZQ)
-            zq_calibrate();
     }
 
     dram_selftest();            /* bus-hangs here if DRAM is not trained */

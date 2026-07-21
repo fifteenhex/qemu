@@ -169,7 +169,11 @@
     {0x2025fc, 0x0000a0e1, 0},
     {0x2025fc, 0x000080e1, 0},
     {0x2025e0, 0x00000000, 0},
-    {0x00400c, 0x00000000, 0},
+    /* ZQ / drive-strength calibration runs HERE in the IPL (0xa00028dc): after
+     * the MIU config, BEFORE the PHY-table loop and BIST, so those see the
+     * calibrated drive strength. This 0x400c write is the calibration's own
+     * latch-clear; zq_calibrate() then does the read/adjust. */
+    {0x000000, 0x00000000, F_ZQ},
     {0x202480, 0x00000015, F_B},
     {0x202481, 0x00000080, F_B},
     {0x202484, 0x00000008, F_B},
@@ -269,6 +273,7 @@
     {0x2070c8, 0x00000030, F_B},
     {0x001c81, 0x00000010, F_B},
     {0x001c81, 0x00000050, F_B},
+    {0x002fc8, 0x00000001, F_B},
     {0x001c80, 0x00000080, F_B},
     {0x2071c4, 0x00000003, F_B},
     {0x2071c5, 0x00000000, F_B},
@@ -342,4 +347,3 @@
     {0x20714c, 0x00000000, 0},
     {0x20718c, 0x00000028, 0},
     {0x2071bc, 0x00000000, 0},
-    {0x00400c, 0x00000000, F_ZQ},
