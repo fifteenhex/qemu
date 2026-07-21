@@ -154,6 +154,17 @@ So the "PM UART" guess was wrong - it is uart0, and there is no banner
 simply because the routine is only ever called on a failure path. The
 UART is **output only**; nothing reads it back.
 
+It is a standard 16550 (8-byte register stride, regshift 3). The ROM
+programs it for **38400 8N1** (``rom``; a terminal at 38400 reads the
+ROM's own messages, ``hw``): line control ``LCR`` (``0x1f221018``) is
+set to ``0x03`` (8 data bits,
+no parity, 1 stop), and the baud divisor ``0x14`` (20) is loaded into
+``DLL``/``DLH`` (``0x1f221000``/``0x221008``) with the ``LCR`` DLAB bit
+set. Divisor 20 for 38400 implies a ~12.288 MHz UART reference clock.
+The model nominally uses a 115200 BAUDBASE, which is wrong but harmless
+because its serial is a socket (baud is not enforced); a terminal on
+real hardware must use 38400.
+
 Boot-media dispatch
 -------------------
 
