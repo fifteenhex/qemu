@@ -19,6 +19,30 @@ reference; it is not under the QEMU licence.
 - `mmiolog.c` — a small QEMU TCG plugin that logs every store into the RIU MMIO
   window as `pc addr size value` (the ground-truth register program).
 - `validate.py` — cross-maps the logged writes onto the decompiled functions.
+- `build/` — a **compilable, cleaned port** of the IPL (`ipl.c` + `rt.h`) with a
+  bare-metal harness (`start.S`, `link.ld`, `Makefile`). It builds a real IPL
+  image, so it can replace the stock IPL in a flash image and be run in the
+  model. The port is grown incrementally, keeping all logic as it is reached.
+- `compare_mmio.py` — compares the port's MMIO writes against the stock IPL's,
+  ignoring PC (the port lives at different addresses) and requiring the same
+  ordered sequence of `(addr, size, value)` writes.
+
+## Building and validating the port
+```
+make -C build                                    # -> build/flash.bin (port as IPL)
+# stock reference trace:
+qemu-system-arm -M miyoomini -drive if=mtd,format=raw,file=MiYoo283v1.1.bin \
+    -L pc-bios -display none -plugin ./mmiolog.so,out=stock.txt
+# the port's trace:
+qemu-system-arm -M miyoomini -drive if=mtd,format=raw,file=build/flash.bin \
+    -L pc-bios -display none -plugin ./mmiolog.so,out=port.txt
+python3 compare_mmio.py port.txt stock.txt
+```
+The port is compiled at different addresses and the compiler is free to generate
+different code; correctness is that the **order, count and values of the MMIO
+accesses match** the stock IPL. `volatile` register accesses guarantee the
+compiler preserves them. The port currently reproduces the entry (the two
+`0x1f200800` progress writes) as an exact prefix; each stage extends it.
 
 ## Reproduce
 Extract the IPL from the NOR image (`IPL_` image at offset 0, 16-byte header +
