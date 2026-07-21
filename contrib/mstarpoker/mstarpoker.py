@@ -224,12 +224,27 @@ def parse_int(s):
     return int(s, 0)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="mstarpoker serial monitor client")
+def add_transport_args(ap):
+    """Add --socket/--serial/--baud to a parser (shared by the scripts)."""
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--socket", help="QEMU unix serial socket")
     g.add_argument("--serial", help="serial device, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
+
+
+def open_link(args):
+    """Open and sync a Link from parsed add_transport_args() options."""
+    if args.socket:
+        lk = Link.open_socket(args.socket)
+    else:
+        lk = Link.open_serial(args.serial, args.baud)
+    lk.sync()
+    return lk
+
+
+def main():
+    ap = argparse.ArgumentParser(description="mstarpoker serial monitor client")
+    add_transport_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping")
     sub.add_parser("faults")
@@ -241,11 +256,7 @@ def main():
     p = sub.add_parser("go"); p.add_argument("addr", type=parse_int)
     args = ap.parse_args()
 
-    if args.socket:
-        lk = Link.open_socket(args.socket)
-    else:
-        lk = Link.open_serial(args.serial, args.baud)
-    lk.sync()
+    lk = open_link(args)
 
     if args.cmd == "ping":
         print("pong" if lk.ping() else "no response")
