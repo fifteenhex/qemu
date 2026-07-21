@@ -132,3 +132,26 @@ def init(lk, verbose=True, method="c"):
         print("[ddr] %s not built (run 'make' in ddr_c/); using replay"
               % os.path.basename(DDR_BLOB))
     return init_replay(lk, verbose=verbose)
+
+
+def main():
+    import argparse
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    from mstarpoker import add_transport_args, open_link  # noqa: E402
+
+    ap = argparse.ArgumentParser(
+        description="Bring up / train the SSD202D DDR over the mstarpoker stub.")
+    add_transport_args(ap)
+    ap.add_argument("--method", choices=("c", "replay"), default="c",
+                    help="'c' = on-target blob (real trainer, default); "
+                         "'replay' = QEMU-only register replay")
+    args = ap.parse_args()
+
+    lk = open_link(args)
+    trained = init(lk, method=args.method)
+    sys.exit(0 if trained else 1)
+
+
+if __name__ == "__main__":
+    main()
