@@ -161,6 +161,7 @@ the same commit as the device model change it describes.
 
    mstarv7/memory-map
    mstarv7/ddr
+   mstarv7/vendor-modules
    mstarv7/bootrom
    mstarv7/timer
    mstarv7/isp
