@@ -1,0 +1,7 @@
+# build artifacts
+*.o
+stub.elf
+stub.bin
+stub.ipl
+flash.bin
+__pycache__/
