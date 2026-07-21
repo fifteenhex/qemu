@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/arm-powerctl.h"
+#include "trace.h"
 
 /*
  * The "DID" block at 0x1f007000. Only DID_KEY, holding the boot-media
@@ -171,16 +172,46 @@ static const MemoryRegionOps mstarv7_l3bridge_ops = {
  * The chiptop block: the pinctrl pad-mux plus the chip straps. The
  * pad-mux registers read back what software writes; the package bond
  * strap at +0x120 reads the SoC's bond value.
+ *
+ * chiptop (pinctrl) registers we have decoded; the rest trace by offset
+ * (enable with -trace enable=mstar_chiptop_write). Like the clkgen maybe_*
+ * names, seed guesses by correlating a pad-mux write with the block that then
+ * lights up (trace mstar_chiptop_write + memory_region_ops_write together).
  */
+static const MStarRegName mstarv7_chiptop_regnames[] = {
+    { 0x120, "bond_strap" },        /* 0x1f203d20, read by socid */
+    { 0x14c, "uart_pad" },          /* 0x1f203d4c, boot ROM UART pad-mux */
+    /* maybe_* first guesses: block first accessed after that pad-mux write. */
+    { 0x020, "maybe_gpio_pad" },    /* -> mstar-gpio.main / sar */
+    { 0x024, "maybe_i2c_pad" },     /* -> mstar-i2c */
+    { 0x034, "maybe_dphy_pad" },    /* -> mstar-dphy */
+    { 0, NULL },
+};
+
+static const char *mstarv7_chiptop_regname(hwaddr off)
+{
+    const MStarRegName *r;
+
+    for (r = mstarv7_chiptop_regnames; r->name; r++) {
+        if (r->offset == off) {
+            return r->name;
+        }
+    }
+    return "?";
+}
+
 static uint64_t mstarv7_chiptop_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarV7SoCState *s = MSTARV7_SOC(opaque);
     MStarV7SoCClass *msc = MSTARV7_SOC_GET_CLASS(opaque);
+    uint64_t val = (addr == MSTARV7_CHIPTOP_BOND) ? msc->bond
+                                                  : s->chiptop_regs[addr / 4];
 
-    if (addr == MSTARV7_CHIPTOP_BOND) {
-        return msc->bond;
+    if (trace_event_get_state_backends(TRACE_MSTAR_CHIPTOP_READ)) {
+        trace_mstar_chiptop_read(MSTARV7_CHIPTOP_BASE + addr,
+                                 mstarv7_chiptop_regname(addr), val);
     }
-    return s->chiptop_regs[addr / 4];
+    return val;
 }
 
 static void mstarv7_chiptop_write(void *opaque, hwaddr addr, uint64_t val,
@@ -188,6 +219,10 @@ static void mstarv7_chiptop_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MStarV7SoCState *s = MSTARV7_SOC(opaque);
 
+    if (trace_event_get_state_backends(TRACE_MSTAR_CHIPTOP_WRITE)) {
+        trace_mstar_chiptop_write(MSTARV7_CHIPTOP_BASE + addr,
+                                  mstarv7_chiptop_regname(addr), val, size);
+    }
     s->chiptop_regs[addr / 4] = val;
 }
 

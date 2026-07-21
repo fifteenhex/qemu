@@ -96,3 +96,7 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
+
+# hw/arm/mstarv7.c
+mstar_chiptop_write(uint32_t addr, const char *name, uint64_t val, unsigned size) "chiptop 0x%08" PRIx32 " %s <- 0x%" PRIx64 " (size %u)"
+mstar_chiptop_read(uint32_t addr, const char *name, uint64_t val) "chiptop 0x%08" PRIx32 " %s -> 0x%" PRIx64
