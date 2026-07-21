@@ -11,6 +11,17 @@
  */
 /* IPL decompiled by Ghidra 12.1.2, base 0xa0000000, ARM:LE:32:v7 */
 
+/*
+ * UART0: a 16550 (register stride 8, i.e. reg-shift 3) the IPL uses for
+ * its boot messages. Confirmed against the model: the IPL polls LSR bit 5
+ * (0x1f221028) for the tx-holding register to empty, then writes the byte
+ * to THR (0x1f221000).
+ */
+#define UART0_BASE     0x1f221000u
+#define UART0_THR      (*(volatile unsigned char *)(UART0_BASE + 0x00)) /* tx holding reg */
+#define UART0_LSR      (*(volatile unsigned char *)(UART0_BASE + 0x28)) /* line status reg */
+#define UART_LSR_THRE  0x20u                                            /* THR empty */
+
 /* thunk_FUN_a0000010 @ a0000000 */
 
 void thunk_FUN_a0000010(void)
@@ -1560,92 +1571,60 @@ void FUN_a000165c(void)
 
 
 
-/* FUN_a0001678 @ a0001678 */
+/* uart_putc @ a0001678 */
 
-void FUN_a0001678(undefined1 param_1)
-
+void uart_putc(char c)
 {
-  do {
-  } while (-1 < (int)((uint)*DAT_a0001688 << 0x1a));
-  *DAT_a000168c = param_1;
-  return;
+  while ((UART0_LSR & UART_LSR_THRE) == 0) {
+    /* wait for the tx holding register to drain */
+  }
+  UART0_THR = c;
 }
 
 
 
-/* FUN_a0001690 @ a0001690 */
+/* uart_put_hex8 @ a0001690 */
 
-void FUN_a0001690(uint param_1,undefined4 param_2,undefined4 param_3,undefined4 param_4)
-
+void uart_put_hex8(uint byte)
 {
-  uint uVar1;
-  int iVar2;
-  uint extraout_r1;
-  undefined4 extraout_r2;
-  
-  uVar1 = param_1 >> 4;
-  if (uVar1 < 10) {
-    iVar2 = uVar1 + 0x30;
-  }
-  else {
-    iVar2 = uVar1 + 0x57;
-  }
-  FUN_a0001678(iVar2,param_1);
-  uVar1 = extraout_r1 & 0xf;
-  if (uVar1 < 10) {
-    iVar2 = uVar1 + 0x30;
-  }
-  else {
-    iVar2 = uVar1 + 0x57;
-  }
-  FUN_a0001678(iVar2,extraout_r1,extraout_r2,param_4);
-  return;
+  uint hi = (byte >> 4) & 0xf;
+  uint lo = byte & 0xf;
+
+  uart_putc(hi < 10 ? hi + '0' : hi + ('a' - 10));
+  uart_putc(lo < 10 ? lo + '0' : lo + ('a' - 10));
 }
 
 
 
-/* FUN_a00016b6 @ a00016b6 */
+/* uart_put_hex32 @ a00016b6 */
 
-void FUN_a00016b6(uint param_1)
-
+void uart_put_hex32(uint val)
 {
-  FUN_a0001690(param_1 >> 0x18);
-  FUN_a0001690((param_1 & 0xffffff) >> 0x10);
-  FUN_a0001690((param_1 & 0xffff) >> 8);
-  FUN_a0001690(param_1 & 0xff);
-  return;
+  uart_put_hex8((val >> 24) & 0xff);
+  uart_put_hex8((val >> 16) & 0xff);
+  uart_put_hex8((val >> 8) & 0xff);
+  uart_put_hex8(val & 0xff);
 }
 
 
 
-/* FUN_a00016da @ a00016da */
+/* uart_put_hex16 @ a00016da */
 
-void FUN_a00016da(uint param_1)
-
+void uart_put_hex16(uint val)
 {
-  FUN_a0001690(param_1 >> 8);
-  FUN_a0001690(param_1 & 0xff);
-  return;
+  uart_put_hex8((val >> 8) & 0xff);
+  uart_put_hex8(val & 0xff);
 }
 
 
 
-/* FUN_a00016ee @ a00016ee */
+/* uart_puts @ a00016ee */
 
-void FUN_a00016ee(int param_1)
-
+void uart_puts(const char *s)
 {
-  char cVar1;
-  int extraout_r1;
-  
-  param_1 = param_1 + -1;
-  while( true ) {
-    cVar1 = *(char *)(param_1 + 1);
-    if (cVar1 == '\0') break;
-    FUN_a0001678(cVar1,(char *)(param_1 + 1));
-    param_1 = extraout_r1;
+  while (*s != '\0') {
+    uart_putc(*s++);
   }
-  return;
 }
 
 
@@ -1668,10 +1647,10 @@ void FUN_a0001700(ushort *param_1,short *param_2,undefined1 *param_3)
       if (*(short *)(DAT_a00017cc + uVar5 * 8 + 4) == 1) goto LAB_a0001734;
     }
   }
-  FUN_a00016ee(DAT_a00017d0);
-  FUN_a00016da(1);
-  FUN_a00016ee(DAT_a00017d4);
-  FUN_a00016ee(DAT_a00017d8);
+  uart_puts(DAT_a00017d0);
+  uart_put_hex16(1);
+  uart_puts(DAT_a00017d4);
+  uart_puts(DAT_a00017d8);
   uVar5 = 1;
 LAB_a0001734:
   uVar1 = DAT_a00017e8;
@@ -1687,12 +1666,12 @@ LAB_a0001734:
     if (*DAT_a00017c8 == iVar2) {
       if ((uint)*(ushort *)(DAT_a00017c8 + 3) < (uVar5 & 0xffff)) {
         *param_1 = 0;
-        FUN_a00016ee(uVar1);
-        FUN_a00016ee(DAT_a00017ec);
-        FUN_a00016ee(DAT_a00017f0);
-        FUN_a00016da(1);
-        FUN_a00016ee(DAT_a00017d4);
-        FUN_a00016ee(DAT_a00017f4);
+        uart_puts(uVar1);
+        uart_puts(DAT_a00017ec);
+        uart_puts(DAT_a00017f0);
+        uart_put_hex16(1);
+        uart_puts(DAT_a00017d4);
+        uart_puts(DAT_a00017f4);
         return;
       }
       iVar2 = uVar5 * 8;
@@ -1723,8 +1702,8 @@ void FUN_a00017f8(void)
 
 {
   FUN_a00002ec();
-  FUN_a00016ee(DAT_a000181c);
-  FUN_a00016ee(DAT_a0001820);
+  uart_puts(DAT_a000181c);
+  uart_puts(DAT_a0001820);
   do {
                     /* WARNING: Do nothing block with infinite loop */
   } while( true );
@@ -1766,7 +1745,7 @@ void FUN_a0001824(uint param_1,undefined4 param_2,undefined4 param_3,undefined2 
   iVar3 = (int)&uStack_28 + iVar5 + 3;
 LAB_a000185e:
   uStack_28 = param_1;
-  FUN_a00016ee(iVar3);
+  uart_puts(iVar3);
   return;
 }
 
@@ -1796,11 +1775,11 @@ undefined4 FUN_a0001870(uint param_1)
   uVar4 = FUN_a000137c();
   uVar3 = (undefined4)((ulonglong)uVar4 >> 0x20);
   if ((int)uVar4 == 0) {
-    FUN_a00016ee(DAT_a00018d8);
-    FUN_a00016ee(DAT_a00018dc);
+    uart_puts(DAT_a00018d8);
+    uart_puts(DAT_a00018dc);
     FUN_a0001824(0x188);
-    FUN_a00016ee(DAT_a00018e0);
-    FUN_a00016ee(DAT_a00018e4);
+    uart_puts(DAT_a00018e0);
+    uart_puts(DAT_a00018e4);
     uVar3 = 2;
   }
   else {
@@ -1842,11 +1821,11 @@ undefined4 FUN_a00018ec(byte *param_1,undefined4 param_2,undefined4 param_3)
     puVar1[0x1a] = 1;
     uVar6 = FUN_a000137c();
     if ((int)uVar6 == 0) {
-      FUN_a00016ee(DAT_a000197c);
-      FUN_a00016ee(DAT_a0001980);
+      uart_puts(DAT_a000197c);
+      uart_puts(DAT_a0001980);
       FUN_a0001824(0x149);
-      FUN_a00016ee(DAT_a0001984);
-      FUN_a00016ee(DAT_a0001988);
+      uart_puts(DAT_a0001984);
+      uart_puts(DAT_a0001988);
       return 2;
     }
     *DAT_a000198c = (short)((uint6)uVar6 >> 0x20);
@@ -1878,11 +1857,11 @@ undefined4 FUN_a000199c(undefined2 param_1)
   uVar3 = FUN_a000137c();
   uVar2 = (undefined4)((ulonglong)uVar3 >> 0x20);
   if ((int)uVar3 == 0) {
-    FUN_a00016ee(DAT_a00019f0);
-    FUN_a00016ee(DAT_a00019f4);
+    uart_puts(DAT_a00019f0);
+    uart_puts(DAT_a00019f4);
     FUN_a0001824(0xdc);
-    FUN_a00016ee(DAT_a00019f8);
-    FUN_a00016ee(DAT_a00019fc);
+    uart_puts(DAT_a00019f8);
+    uart_puts(DAT_a00019fc);
     uVar2 = 2;
   }
   else {
@@ -1959,7 +1938,7 @@ uint FUN_a0001a58(byte param_1)
   *DAT_a0001b1c = *DAT_a0001b1c | 1;
   uVar2 = FUN_a0001a1c();
   if ((uVar2 & 1) == 0) {
-    FUN_a00016ee(DAT_a0001b20);
+    uart_puts(DAT_a0001b20);
   }
   return uVar2 & 1;
 }
@@ -1987,7 +1966,7 @@ uint FUN_a0001b24(ushort param_1,ushort *param_2)
   *DAT_a0001bc0 = *DAT_a0001bc0 | 1;
   uVar2 = FUN_a0001a1c();
   if ((uVar2 & 1) == 0) {
-    FUN_a00016ee(DAT_a0001bc4);
+    uart_puts(DAT_a0001bc4);
   }
   *param_2 = *DAT_a0001bc8 & 0xff;
   return uVar2 & 1;
@@ -2029,7 +2008,7 @@ uint FUN_a0001bcc(ushort param_1)
   *DAT_a0001ccc = *DAT_a0001ccc | 1;
   uVar2 = FUN_a0001a1c();
   if ((uVar2 & 1) == 0) {
-    FUN_a00016ee(DAT_a0001cd0);
+    uart_puts(DAT_a0001cd0);
   }
   return uVar2 & 1;
 }
@@ -2076,13 +2055,13 @@ void FUN_a0001d10(void)
   byte *pbVar1;
   undefined4 uVar2;
   
-  FUN_a00016ee(DAT_a0001d3c);
+  uart_puts(DAT_a0001d3c);
   uVar2 = DAT_a0001d44;
   pbVar1 = DAT_a0001d40;
   *DAT_a0001d40 = 0x10;
   *pbVar1 = *pbVar1 | 0x40;
-  FUN_a00016ee(uVar2);
-  FUN_a00016ee(DAT_a0001d48);
+  uart_puts(uVar2);
+  uart_puts(DAT_a0001d48);
   *DAT_a0001d4c = 0x1011;
   return;
 }
@@ -2275,25 +2254,25 @@ LAB_a0001e64:
     pbVar45 = pbVar45 + 1;
   } while (local_84 != 0);
   local_5c = 0;
-  FUN_a00016ee(DAT_a0001f98);
-  FUN_a00016ee(local_64);
-  FUN_a00016ee(DAT_a0001f9c);
-  FUN_a00016ee(DAT_a0001fa0);
-  FUN_a0001690(bVar1);
-  FUN_a00016ee(DAT_a0001fa4);
+  uart_puts(DAT_a0001f98);
+  uart_puts(local_64);
+  uart_puts(DAT_a0001f9c);
+  uart_puts(DAT_a0001fa0);
+  uart_put_hex8(bVar1);
+  uart_puts(DAT_a0001fa4);
   puVar36 = DAT_a000232c;
   uVar32 = DAT_a0001fac;
   if (((int)((uint)*DAT_a0001fa8 << 0x1e) < 0) &&
      (uVar32 = DAT_a0002470, (int)((uint)*DAT_a000232c << 0x1f) < 0)) {
-    FUN_a00016ee(DAT_a0002330);
+    uart_puts(DAT_a0002330);
     *puVar36 = *puVar36 | 1;
   }
   else {
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
   }
   FUN_a00015fc(0x29e,DAT_a0002334);
   if (bVar1 == 0x1d) {
-    FUN_a00016ee(DAT_a00027ec);
+    uart_puts(DAT_a00027ec);
     puVar12 = DAT_a0002828;
     puVar8 = DAT_a00027f4;
     puVar11 = DAT_a00027f0;
@@ -2501,7 +2480,7 @@ LAB_a00028c0:
   }
   else {
     if ((0x1c < bVar1) && (bVar1 < 0x20)) {
-      FUN_a00016ee(DAT_a0002338);
+      uart_puts(DAT_a0002338);
       puVar8 = DAT_a0002340;
       puVar11 = DAT_a000233c;
       *DAT_a000233c = 0;
@@ -2700,23 +2679,23 @@ LAB_a00028c0:
       *puVar26 = 0x7ffe;
       goto LAB_a00028c0;
     }
-    FUN_a00016ee(DAT_a0003240);
+    uart_puts(DAT_a0003240);
   }
   puVar13 = DAT_a0002bcc;
   puVar36 = DAT_a0002bc8;
   *DAT_a0002bc8 = *DAT_a0002bc8 & 0xfeff;
   if ((*puVar13 & 0x800) != 0) {
     uVar24 = (*puVar13 & 0x7ff) >> 5;
-    FUN_a00016ee(DAT_a0002bd0);
-    FUN_a00016da(uVar24);
-    FUN_a00016ee(DAT_a0002bd4);
+    uart_puts(DAT_a0002bd0);
+    uart_put_hex16(uVar24);
+    uart_puts(DAT_a0002bd4);
     *DAT_a0002bd8 = *DAT_a0002bd8 & 0x81ff | (ushort)(uVar24 << 9);
   }
   if ((int)((uint)*DAT_a0002bdc << 0x10) < 0) {
     uVar24 = (*DAT_a0002bdc & 0x7fff) >> 0xc;
-    FUN_a00016ee(DAT_a0002be0);
-    FUN_a00016da(uVar24);
-    FUN_a00016ee(DAT_a0002bd4);
+    uart_puts(DAT_a0002be0);
+    uart_put_hex16(uVar24);
+    uart_puts(DAT_a0002bd4);
     uVar24 = uVar24 - 1 & 0xffff;
     if (uVar24 < 7) {
       iVar25 = (int)*(char *)(DAT_a0002be8 + uVar24);
@@ -2732,9 +2711,9 @@ LAB_a00028c0:
   }
   if ((int)((uint)*puVar13 << 0x10) < 0) {
     uVar24 = (*puVar13 & 0x7fff) >> 0xc;
-    FUN_a00016ee(DAT_a0002bf0);
-    FUN_a00016da(uVar24);
-    FUN_a00016ee(DAT_a0002bd4);
+    uart_puts(DAT_a0002bf0);
+    uart_put_hex16(uVar24);
+    uart_puts(DAT_a0002bd4);
     uVar24 = uVar24 - 1 & 0xffff;
     if (uVar24 < 7) {
       iVar25 = (int)*(char *)(DAT_a0002be8 + uVar24);
@@ -2837,7 +2816,7 @@ LAB_a00028c0:
   puVar11[4] = 2;
   puVar11[0x1b] = 0xe1;
   puVar11[0x1c] = 0xff;
-  FUN_a00016ee(DAT_a0002f5c);
+  uart_puts(DAT_a0002f5c);
   uVar32 = DAT_a0002f64;
   if ((*DAT_a0002f60 & 0x18) != 0) {
     *DAT_a0002f60 = 0xc0;
@@ -2875,7 +2854,7 @@ LAB_a00028c0:
     puVar46 = puVar14 + 0x800;
     *puVar8 = 0x7f03;
     puVar39 = puVar8 + 0x400;
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
     puVar11 = DAT_a000348c;
     puVar35 = DAT_a0003488;
     *(undefined1 *)DAT_a0003488 = 0x2f;
@@ -2899,7 +2878,7 @@ LAB_a00028c0:
     uVar32 = DAT_a0003490;
     *puVar46 = 0;
     *puVar39 = 0x7f03;
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
     puVar35 = DAT_a0003494;
     *(undefined1 *)DAT_a0003494 = 0x2f;
     *DAT_a0003498 = 0xc;
@@ -2923,10 +2902,10 @@ LAB_a00028c0:
     uVar32 = DAT_a00034a0;
     puVar14[0x1000] = 0;
     puVar8[0x800] = 0x7f03;
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
     uVar32 = DAT_a00034a4;
   }
-  FUN_a00016ee(uVar32);
+  uart_puts(uVar32);
   puVar14 = DAT_a0002f6c;
   puVar11 = DAT_a0002f68;
   *DAT_a0002f6c = 0x88;
@@ -2942,7 +2921,7 @@ LAB_a00028c0:
   *DAT_a0002f70 = 1;
   puVar14[-3] = 0;
   FUN_a0001cd4(0x4b0);
-  FUN_a00016ee(DAT_a0002f78);
+  uart_puts(DAT_a0002f78);
   puVar11 = DAT_a0002f7c;
   *DAT_a0002f7c = 0x18;
   puVar11[0x24] = 4;
@@ -2967,7 +2946,7 @@ LAB_a00028c0:
   puVar44[1] = 0;
   *puVar46 = 4;
   *puVar46 = 0x14;
-  FUN_a00016ee(uVar32);
+  uart_puts(uVar32);
   uVar24 = FUN_a00011c8(2);
   uVar34 = FUN_a00011c8(3);
   uVar27 = FUN_a00011c8(0xd);
@@ -2976,58 +2955,58 @@ LAB_a00028c0:
   uVar32 = DAT_a0002f98;
   if ((uVar24 & 0x10) != 0) {
     *DAT_a0002f94 = *DAT_a0002f94 & 0xfe1f | (ushort)((uVar24 & 0xf) << 5);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar24 & 0xf);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar24 & 0xf);
+    uart_puts(DAT_a0002f9c);
     uVar32 = DAT_a0002fa4;
     puVar13 = DAT_a0002fa0;
     uVar47 = uVar28 & 0xf;
     *DAT_a0002fa0 = *DAT_a0002fa0 & 0xfff8 | (ushort)(uVar47 >> 1);
     puVar13[-2] = puVar13[-2] & 0x7fff | (ushort)(uVar47 << 0xf);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a0002f9c);
   }
   uVar32 = DAT_a0002fac;
   if ((uVar28 & 0x1000) != 0) {
     uVar47 = (uVar28 & 0xff) >> 4;
     *DAT_a0002fa8 = *DAT_a0002fa8 & 0xfe1f | (ushort)(uVar47 << 5);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a0002f9c);
     uVar32 = DAT_a0002fb4;
     puVar13 = DAT_a0002fb0;
     uVar47 = (uVar28 & 0xfff) >> 8;
     *DAT_a0002fb0 = *DAT_a0002fb0 & 0xfff8 | (ushort)((uVar28 << 0x14) >> 0x1d);
     puVar13[-2] = puVar13[-2] & 0x7fff | (ushort)(uVar47 << 0xf);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a0002f9c);
   }
   uVar17 = DAT_a00034ac;
   uVar32 = DAT_a0002fbc;
   if ((int)(uVar27 << 0x12) < 0) {
     uVar47 = (uVar27 & 0x1ff) >> 5;
     *DAT_a0002fb8 = *DAT_a0002fb8 & 0xfe1f | (ushort)(uVar47 << 5);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a0002f9c);
     uVar47 = uVar27 << 0x13;
 LAB_a0002e12:
     uVar32 = DAT_a0002fc4;
     puVar13 = DAT_a0002fc0;
     *DAT_a0002fc0 = *DAT_a0002fc0 & 0xfff8 | (ushort)(uVar47 >> 0x1d);
     puVar13[-2] = puVar13[-2] & 0x7fff | (ushort)((uVar47 >> 0x1c) << 0xf);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47 >> 0x1c);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47 >> 0x1c);
+    uart_puts(DAT_a0002f9c);
   }
   else if ((uVar28 & 0x1000) != 0) {
     uVar47 = (uVar28 & 0xff) >> 4;
     *DAT_a00034a8 = *DAT_a00034a8 & 0xfe1f | (ushort)(uVar47 << 5);
-    FUN_a00016ee(uVar17);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a00034b0);
+    uart_puts(uVar17);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a00034b0);
     uVar47 = uVar28 << 0x14;
     goto LAB_a0002e12;
   }
@@ -3035,12 +3014,12 @@ LAB_a0002e12:
   if ((uVar24 & 0x4000000) != 0) {
     uVar47 = (uVar24 & 0xffff) >> 10;
     *DAT_a0002fc8 = *DAT_a0002fc8 & 0xff80 | (ushort)(uVar47 << 1) | 1;
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar47);
-    FUN_a00016ee(DAT_a0002f9c);
-    FUN_a00016ee(DAT_a0002fd0);
-    FUN_a00016da((uVar24 & 0x3ffffff) >> 0x10);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar47);
+    uart_puts(DAT_a0002f9c);
+    uart_puts(DAT_a0002fd0);
+    uart_put_hex16((uVar24 & 0x3ffffff) >> 0x10);
+    uart_puts(DAT_a0002f9c);
   }
   puVar16 = DAT_a0002ffc;
   uVar32 = DAT_a0002fdc;
@@ -3050,26 +3029,26 @@ LAB_a0002e12:
     *DAT_a0002fd4 = *DAT_a0002fd4 | 4;
     *puVar15 = *puVar15 | 0x8000;
     *puVar16 = *puVar16 & 0xffe0 | (ushort)(uVar34 & 0x1f);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar34 & 0x1f);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar34 & 0x1f);
+    uart_puts(DAT_a0002f9c);
     uVar32 = DAT_a0002fe0;
     uVar24 = (uVar34 & 0x3ff) >> 5;
     *puVar16 = *puVar16 & 0xe0ff | (ushort)(uVar24 << 8);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar24);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar24);
+    uart_puts(DAT_a0002f9c);
     uVar32 = DAT_a0002fe4;
     uVar24 = (uVar34 & 0x3fff) >> 10;
     *puVar13 = *puVar13 & 0xf87f | (ushort)(uVar24 << 7);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar24);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar24);
+    uart_puts(DAT_a0002f9c);
     uVar32 = DAT_a0002fec;
     *DAT_a0002fe8 = *DAT_a0002fe8 & 0xfff0 | (ushort)((uVar34 & 0xfffff) >> 0x10);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar34 & 0xfffff) >> 0x10);
-    FUN_a00016ee(DAT_a0002f9c);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar34 & 0xfffff) >> 0x10);
+    uart_puts(DAT_a0002f9c);
     *DAT_a0002ff0 = *DAT_a0002ff0 | 1;
   }
   uVar32 = DAT_a00031f4;
@@ -3082,66 +3061,66 @@ LAB_a0002e12:
     puVar13[4] = puVar13[4] & 0xfffc | uVar37;
     puVar13[6] = puVar13[6] & 0xfffc | uVar37;
     puVar13[8] = uVar37 | puVar13[8] & 0xfffc;
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar34 & 0xffff) >> 0xe);
-    FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar34 & 0xffff) >> 0xe);
+    uart_puts(DAT_a00031f8);
     uVar32 = DAT_a0003200;
     uVar24 = (uVar28 & 0x7fff) >> 0xd;
     *DAT_a00031fc = *DAT_a00031fc & 0xe7ff | (ushort)(uVar24 << 0xb);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar24);
-    iVar25 = FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar24);
+    iVar25 = uart_puts(DAT_a00031f8);
   }
   uVar32 = DAT_a0003208;
   if ((uVar29 & 0x80) != 0) {
     *DAT_a0003204 = *DAT_a0003204 & 0xff80 | (ushort)(uVar29 & 0x7f);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar29 & 0x7f);
-    iVar25 = FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar29 & 0x7f);
+    iVar25 = uart_puts(DAT_a00031f8);
   }
   uVar32 = DAT_a0003210;
   if ((uVar29 & 0x8000) != 0) {
     *DAT_a000320c = *DAT_a000320c & 0xff80 | (ushort)((uVar29 & 0x7fff) >> 8);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar29 & 0x7fff) >> 8);
-    iVar25 = FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar29 & 0x7fff) >> 8);
+    iVar25 = uart_puts(DAT_a00031f8);
   }
   uVar32 = DAT_a0003218;
   if ((uVar29 & 0x800000) != 0) {
     *DAT_a0003214 = *DAT_a0003214 & 0xff80 | (ushort)((uVar29 & 0x7fffff) >> 0x10);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar29 & 0x7fffff) >> 0x10);
-    iVar25 = FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar29 & 0x7fffff) >> 0x10);
+    iVar25 = uart_puts(DAT_a00031f8);
   }
   uVar32 = DAT_a0003224;
   puVar13 = DAT_a0003220;
   if ((int)(uVar28 << 5) < 0) {
     *DAT_a000321c = *DAT_a000321c & 0xffe0 | (ushort)((uVar28 & 0x1fffff) >> 0x10);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar28 & 0x1fffff) >> 0x10);
-    FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar28 & 0x1fffff) >> 0x10);
+    uart_puts(DAT_a00031f8);
     uVar32 = DAT_a0003228;
     *puVar13 = *puVar13 & 0xffe0 | (ushort)((uVar28 & 0x3ffffff) >> 0x15);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar28 & 0x3ffffff) >> 0x15);
-    FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar28 & 0x3ffffff) >> 0x15);
+    uart_puts(DAT_a00031f8);
     uVar32 = DAT_a000322c;
     uVar24 = (uVar27 & 0x1fffff) >> 0x10;
     *puVar13 = *puVar13 & 0xe0ff | (ushort)((uVar27 & 0x1f) << 8);
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
     puVar13 = DAT_a0003230;
-    FUN_a00016da(uVar27 & 0x1f);
-    FUN_a00016ee(DAT_a00031f8);
+    uart_put_hex16(uVar27 & 0x1f);
+    uart_puts(DAT_a00031f8);
     uVar32 = DAT_a0003234;
     *puVar13 = *puVar13 & 0xffe0 | (ushort)((uVar27 & 0x1fff) >> 8);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da((uVar27 & 0x1fff) >> 8);
-    FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16((uVar27 & 0x1fff) >> 8);
+    uart_puts(DAT_a00031f8);
     uVar32 = DAT_a0003238;
     *puVar13 = *puVar13 & 0xe0ff | (ushort)(uVar24 << 8);
-    FUN_a00016ee(uVar32);
-    FUN_a00016da(uVar24);
-    iVar25 = FUN_a00016ee(DAT_a00031f8);
+    uart_puts(uVar32);
+    uart_put_hex16(uVar24);
+    iVar25 = uart_puts(DAT_a00031f8);
   }
   puVar13 = DAT_a000323c;
   *puVar36 = *puVar36 & 0xfeff;
@@ -3161,7 +3140,7 @@ LAB_a0002e12:
   }
   *puVar36 = *puVar36 & 0xfeff;
   if ((*puVar13 & 0x7f) >> 5 == 1) {
-    FUN_a00016ee(DAT_a00034b4);
+    uart_puts(DAT_a00034b4);
     do {
                     /* WARNING: Do nothing block with infinite loop */
     } while( true );
@@ -3212,7 +3191,7 @@ LAB_a00034fe:
   _DAT_24000000 = 0x22222222;
   _DAT_28000000 = 0x44444444;
   _DAT_30000000 = 0x88888888;
-  FUN_a00016ee(DAT_a0003814);
+  uart_puts(DAT_a0003814);
   *DAT_a0003818 = (ushort)(((uint)*DAT_a0003818 << 0x14) >> 0x14) | 0x9000;
   uVar32 = DAT_a0003828;
   puVar15 = DAT_a0003824;
@@ -3226,9 +3205,9 @@ LAB_a00034fe:
   puVar8[2] = 0xffff;
   puVar8[4] = 0x1fe;
   *DAT_a0003830 = 0x5aa5;
-  FUN_a00016ee(uVar32);
+  uart_puts(uVar32);
   *puVar15 = 0;
-  FUN_a00016da(1);
+  uart_put_hex16(1);
   *puVar13 = 1;
   do {
     uVar37 = *puVar13;
@@ -3236,11 +3215,11 @@ LAB_a00034fe:
   local_84 = 0;
   uVar32 = DAT_a0003bf0;
   if ((uVar37 & 0x6000) != 0) goto LAB_a0003b2a;
-  FUN_a00016ee(DAT_a0003834);
+  uart_puts(DAT_a0003834);
   *puVar15 = uVar37 & 0x6000;
   *puVar13 = uVar37 & 0x6000;
   FUN_a000014c();
-  FUN_a00016ee(DAT_a0003838);
+  uart_puts(DAT_a0003838);
   FUN_a00015fc(499,DAT_a000383c);
   uVar24 = (uint)*DAT_a0003840;
   if (*DAT_a0003844 == -6) goto LAB_a0003b32;
@@ -3248,7 +3227,7 @@ LAB_a00034fe:
 LAB_a0003616:
   pcVar42 = DAT_a0004114;
   if ((uVar24 & 0x24) == 0x20) {
-    FUN_a00016ee(DAT_a0003848);
+    uart_puts(DAT_a0003848);
     puVar15 = DAT_a000388c;
     psVar20 = DAT_a0003888;
     pcVar42 = DAT_a0003884;
@@ -3260,9 +3239,9 @@ LAB_a0003616:
     else {
       iVar25 = 0x10000;
     }
-    FUN_a00016ee(DAT_a0003850);
-    FUN_a00016b6(iVar25);
-    FUN_a00016ee(DAT_a0003860);
+    uart_puts(DAT_a0003850);
+    uart_put_hex32(iVar25);
+    uart_puts(DAT_a0003860);
     puVar16 = DAT_a0003864;
     local_84 = iVar25 + 0x14000000;
     uVar43 = *(ushort *)(&DAT_14000008 + iVar25);
@@ -3287,13 +3266,13 @@ LAB_a0003616:
     *puVar15 = *puVar15 | 1;
     uVar24 = FUN_a0001a1c();
     if ((uVar24 & 1) == 0) {
-      FUN_a00016ee(DAT_a000386c);
+      uart_puts(DAT_a000386c);
     }
     puVar16 = DAT_a0003870;
     if ((uVar24 & 1) == 0) {
 LAB_a000399a:
       if (*pcVar42 != '\0') goto LAB_a0003b66;
-      FUN_a00016ee(DAT_a0003ba0);
+      uart_puts(DAT_a0003ba0);
     }
     else {
       cVar5 = (char)*DAT_a0003870;
@@ -3308,11 +3287,11 @@ LAB_a000399a:
             *(undefined4 *)psVar20 = *puVar48;
             *(undefined4 *)(psVar20 + 2) = puVar48[1];
             *(undefined4 *)(psVar20 + 4) = puVar48[2];
-            FUN_a00016ee(DAT_a000387c);
-            FUN_a0001690(cVar5);
-            FUN_a0001690(uVar33);
-            FUN_a0001690(cVar6);
-            FUN_a00016ee(DAT_a0003880);
+            uart_puts(DAT_a000387c);
+            uart_put_hex8(cVar5);
+            uart_put_hex8(uVar33);
+            uart_put_hex8(cVar6);
+            uart_puts(DAT_a0003880);
             puVar18 = DAT_a0003864;
             if ((*psVar20 == 0x506) || (*psVar20 == 0x508)) {
               *(undefined1 *)local_7c = 1;
@@ -3336,16 +3315,16 @@ LAB_a000399a:
               *puVar15 = *puVar15 | 1;
               iVar25 = FUN_a0001a1c();
               if (iVar25 == 0) {
-                FUN_a00016ee(DAT_a0003b94);
+                uart_puts(DAT_a0003b94);
               }
               uVar33 = *puVar16;
               uVar3 = *puVar16;
-              FUN_a00016ee(DAT_a0003b98);
+              uart_puts(DAT_a0003b98);
               cVar5 = (char)uVar33;
               uVar24 = (uint)(uVar3 >> 8);
-              FUN_a0001690(cVar5);
-              FUN_a0001690(uVar24);
-              FUN_a00016ee(DAT_a0003b9c);
+              uart_put_hex8(cVar5);
+              uart_put_hex8(uVar24);
+              uart_puts(DAT_a0003b9c);
               if (cVar5 == -0x3e) {
                 if (uVar24 - 0x16 < 2) {
                   psVar20[3] = 6;
@@ -3371,7 +3350,7 @@ LAB_a0003b66:
       if (cVar5 == 'h') {
         if (*pcVar42 != '\0') {
           FUN_a0001bcc(0);
-          FUN_a00016ee(DAT_a0003bf4);
+          uart_puts(DAT_a0003bf4);
         }
         uVar22 = 0;
       }
@@ -3412,7 +3391,7 @@ LAB_a0003b66:
             iVar25 = FUN_a0001a1c();
             uVar32 = DAT_a0003dc0;
             if (-1 < iVar25 << 0x1f) {
-              FUN_a00016ee(DAT_a0003dbc);
+              uart_puts(DAT_a0003dbc);
               uVar32 = DAT_a0003dc0;
             }
           }
@@ -3438,7 +3417,7 @@ LAB_a0003b66:
             FUN_a0001bcc(0x40);
             uVar32 = DAT_a0003dd0;
           }
-          FUN_a00016ee(uVar32);
+          uart_puts(uVar32);
         }
         uVar22 = 10;
       }
@@ -3475,7 +3454,7 @@ LAB_a0003b66:
         uVar32 = DAT_a0003dd4;
       } while (iVar49 != 0);
     }
-    FUN_a00016ee(uVar32);
+    uart_puts(uVar32);
 LAB_a00039c8:
     do {
     } while (-1 < (int)((uint)*DAT_a0003ba8 << 0x1c));
@@ -3483,13 +3462,13 @@ LAB_a00039c8:
     iVar49 = coprocessor_movefromRt(0xf,0,in_cr14);
     coprocessor_movefromRt2(0xf,0,in_cr14);
     uVar4 = (ulonglong)DAT_a0003bac;
-    FUN_a00016ee(DAT_a0003bb0);
+    uart_puts(DAT_a0003bb0);
     uVar34 = (uint)((uint)(iVar49 - iVar25) * uVar4 >> 0x22);
     FUN_a0001824(uVar34);
-    FUN_a00016ee(DAT_a0003bb4);
+    uart_puts(DAT_a0003bb4);
     FUN_a00046cc(uVar24 * 1000,uVar34);
     FUN_a0001824();
-    FUN_a00016ee(DAT_a0003bb8);
+    uart_puts(DAT_a0003bb8);
 LAB_a0003a0c:
     FUN_a000036c();
     FUN_a000165c();
@@ -3508,20 +3487,20 @@ LAB_a0004590:
           uVar34 = uVar34 + *(int *)(&DAT_23c00010 + uVar24);
         }
         if ((uint)uVar43 == (uVar34 & 0xffff)) {
-          FUN_a00016ee(DAT_a00046a0);
+          uart_puts(DAT_a00046a0);
           FUN_a00015fc(0x1ea,DAT_a00046a4);
           FUN_a00015fc(0x209,DAT_a00046a8);
           (*(code *)&SUB_23c00000)();
           return;
         }
-        FUN_a00016ee(DAT_a00046ac);
-        FUN_a00016da((uint)uVar43);
-        FUN_a00016ee(DAT_a00046b0);
+        uart_puts(DAT_a00046ac);
+        uart_put_hex16((uint)uVar43);
+        uart_puts(DAT_a00046b0);
         uVar24 = 0;
         for (uVar34 = 0; uVar34 < uVar37 - 0x10; uVar34 = uVar34 + 4) {
           uVar24 = uVar24 + *(int *)(&DAT_23c00010 + uVar34);
         }
-        FUN_a00016da(uVar24 & 0xffff);
+        uart_put_hex16(uVar24 & 0xffff);
         uVar32 = DAT_a00046b0;
       }
       else {
@@ -3530,37 +3509,37 @@ LAB_a0004590:
           puVar44 = &SUB_23c00000 +
                     (((uint)*DAT_a000469c - (uint)*DAT_a000465c) - (uint)*DAT_a0004660);
           uVar24 = (uint)*DAT_a000469c;
-          FUN_a00016ee(DAT_a0004664);
-          FUN_a00016ee(DAT_a0004668);
-          FUN_a00016b6(puVar44);
-          FUN_a00016ee(DAT_a000466c);
-          FUN_a00016ee(DAT_a0004670);
-          FUN_a00016da(*puVar36);
-          FUN_a00016ee(DAT_a000466c);
+          uart_puts(DAT_a0004664);
+          uart_puts(DAT_a0004668);
+          uart_put_hex32(puVar44);
+          uart_puts(DAT_a000466c);
+          uart_puts(DAT_a0004670);
+          uart_put_hex16(*puVar36);
+          uart_puts(DAT_a000466c);
           FUN_a000036c();
           FUN_a000165c();
           uVar37 = *puVar13;
-          FUN_a00016ee(DAT_a0004674);
-          FUN_a00016b6(uVar37 + 0x23c00100);
-          FUN_a00016ee(DAT_a000466c);
+          uart_puts(DAT_a0004674);
+          uart_put_hex32(uVar37 + 0x23c00100);
+          uart_puts(DAT_a000466c);
           iVar25 = FUN_a00010c2(puVar44,0x100,uVar37 + 0x23c00100,0);
           uVar32 = DAT_a0004678;
           if (iVar25 != 0) {
             FUN_a000036c();
             FUN_a000165c();
-            FUN_a00016ee(DAT_a000467c);
-            FUN_a00016b6(&SUB_23c00000);
-            FUN_a00016ee(DAT_a000466c);
-            FUN_a00016ee(DAT_a0004680);
-            FUN_a00016b6(uVar24);
-            FUN_a00016ee(DAT_a000466c);
-            FUN_a00016ee(DAT_a0004684);
-            FUN_a00016b6(&SUB_23c00000 + uVar24);
-            FUN_a00016ee(DAT_a000466c);
+            uart_puts(DAT_a000467c);
+            uart_put_hex32(&SUB_23c00000);
+            uart_puts(DAT_a000466c);
+            uart_puts(DAT_a0004680);
+            uart_put_hex32(uVar24);
+            uart_puts(DAT_a000466c);
+            uart_puts(DAT_a0004684);
+            uart_put_hex32(&SUB_23c00000 + uVar24);
+            uart_puts(DAT_a000466c);
             iVar25 = FUN_a00010c2(&SUB_23c00000,uVar24,&SUB_23c00000 + uVar24,puVar44);
             uVar32 = DAT_a0004688;
             if (iVar25 != 0) {
-              FUN_a00016ee(DAT_a000468c);
+              uart_puts(DAT_a000468c);
               *DAT_a0004690 = *DAT_a0004690 | 4;
               goto LAB_a0004590;
             }
@@ -3571,7 +3550,7 @@ LAB_a0004590:
   }
   else {
     if ((uVar24 & 0x24) != 4) goto LAB_a0003a0c;
-    FUN_a00016ee(DAT_a0004118);
+    uart_puts(DAT_a0004118);
     piVar21 = DAT_a0004178;
     pbVar38 = DAT_a000411c;
     if (*pcVar42 == '\0') {
@@ -3603,29 +3582,29 @@ LAB_a0003f5a:
             if (uVar24 == 0) {
               uVar24 = FUN_a00018ec(&local_67);
               if (uVar24 == 0) goto LAB_a0003fbe;
-              FUN_a00016ee(DAT_a0004170);
-              FUN_a00016b6(iVar30);
-              FUN_a00016ee(DAT_a0004160);
-              FUN_a0001690(uVar24 & 0xff);
-              FUN_a00016ee(DAT_a000414c);
+              uart_puts(DAT_a0004170);
+              uart_put_hex32(iVar30);
+              uart_puts(DAT_a0004160);
+              uart_put_hex8(uVar24 & 0xff);
+              uart_puts(DAT_a000414c);
               FUN_a0001824(0x11d);
-              FUN_a00016ee(DAT_a000414c);
+              uart_puts(DAT_a000414c);
               uVar32 = DAT_a0004174;
             }
             else {
-              FUN_a00016ee(DAT_a000415c);
-              FUN_a00016b6(iVar30);
-              FUN_a00016ee(DAT_a0004160);
-              FUN_a0001690(uVar24 & 0xff);
-              FUN_a00016ee(DAT_a000414c);
+              uart_puts(DAT_a000415c);
+              uart_put_hex32(iVar30);
+              uart_puts(DAT_a0004160);
+              uart_put_hex8(uVar24 & 0xff);
+              uart_puts(DAT_a000414c);
               FUN_a0001824(0x10f);
-              FUN_a00016ee(DAT_a000414c);
+              uart_puts(DAT_a000414c);
               uVar32 = DAT_a0004164;
             }
-            FUN_a00016ee(uVar32);
-            FUN_a00016ee(DAT_a0004168);
+            uart_puts(uVar32);
+            uart_puts(DAT_a0004168);
             FUN_a0001824(0x2a1);
-            FUN_a00016ee(DAT_a000414c);
+            uart_puts(DAT_a000414c);
             uVar31 = DAT_a000416c;
             goto LAB_a00040c4;
           }
@@ -3638,9 +3617,9 @@ LAB_a0003fbe:
           }
           uVar31 = DAT_a000444c;
           if (CONCAT11(local_64[1],local_64[0]) == 0) goto LAB_a00040c4;
-          FUN_a00016ee(uVar17);
-          FUN_a0001690(local_64[0]);
-          FUN_a00016ee(uVar32);
+          uart_puts(uVar17);
+          uart_put_hex8(local_64[0]);
+          uart_puts(uVar32);
           if (iVar49 == 1) goto code_r0xa0004000;
           iVar49 = 1;
           bVar1 = local_64[0];
@@ -3694,14 +3673,14 @@ LAB_a000435e:
         if ((pcVar42 == (char *)0x0) || (pcVar42[3] == '\0')) {
           iVar49 = FUN_a0001398(uVar47);
           if (iVar49 == 0) {
-            FUN_a00016ee(DAT_a0004468);
+            uart_puts(DAT_a0004468);
             FUN_a0001824(0x185);
-            FUN_a00016ee(DAT_a000446c);
-            FUN_a00016ee(DAT_a0004470);
+            uart_puts(DAT_a000446c);
+            uart_puts(DAT_a0004470);
           }
           uVar24 = FUN_a00015ac();
           if (uVar24 != 0) {
-            FUN_a00016ee(DAT_a0004474);
+            uart_puts(DAT_a0004474);
             uVar32 = 0x18e;
             goto LAB_a00043e4;
           }
@@ -3767,30 +3746,30 @@ LAB_a0004216:
             uVar32 = DAT_a000447c;
             if (uVar24 == 0) goto LAB_a0004216;
 LAB_a00043bc:
-            FUN_a00016ee(uVar32);
-            FUN_a00016b6(uVar47);
-            FUN_a00016ee(DAT_a0004480);
-            FUN_a0001690(uVar24 & 0xff);
-            FUN_a00016ee(DAT_a000446c);
+            uart_puts(uVar32);
+            uart_put_hex32(uVar47);
+            uart_puts(DAT_a0004480);
+            uart_put_hex8(uVar24 & 0xff);
+            uart_puts(DAT_a000446c);
           }
-          FUN_a00016ee(DAT_a0004484);
+          uart_puts(DAT_a0004484);
           uVar32 = 0x178;
 LAB_a00043e4:
           FUN_a0001824(uVar32);
-          FUN_a00016ee(DAT_a000446c);
-          FUN_a00016ee(DAT_a0004488);
+          uart_puts(DAT_a000446c);
+          uart_puts(DAT_a0004488);
         }
         if (*DAT_a0004464 != -1) {
-          FUN_a00016ee(DAT_a000448c);
+          uart_puts(DAT_a000448c);
 LAB_a0004402:
-          FUN_a00016ee(DAT_a0004490);
-          FUN_a0001690(uVar29 + 1 & 0xff);
-          FUN_a00016ee(DAT_a000446c);
+          uart_puts(DAT_a0004490);
+          uart_put_hex8(uVar29 + 1 & 0xff);
+          uart_puts(DAT_a000446c);
           if (local_84 == 0) {
             uVar31 = DAT_a0004498;
             if (CONCAT11(local_64[1],local_64[0]) != 0) {
               uVar24 = 3;
-              FUN_a00016ee(DAT_a0004494);
+              uart_puts(DAT_a0004494);
               goto LAB_a0004326;
             }
             goto LAB_a00040c4;
@@ -3803,9 +3782,9 @@ LAB_a0004402:
           uVar31 = DAT_a0004498;
           if (CONCAT11(local_64[1],local_64[0]) == 0) goto LAB_a00040c4;
 LAB_a0004326:
-          FUN_a00016ee(DAT_a0004478);
-          FUN_a0001690(local_64[0]);
-          FUN_a00016ee(DAT_a000446c);
+          uart_puts(DAT_a0004478);
+          uart_put_hex8(local_64[0]);
+          uart_puts(DAT_a000446c);
           uVar43 = CONCAT11(local_64[1],local_64[0]);
           local_64[0] = 0;
           local_64[1] = 0;
@@ -3883,7 +3862,7 @@ LAB_a0004326:
         }
         else {
           FUN_a000153c(1);
-          FUN_a00016ee(DAT_a0004154);
+          uart_puts(DAT_a0004154);
         }
         iVar25 = DAT_a000417c;
         puVar8 = DAT_a0004140;
@@ -3907,14 +3886,14 @@ LAB_a0004326:
   }
   goto LAB_a0003b2a;
 code_r0xa0004000:
-  FUN_a00016ee(DAT_a0004148);
-  FUN_a0001690(iVar30);
+  uart_puts(DAT_a0004148);
+  uart_put_hex8(iVar30);
   uVar31 = DAT_a000414c;
 LAB_a00040c4:
-  FUN_a00016ee(uVar31);
+  uart_puts(uVar31);
   uVar32 = DAT_a0004454;
 LAB_a0003b2a:
-  FUN_a00016ee(uVar32);
+  uart_puts(uVar32);
   FUN_a00017f8();
   uVar24 = extraout_r3;
 LAB_a0003b32:
