@@ -64,6 +64,36 @@ static void delay_ticks(u32 ticks)
 
 #define DDR_DELAY 0x2ee0u       /* 12000 ticks - the IPL's DDR settle delay */
 
+/* ---- watchdog: auto-reset the SoC if we bus-hang ----
+ *
+ * The DRAM self-test (and any bad register access) can bus-hang the CPU with
+ * no recoverable abort - normally that wedges the target until a manual power
+ * cycle. Arm the watchdog around the whole sequence so a hang instead resets
+ * the SoC: the mask ROM then reloads this stub from flash and the host just
+ * reconnects. On a clean run we disarm it before returning.
+ *
+ * WDT at 0x1f006000, 12 MHz crystal: MAX_L/H = timeout in ticks, CLR feeds it,
+ * MAX = 0 disarms (see hw/watchdog/mstar_wdt.c / the mainline msc313e driver).
+ */
+#define WDT       0x1f006000u
+#define WDT_CLR   0x00u
+#define WDT_MAX_L 0x10u
+#define WDT_MAX_H 0x14u
+#define WDT_TIMEOUT 0x02000000u  /* ~2.8 s at 12 MHz (a clean run takes <1 s) */
+
+static void wdt_arm(u32 ticks)
+{
+    RH(WDT + WDT_MAX_L) = (u16)(ticks & 0xffff);
+    RH(WDT + WDT_MAX_H) = (u16)(ticks >> 16);
+    RH(WDT + WDT_CLR) = 1;        /* feed / start the counter */
+}
+
+static void wdt_disarm(void)
+{
+    RH(WDT + WDT_MAX_L) = 0;
+    RH(WDT + WDT_MAX_H) = 0;
+}
+
 /* ---- config-write table ----
  *
  * The full ordered write sequence the vendor IPL makes during DDR bring-up,
@@ -201,6 +231,8 @@ void ddr_init(void)
 {
     unsigned i;
 
+    wdt_arm(WDT_TIMEOUT);       /* a hang from here on auto-resets the SoC */
+
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
         u32 a = RIU + seq[i].off;
 
@@ -215,5 +247,7 @@ void ddr_init(void)
             zq_calibrate();
     }
 
-    dram_selftest();
+    dram_selftest();            /* bus-hangs here if DRAM is not trained */
+
+    wdt_disarm();               /* clean run - cancel the auto-reset */
 }

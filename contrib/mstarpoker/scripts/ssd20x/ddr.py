@@ -60,12 +60,23 @@ def init_c(lk, verbose=True, blob=DDR_BLOB):
     lk.upload(BLOB_ADDR, data)
     if verbose:
         print("[ddr] running on-target ddr_init() (real ZQ cal + delays)...")
-    # The blob busy-waits through the DDR settle delays before returning.
-    lk.go(BLOB_ADDR, timeout=5.0)
+    # The blob busy-waits through the DDR settle delays before returning. It
+    # also arms the watchdog, so a DRAM bus-hang resets the SoC (~3s) instead
+    # of wedging forever; the mask ROM then reloads the stub.
+    lk.go(BLOB_ADDR, timeout=6.0)
     if not lk.alive():
-        if verbose:
-            print("[ddr] target wedged - the DRAM self-test bus-hung, so DRAM "
-                  "is NOT trained (power-cycle before retrying)")
+        # Maybe the self-test hung and the watchdog reset the SoC - the stub
+        # reloads from flash and comes back. Give it time and re-sync.
+        try:
+            lk.sync(tries=200)
+            if verbose:
+                print("[ddr] the DRAM self-test bus-hung; the watchdog reset "
+                      "the SoC and the stub reloaded - DRAM is NOT trained "
+                      "(no power-cycle needed)")
+        except IOError:
+            if verbose:
+                print("[ddr] target did not come back (no watchdog reset?) - "
+                      "power-cycle before retrying")
         return False
 
     verdict = lk.read32(RESULT_ADDR)
