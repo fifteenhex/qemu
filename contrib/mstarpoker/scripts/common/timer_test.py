@@ -58,6 +58,14 @@ def measure(lk, base, secs):
     return ticks, dt
 
 
+def dump_regs(lk, base, tag):
+    print("  registers %s:" % tag)
+    for name, off in [("CTRL", CTRL), ("MAX_L", MAX_L), ("MAX_H", MAX_H),
+                      ("CNT_L", CNT_L), ("CNT_H", CNT_H), ("DIVIDE", DIV)]:
+        print("    %-6s 0x%08x = 0x%04x"
+              % (name, base + off, lk.read32(base + off) & 0xffff))
+
+
 def start_timer(lk, base, divide=None):
     """Program a full-range free-running counter and (re)start it, applying
     `divide` first if given. TRIG reloads the divider so a divide change on an
@@ -72,18 +80,20 @@ def start_timer(lk, base, divide=None):
 def check_timer(lk, idx, secs, set_divide):
     base = TIMER_BASE + idx * TIMER_STRIDE
     print("=== timer[%d] @ 0x%08x ===" % (idx, base))
-    for name, off in [("CTRL", CTRL), ("MAX_L", MAX_L), ("MAX_H", MAX_H),
-                      ("CNT_L", CNT_L), ("CNT_H", CNT_H), ("DIVIDE", DIV)]:
-        print("  %-6s 0x%08x = 0x%04x"
-              % (name, base + off, lk.read32(base + off) & 0xffff))
+    dump_regs(lk, base, "before")
 
     running = counter(lk, base) != counter(lk, base)
 
     # Enable a frozen timer, or (re)start with the new divider so it applies.
     if not running or set_divide is not None:
-        start_timer(lk, base, set_divide)
-        print("  [start] MAX=0xffffffff, EN|TRIG%s"
-              % ("" if set_divide is None else ", DIVIDE=0x%x" % set_divide))
+        w = [("DIVIDE", base + DIV, set_divide)] if set_divide is not None else []
+        w += [("MAX_L", base + MAX_L, 0xffff), ("MAX_H", base + MAX_H, 0xffff),
+              ("CTRL", base + CTRL, CTRL_EN | CTRL_TRIG)]
+        print("  [writing] " + ", ".join("0x%08x <- 0x%x" % (a, v)
+                                         for _, a, v in w))
+        for _, a, v in w:
+            lk.write32(a, v)
+        dump_regs(lk, base, "after write (did they stick?)")
 
     c0 = counter(lk, base)
     c1 = counter(lk, base)
