@@ -79,18 +79,36 @@ def addr_bus_test(lk, base, size):
     return None
 
 
+# Cap a single block transfer so one request stays well within the stub's
+# and the transport's buffers (a whole 64 KiB in one write_block overruns
+# the link). Larger regions are split into this many words per request.
+_CHUNK_WORDS = 1024
+
+
+def _write_words(lk, base, words):
+    for i in range(0, len(words), _CHUNK_WORDS):
+        lk.write_block(base + i * 4, words[i:i + _CHUNK_WORDS])
+
+
+def _read_words(lk, base, nw):
+    out = []
+    for i in range(0, nw, _CHUNK_WORDS):
+        out += lk.read_block(base + i * 4, min(_CHUNK_WORDS, nw - i))
+    return out
+
+
 def pattern_test(lk, base, nbytes):
     """Fixed and random patterns over a region (stuck / weak cells)."""
     nw = nbytes // 4
     for pat in (0x00000000, 0xffffffff, 0xaaaaaaaa, 0x55555555):
-        lk.write_block(base, [pat] * nw)
-        rd = lk.read_block(base, nw)
+        _write_words(lk, base, [pat] * nw)
+        rd = _read_words(lk, base, nw)
         for i, v in enumerate(rd):
             if v != pat:
                 return "pattern 0x%08x: @0x%08x read 0x%08x" % (pat, base + i * 4, v)
     words = [random.getrandbits(32) for _ in range(nw)]
-    lk.write_block(base, words)
-    rd = lk.read_block(base, nw)
+    _write_words(lk, base, words)
+    rd = _read_words(lk, base, nw)
     for i, (w, v) in enumerate(zip(words, rd)):
         if v != w:
             return "random: @0x%08x wrote 0x%08x read 0x%08x" % (base + i * 4, w, v)
@@ -118,17 +136,28 @@ def main():
     if not size:
         sys.exit("[detect] unknown DRAM size - cannot size the address test")
 
+    trained = True
     if args.no_init:
         print("[init] skipped (--no-init)")
     else:
         before = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
-        ddr.init(lk)
+        trained = ddr.init(lk)
         after = regdump.snapshot(lk, MIU_REGS, MIU_UNSAFE)
         regdump.print_diff(before, after, "MIU registers around DDR init",
                            changed_only=True)
         if args.json:
             regdump.write_json(args.json, before=before, after=after)
             print("[init] wrote MIU register table to %s" % args.json)
+
+    # A read of untrained DRAM bus-hangs the CPU with no recoverable abort,
+    # so never run the memory tests unless init-done/BIST actually asserted.
+    # The MIU before/after table is already saved above regardless.
+    if not trained:
+        print("[test] SKIPPED - DDR init did not complete (see the poll "
+              "timeouts above); reading DRAM would hang the target.")
+        print("[result] DDR init FAILED on this target - the replayed "
+              "sequence did not train DRAM. Stub still alive; send hw_miu.json.")
+        sys.exit(2)
 
     print("[test] running...")
     tests = [

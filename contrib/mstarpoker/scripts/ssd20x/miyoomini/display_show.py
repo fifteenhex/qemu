@@ -181,8 +181,10 @@ def main():
     lk = open_link(args)
     if args.no_ddr_init:
         print("[ddr] skipped (--no-ddr-init)")
-    else:
-        ddr.init(lk)
+    elif not ddr.init(lk):
+        sys.exit("[ddr] DDR init did not complete - refusing to touch DRAM "
+                 "(the framebuffer lives there; a write would hang the "
+                 "target). Fix DDR bring-up first (see dram_test.py).")
 
     before = regdump.snapshot(lk, DISP_REGS, DISP_UNSAFE)
     display_init(lk)

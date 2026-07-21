@@ -140,8 +140,10 @@ def main():
     lk = open_link(args)
     if args.no_ddr_init:
         print("[ddr] skipped (--no-ddr-init)")
-    else:
-        ddr.init(lk)
+    elif not ddr.init(lk):
+        sys.exit("[ddr] DDR init did not complete - refusing to touch DRAM "
+                 "(the PCM buffer lives there; a read/write would hang the "
+                 "target). Fix DDR bring-up first (see dram_test.py).")
 
     before = regdump.snapshot(lk, BACH_REGS, BACH_UNSAFE)
     audio_init(lk)
