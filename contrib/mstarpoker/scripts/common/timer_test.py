@@ -36,6 +36,13 @@ CTRL, MAX_L, MAX_H, CNT_L, CNT_H, DIV = 0x00, 0x08, 0x0c, 0x10, 0x14, 0x18
 CTRL_EN = 1 << 0
 CTRL_TRIG = 1 << 1
 
+# The IPL writes 0x1f207004 (clkgen) = 0x30 immediately before setting timer[0]'s
+# divider - the timer clock-source select. It switches the timers off the
+# always-on 12 MHz onto a faster source (candidate: 432 MHz); with DIVIDE=0x23
+# (/36) that lands back at 12 MHz. --clksrc applies it so we can see the jump.
+CLKGEN_TIMER_SRC = 0x1f207004
+CLKGEN_TIMER_SRC_VAL = 0x30
+
 # The model assumes the block is clocked off 432 MHz (infinity2m.h); the 12 MHz
 # crystal is the other candidate. rate*(DIVIDE+1) should reveal the source.
 SRC_CANDIDATES = (432000000, 12000000)
@@ -122,6 +129,9 @@ def main():
     add_transport_args(ap)
     ap.add_argument("--set-divide", type=parse_int,
                     help="write TIMER_DIVIDE on each timer before measuring")
+    ap.add_argument("--clksrc", nargs="?", type=parse_int, const=CLKGEN_TIMER_SRC_VAL,
+                    help="write the IPL's timer clock-source select "
+                         "(0x1f207004, default 0x30) before measuring")
     ap.add_argument("--timer", type=int, choices=range(NUM_TIMERS),
                     help="only check this timer (default: all)")
     ap.add_argument("--secs", type=float, default=0.5,
@@ -129,6 +139,11 @@ def main():
     args = ap.parse_args()
 
     lk = open_link(args)
+    if args.clksrc is not None:
+        lk.write32(CLKGEN_TIMER_SRC, args.clksrc)
+        print("[clksrc] 0x%08x <- 0x%x (read back 0x%04x)\n"
+              % (CLKGEN_TIMER_SRC, args.clksrc,
+                 lk.read32(CLKGEN_TIMER_SRC) & 0xffff))
     idxs = [args.timer] if args.timer is not None else range(NUM_TIMERS)
     for i in idxs:
         check_timer(lk, i, args.secs, args.set_divide)
