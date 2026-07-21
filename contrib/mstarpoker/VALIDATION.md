@@ -130,3 +130,11 @@ differences into model changes, updating this plan as we go.
 | Date | Item | Result | Action |
 |------|------|--------|--------|
 | 2026-07-21 | uart0 baud | HW is 38400 8N1 (ROM sets LCR 0x03, divisor 0x14=20), not the model's nominal 115200 | client/docs default -> 38400; real baudbase ~768000 for the model doc |
+| 2026-07-21 | boot ROM (P1) | `hw_bootrom_16k.bin` is byte-identical to `pc-bios/ssd202d_bootrom.bin`; the 32 KiB dump shows 0x4000-0x8000 mirroring 0x0-0x4000 | ROM is 16 KiB, aliased - resolves the "is it larger?" open question; no model change |
+| 2026-07-21 | chip version (P1) | `0x1f003d9c` reads `0x100` on HW (bit 8 set); model's 0x1f003xxx region is unmapped and reads 0 | model must return 0x100 at 0x1f003d9c so `socid` reports the right revision |
+| 2026-07-21 | bond strap (P1) | `0x1f203d20` = `0x1e` on HW - matches the model (SSD202D / 128 MiB) | confirmed, no change |
+| 2026-07-21 | regbank defaults (P1) | readback banks the model resets to 0 have real non-zero defaults on HW: clkgen (0x1f207000), pm_clkgen (0x1f001c00), chiptop (0x1f203c00), pwm (0x1f003400), cpupll (0x1f206400); 123 PM regs differ non-trivially | seed each bank's reset table from the `hw_*` dumps |
+| 2026-07-21 | PM GPIO pads (P1) | `0x1f001e00`-`0x1f001f2c` read `0x11`/`0x15` on HW (bit0+bit4), not the model's flat `0x01`; `0x1f001f30`+ read 0 (model wrongly fills them 0x01) | fix `mstar_gpio` PM pad reset defaults |
+| 2026-07-21 | DID_KEY (P1) | `0x1f0071c0` = `0x0a20` on HW; model returns just the `did-key` strap `0x20` (extra 0x0a00 strap bits absent) | note; low priority |
+| 2026-07-21 | DID chip id (P1) | `0x1f007000/04/08` = `0x10bd/0x741a/0x84d1` on HW (per-unit OTP id); model reads 0 | do NOT hardcode (per-chip); leave 0 or model as random/efuse |
+| 2026-07-21 | dynamic regs (P1) | timer/wdt latches `0x1f006050/54`, `0x1f006830/34` differ - free-running counters, expected | exclude from any reset-default baking |
