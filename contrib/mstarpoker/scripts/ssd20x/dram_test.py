@@ -30,9 +30,9 @@ from mstarpoker import add_transport_args, open_link, parse_int  # noqa: E402
 import socid  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
-import ddr_seq_ssd202d as ddr  # noqa: E402
+import ddr  # noqa: E402
 
-DRAM_BASE = 0x20000000
+DRAM_BASE = ddr.DRAM_BASE
 
 
 def dram_bytes(soc):
@@ -40,22 +40,6 @@ def dram_bytes(soc):
         return int(soc.memory.split()[0]) * 1024 * 1024
     except (ValueError, IndexError):
         return 0
-
-
-def ddr_init(lk):
-    print("[init] replaying %d MIU writes to bring up DDR..." % len(ddr.INIT_SEQ))
-    for off, val in ddr.INIT_SEQ:
-        lk.write32(ddr.MIU_BASE + off, val)
-        poll = ddr.POLL_AFTER.get((off, val))
-        if poll:
-            po, mask = poll
-            for _ in range(2000):
-                if lk.read32(ddr.MIU_BASE + po) & mask:
-                    break
-            else:
-                print("[init] WARNING: poll 0x%03x & 0x%04x timed out"
-                      % (po, mask))
-    print("[init] sequence complete")
 
 
 # --- tests: each returns None on pass or an error string on failure --------
@@ -125,7 +109,7 @@ def main():
     if args.no_init:
         print("[init] skipped (--no-init)")
     else:
-        ddr_init(lk)
+        ddr.init(lk)
 
     print("[test] running...")
     tests = [
