@@ -199,17 +199,27 @@ class Link:
         self.t.send(b"B" + struct.pack("<I", addr) + bytes([val & 0xff]))
         return self._need(1) == b"B"
 
+    # A single block write of more than a few KiB overruns the stub's / the
+    # transport's buffers, so split large transfers into this many words.
+    CHUNK_WORDS = 1024
+
     def upload(self, addr, data):
-        """Upload raw bytes (padded to a word) via a block write."""
+        """Upload raw bytes (padded to a word) via chunked block writes."""
         if len(data) % 4:
             data = data + b"\0" * (4 - len(data) % 4)
         words = list(struct.unpack("<%dI" % (len(data) // 4), data))
-        return self.write_block(addr, words)
+        for i in range(0, len(words), self.CHUNK_WORDS):
+            if not self.write_block(addr + i * 4, words[i:i + self.CHUNK_WORDS]):
+                return False
+        return True
 
-    def go(self, addr):
-        """Call addr (bit0 selects Thumb). Returns any text until it settles."""
+    def go(self, addr, timeout=1.0):
+        """Call addr (bit0 selects Thumb). Returns any text until it settles.
+
+        Uploaded code that busy-waits (e.g. DDR settle delays) can take a while
+        to return; raise timeout for those."""
         self.t.send(b"G" + struct.pack("<I", addr))
-        return self.t.recv(64, 1.0)
+        return self.t.recv(64, timeout)
 
     # --- convenience -----------------------------------------------------
     def dump(self, addr, nwords, out=sys.stdout):
