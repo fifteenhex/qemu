@@ -229,11 +229,21 @@ static void dram_selftest(void)
 /* ---- entry: bring DDR up, self-test it, then return to the stub monitor ---- */
 
 __attribute__((section(".text.start"), used))
+/* timer[0] divider (0x1f006058, TIMER_DIVIDE). The IPL sets it to 0x23 in its
+ * prologue so the delay timer counts at xtal/(0x23+1). The settle delays below
+ * all measure against this timer, so without the same divider they run at the
+ * wrong (reset-default) rate - far too short for the PLLs/DLL to lock. */
+#define TIMER0_DIVIDE 0x1f006058u
+#define TIMER0_DIVIDE_VAL 0x23u
+
 void ddr_init(void)
 {
     unsigned i;
 
     wdt_arm(WDT_TIMEOUT);       /* a hang from here on auto-resets the SoC */
+
+    /* Match the IPL's delay-timer rate so the settle delays are real. */
+    RW(TIMER0_DIVIDE) = TIMER0_DIVIDE_VAL;
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
         u32 a = RIU + seq[i].off;
