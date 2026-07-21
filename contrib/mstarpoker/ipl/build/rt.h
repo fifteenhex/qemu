@@ -3,6 +3,12 @@
 #ifndef IPL_RT_H
 #define IPL_RT_H
 
+/* short type names, as the Ghidra reference uses them */
+typedef unsigned char  byte;
+typedef unsigned short ushort;
+typedef unsigned int   uint;
+typedef unsigned long long ulonglong;
+
 /* Sized volatile RIU register access (keeps the compiler from reordering,
  * merging or dropping the MMIO, and preserves each access width). */
 #define R8(a)  (*(volatile unsigned char  *)(a))
