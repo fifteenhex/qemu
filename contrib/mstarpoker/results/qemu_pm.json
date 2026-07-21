@@ -3,7 +3,7 @@
     {
       "addr": "0x1f001c00",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000003",
       "note": null
     },
     {
@@ -51,7 +51,7 @@
     {
       "addr": "0x1f001c20",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x000000ff",
       "note": null
     },
     {
@@ -123,7 +123,7 @@
     {
       "addr": "0x1f001c50",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000000f",
       "note": null
     },
     {
@@ -135,7 +135,7 @@
     {
       "addr": "0x1f001c58",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000003f",
       "note": null
     },
     {
@@ -171,7 +171,7 @@
     {
       "addr": "0x1f001c70",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000300",
       "note": null
     },
     {
@@ -189,7 +189,7 @@
     {
       "addr": "0x1f001c7c",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00001800",
       "note": null
     },
     {
@@ -279,7 +279,7 @@
     {
       "addr": "0x1f001cb8",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x000000ff",
       "note": null
     },
     {
@@ -291,7 +291,7 @@
     {
       "addr": "0x1f001cc0",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000003",
       "note": null
     },
     {
@@ -321,7 +321,7 @@
     {
       "addr": "0x1f001cd4",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000008",
       "note": null
     },
     {
@@ -333,7 +333,7 @@
     {
       "addr": "0x1f001cdc",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000ffff",
       "note": null
     },
     {
@@ -357,19 +357,19 @@
     {
       "addr": "0x1f001cec",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000ffff",
       "note": null
     },
     {
       "addr": "0x1f001cf0",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000ffff",
       "note": null
     },
     {
       "addr": "0x1f001cf4",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000003f",
       "note": null
     },
     {
@@ -441,13 +441,13 @@
     {
       "addr": "0x1f001d24",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000020",
       "note": null
     },
     {
       "addr": "0x1f001d28",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000000f",
       "note": null
     },
     {
@@ -459,7 +459,7 @@
     {
       "addr": "0x1f001d30",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000000f",
       "note": null
     },
     {
@@ -519,7 +519,7 @@
     {
       "addr": "0x1f001d58",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x0000003f",
       "note": null
     },
     {
@@ -585,37 +585,37 @@
     {
       "addr": "0x1f001d84",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00003c3f",
       "note": null
     },
     {
       "addr": "0x1f001d88",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00004000",
       "note": null
     },
     {
       "addr": "0x1f001d8c",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000600",
       "note": null
     },
     {
       "addr": "0x1f001d90",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00002000",
       "note": null
     },
     {
       "addr": "0x1f001d94",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x000001ff",
       "note": null
     },
     {
       "addr": "0x1f001d98",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000006",
       "note": null
     },
     {
@@ -669,7 +669,7 @@
     {
       "addr": "0x1f001dbc",
       "name": "",
-      "value": "0x00000000",
+      "value": "0x00000003",
       "note": null
     },
     {
@@ -2433,13 +2433,13 @@
     {
       "addr": "0x1f006050",
       "name": "",
-      "value": "0x00004cff",
+      "value": "0x00008ca0",
       "note": null
     },
     {
       "addr": "0x1f006054",
       "name": "",
-      "value": "0x000050a0",
+      "value": "0x0000586c",
       "note": null
     },
     {
@@ -3155,13 +3155,13 @@
     {
       "addr": "0x1f006830",
       "name": "",
-      "value": "0x0000d8e4",
+      "value": "0x0000085c",
       "note": null
     },
     {
       "addr": "0x1f006834",
       "name": "",
-      "value": "0x00006a5e",
+      "value": "0x00006a5f",
       "note": null
     },
     {

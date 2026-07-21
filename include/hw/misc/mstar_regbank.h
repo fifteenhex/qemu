@@ -18,6 +18,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(MStarRegbankState, MSTAR_REGBANK)
 #define MSTAR_REGBANK_SIZE     0x200
 #define MSTAR_REGBANK_NUM_REGS (MSTAR_REGBANK_SIZE / 4)
 
+/*
+ * A sparse reset-default: the value a register in the bank powers up
+ * holding. Captured from real silicon; see contrib/mstarpoker.
+ */
+typedef struct MStarRegDefault {
+    uint16_t offset;    /* byte offset within the bank */
+    uint16_t value;
+} MStarRegDefault;
+
 struct MStarRegbankState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -25,6 +34,10 @@ struct MStarRegbankState {
 
     MemoryRegion iomem;
     uint16_t regs[MSTAR_REGBANK_NUM_REGS];
+
+    /* Optional reset defaults, set by the instantiator before realize. */
+    const MStarRegDefault *defaults;
+    unsigned num_defaults;
 };
 
 #endif /* HW_MISC_MSTAR_REGBANK_H */

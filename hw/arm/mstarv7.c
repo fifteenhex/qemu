@@ -221,6 +221,41 @@ static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
     MSTARV7_RIU_BASE + 0x2a4e00,    /* mipi/dsi analog */
 };
 
+/*
+ * Reset defaults for the readback banks, captured from a real SSD202D
+ * (Miyoo Mini) via contrib/mstarpoker - the values these banks power up
+ * holding, which the vendor code reads back. See VALIDATION.md; only the
+ * non-zero registers are listed (the rest reset to 0). Registers the boot
+ * ROM itself programs (clkgen +0xc4 / pm_clkgen +0x24, the UART pad-mux
+ * and clock; see bootrom.rst) are deliberately excluded - they are not
+ * reset values, and the ROM writes them on every boot regardless.
+ *
+ * clkgen +0xc4 reads 0x1108 on hardware but only 0x08 here: the ROM
+ * writes 0x08 (the UART clock-mux select) and bits 0x1100 are read-only
+ * strap/status bits the generic readback bank does not model. Left as a
+ * known 1-register gap rather than special-casing it.
+ */
+static const MStarRegDefault mstarv7_clkgen_defaults[] = {
+    { 0x008, 0x0001 }, { 0x00c, 0x0001 }, { 0x0cc, 0x1101 },
+    { 0x0d0, 0x0211 }, { 0x0d4, 0x45a9 }, { 0x0dc, 0x0101 }, { 0x108, 0x0001 },
+    { 0x114, 0x0001 }, { 0x118, 0x0101 }, { 0x144, 0x0001 }, { 0x148, 0x0001 },
+    { 0x14c, 0x0101 }, { 0x150, 0x0001 }, { 0x154, 0x0101 }, { 0x158, 0x0101 },
+    { 0x15c, 0x0001 }, { 0x180, 0x0001 }, { 0x184, 0x0001 }, { 0x18c, 0x0009 },
+    { 0x1a8, 0x0001 }, { 0x1b0, 0x0100 }, { 0x1b4, 0x003d }, { 0x1b8, 0x0001 },
+    { 0x1bc, 0x0001 }, { 0x1c4, 0xffff }, { 0x1cc, 0x0a40 }, { 0x1f8, 0x0101 },
+    { 0x1fc, 0xffff },
+};
+
+static const MStarRegDefault mstarv7_pm_clkgen_defaults[] = {
+    { 0x000, 0x0003 }, { 0x020, 0x00ff }, { 0x050, 0x000f },
+    { 0x058, 0x003f }, { 0x070, 0x0300 }, { 0x07c, 0x1800 }, { 0x0b8, 0x00ff },
+    { 0x0c0, 0x0003 }, { 0x0d4, 0x0008 }, { 0x0dc, 0xffff }, { 0x0ec, 0xffff },
+    { 0x0f0, 0xffff }, { 0x0f4, 0x003f }, { 0x124, 0x0020 }, { 0x128, 0x000f },
+    { 0x130, 0x000f }, { 0x158, 0x003f }, { 0x184, 0x3c3f }, { 0x188, 0x4000 },
+    { 0x18c, 0x0600 }, { 0x190, 0x2000 }, { 0x194, 0x01ff }, { 0x198, 0x0006 },
+    { 0x1bc, 0x0003 },
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -250,7 +285,11 @@ static void mstarv7_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
+    s->clkgen.defaults = mstarv7_clkgen_defaults;
+    s->clkgen.num_defaults = ARRAY_SIZE(mstarv7_clkgen_defaults);
     object_initialize_child(obj, "pm-clkgen", &s->pm_clkgen, TYPE_MSTAR_REGBANK);
+    s->pm_clkgen.defaults = mstarv7_pm_clkgen_defaults;
+    s->pm_clkgen.num_defaults = ARRAY_SIZE(mstarv7_pm_clkgen_defaults);
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         object_initialize_child(obj, "disp-cfg[*]", &s->disp_cfg[i],
                                 TYPE_MSTAR_REGBANK);

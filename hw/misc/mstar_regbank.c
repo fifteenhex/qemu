@@ -42,8 +42,12 @@ static const MemoryRegionOps mstar_regbank_ops = {
 static void mstar_regbank_reset(DeviceState *dev)
 {
     MStarRegbankState *s = MSTAR_REGBANK(dev);
+    unsigned i;
 
     memset(s->regs, 0, sizeof(s->regs));
+    for (i = 0; i < s->num_defaults; i++) {
+        s->regs[s->defaults[i].offset / 4] = s->defaults[i].value;
+    }
 }
 
 static void mstar_regbank_init(Object *obj)
