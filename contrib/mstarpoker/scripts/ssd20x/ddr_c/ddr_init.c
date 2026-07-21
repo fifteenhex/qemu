@@ -30,8 +30,9 @@ typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 
-#define MIU     0x1f202000u
-#define TIMER   0x1f006050u     /* PM free-running counter: +0 low16, +4 high16 */
+#define MIU       0x1f202000u
+#define TIMER     0x1f006050u   /* PM free-running counter: +0 low16, +4 high16 */
+#define DRAM_BASE 0x20000000u
 
 #define RH(a)   (*(volatile u16 *)(unsigned long)(a))
 #define RB(a)   (*(volatile u8  *)(unsigned long)(a))
@@ -148,7 +149,38 @@ static void zq_calibrate(void)
     }
 }
 
-/* ---- entry: bring DDR up, then return to the stub monitor ---- */
+/* ---- on-target DRAM self-test ----
+ *
+ * The MIU init-done bit is faked by the QEMU model and, on real silicon, the
+ * IPL never polls it - so it is not a reliable "DRAM trained" signal. Instead
+ * the blob writes/reads a few words of DRAM itself and reports the verdict in
+ * an SRAM word the host can read safely (DRAM that is not trained bus-hangs on
+ * the read; the RESULT_PROBING marker tells the host that is where it stopped).
+ */
+#define RESULT_ADDR    0xa0009000u
+#define RESULT_PROBING 0xd1900001u  /* about to touch DRAM */
+#define RESULT_PASS    0xd1900a00u  /* DRAM read back correctly */
+#define RESULT_FAIL    0xd1900badu  /* DRAM responded but data wrong */
+
+static void dram_selftest(void)
+{
+    volatile u32 *mark = (volatile u32 *)(unsigned long)RESULT_ADDR;
+    volatile u32 *dram = (volatile u32 *)(unsigned long)DRAM_BASE;
+    static const u32 pat[4] = { 0xa5a5a5a5u, 0x5a5a5a5au,
+                                0x00000000u, 0xffffffffu };
+    unsigned i;
+    u32 ok = RESULT_PASS;
+
+    *mark = RESULT_PROBING;
+    for (i = 0; i < 4; i++)
+        dram[i] = pat[i];
+    for (i = 0; i < 4; i++)
+        if (dram[i] != pat[i])
+            ok = RESULT_FAIL;
+    *mark = ok;
+}
+
+/* ---- entry: bring DDR up, self-test it, then return to the stub monitor ---- */
 
 __attribute__((section(".text.start"), used))
 void ddr_init(void)
@@ -168,4 +200,6 @@ void ddr_init(void)
         if (seq[i].flags & F_ZQ)
             zq_calibrate();
     }
+
+    dram_selftest();
 }

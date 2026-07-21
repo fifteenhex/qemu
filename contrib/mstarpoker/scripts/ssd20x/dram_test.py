@@ -82,7 +82,7 @@ def addr_bus_test(lk, base, size):
 # Cap a single block transfer so one request stays well within the stub's
 # and the transport's buffers (a whole 64 KiB in one write_block overruns
 # the link). Larger regions are split into this many words per request.
-_CHUNK_WORDS = 1024
+_CHUNK_WORDS = 256
 
 
 def _write_words(lk, base, words):

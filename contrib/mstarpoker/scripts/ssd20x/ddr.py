@@ -32,6 +32,14 @@ DRAM_BASE = 0x20000000
 DDR_BLOB = os.path.join(os.path.dirname(__file__), "ddr_c", "ddr_init.bin")
 BLOB_ADDR = 0xa0008000
 
+# The blob's DRAM self-test verdict, written to this SRAM word (ddr_init.c).
+# init-done is not a reliable "trained" signal on real silicon (the IPL never
+# polls it; the model fakes it), so we rely on the blob actually touching DRAM.
+RESULT_ADDR = 0xa0009000
+RESULT_PROBING = 0xd1900001      # reached the DRAM probe (a hang stops here)
+RESULT_PASS = 0xd1900a00         # DRAM read back correctly
+RESULT_FAIL = 0xd1900bad         # DRAM responded but data was wrong
+
 
 def _poll(lk, off, mask, tries=2000):
     for _ in range(tries):
@@ -40,18 +48,15 @@ def _poll(lk, off, mask, tries=2000):
     return False
 
 
-def _trained(lk):
-    """True if the MIU reports init-done and BIST-done (DRAM is up)."""
-    return _poll(lk, 0x400, 0x8000) and _poll(lk, 0x5c0, 0x8000)
-
-
 def init_c(lk, verbose=True, blob=DDR_BLOB):
-    """Upload and run the on-target DDR-init blob. Returns the trained flag."""
+    """Upload and run the on-target DDR-init blob. Returns the trained flag,
+    decided by the blob's own DRAM self-test (see RESULT_ADDR)."""
     with open(blob, "rb") as f:
         data = f.read()
     if verbose:
         print("[ddr] uploading DDR-init blob (%d bytes) to 0x%08x"
               % (len(data), BLOB_ADDR))
+    lk.write32(RESULT_ADDR, 0)          # clear the verdict word first
     lk.upload(BLOB_ADDR, data)
     if verbose:
         print("[ddr] running on-target ddr_init() (real ZQ cal + delays)...")
@@ -59,13 +64,22 @@ def init_c(lk, verbose=True, blob=DDR_BLOB):
     lk.go(BLOB_ADDR, timeout=5.0)
     if not lk.alive():
         if verbose:
-            print("[ddr] stub did not come back after ddr_init - target wedged")
+            print("[ddr] target wedged - the DRAM self-test bus-hung, so DRAM "
+                  "is NOT trained (power-cycle before retrying)")
         return False
-    ok = _trained(lk)
+
+    verdict = lk.read32(RESULT_ADDR)
+    if verdict == RESULT_PASS:
+        if verbose:
+            print("[ddr] ddr_init done - DRAM self-test PASSED (DRAM trained)")
+        return True
     if verbose:
-        print("[ddr] ddr_init done%s"
-              % ("" if ok else " (init-done/BIST NOT set - DRAM not trained)"))
-    return ok
+        msg = {RESULT_FAIL: "DRAM responded but data was wrong (marginal)",
+               RESULT_PROBING: "stopped at the DRAM probe",
+               0: "blob did not reach the self-test"}.get(
+                   verdict, "unexpected verdict 0x%08x" % verdict)
+        print("[ddr] ddr_init done - DRAM self-test did NOT pass: %s" % msg)
+    return False
 
 
 def init_replay(lk, verbose=True):

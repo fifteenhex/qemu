@@ -201,7 +201,7 @@ class Link:
 
     # A single block write of more than a few KiB overruns the stub's / the
     # transport's buffers, so split large transfers into this many words.
-    CHUNK_WORDS = 1024
+    CHUNK_WORDS = 256
 
     def upload(self, addr, data):
         """Upload raw bytes (padded to a word) via chunked block writes."""
