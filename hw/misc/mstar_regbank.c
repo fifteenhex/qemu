@@ -15,12 +15,31 @@
 
 #include "qemu/osdep.h"
 #include "hw/misc/mstar_regbank.h"
+#include "trace.h"
+
+/* Name of the register at `off`, or "?" if we have not decoded it yet. */
+static const char *mstar_regbank_regname(MStarRegbankState *s, hwaddr off)
+{
+    const MStarRegName *r;
+
+    for (r = s->regnames; r && r->name; r++) {
+        if (r->offset == off) {
+            return r->name;
+        }
+    }
+    return "?";
+}
 
 static uint64_t mstar_regbank_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarRegbankState *s = MSTAR_REGBANK(opaque);
+    uint64_t val = s->regs[addr / 4];
 
-    return s->regs[addr / 4];
+    if (trace_event_get_state_backends(TRACE_MSTAR_REGBANK_READ)) {
+        trace_mstar_regbank_read(s->bankname ?: "regbank", s->base + addr,
+                                 mstar_regbank_regname(s, addr), val);
+    }
+    return val;
 }
 
 static void mstar_regbank_write(void *opaque, hwaddr addr, uint64_t val,
@@ -28,6 +47,10 @@ static void mstar_regbank_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MStarRegbankState *s = MSTAR_REGBANK(opaque);
 
+    if (trace_event_get_state_backends(TRACE_MSTAR_REGBANK_WRITE)) {
+        trace_mstar_regbank_write(s->bankname ?: "regbank", s->base + addr,
+                                  mstar_regbank_regname(s, addr), val, size);
+    }
     s->regs[addr / 4] = val;
 }
 

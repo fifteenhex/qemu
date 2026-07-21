@@ -442,3 +442,7 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
 iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
+
+# hw/misc/mstar_regbank.c
+mstar_regbank_write(const char *bank, uint32_t addr, const char *name, uint64_t val, unsigned size) "%s 0x%08" PRIx32 " %s <- 0x%" PRIx64 " (size %u)"
+mstar_regbank_read(const char *bank, uint32_t addr, const char *name, uint64_t val) "%s 0x%08" PRIx32 " %s -> 0x%" PRIx64

@@ -257,6 +257,17 @@ static const MStarRegDefault mstarv7_pm_clkgen_defaults[] = {
 };
 
 /*
+ * clkgen registers we have decoded so far; the rest are traced by offset
+ * (enable with -trace enable=mstar_regbank_write). See the mstar clock-tree
+ * notes / contrib/mstarpoker for how these were worked out.
+ */
+static const MStarRegName mstarv7_clkgen_regnames[] = {
+    { 0x004, "timer_clk_src" },     /* 0x30 selects the MPLL for timer[0] */
+    { 0x0c4, "uart_pad" },          /* boot ROM UART pad-mux */
+    { 0, NULL },
+};
+
+/*
  * chiptop reset defaults (base 0x1f203c00). The bond strap at +0x120 is
  * driven by the SoC class, not stored, so it is not listed here. The UART
  * pad-mux at +0x14c (0x1f203d4c) is written by the boot ROM and excluded.
@@ -306,9 +317,14 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "clkgen", &s->clkgen, TYPE_MSTAR_REGBANK);
     s->clkgen.defaults = mstarv7_clkgen_defaults;
     s->clkgen.num_defaults = ARRAY_SIZE(mstarv7_clkgen_defaults);
+    s->clkgen.base = MSTARV7_CLKGEN_BASE;
+    s->clkgen.bankname = "clkgen";
+    s->clkgen.regnames = mstarv7_clkgen_regnames;
     object_initialize_child(obj, "pm-clkgen", &s->pm_clkgen, TYPE_MSTAR_REGBANK);
     s->pm_clkgen.defaults = mstarv7_pm_clkgen_defaults;
     s->pm_clkgen.num_defaults = ARRAY_SIZE(mstarv7_pm_clkgen_defaults);
+    s->pm_clkgen.base = MSTARV7_PM_CLKGEN_BASE;
+    s->pm_clkgen.bankname = "pm_clkgen";
     object_initialize_child(obj, "chipver", &s->chipver, TYPE_MSTAR_REGBANK);
     s->chipver.defaults = mstarv7_chipver_defaults;
     s->chipver.num_defaults = ARRAY_SIZE(mstarv7_chipver_defaults);

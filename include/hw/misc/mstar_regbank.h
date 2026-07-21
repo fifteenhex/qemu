@@ -27,6 +27,16 @@ typedef struct MStarRegDefault {
     uint16_t value;
 } MStarRegDefault;
 
+/*
+ * A name for a register whose meaning we have worked out. Banks whose
+ * registers are mostly still unknown (clkgen, ...) can supply the few they
+ * understand here; the rest are traced by offset. Terminate with a NULL name.
+ */
+typedef struct MStarRegName {
+    uint16_t offset;
+    const char *name;
+} MStarRegName;
+
 struct MStarRegbankState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -38,6 +48,17 @@ struct MStarRegbankState {
     /* Optional reset defaults, set by the instantiator before realize. */
     const MStarRegDefault *defaults;
     unsigned num_defaults;
+
+    /*
+     * Tracing support, set by the instantiator before realize. `base` is the
+     * bank's absolute RIU address and `bankname` a short label, both used in
+     * the trace output; `regnames` optionally names the registers we have
+     * decoded (see the mstar_regbank_read/write trace events). Enable with
+     * e.g. -trace enable=mstar_regbank_write.
+     */
+    uint32_t base;
+    const char *bankname;
+    const MStarRegName *regnames;
 };
 
 #endif /* HW_MISC_MSTAR_REGBANK_H */
