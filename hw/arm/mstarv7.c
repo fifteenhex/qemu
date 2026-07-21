@@ -264,6 +264,19 @@ static const MStarRegDefault mstarv7_pm_clkgen_defaults[] = {
 static const MStarRegName mstarv7_clkgen_regnames[] = {
     { 0x004, "timer_clk_src" },     /* 0x30 selects the MPLL for timer[0] */
     { 0x0c4, "uart_pad" },          /* boot ROM UART pad-mux */
+    /*
+     * The maybe_* below are first guesses: each is the hardware block first
+     * accessed after that clkgen register is written on a full boot (trace both
+     * mstar_regbank_write + memory_region_ops_write). Heuristic - confirm/rename
+     * as we trace each out (the two known ones above show it can mis-attribute).
+     */
+    { 0x0c8, "maybe_pm_gpio" },     /* -> mstar-gpio.pm */
+    { 0x114, "maybe_fcie_sd" },     /* -> mstar-fcie (also gpio.main, sar) */
+    { 0x14c, "maybe_disp" },        /* -> mstar-disp.top/.mop */
+    { 0x184, "maybe_i2c" },         /* -> mstar-i2c (single block) */
+    { 0x18c, "maybe_dsi" },         /* -> mstar-dsi (also intc) */
+    { 0x1a8, "maybe_gop_audio" },   /* -> mstar-disp.gop / audiotop / bach */
+    { 0x1bc, "maybe_dphy" },        /* -> mstar-dphy (single block) */
     { 0, NULL },
 };
 
