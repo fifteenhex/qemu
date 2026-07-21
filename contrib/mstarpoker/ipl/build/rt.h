@@ -9,14 +9,20 @@ typedef unsigned short ushort;
 typedef unsigned int   uint;
 typedef unsigned long long ulonglong;
 
-/* Sized volatile RIU register access (keeps the compiler from reordering,
- * merging or dropping the MMIO, and preserves each access width). */
-#define R8(a)  (*(volatile unsigned char  *)(a))
-#define R16(a) (*(volatile unsigned short *)(a))
-#define R32(a) (*(volatile unsigned int   *)(a))
+/*
+ * Sized RIU register accessors. volatile keeps the compiler from
+ * reordering, merging or dropping the MMIO and preserves each access
+ * width; every hardware access in the port goes through these.
+ */
+static inline unsigned int rd8(unsigned int a)  { return *(volatile unsigned char  *)a; }
+static inline unsigned int rd16(unsigned int a) { return *(volatile unsigned short *)a; }
+static inline unsigned int rd32(unsigned int a) { return *(volatile unsigned int   *)a; }
+static inline void wr8(unsigned int a, unsigned int v)  { *(volatile unsigned char  *)a = v; }
+static inline void wr16(unsigned int a, unsigned int v) { *(volatile unsigned short *)a = v; }
+static inline void wr32(unsigned int a, unsigned int v) { *(volatile unsigned int   *)a = v; }
 
 /* Boot-progress marker the mask ROM/IPL write to the SMP scratch register. */
-#define IPL_PROGRESS (*(volatile unsigned int *)0x1f200800)
+#define IPL_PROGRESS 0x1f200800u
 
 /*
  * Entry CP15 bring-up (a0000028..a000004c), kept verbatim as the IPL does

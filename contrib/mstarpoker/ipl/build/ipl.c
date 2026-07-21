@@ -10,9 +10,9 @@
 /* ---- UART0 boot-message output (a0001678 / a00016ee / a0001690) ------- */
 static void uart_putc(char c)                    /* FUN_a0001678 */
 {
-    while ((R8(0x1f221028) & 0x20) == 0) {       /* wait for THR empty */
+    while ((rd8(0x1f221028) & 0x20) == 0) {       /* wait for THR empty */
     }
-    R8(0x1f221000) = c;
+    wr8(0x1f221000, c);
 }
 
 static void uart_puts(const char *s)             /* FUN_a00016ee */
@@ -39,7 +39,7 @@ static void uart_put_hex16(unsigned int val)     /* FUN_a00016da */
 /* ---- free-running timer + delay (a0001a04 / a0001cd4) ----------------- */
 static unsigned int timer_read(void)             /* FUN_a0001a04 */
 {
-    return ((unsigned int)R16(0x1f006052) << 16) | (R16(0x1f006050) & 0xffff);
+    return ((unsigned int)rd16(0x1f006052) << 16) | (rd16(0x1f006050) & 0xffff);
 }
 
 static void delay(unsigned int ticks)            /* FUN_a0001cd4 */
@@ -85,8 +85,8 @@ static int clk_check(void)                       /* FUN_a000119c */
 {
     unsigned int v;
 
-    R16(0x1f00400c) &= 0xfeff;
-    v = (R16(0x1f004014) & 0x1f) >> 3;
+    wr16(0x1f00400c, rd16(0x1f00400c) & 0xfeff);
+    v = (rd16(0x1f004014) & 0x1f) >> 3;
     if (v != 0) {
         return v == 3;
     }
@@ -95,51 +95,51 @@ static int clk_check(void)                       /* FUN_a000119c */
 
 static unsigned int pll_read(unsigned int sel)   /* FUN_a00011c8 */
 {
-    volatile unsigned short *pv;
+    unsigned int pv;
 
     if (sel < 8) {
-        R16(0x1f00400c) &= 0xfeff;
-        pv = (volatile unsigned short *)0x1f004010;
+        wr16(0x1f00400c, rd16(0x1f00400c) & 0xfeff);
+        pv = 0x1f004010;
         if (sel == 0) {
             goto done;
         }
     } else {
-        R16(0x1f00400c) |= 0x100;
-        pv = (volatile unsigned short *)0x1f004010;
+        wr16(0x1f00400c, rd16(0x1f00400c) | 0x100);
+        pv = 0x1f004010;
         if (sel == 8) {
             goto done;
         }
     }
     sel &= ~8u;
-    pv = (volatile unsigned short *)0x1f004018;
+    pv = 0x1f004018;
     if (sel != 1
-        && (pv = (volatile unsigned short *)0x1f004020, sel != 2)
-        && (pv = (volatile unsigned short *)0x1f004028, sel != 3)
-        && (pv = (volatile unsigned short *)0x1f004058, sel != 4
-            && (pv = (volatile unsigned short *)0x1f004060, sel != 5))
-        && (pv = (volatile unsigned short *)0x1f004068, sel != 6
-            && (pv = (volatile unsigned short *)0x1f004070, sel != 7))) {
+        && (pv = 0x1f004020, sel != 2)
+        && (pv = 0x1f004028, sel != 3)
+        && (pv = 0x1f004058, sel != 4
+            && (pv = 0x1f004060, sel != 5))
+        && (pv = 0x1f004068, sel != 6
+            && (pv = 0x1f004070, sel != 7))) {
         return 0;
     }
 done:
-    return ((unsigned int)pv[2] << 16) | pv[0];
+    return (rd16(pv + 4) << 16) | rd16(pv);
 }
 
-static void FUN_a0001128(unsigned int p1, volatile unsigned short *p2,
+static void FUN_a0001128(unsigned int p1, unsigned int p2,
                          unsigned int p3, int p4)   /* FUN_a0001128 */
 {
-    volatile unsigned short *shared = (volatile unsigned short *)0x1f2021bc;
+    unsigned int shared = 0x1f2021bc;
     unsigned short v1;
     int i2;
     unsigned int u3 = 0xfu << (p3 & 0xff);
     unsigned int u4 = 1u << (p1 & 0xff);
 
-    i2 = p4 + (((int)(*p2 & u3) >> (p3 & 0xff)
-                | ((int)(u4 & *shared) >> (p1 & 0xff)) << 4) & 0xffff);
+    i2 = p4 + (((int)(rd16(p2) & u3) >> (p3 & 0xff)
+                | ((int)(u4 & rd16(shared)) >> (p1 & 0xff)) << 4) & 0xffff);
     v1 = (p4 < 0 && i2 < 0) ? 0 : (unsigned short)i2;
-    *shared = (unsigned short)(((v1 & 0x1f) >> 4) << (p1 & 0xff))
-              | (*shared & ~(unsigned short)u4);
-    *p2 = (*p2 & ~(unsigned short)u3) | (unsigned short)((v1 & 0xf) << (p3 & 0xff));
+    wr16(shared, (unsigned short)(((v1 & 0x1f) >> 4) << (p1 & 0xff))
+                 | (rd16(shared) & ~(unsigned short)u4));
+    wr16(p2, (rd16(p2) & ~(unsigned short)u3) | (unsigned short)((v1 & 0xf) << (p3 & 0xff)));
 }
 
 /*
@@ -153,56 +153,56 @@ void ipl_main(void)
     unsigned int r, i, u34;
     unsigned char b2;
     const char *reset_msg;
-    volatile unsigned short *puVar8, *puVar12, *puVar26, *puVar35, *puVar39, *puVar40;
-    volatile unsigned short *puVar13, *puVar36;
-    volatile unsigned char *puVar11, *puVar14, *puVar46;
+    unsigned int puVar8, puVar12, puVar26, puVar35, puVar39, puVar40;
+    unsigned int puVar13, puVar36;
+    unsigned int puVar11, puVar14, puVar46;
     unsigned int uVar24;
     int iVar25;
 
-    bond = R8(0x1f203d20);              /* chip bond id (0x1e = SSD202D) */
+    bond = rd8(0x1f203d20);              /* chip bond id (0x1e = SSD202D) */
     boot_log_n = 0;
     boot_record(timer_read() / 12u, "IPL+");
 
-    R16(0x1f20025c) |= 1;                                   /* a0001d84 */
-    R16(0x1f203c0c) = (R16(0x1f203c0c) & 0xff8f) | 0x10;    /* a0001d98 */
-    R16(0x1f203c20) = (R16(0x1f203c20) & 0xfcff) | 0x100;   /* a0001da6 */
+    wr16(0x1f20025c, rd16(0x1f20025c) | 1);                                   /* a0001d84 */
+    wr16(0x1f203c0c, (rd16(0x1f203c0c) & 0xff8f) | 0x10);    /* a0001d98 */
+    wr16(0x1f203c20, (rd16(0x1f203c20) & 0xfcff) | 0x100);   /* a0001da6 */
 
     /* keep the short-circuit: pll_read runs only when clk_check != 0 */
     if (clk_check() == 0) {                                 /* a00011a8 */
-        R16(0x1f203cf0) &= 0x3f;
+        wr16(0x1f203cf0, rd16(0x1f203cf0) & 0x3f);
     } else {
         r = pll_read(0);                                    /* a00011f0 */
         if (((r & 0x7ffff) >> 16) == 2) {
-            R16(0x1f203cf0) &= 0x3f;
+            wr16(0x1f203cf0, rd16(0x1f203cf0) & 0x3f);
         }
     }
 
-    R8(0x1f001cf4) = 0;                                     /* a0001dc4 */
+    wr8(0x1f001cf4, 0);                                     /* a0001dc4 */
     delay(0x4b0);
-    R8(0x1f206005) = 0;                                     /* a0001dd0: MPLL enable */
+    wr8(0x1f206005, 0);                                     /* a0001dd0: MPLL enable */
     delay(12000);
-    R8(0x1f207004) = 0x30;                                  /* a0001dde: timer clock src */
-    R32(0x1f006058) = 0x23;                                 /* a0001de2 */
-    R8(0x1f2070c4) = 0;                                     /* a0001de6 */
-    R8(0x1f001cc0) |= 0x10;                                 /* a0001dee */
+    wr8(0x1f207004, 0x30);                                  /* a0001dde: timer clock src */
+    wr32(0x1f006058, 0x23);                                 /* a0001de2 */
+    wr8(0x1f2070c4, 0);                                     /* a0001de6 */
+    wr8(0x1f001cc0, rd8(0x1f001cc0) | 0x10);                                 /* a0001dee */
 
     /* UART0 bring-up (a0001de8..a0001e98) */
     for (i = 0; i != 0x100; i++) {         /* wait for LSR bit6, else 256 tries */
         u34 = i & 0xff;
-        if ((R16(0x1f221028) & 0x40) != 0) {
+        if ((rd16(0x1f221028) & 0x40) != 0) {
             goto lsr_ready;
         }
     }
     u34 = 0xff;
 lsr_ready:
-    R8(0x1f2070c4) = 0;                                     /* a0001e10 */
-    R16(0x1f001c24) &= 0xf7ff;                              /* a0001e24 */
-    R16(0x1f203d4c) = 0x3210;                               /* a0001e2a */
-    R8(0x1f221070) &= 0xfe;                                 /* a0001e34 */
-    R8(0x1f221070) |= 1;                                    /* a0001e40 */
-    R8(0x1f221008) = 0;                                     /* a0001e44 */
-    R8(0x1f221020) |= 0x10;                                 /* a0001e52 */
-    while ((b2 = R8(0x1f221038)) & 1) {                     /* wait for UART idle */
+    wr8(0x1f2070c4, 0);                                     /* a0001e10 */
+    wr16(0x1f001c24, rd16(0x1f001c24) & 0xf7ff);                              /* a0001e24 */
+    wr16(0x1f203d4c, 0x3210);                               /* a0001e2a */
+    wr8(0x1f221070, rd8(0x1f221070) & 0xfe);                                 /* a0001e34 */
+    wr8(0x1f221070, rd8(0x1f221070) | 1);                                    /* a0001e40 */
+    wr8(0x1f221008, 0);                                     /* a0001e44 */
+    wr8(0x1f221020, rd8(0x1f221020) | 0x10);                                 /* a0001e52 */
+    while ((b2 = rd8(0x1f221038)) & 1) {                     /* wait for UART idle */
         if (u34 == 0xff) {
             goto uart_err;
         }
@@ -210,18 +210,18 @@ lsr_ready:
     }
     if (u34 == 0xff) {
 uart_err:
-        R32(0x1f200800) = 0xbf1;
+        wr32(0x1f200800, 0xbf1);
     } else {
-        R8(0x1f221018) |= 0x80;                             /* a0001f2e */
-        R8(0x1f221000) = 0x5e;                              /* a0001f32 */
-        R8(0x1f221008) = b2 & 1;                            /* a0001f36 */
-        R8(0x1f221018) &= 0x7f;                             /* a0001f40 */
+        wr8(0x1f221018, rd8(0x1f221018) | 0x80);                             /* a0001f2e */
+        wr8(0x1f221000, 0x5e);                              /* a0001f32 */
+        wr8(0x1f221008, b2 & 1);                            /* a0001f36 */
+        wr8(0x1f221018, rd8(0x1f221018) & 0x7f);                             /* a0001f40 */
     }
-    R8(0x1f221018) = 3;                                     /* a0001e76 */
-    R8(0x1f221020) &= 0xef;                                 /* a0001e84 */
-    R8(0x1f221010) = 7;                                     /* a0001e8a */
-    R16(0x1f203d4c) = 0x3012;                               /* a0001e90 */
-    R16(0x1f001c24) |= 0x800;                               /* a0001e98 */
+    wr8(0x1f221018, 3);                                     /* a0001e76 */
+    wr8(0x1f221020, rd8(0x1f221020) & 0xef);                                 /* a0001e84 */
+    wr8(0x1f221010, 7);                                     /* a0001e8a */
+    wr16(0x1f203d4c, 0x3012);                               /* a0001e90 */
+    wr16(0x1f001c24, rd16(0x1f001c24) | 0x800);                               /* a0001e98 */
 
     /* boot banner (a0001f4c..) */
     uart_puts("\r\nIPL ");
@@ -233,11 +233,11 @@ uart_err:
 
     /* reset-reason detect: WDT / SW / HW (0x1f002400, 0x1f006008) */
     reset_msg = "HW Reset\r\n";
-    if ((R16(0x1f002400) & 2) != 0) {
+    if ((rd16(0x1f002400) & 2) != 0) {
         reset_msg = "SW Reset\r\n";
-        if ((R16(0x1f006008) & 1) != 0) {
+        if ((rd16(0x1f006008) & 1) != 0) {
             uart_puts("WDT Reset\r\n");
-            R16(0x1f006008) |= 1;
+            wr16(0x1f006008, rd16(0x1f006008) | 1);
             goto reset_done;
         }
     }
@@ -250,356 +250,356 @@ reset_done:
         /* SSD201 / 64MB path - not ported yet (bond is 0x1e on this board) */
     } else if ((0x1c < bond) && (bond < 0x20)) {
         uart_puts("miupll_233MHz\r\n");
-        puVar8 = (volatile unsigned short *)0x1f20243c;
-        puVar11 = (volatile unsigned char *)0x1f206205;
-        *(volatile unsigned char *)0x1f206205 = 0;
-        puVar11[3] = 0;
-        puVar11[4] = 0;
-        puVar26 = (volatile unsigned short *)0x1f20248c;
-        puVar11[7] = 0x1e;
-        puVar11[8] = 1;
-        puVar11[0xb] = 0x10;
-        puVar35 = (volatile unsigned short *)0x1f2024cc;
-        puVar11[0xc] = 0;
-        puVar8[0] = 0xc00;
-        puVar8[0] = 0xc00;
-        puVar8[0] = 0xc00;
-        puVar8[0] = 0xc01;
-        puVar26[0] = 0xfffe;
-        puVar35[0] = 0xffff;
-        puVar35[0x20] = 0xffff;
-        puVar35[0x40] = 0xffff;
-        puVar35[-0x160] = 0xffff;
-        puVar35[-0x140] = 0xffff;
-        puVar35[-0x80] = 0xfffe;
-        puVar12 = (volatile unsigned short *)0x1f202048;
-        *(volatile unsigned short *)0x1f2020f0 = 1;
+        puVar8 = 0x1f20243c;
+        puVar11 = 0x1f206205;
+        wr8(0x1f206205, 0);
+        wr8(puVar11 + 0x3, 0);
+        wr8(puVar11 + 0x4, 0);
+        puVar26 = 0x1f20248c;
+        wr8(puVar11 + 0x7, 0x1e);
+        wr8(puVar11 + 0x8, 1);
+        wr8(puVar11 + 0xb, 0x10);
+        puVar35 = 0x1f2024cc;
+        wr8(puVar11 + 0xc, 0);
+        wr16(puVar8, 0xc00);
+        wr16(puVar8, 0xc00);
+        wr16(puVar8, 0xc00);
+        wr16(puVar8, 0xc01);
+        wr16(puVar26, 0xfffe);
+        wr16(puVar35, 0xffff);
+        wr16(puVar35 + 0x40, 0xffff);
+        wr16(puVar35 + 0x80, 0xffff);
+        wr16(puVar35 - 0x2c0, 0xffff);
+        wr16(puVar35 - 0x280, 0xffff);
+        wr16(puVar35 - 0x100, 0xfffe);
+        puVar12 = 0x1f202048;
+        wr16(0x1f2020f0, 1);
         delay(12000);
-        puVar12[0] = 0x1000;
+        wr16(puVar12, 0x1000);
         delay(12000);
-        puVar12[0] = 0;
+        wr16(puVar12, 0);
         delay(12000);
-        puVar35 = (volatile unsigned short *)0x1f20206c;
-        *(volatile unsigned short *)0x1f20206c = 0x400;
-        puVar35[-2] = 0x2004;
-        puVar12[0x66] = 1;
-        puVar35[-6] = 0x8f5c;
-        puVar35[-4] = 0x1e;
+        puVar35 = 0x1f20206c;
+        wr16(0x1f20206c, 0x400);
+        wr16(puVar35 - 0x4, 0x2004);
+        wr16(puVar12 + 0xcc, 1);
+        wr16(puVar35 - 0xc, 0x8f5c);
+        wr16(puVar35 - 0x8, 0x1e);
         delay(12000);
-        puVar35 = (volatile unsigned short *)0x1f202044;
-        *(volatile unsigned short *)0x1f202044 = 4;
-        puVar35[10] = 0x114;
-        puVar35[0x66] = 0x11;
-        puVar35[0x1e0] = 0x2a3;
-        puVar35[0x1e2] = 0x54;
-        puVar35[0x1e4] = 0x1570;
-        puVar35[0x1e6] = 0x20dd;
-        puVar35[0x1e8] = 0x2d76;
-        puVar35[0x1ea] = 0xe7e9;
-        puVar35[0x1ec] = 0x4096;
-        puVar35[0x1ee] = 0x1f14;
-        puVar35[0x1f0] = 0x4004;
-        puVar35[0x1f2] = 0x8020;
-        puVar35[500] = 0xc000;
-        puVar35[0x206] = 0xb0;
-        puVar35[0x300] = 3;
-        puVar35[0x31e] = 0xd0d;
-        puVar35[800] = 0x620;
-        puVar35[0x322] = 0x2d07;
-        puVar35[0x324] = 0xe09;
-        puVar35[0x326] = 0xe07;
-        puVar35[0x328] = 0x504;
-        puVar35[0x32a] = 0x528;
-        puVar35[0x32c] = 0x96;
-        puVar35[0x32e] = 0xe000;
-        puVar35[0x330] = 0;
-        puVar35[0x332] = 0xd00;
-        puVar35[0x35e] = 0;
-        puVar35[0x364] = 0;
-        puVar35[0x3dc] = 0;
-        puVar35[0x13e] = 0;
-        puVar35[0x140] = 0;
-        puVar35[0x142] = 0;
-        puVar35[0x144] = 0x30;
-        puVar35[0x146] = 0x5000;
-        puVar35[-0x20] = 0xaaaa;
-        puVar35[-0x1e] = 0x80;
-        puVar35[-0x18] = 0x2200;
-        puVar35[-0x14] = 0x97;
-        puVar35[0xc] = 0x1122;
-        puVar39 = (volatile unsigned short *)0x1f2020d8;
-        R16(0x1f202070) = 0x77;
-        R16(0x1f202074) = 0x6066;
-        R16(0x1f202078) = 0x9422;
-        R16(0x1f20207c) = 0xa044;
-        R16(0x1f202090) = 0x77;
-        *(volatile unsigned short *)0x1f202094 = 0x6060;
-        puVar35 = (volatile unsigned short *)0x1f202098;
-        *(volatile unsigned short *)0x1f202098 = 0x44;
-        puVar35[2] = 0x44;
-        puVar35[4] = 0x1111;
-        puVar35[6] = 0xc;
-        puVar39[0] = 0x808;
-        puVar39[2] = 0x808;
-        puVar39[8] = 0x404;
-        puVar39[10] = 0x404;
-        puVar35 = (volatile unsigned short *)0x1f202128;
-        *(volatile unsigned short *)0x1f202128 = 0x1313;
-        puVar35[0xc] = 0x4045;
-        puVar35[0xe] = 0x5453;
-        puVar35[0x10] = 0x6555;
-        puVar35[0x12] = 0x6666;
-        puVar35[0x14] = 0x1111;
-        puVar39 = (volatile unsigned short *)0x1f202174;
-        puVar35[0x16] = 0x1111;
-        puVar35[0x18] = 0x1111;
-        puVar35[0x1a] = 0x1111;
-        *(volatile unsigned short *)0x1f20216c = 0;
-        puVar35[0x24] = 0x4444;
-        puVar39[0] = 0x444;
-        puVar39[2] = 0x444;
-        puVar39[4] = 0x444;
-        puVar35 = (volatile unsigned short *)0x1f2021a0;
-        *(volatile unsigned short *)0x1f2021a0 = 0x4444;
-        puVar35[2] = 0x4444;
-        puVar35[4] = 0x5555;
-        puVar35[6] = 0x5555;
-        puVar35[8] = 0x54;
-        puVar35[0x10] = 0x5555;
-        puVar35[0x12] = 0x5555;
-        puVar35[0x14] = 0x5555;
-        puVar35[0x16] = 0x5555;
-        puVar35 = (volatile unsigned short *)0x1f2021d0;
-        puVar39 = (volatile unsigned short *)0x1f2021d0 - 0x86;
-        *(volatile unsigned short *)0x1f2021d0 = 0x55;
-        puVar40 = puVar35 - 0x88;
-        puVar39[0] = 0x7f;
-        puVar35[-0x84] = 0xf000;
-        puVar40[0] = 0xcb;
-        puVar40[0] = 0xcf;
-        puVar40[0] = 0xcb;
-        puVar40[0] = 0xc3;
-        puVar40[0] = 0xcb;
-        puVar40[0] = 0xc3;
-        puVar40[0] = 0xcb;
-        puVar40[0] = 0xc2;
-        puVar40[0] = 0xc0;
-        puVar40[0] = 0x33c8;
-        puVar39 = (volatile unsigned short *)0x1f202130;
-        puVar35[-0x78] = 0;
-        puVar39[0] = 0;
-        puVar39[2] = 0;
-        puVar39[-8] = 0xf0f1;
-        puVar39 = (volatile unsigned short *)0x1f202458;
-        puVar35[-0x78] = 0x800;
-        puVar39[0] = 0x8021;
-        puVar39[0xd0] = 0x951a;
-        puVar39[0x26] = 0xffff;
-        puVar39[0x46] = 0xffff;
-        puVar39[0x66] = 0xffff;
-        puVar39[0x86] = 0xffff;
-        puVar39[-0x11a] = 0xffff;
-        puVar39[-0xfa] = 0xffff;
-        puVar39[0x14] = 0x8015;
-        puVar39[0x34] = 0x8015;
-        puVar39[0x54] = 0x8015;
-        puVar39[0x74] = 0x8015;
-        puVar39[-300] = 0x8015;
-        puVar39[-0x10c] = 0x8015;
-        puVar39 = (volatile unsigned short *)0x1f20203c;
-        puVar12[0x66] = 1;
-        puVar35[-0x78] = 0x800;
-        puVar35[-0x90] = 0xa0a;
-        puVar35[-0x8e] = 0xaaaa;
-        puVar35[-0x8c] = 0xaaaa;
-        puVar35[-0x8a] = 0xaaaa;
-        puVar35[-0xce] = 0x8000;
-        puVar35[-0xcc] = 0x20;
-        puVar35[-0xe0] = 0x3f;
-        puVar39[0] = 5;
-        puVar39[0] = 0xf;
-        puVar39[0] = 5;
-        puVar8[0] = 0x8c01;
-        puVar8[0] = 0x8c00;
-        puVar35 = (volatile unsigned short *)0x1f202000;
-        *(volatile unsigned short *)0x1f202000 = 0x2010;
-        puVar35[0] = 0;
-        R16(0x1f202030) = 0;
-        R16(0x1f2020f8) = 0;
-        R16(0x1f2020a8) = 0xc000;
-        puVar39[0] = 5;
-        puVar39[0] = 0xf;
-        puVar39[0] = 5;
-        puVar35[0] = 2;
-        puVar8[-0x1e] = 0;
+        puVar35 = 0x1f202044;
+        wr16(0x1f202044, 4);
+        wr16(puVar35 + 0x14, 0x114);
+        wr16(puVar35 + 0xcc, 0x11);
+        wr16(puVar35 + 0x3c0, 0x2a3);
+        wr16(puVar35 + 0x3c4, 0x54);
+        wr16(puVar35 + 0x3c8, 0x1570);
+        wr16(puVar35 + 0x3cc, 0x20dd);
+        wr16(puVar35 + 0x3d0, 0x2d76);
+        wr16(puVar35 + 0x3d4, 0xe7e9);
+        wr16(puVar35 + 0x3d8, 0x4096);
+        wr16(puVar35 + 0x3dc, 0x1f14);
+        wr16(puVar35 + 0x3e0, 0x4004);
+        wr16(puVar35 + 0x3e4, 0x8020);
+        wr16(puVar35 + 0x3e8, 0xc000);
+        wr16(puVar35 + 0x40c, 0xb0);
+        wr16(puVar35 + 0x600, 3);
+        wr16(puVar35 + 0x63c, 0xd0d);
+        wr16(puVar35 + 0x640, 0x620);
+        wr16(puVar35 + 0x644, 0x2d07);
+        wr16(puVar35 + 0x648, 0xe09);
+        wr16(puVar35 + 0x64c, 0xe07);
+        wr16(puVar35 + 0x650, 0x504);
+        wr16(puVar35 + 0x654, 0x528);
+        wr16(puVar35 + 0x658, 0x96);
+        wr16(puVar35 + 0x65c, 0xe000);
+        wr16(puVar35 + 0x660, 0);
+        wr16(puVar35 + 0x664, 0xd00);
+        wr16(puVar35 + 0x6bc, 0);
+        wr16(puVar35 + 0x6c8, 0);
+        wr16(puVar35 + 0x7b8, 0);
+        wr16(puVar35 + 0x27c, 0);
+        wr16(puVar35 + 0x280, 0);
+        wr16(puVar35 + 0x284, 0);
+        wr16(puVar35 + 0x288, 0x30);
+        wr16(puVar35 + 0x28c, 0x5000);
+        wr16(puVar35 - 0x40, 0xaaaa);
+        wr16(puVar35 - 0x3c, 0x80);
+        wr16(puVar35 - 0x30, 0x2200);
+        wr16(puVar35 - 0x28, 0x97);
+        wr16(puVar35 + 0x18, 0x1122);
+        puVar39 = 0x1f2020d8;
+        wr16(0x1f202070, 0x77);
+        wr16(0x1f202074, 0x6066);
+        wr16(0x1f202078, 0x9422);
+        wr16(0x1f20207c, 0xa044);
+        wr16(0x1f202090, 0x77);
+        wr16(0x1f202094, 0x6060);
+        puVar35 = 0x1f202098;
+        wr16(0x1f202098, 0x44);
+        wr16(puVar35 + 0x4, 0x44);
+        wr16(puVar35 + 0x8, 0x1111);
+        wr16(puVar35 + 0xc, 0xc);
+        wr16(puVar39, 0x808);
+        wr16(puVar39 + 0x4, 0x808);
+        wr16(puVar39 + 0x10, 0x404);
+        wr16(puVar39 + 0x14, 0x404);
+        puVar35 = 0x1f202128;
+        wr16(0x1f202128, 0x1313);
+        wr16(puVar35 + 0x18, 0x4045);
+        wr16(puVar35 + 0x1c, 0x5453);
+        wr16(puVar35 + 0x20, 0x6555);
+        wr16(puVar35 + 0x24, 0x6666);
+        wr16(puVar35 + 0x28, 0x1111);
+        puVar39 = 0x1f202174;
+        wr16(puVar35 + 0x2c, 0x1111);
+        wr16(puVar35 + 0x30, 0x1111);
+        wr16(puVar35 + 0x34, 0x1111);
+        wr16(0x1f20216c, 0);
+        wr16(puVar35 + 0x48, 0x4444);
+        wr16(puVar39, 0x444);
+        wr16(puVar39 + 0x4, 0x444);
+        wr16(puVar39 + 0x8, 0x444);
+        puVar35 = 0x1f2021a0;
+        wr16(0x1f2021a0, 0x4444);
+        wr16(puVar35 + 0x4, 0x4444);
+        wr16(puVar35 + 0x8, 0x5555);
+        wr16(puVar35 + 0xc, 0x5555);
+        wr16(puVar35 + 0x10, 0x54);
+        wr16(puVar35 + 0x20, 0x5555);
+        wr16(puVar35 + 0x24, 0x5555);
+        wr16(puVar35 + 0x28, 0x5555);
+        wr16(puVar35 + 0x2c, 0x5555);
+        puVar35 = 0x1f2021d0;
+        puVar39 = 0x1f2021d0 - 0x10c;
+        wr16(0x1f2021d0, 0x55);
+        puVar40 = puVar35 - 0x110;
+        wr16(puVar39, 0x7f);
+        wr16(puVar35 - 0x108, 0xf000);
+        wr16(puVar40, 0xcb);
+        wr16(puVar40, 0xcf);
+        wr16(puVar40, 0xcb);
+        wr16(puVar40, 0xc3);
+        wr16(puVar40, 0xcb);
+        wr16(puVar40, 0xc3);
+        wr16(puVar40, 0xcb);
+        wr16(puVar40, 0xc2);
+        wr16(puVar40, 0xc0);
+        wr16(puVar40, 0x33c8);
+        puVar39 = 0x1f202130;
+        wr16(puVar35 - 0xf0, 0);
+        wr16(puVar39, 0);
+        wr16(puVar39 + 0x4, 0);
+        wr16(puVar39 - 0x10, 0xf0f1);
+        puVar39 = 0x1f202458;
+        wr16(puVar35 - 0xf0, 0x800);
+        wr16(puVar39, 0x8021);
+        wr16(puVar39 + 0x1a0, 0x951a);
+        wr16(puVar39 + 0x4c, 0xffff);
+        wr16(puVar39 + 0x8c, 0xffff);
+        wr16(puVar39 + 0xcc, 0xffff);
+        wr16(puVar39 + 0x10c, 0xffff);
+        wr16(puVar39 - 0x234, 0xffff);
+        wr16(puVar39 - 0x1f4, 0xffff);
+        wr16(puVar39 + 0x28, 0x8015);
+        wr16(puVar39 + 0x68, 0x8015);
+        wr16(puVar39 + 0xa8, 0x8015);
+        wr16(puVar39 + 0xe8, 0x8015);
+        wr16(puVar39 - 0x258, 0x8015);
+        wr16(puVar39 - 0x218, 0x8015);
+        puVar39 = 0x1f20203c;
+        wr16(puVar12 + 0xcc, 1);
+        wr16(puVar35 - 0xf0, 0x800);
+        wr16(puVar35 - 0x120, 0xa0a);
+        wr16(puVar35 - 0x11c, 0xaaaa);
+        wr16(puVar35 - 0x118, 0xaaaa);
+        wr16(puVar35 - 0x114, 0xaaaa);
+        wr16(puVar35 - 0x19c, 0x8000);
+        wr16(puVar35 - 0x198, 0x20);
+        wr16(puVar35 - 0x1c0, 0x3f);
+        wr16(puVar39, 5);
+        wr16(puVar39, 0xf);
+        wr16(puVar39, 5);
+        wr16(puVar8, 0x8c01);
+        wr16(puVar8, 0x8c00);
+        puVar35 = 0x1f202000;
+        wr16(0x1f202000, 0x2010);
+        wr16(puVar35, 0);
+        wr16(0x1f202030, 0);
+        wr16(0x1f2020f8, 0);
+        wr16(0x1f2020a8, 0xc000);
+        wr16(puVar39, 5);
+        wr16(puVar39, 0xf);
+        wr16(puVar39, 5);
+        wr16(puVar35, 2);
+        wr16(puVar8 - 0x3c, 0);
         delay(12000);
-        puVar8[-0x1e] = 8;
-        puVar8[-0x1e] = 0xc;
+        wr16(puVar8 - 0x3c, 8);
+        wr16(puVar8 - 0x3c, 0xc);
         delay(12000);
-        puVar8[-0x1e] = 0xe;
+        wr16(puVar8 - 0x3c, 0xe);
         delay(12000);
-        puVar8[-0x1e] = 0xf;
+        wr16(puVar8 - 0x3c, 0xf);
         delay(12000);
         delay(12000);
         delay(12000);
-        puVar39[0] = 5;
-        puVar39[0] = 0xf;
-        puVar39[0] = 5;
-        puVar26[0] = 0x7ffe;
+        wr16(puVar39, 5);
+        wr16(puVar39, 0xf);
+        wr16(puVar39, 5);
+        wr16(puVar26, 0x7ffe);
         /* LAB_a00028c0: shared tail (both DDR paths converge here) */
-        puVar8 = (volatile unsigned short *)0x1f2023cc;
-        puVar8[0] = 0xfffa;
-        puVar8[0x118] = 0xa0e1;
-        puVar8[0x118] = 0x80e1;
-        *(volatile unsigned short *)0x1f2025e0 = 0;
+        puVar8 = 0x1f2023cc;
+        wr16(puVar8, 0xfffa);
+        wr16(puVar8 + 0x230, 0xa0e1);
+        wr16(puVar8 + 0x230, 0x80e1);
+        wr16(0x1f2025e0, 0);
     } else {
         uart_puts("unknown miupll\\r\\n");
     }
 
     /* --- DDR calibration report + MIU byte config (a00028c0..) --- */
-    puVar13 = (volatile unsigned short *)0x1f00402c;
-    puVar36 = (volatile unsigned short *)0x1f00400c;
-    puVar36[0] = *(volatile unsigned short *)0x1f00400c & 0xfeff;
-    if ((*puVar13 & 0x800) != 0) {
-      uVar24 = (*puVar13 & 0x7ff) >> 5;
+    puVar13 = 0x1f00402c;
+    puVar36 = 0x1f00400c;
+    wr16(puVar36, rd16(0x1f00400c) & 0xfeff);
+    if ((rd16(puVar13) & 0x800) != 0) {
+      uVar24 = (rd16(puVar13) & 0x7ff) >> 5;
       uart_puts("MIU0 zq=0x");
       uart_put_hex16(uVar24);
       uart_puts("\n\r");
-      *(volatile unsigned short *)0x1f202160 = *(volatile unsigned short *)0x1f202160 & 0x81ff | (ushort)(uVar24 << 9);
+      wr16(0x1f202160, rd16(0x1f202160) & 0x81ff | (ushort)(uVar24 << 9));
     }
-    if ((int)((uint)*(volatile unsigned short *)0x1f004024 << 0x10) < 0) {
-      uVar24 = (*(volatile unsigned short *)0x1f004024 & 0x7fff) >> 0xc;
+    if ((int)((uint)rd16(0x1f004024) << 0x10) < 0) {
+      uVar24 = (rd16(0x1f004024) & 0x7fff) >> 0xc;
       uart_puts("MIU0 drvp=0x");
       uart_put_hex16(uVar24);
       uart_puts("\n\r");
       uVar24 = uVar24 - 1 & 0xffff;
       if (uVar24 < 7) {
-        iVar25 = (int)*(char *)((volatile unsigned short *)0xa0004920 + uVar24);
+        iVar25 = (int)*(char *)(0xa0004920 + uVar24);
       }
       else {
         iVar25 = 0;
       }
-      FUN_a0001128(0xe,(volatile unsigned short *)0x1f2020b0,8,iVar25);
-      FUN_a0001128(8,(volatile unsigned short *)0x1f2020bc,0,iVar25);
-      FUN_a0001128(10,(volatile unsigned short *)0x1f2020bc,4,iVar25);
-      FUN_a0001128(0xc,(volatile unsigned short *)0x1f2020bc,8,iVar25);
-      FUN_a0001128(0xd,(volatile unsigned short *)0x1f2020bc,0xc,iVar25);
+      FUN_a0001128(0xe,0x1f2020b0,8,iVar25);
+      FUN_a0001128(8,0x1f2020bc,0,iVar25);
+      FUN_a0001128(10,0x1f2020bc,4,iVar25);
+      FUN_a0001128(0xc,0x1f2020bc,8,iVar25);
+      FUN_a0001128(0xd,0x1f2020bc,0xc,iVar25);
     }
-    if ((int)((uint)*puVar13 << 0x10) < 0) {
-      uVar24 = (*puVar13 & 0x7fff) >> 0xc;
+    if ((int)((uint)rd16(puVar13) << 0x10) < 0) {
+      uVar24 = (rd16(puVar13) & 0x7fff) >> 0xc;
       uart_puts("MIU0 drvN=0x");
       uart_put_hex16(uVar24);
       uart_puts("\n\r");
       uVar24 = uVar24 - 1 & 0xffff;
       if (uVar24 < 7) {
-        iVar25 = (int)*(char *)((volatile unsigned short *)0xa0004920 + uVar24);
+        iVar25 = (int)*(char *)(0xa0004920 + uVar24);
       }
       else {
         iVar25 = 0;
       }
-      FUN_a0001128(6,(volatile unsigned short *)0x1f2020b0,0,iVar25);
-      FUN_a0001128(0,(volatile unsigned short *)0x1f2020b8,0,iVar25);
-      FUN_a0001128(2,(volatile unsigned short *)0x1f2020b8,4,iVar25);
-      FUN_a0001128(4,(volatile unsigned short *)0x1f2020b8,8,iVar25);
-      FUN_a0001128(5,(volatile unsigned short *)0x1f2020b8,0xc,iVar25);
+      FUN_a0001128(6,0x1f2020b0,0,iVar25);
+      FUN_a0001128(0,0x1f2020b8,0,iVar25);
+      FUN_a0001128(2,0x1f2020b8,4,iVar25);
+      FUN_a0001128(4,0x1f2020b8,8,iVar25);
+      FUN_a0001128(5,0x1f2020b8,0xc,iVar25);
     }
     boot_record(0x2a0, "MIU-");
-    puVar46 = (volatile unsigned char *)0x1f2024a1;
-    puVar14 = (volatile unsigned char *)0x1f202480;
-    puVar11 = (volatile unsigned char *)0x1f202490;
-    puVar14[0] = 0x15;
-    puVar14[1] = 0x80;
-    puVar14[4] = 8;
-    puVar14[5] = 0x20;
-    puVar14[8] = 0;
-    puVar14[9] = 4;
-    puVar11[0] = 0xff;
-    puVar11[1] = 0xff;
-    puVar11[4] = 0x10;
-    puVar11[5] = 0x32;
-    puVar11[8] = 0x54;
-    puVar11[9] = 0x76;
-    puVar11[0xc] = 0x98;
-    puVar11[0xd] = 0xba;
-    puVar11[0x10] = 0xdc;
-    puVar46[0] = 0xfe;
-    puVar46[0x17] = 0;
-    puVar46[0x18] = 0;
-    puVar46[0x1f] = 0x15;
-    puVar46[0x20] = 0x80;
-    puVar46[0x23] = 8;
-    puVar46[0x24] = 0x20;
-    puVar46[0x27] = 0;
-    puVar46[0x28] = 4;
-    puVar46[0x2f] = 0xff;
-    puVar46[0x30] = 0xff;
-    puVar46[0x33] = 0x10;
-    puVar46[0x34] = 0x32;
-    puVar46[0x37] = 0x54;
-    puVar46[0x38] = 0x76;
-    puVar46[0x3b] = 0x98;
-    puVar46[0x3c] = 0xba;
-    puVar46[0x3f] = 0xdc;
-    puVar46[0x40] = 0xfe;
-    puVar46[0x5f] = 0x15;
-    puVar46[0x60] = 0x80;
-    puVar46[99] = 8;
-    puVar46[100] = 0x20;
-    puVar46[0x67] = 0;
-    puVar46[0x68] = 4;
-    puVar46[0x6f] = 0xff;
-    puVar46[0x70] = 0xff;
-    puVar46[0x73] = 0x10;
-    puVar46[0x74] = 0x32;
-    puVar46[0x77] = 0x54;
-    puVar46[0x78] = 0x76;
-    puVar46[0x7b] = 0x98;
-    puVar46[0x7c] = 0xba;
-    puVar46[0x7f] = 0xdc;
-    puVar46[0x80] = 0xfe;
-    puVar46[0x9f] = 0x15;
-    puVar11 = (volatile unsigned char *)0x1f202541;
-    puVar11[0] = 0x80;
-    puVar11[3] = 8;
-    puVar11[4] = 0x20;
-    puVar11 = (volatile unsigned char *)0x1f202548;
-    puVar11[0] = 0;
-    puVar11[1] = 4;
-    puVar11 = (volatile unsigned char *)0x1f202550;
-    puVar11[0] = 0xff;
-    puVar11[1] = 0xff;
-    puVar11[4] = 0x10;
-    puVar11[5] = 0x32;
-    puVar11[8] = 0x54;
-    puVar11[9] = 0x76;
-    puVar11[0xc] = 0x98;
-    *(volatile unsigned short *)0x1f20255d = 0xba;
-    *(volatile unsigned short *)0x1f202560 = 0xdc;
-    puVar11 = (volatile unsigned char *)0x1f202561;
-    puVar11[0] = 0xfe;
-    puVar11[0x9b] = 0xe1;
-    puVar11[0x9c] = 0x80;
-    puVar11[-0x1a1] = 2;
-    puVar11[-0x1a0] = 0;
-    puVar11[-0x19d] = 0x1e;
-    puVar11[-0x19c] = 0;
-    puVar11[-0x191] = 0x18;
-    puVar11[-400] = 0;
-    puVar11[-0x18d] = 8;
-    puVar11 = (volatile unsigned char *)0x1f2023d5;
-    puVar11[0] = 0x40;
-    puVar11[3] = 2;
-    puVar11[4] = 2;
-    puVar11[0x1b] = 0xe1;
-    puVar11[0x1c] = 0xff;
+    puVar46 = 0x1f2024a1;
+    puVar14 = 0x1f202480;
+    puVar11 = 0x1f202490;
+    wr8(puVar14, 0x15);
+    wr8(puVar14 + 0x1, 0x80);
+    wr8(puVar14 + 0x4, 8);
+    wr8(puVar14 + 0x5, 0x20);
+    wr8(puVar14 + 0x8, 0);
+    wr8(puVar14 + 0x9, 4);
+    wr8(puVar11, 0xff);
+    wr8(puVar11 + 0x1, 0xff);
+    wr8(puVar11 + 0x4, 0x10);
+    wr8(puVar11 + 0x5, 0x32);
+    wr8(puVar11 + 0x8, 0x54);
+    wr8(puVar11 + 0x9, 0x76);
+    wr8(puVar11 + 0xc, 0x98);
+    wr8(puVar11 + 0xd, 0xba);
+    wr8(puVar11 + 0x10, 0xdc);
+    wr8(puVar46, 0xfe);
+    wr8(puVar46 + 0x17, 0);
+    wr8(puVar46 + 0x18, 0);
+    wr8(puVar46 + 0x1f, 0x15);
+    wr8(puVar46 + 0x20, 0x80);
+    wr8(puVar46 + 0x23, 8);
+    wr8(puVar46 + 0x24, 0x20);
+    wr8(puVar46 + 0x27, 0);
+    wr8(puVar46 + 0x28, 4);
+    wr8(puVar46 + 0x2f, 0xff);
+    wr8(puVar46 + 0x30, 0xff);
+    wr8(puVar46 + 0x33, 0x10);
+    wr8(puVar46 + 0x34, 0x32);
+    wr8(puVar46 + 0x37, 0x54);
+    wr8(puVar46 + 0x38, 0x76);
+    wr8(puVar46 + 0x3b, 0x98);
+    wr8(puVar46 + 0x3c, 0xba);
+    wr8(puVar46 + 0x3f, 0xdc);
+    wr8(puVar46 + 0x40, 0xfe);
+    wr8(puVar46 + 0x5f, 0x15);
+    wr8(puVar46 + 0x60, 0x80);
+    wr8(puVar46 + 0x63, 8);
+    wr8(puVar46 + 0x64, 0x20);
+    wr8(puVar46 + 0x67, 0);
+    wr8(puVar46 + 0x68, 4);
+    wr8(puVar46 + 0x6f, 0xff);
+    wr8(puVar46 + 0x70, 0xff);
+    wr8(puVar46 + 0x73, 0x10);
+    wr8(puVar46 + 0x74, 0x32);
+    wr8(puVar46 + 0x77, 0x54);
+    wr8(puVar46 + 0x78, 0x76);
+    wr8(puVar46 + 0x7b, 0x98);
+    wr8(puVar46 + 0x7c, 0xba);
+    wr8(puVar46 + 0x7f, 0xdc);
+    wr8(puVar46 + 0x80, 0xfe);
+    wr8(puVar46 + 0x9f, 0x15);
+    puVar11 = 0x1f202541;
+    wr8(puVar11, 0x80);
+    wr8(puVar11 + 0x3, 8);
+    wr8(puVar11 + 0x4, 0x20);
+    puVar11 = 0x1f202548;
+    wr8(puVar11, 0);
+    wr8(puVar11 + 0x1, 4);
+    puVar11 = 0x1f202550;
+    wr8(puVar11, 0xff);
+    wr8(puVar11 + 0x1, 0xff);
+    wr8(puVar11 + 0x4, 0x10);
+    wr8(puVar11 + 0x5, 0x32);
+    wr8(puVar11 + 0x8, 0x54);
+    wr8(puVar11 + 0x9, 0x76);
+    wr8(puVar11 + 0xc, 0x98);
+    wr16(0x1f20255d, 0xba);
+    wr16(0x1f202560, 0xdc);
+    puVar11 = 0x1f202561;
+    wr8(puVar11, 0xfe);
+    wr8(puVar11 + 0x9b, 0xe1);
+    wr8(puVar11 + 0x9c, 0x80);
+    wr8(puVar11 - 0x1a1, 2);
+    wr8(puVar11 - 0x1a0, 0);
+    wr8(puVar11 - 0x19d, 0x1e);
+    wr8(puVar11 - 0x19c, 0);
+    wr8(puVar11 - 0x191, 0x18);
+    wr8(puVar11 - 0x190, 0);
+    wr8(puVar11 - 0x18d, 8);
+    puVar11 = 0x1f2023d5;
+    wr8(puVar11, 0x40);
+    wr8(puVar11 + 0x3, 2);
+    wr8(puVar11 + 0x4, 2);
+    wr8(puVar11 + 0x1b, 0xe1);
+    wr8(puVar11 + 0x1c, 0xff);
     uart_puts("miu_bw_set\r\n");
 }
 
 /* entry @ a0000010 */
 void ipl_entry(void)
 {
-    IPL_PROGRESS = 0xa001;      /* a0000018 */
+    wr32(IPL_PROGRESS, 0xa001);      /* a0000018 */
     cp15_smp_fp_init();         /* a0000028..a000004c (no RIU writes) */
-    IPL_PROGRESS = 0xa002;      /* a0000058 */
+    wr32(IPL_PROGRESS, 0xa002);      /* a0000058 */
     ipl_main();                 /* blx a0001d50 */
 }
