@@ -256,6 +256,25 @@ static const MStarRegDefault mstarv7_pm_clkgen_defaults[] = {
     { 0x1bc, 0x0003 },
 };
 
+/*
+ * chiptop reset defaults (base 0x1f203c00). The bond strap at +0x120 is
+ * driven by the SoC class, not stored, so it is not listed here. The UART
+ * pad-mux at +0x14c (0x1f203d4c) is written by the boot ROM and excluded.
+ */
+static const MStarRegDefault mstarv7_chiptop_defaults[] = {
+    { 0x004, 0x0200 }, { 0x074, 0x7ff2 }, { 0x078, 0x800d }, { 0x080, 0xffff },
+    { 0x088, 0xffff }, { 0x0c4, 0x7fff }, { 0x0c8, 0x7f00 }, { 0x0e0, 0xffff },
+    { 0x0e4, 0x0fff }, { 0x0e8, 0xffff }, { 0x0ec, 0x0fff }, { 0x0f0, 0xffff },
+    { 0x0f4, 0x0fff }, { 0x100, 0x0003 }, { 0x110, 0xffff }, { 0x114, 0xffff },
+    { 0x118, 0xffff }, { 0x150, 0x0054 }, { 0x194, 0x1006 }, { 0x1cc, 0xffff },
+    { 0x1f0, 0xffff }, { 0x1f4, 0x0003 }, { 0x1f8, 0x000f },
+};
+
+/* The chip-version bank: only +0x19c (0x1f003d9c) is known. */
+static const MStarRegDefault mstarv7_chipver_defaults[] = {
+    { MSTARV7_CHIPVER_REG, MSTARV7_CHIPVER_VALUE },
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -290,6 +309,9 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "pm-clkgen", &s->pm_clkgen, TYPE_MSTAR_REGBANK);
     s->pm_clkgen.defaults = mstarv7_pm_clkgen_defaults;
     s->pm_clkgen.num_defaults = ARRAY_SIZE(mstarv7_pm_clkgen_defaults);
+    object_initialize_child(obj, "chipver", &s->chipver, TYPE_MSTAR_REGBANK);
+    s->chipver.defaults = mstarv7_chipver_defaults;
+    s->chipver.num_defaults = ARRAY_SIZE(mstarv7_chipver_defaults);
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         object_initialize_child(obj, "disp-cfg[*]", &s->disp_cfg[i],
                                 TYPE_MSTAR_REGBANK);
@@ -457,6 +479,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->pm_clkgen), 0, MSTARV7_PM_CLKGEN_BASE);
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->chipver), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->chipver), 0, MSTARV7_CHIPVER_BASE);
+
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp_cfg[i]), errp)) {
             return;
@@ -484,6 +511,10 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
                           "mstarv7.chiptop", MSTARV7_CHIPTOP_SIZE);
     memory_region_add_subregion(get_system_memory(), MSTARV7_CHIPTOP_BASE,
                                 &s->chiptop);
+    for (i = 0; i < ARRAY_SIZE(mstarv7_chiptop_defaults); i++) {
+        s->chiptop_regs[mstarv7_chiptop_defaults[i].offset / 4] =
+            mstarv7_chiptop_defaults[i].value;
+    }
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dsi), errp)) {
         return;

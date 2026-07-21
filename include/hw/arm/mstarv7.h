@@ -108,6 +108,14 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_CHIPTOP_SIZE    0x200
 #define MSTARV7_CHIPTOP_NUM_REGS (MSTARV7_CHIPTOP_SIZE / 4)
 #define MSTARV7_CHIPTOP_BOND    0x120
+/*
+ * The chip-version bank (RIU bank 0x1e, 0x1f003c00). The vendor GOP code
+ * reads the chip version from +0x19c (0x1f003d9c); bit 8 distinguishes the
+ * revision. Captured as 0x0100 on a real SSD202D (see contrib/mstarpoker).
+ */
+#define MSTARV7_CHIPVER_BASE    (MSTARV7_RIU_BASE + 0x3c00)
+#define MSTARV7_CHIPVER_REG     0x19c
+#define MSTARV7_CHIPVER_VALUE   0x0100
 /* The two HWI2C masters (i2c@223000 and i2c@223200) */
 #define MSTARV7_NUM_I2C         2
 #define MSTARV7_I2C_BASE        (MSTARV7_RIU_BASE + 0x223000)
@@ -271,6 +279,7 @@ struct MStarV7SoCState {
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
     MStarRegbankState pm_clkgen;
+    MStarRegbankState chipver;
     MStarRegbankState disp_cfg[MSTARV7_NUM_DISP_CFG];
     MStarCpupllState cpupll;
     MStarPwmState pwm;
