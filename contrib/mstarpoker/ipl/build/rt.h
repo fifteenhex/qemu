@@ -36,4 +36,12 @@ static inline void cp15_smp_fp_init(void)
     __asm__ volatile("vmsr fpexc, %0" :: "r"(r));
 }
 
+
+/* Ghidra helpers used by the decompiled reference */
+#define CONCAT11(a,b) ((unsigned short)(((unsigned int)(a)<<8)|((unsigned char)(b))))
+#define CONCAT22(a,b) (((unsigned int)(a)<<16)|((unsigned short)(b)))
+#define SUB41(x,n)    ((unsigned char)((unsigned int)(x) >> ((n)*8)))
+#define SUB81(x,n)    ((unsigned char)((unsigned long long)(x) >> ((n)*8)))
+#define SUB42(x,n)    ((unsigned short)((unsigned int)(x) >> ((n)*8)))
+
 #endif
