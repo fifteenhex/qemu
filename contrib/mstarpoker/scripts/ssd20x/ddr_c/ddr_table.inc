@@ -21,14 +21,9 @@
     {0x20220c, 0x0000ffff, 0},
     {0x20224c, 0x0000ffff, 0},
     {0x2023cc, 0x0000fffe, 0},
-    {0x2020f0, 0x00000001, F_DLY},
-    {0x202048, 0x00001000, F_DLY},
-    {0x202048, 0x00000000, F_DLY},
-    {0x20206c, 0x00000400, 0},
-    {0x202068, 0x00002004, 0},
-    {0x202114, 0x00000001, 0},
-    {0x202060, 0x00008f5c, 0},
-    {0x202064, 0x0000001e, F_DLY},
+    /* MIU analog / DDR PHY bring-up (reset pulse + timed power-up) lifted into
+     * miu_phy_init() - see ddr_init.c. The ~1 ms delays here are mandatory. */
+    {0x000000, 0x00000000, F_PHY},
     {0x202044, 0x00000004, 0},
     {0x202058, 0x00000114, 0},
     {0x202110, 0x00000011, 0},

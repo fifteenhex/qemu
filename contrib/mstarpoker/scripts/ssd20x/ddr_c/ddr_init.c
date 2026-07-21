@@ -20,10 +20,13 @@
  *   2. miupll_init(): the DDR clock PLL (0x1f206200) - bond-strap-selected
  *      frequency word, no lock bit (fixed settle), lifted out of the table so
  *      the one clock the DDR controller runs against is explicit;
- *   3. zq_calibrate(): the read-compute-write impedance / drive-strength
+ *   3. miu_phy_init(): the MIU analog / DDR PHY bring-up (0x1f2020xx) - a timed
+ *      reset pulse + power-up whose mandatory ~1 ms delays are the handshake
+ *      (nothing is polled in DDR init), lifted out so the timing is explicit;
+ *   4. zq_calibrate(): the read-compute-write impedance / drive-strength
  *      calibration the IPL runs (IPL 0x28dc-0x29f8), which a QEMU capture
  *      skips because the analog ZQ-done bits are never set in the model; and
- *   4. delay_ticks(): the IPL's timer busy-wait (IPL routine 0x1cd4).
+ *   5. delay_ticks(): the IPL's timer busy-wait (IPL routine 0x1cd4).
  *
  * Entry point ddr_init() runs the whole sequence and returns (bx lr) to the
  * stub monitor, after which the host can test DRAM.
@@ -109,6 +112,40 @@ static void miupll_init(void)
     delay_ticks(DDR_DELAY);                 /* ~1 ms settle; there is no lock bit */
 }
 
+/* ---- MIU analog / DDR PHY bring-up (IPL 0xa0002052) ----
+ *
+ * With the DDR clock (miupll) now running, power up the MIU analog / DDR PHY
+ * block (0x1f2020xx). The IPL does this as a timed sequence with a reset pulse
+ * in the middle. Pulled out of the flat table because the timing is the whole
+ * point: NOTHING is polled anywhere in the DDR bring-up (confirmed in the IPL
+ * disassembly - it is entirely fixed delays), so these ~1 ms settles ARE the
+ * handshake and each one is mandatory. Values are the SSD202D capture; the
+ * analog block is 0x2020xx (the digital / arbiter block at 0x2024xx stays in
+ * the table). This runs after the arbiter group-enable writes, matching the
+ * IPL order.
+ */
+#define MIU 0x1f202000u
+
+static void miu_phy_init(void)
+{
+    RH(MIU + 0x0f0) = 0x0001;
+    delay_ticks(DDR_DELAY);
+
+    /* PHY reset pulse: assert, hold ~1 ms, release, hold ~1 ms */
+    RH(MIU + 0x048) = 0x1000;
+    delay_ticks(DDR_DELAY);
+    RH(MIU + 0x048) = 0x0000;
+    delay_ticks(DDR_DELAY);
+
+    /* PHY power-up configuration */
+    RH(MIU + 0x06c) = 0x0400;
+    RH(MIU + 0x068) = 0x2004;
+    RH(MIU + 0x114) = 0x0001;
+    RH(MIU + 0x060) = 0x8f5c;
+    RH(MIU + 0x064) = 0x001e;
+    delay_ticks(DDR_DELAY);
+}
+
 /* ---- watchdog: auto-reset the SoC if we bus-hang ----
  *
  * The DRAM self-test (and any bad register access) can bus-hang the CPU with
@@ -158,6 +195,7 @@ static void wdt_disarm(void)
 #define F_ZQ     4              /* run ZQ read/adjust after this write */
 #define F_W      8              /* 32-bit write (default is 16-bit) */
 #define F_MIUPLL 16             /* run miupll_init() here (not a write) */
+#define F_PHY    32             /* run miu_phy_init() here (not a write) */
 
 struct rw { u32 off; u32 val; u8 flags; };
 
@@ -299,6 +337,10 @@ void ddr_init(void)
 
         if (seq[i].flags & F_MIUPLL) {
             miupll_init();      /* the DDR PLL: bond-selected freq, fixed settle */
+            continue;
+        }
+        if (seq[i].flags & F_PHY) {
+            miu_phy_init();     /* MIU analog / PHY: reset pulse + timed power-up */
             continue;
         }
 
