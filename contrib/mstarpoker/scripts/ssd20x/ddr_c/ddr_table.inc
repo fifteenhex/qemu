@@ -6,13 +6,10 @@
     {0x001cf4, 0x00000000, F_B|F_DLY},
     {0x206005, 0x00000000, F_B|F_DLY},
     {0x001cc0, 0x00000013, F_B},
-    {0x206205, 0x00000000, F_B},
-    {0x206208, 0x00000000, F_B},
-    {0x206209, 0x00000000, F_B},
-    {0x20620c, 0x0000001e, F_B},
-    {0x20620d, 0x00000001, F_B},
-    {0x206210, 0x00000010, F_B},
-    {0x206211, 0x00000000, F_B},
+    /* miupll (DDR PLL, 0x1f206200) config lifted into miupll_init() - the IPL
+     * programs it here, between MPLL enable and the MIU arbiter. The frequency
+     * word is bond-strap-selected and there is no lock bit; see ddr_init.c. */
+    {0x000000, 0x00000000, F_MIUPLL},
     {0x20243c, 0x00000c00, 0},
     {0x20243c, 0x00000c00, 0},
     {0x20243c, 0x00000c00, 0},

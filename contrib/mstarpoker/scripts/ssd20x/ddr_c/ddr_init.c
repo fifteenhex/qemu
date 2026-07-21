@@ -16,11 +16,14 @@
  *
  *   1. a table of the deterministic config writes (the HW-validated
  *      ddr_seq_ssd202d capture), with markers for where the IPL inserts a
- *      timer delay and where it runs ZQ calibration;
- *   2. zq_calibrate(): the read-compute-write impedance / drive-strength
+ *      timer delay, where it runs ZQ calibration, and where the miupll is set;
+ *   2. miupll_init(): the DDR clock PLL (0x1f206200) - bond-strap-selected
+ *      frequency word, no lock bit (fixed settle), lifted out of the table so
+ *      the one clock the DDR controller runs against is explicit;
+ *   3. zq_calibrate(): the read-compute-write impedance / drive-strength
  *      calibration the IPL runs (IPL 0x28dc-0x29f8), which a QEMU capture
  *      skips because the analog ZQ-done bits are never set in the model; and
- *   3. delay_ticks(): the IPL's timer busy-wait (IPL routine 0x1cd4).
+ *   4. delay_ticks(): the IPL's timer busy-wait (IPL routine 0x1cd4).
  *
  * Entry point ddr_init() runs the whole sequence and returns (bx lr) to the
  * stub monitor, after which the host can test DRAM.
@@ -65,6 +68,47 @@ static void delay_ticks(u32 ticks)
 
 #define DDR_DELAY 0x2ee0u       /* 12000 ticks - the IPL's DDR settle delay */
 
+/* ---- miupll: the DDR clock PLL (0x1f206200) ----
+ *
+ * The PLL that clocks the MIU / DDR controller - distinct from the MPLL
+ * (0x1f206000) and the cpupll (0x1f206400). Pulled out of the flat config table
+ * into this function once it was understood (confirmed on hardware and in the
+ * IPL disassembly at 0xa0002000):
+ *
+ *   - The frequency word is selected by the bond strap (chiptop 0x1f203d20):
+ *     SSD202D (0x1e / 0x1f) uses 0x011e (233 MHz); SSD201 (0x1d) uses 0x021c
+ *     (166 MHz). These are mutually-exclusive per-variant paths - the IPL picks
+ *     one by the strap, it is not a two-pass sequence. The Miyoo Mini is 0x1e.
+ *   - There is NO lock bit: the IPL configures the PLL and never reads the block
+ *     back - it just waits. So we program it and do a fixed settle delay rather
+ *     than polling anything.
+ *
+ * Writes follow the IPL's exact order: clear the reset/enable byte at +0x05
+ * first (it reads 0x01 out of the mask ROM; clearing it enables the output, cf.
+ * the MPLL's 0x1f206005), then the frequency word at +0x0c/+0x0d and the divider
+ * at +0x10/+0x11.
+ */
+#define MIUPLL     0x1f206200u
+#define BOND_STRAP 0x1f203d20u   /* chiptop +0x120: 0x1e=SSD202D, 0x1d=SSD201 */
+
+static void miupll_init(void)
+{
+    u32 bond = RB(BOND_STRAP);
+    /* SSD201 (0x1d) uses a different frequency word; everything else - our
+     * SSD202D at 0x1e/0x1f, and any unknown strap - takes the 233 MHz word. */
+    u16 freq = (bond == 0x1d) ? 0x021c : 0x011e;
+
+    RB(MIUPLL + 0x05) = 0x00;               /* release / enable the PLL output */
+    RB(MIUPLL + 0x08) = 0x00;
+    RB(MIUPLL + 0x09) = 0x00;
+    RB(MIUPLL + 0x0c) = (u8)(freq & 0xff);  /* frequency word, low byte  */
+    RB(MIUPLL + 0x0d) = (u8)(freq >> 8);    /* frequency word, high byte */
+    RB(MIUPLL + 0x10) = 0x10;               /* divider */
+    RB(MIUPLL + 0x11) = 0x00;
+
+    delay_ticks(DDR_DELAY);                 /* ~1 ms settle; there is no lock bit */
+}
+
 /* ---- watchdog: auto-reset the SoC if we bus-hang ----
  *
  * The DRAM self-test (and any bad register access) can bus-hang the CPU with
@@ -103,18 +147,17 @@ static void wdt_disarm(void)
  * relative to the RIU base (0x1f000000), so unlike the earlier MIU-only capture
  * this now includes the essential non-MIU setup the DDR needs:
  *
- *   - the MIU clock PLL (miupll, 0x206205-0x206211) - without it the controller
- *     runs against a dead clock;
  *   - the MIU select / reset (0x20025c) and cpupll poke (0x206005); and
  *   - the ZQ analog latch trigger (0x00400c toggling 0->0x100->0).
  *
  * The console UART writes (0x221xxx) the IPL makes here are deliberately
  * excluded - replicating them would reconfigure the UART and kill our link.
  */
-#define F_B   1                 /* byte write */
-#define F_DLY 2                 /* delay after this write */
-#define F_ZQ  4                 /* run ZQ read/adjust after this write */
-#define F_W   8                 /* 32-bit write (default is 16-bit) */
+#define F_B      1              /* byte write */
+#define F_DLY    2              /* delay after this write */
+#define F_ZQ     4              /* run ZQ read/adjust after this write */
+#define F_W      8              /* 32-bit write (default is 16-bit) */
+#define F_MIUPLL 16             /* run miupll_init() here (not a write) */
 
 struct rw { u32 off; u32 val; u8 flags; };
 
@@ -252,7 +295,14 @@ void ddr_init(void)
     RW(TIMER0_CTRL) = 1;        /* EN (in case a prior test disabled it) */
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
-        u32 a = RIU + seq[i].off;
+        u32 a;
+
+        if (seq[i].flags & F_MIUPLL) {
+            miupll_init();      /* the DDR PLL: bond-selected freq, fixed settle */
+            continue;
+        }
+
+        a = RIU + seq[i].off;
 
         if (seq[i].flags & F_B)
             RB(a) = (u8)seq[i].val;
