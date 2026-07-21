@@ -22,6 +22,7 @@ init(lk) returns True only if DRAM genuinely trained (MIU init-done + BIST
 asserted). A False return means callers must not touch 0x20000000+, because a
 read of untrained DRAM bus-hangs the CPU with no recoverable abort.
 """
+import hashlib
 import os
 
 import ddr_seq_ssd202d as seq
@@ -53,13 +54,15 @@ def init_c(lk, verbose=True, blob=DDR_BLOB):
     decided by the blob's own DRAM self-test (see RESULT_ADDR)."""
     with open(blob, "rb") as f:
         data = f.read()
+    sha = hashlib.sha256(data).hexdigest()[:16]
     if verbose:
-        print("[ddr] uploading DDR-init blob (%d bytes) to 0x%08x"
-              % (len(data), BLOB_ADDR))
+        # Print the blob's hash so a pasted-back log can be matched to the
+        # exact blob that produced it (we iterate on this fast).
+        print("[ddr] DDR-init blob: %d bytes, sha256:%s" % (len(data), sha))
+        print("[ddr] uploading to 0x%08x and running on-target ddr_init()..."
+              % BLOB_ADDR)
     lk.write32(RESULT_ADDR, 0)          # clear the verdict word first
     lk.upload(BLOB_ADDR, data)
-    if verbose:
-        print("[ddr] running on-target ddr_init() (real ZQ cal + delays)...")
     # The blob busy-waits through the DDR settle delays before returning. It
     # also arms the watchdog, so a DRAM bus-hang resets the SoC (~3s) instead
     # of wedging forever; the mask ROM then reloads the stub.
