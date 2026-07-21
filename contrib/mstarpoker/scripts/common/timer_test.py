@@ -140,6 +140,8 @@ def main():
 
     lk = open_link(args)
     if args.clksrc is not None:
+        print("[clksrc] WARNING: selecting the fast timer source needs its PLL "
+              "up; without it this can hang the SoC (power-cycle to recover).")
         lk.write32(CLKGEN_TIMER_SRC, args.clksrc)
         print("[clksrc] 0x%08x <- 0x%x (read back 0x%04x)\n"
               % (CLKGEN_TIMER_SRC, args.clksrc,

@@ -228,22 +228,28 @@ static void dram_selftest(void)
 
 /* ---- entry: bring DDR up, self-test it, then return to the stub monitor ---- */
 
-__attribute__((section(".text.start"), used))
-/* timer[0] divider (0x1f006058, TIMER_DIVIDE). The IPL sets it to 0x23 in its
- * prologue so the delay timer counts at xtal/(0x23+1). The settle delays below
- * all measure against this timer, so without the same divider they run at the
- * wrong (reset-default) rate - far too short for the PLLs/DLL to lock. */
+/*
+ * The delay timer, timer[0]. The settle delays measure against its counter
+ * (0x1f006050). The IPL switches this timer onto a fast clock source via clkgen
+ * (0x1f207004) and then divides by 36 (TIMER_DIVIDE=0x23), landing at 12 MHz.
+ * We must NOT do that source switch: the fast source needs a PLL that is not up
+ * in this context, and selecting it hangs the SoC. Instead use the always-on
+ * 12 MHz the ROM leaves the timer on (TIMER_DIVIDE=0) - the same effective rate
+ * as the IPL - so 0x2ee0 ticks is ~1 ms exactly as the IPL intends. Ensure the
+ * timer is enabled (EN, never TRIG - TRIG clears enable on real hardware).
+ */
+#define TIMER0_CTRL   0x1f006040u
 #define TIMER0_DIVIDE 0x1f006058u
-#define TIMER0_DIVIDE_VAL 0x23u
 
+__attribute__((section(".text.start"), used))
 void ddr_init(void)
 {
     unsigned i;
 
     wdt_arm(WDT_TIMEOUT);       /* a hang from here on auto-resets the SoC */
 
-    /* Match the IPL's delay-timer rate so the settle delays are real. */
-    RW(TIMER0_DIVIDE) = TIMER0_DIVIDE_VAL;
+    RW(TIMER0_DIVIDE) = 0;      /* always-on 12 MHz, no divider */
+    RW(TIMER0_CTRL) = 1;        /* EN (in case a prior test disabled it) */
 
     for (i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
         u32 a = RIU + seq[i].off;
