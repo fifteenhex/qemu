@@ -224,7 +224,8 @@ Mini's IPL is unsigned, so the ``0xfa`` test fails and the whole
 authentication path is skipped - which is why a crypto access is never
 *seen* at runtime even though the code is present.
 
-On success the ROM jumps to the IPL entry at ``0xa0000000``.
+On success the ROM jumps to the IPL entry at ``0xa0000000`` (see
+:doc:`ipl`).
 
 No recovery / backup loader
 ---------------------------
