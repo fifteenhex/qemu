@@ -888,12 +888,11 @@ static void amiga_custom_dsklen_write(AmigaCustomState *s, uint16_t val)
 
 /* --- register access --- */
 
-static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
+static uint16_t amiga_custom_reg_read(AmigaCustomState *s, unsigned reg)
 {
-    AmigaCustomState *s = opaque;
     uint32_t vpos, hpos;
 
-    switch (addr & 0x1fe) {
+    switch (reg) {
     case REG_BLTDDAT:
         return 0;
     case REG_DMACONR:
@@ -935,10 +934,23 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
         return 0xff00 | s->denise_id;
     default:
         qemu_log_mask(LOG_UNIMP,
-                      "amiga-custom: unimplemented read 0x%03" HWADDR_PRIx "\n",
-                      addr & 0x1fe);
+                      "amiga-custom: unimplemented read 0x%03x\n", reg);
         return 0;
     }
+}
+
+/*
+ * The chip bus is 16 bits wide; byte reads see the matching half of
+ * the register, byte writes drive both halves with the same value.
+ */
+static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint16_t val = amiga_custom_reg_read(opaque, addr & 0x1fe);
+
+    if (size == 1) {
+        return (addr & 1) ? (val & 0xff) : (val >> 8);
+    }
+    return val;
 }
 
 static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
@@ -1011,6 +1023,9 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
 static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size)
 {
+    if (size == 1) {
+        val = (val & 0xff) * 0x101;
+    }
     amiga_custom_reg_write(opaque, addr & 0x1fe, val);
 }
 
@@ -1023,7 +1038,7 @@ static const MemoryRegionOps amiga_custom_ops = {
         .max_access_size = 4,
     },
     .impl = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
 };
