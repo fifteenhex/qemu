@@ -22,6 +22,8 @@ config STM32F2XX_SPI
     select SSI
 
 config BCM2835_SPI
+
+config DRAGONBALL_SPI
     bool
     select SSI
 
