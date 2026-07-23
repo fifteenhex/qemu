@@ -85,7 +85,17 @@ static void mos8520_port_update(MOS8520State *s, int port)
         pins = mos8520_port_pins(s->prb, s->ddrb, s->input_b);
         out = s->port_b_out;
     }
-    for (i = 0; i < 8; i++) {
+    /*
+     * On silicon all eight pins change together; qemu_irq delivers
+     * them one at a time.  Dispatch high to low so that on CIA-B port
+     * B the floppy motor (PB7), selects (PB6..PB3), side (PB2) and
+     * direction (PB1) lines are stable before the step edge (PB0):
+     * Kickstart 1.3's trackdisk changes direction and pulses step in
+     * a single port write and the drive samples direction at the step
+     * edge, so the low-to-high order stepped the wrong way once per
+     * seek reversal.
+     */
+    for (i = 7; i >= 0; i--) {
         qemu_set_irq(out[i], (pins >> i) & 1);
     }
 }
