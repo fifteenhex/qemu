@@ -21,6 +21,8 @@ struct DragonBallGPIOPort {
 	uint8_t data;
 	uint8_t puden;
 	uint8_t sel;
+	/* level driven onto the pins from outside */
+	uint8_t ext;
 };
 
 struct DragonBallGPIOState {

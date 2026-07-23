@@ -23,10 +23,12 @@ static uint64_t dragonball_gpio_read(void *opaque, hwaddr addr, unsigned int siz
     case DRAGONBALL_GPIO_REG_DIR:
         val = s->ports[port].data;
         val |= ((uint16_t)s->ports[port].dir) << 8;
-	//printf("0x%04x\n", (unsigned) val);
         return val;
     case DRAGONBALL_GPIO_REG_DATA:
-        return s->ports[port].data;
+        /* input pins read the external level, output pins the latch */
+        val = (s->ports[port].data & s->ports[port].dir) |
+              (s->ports[port].ext & ~s->ports[port].dir);
+        return val;
     case DRAGONBALL_GPIO_REG_PUDEN:
         val = s->ports[port].sel;
         val |= ((uint16_t)s->ports[port].puden) << 8;
@@ -108,14 +110,32 @@ static const MemoryRegionOps gpio_ops = {
 
 static void dragonball_gpio_set(void *opaque, int line, int value)
 {
-    //DragonBallGPIOState *s = DRAGONBALL_GPIO(opaque);
+    DragonBallGPIOState *s = DRAGONBALL_GPIO(opaque);
+    unsigned int port = line / DRAGONBALL_GPIO_NGPIOPERPORT;
+    uint8_t mask = 1 << (line % DRAGONBALL_GPIO_NGPIOPERPORT);
+
+    if (value)
+        s->ports[port].ext |= mask;
+    else
+        s->ports[port].ext &= ~mask;
 }
 
 static void dragonball_gpio_reset(DeviceState *dev)
 {
     DragonBallGPIOState *s = DRAGONBALL_GPIO(dev);
 
-    memset(s->ports, 0, sizeof(s->ports));
+    int i;
+
+    /*
+     * Chip reset does not change the level on the pins: preserve the
+     * externally driven state, clear only the register file.
+     */
+    for (i = 0; i < DRAGONBALL_GPIO_PORTS; i++) {
+        s->ports[i].dir = 0;
+        s->ports[i].data = 0;
+        s->ports[i].puden = 0;
+        s->ports[i].sel = 0;
+    }
 
     s->ports[0].puden = DRAGONBALL_GPIO_PAPUEN_RESET;
     s->ports[1].puden = DRAGONBALL_GPIO_PBPUEN_RESET;
@@ -167,7 +187,7 @@ static void dragonball_gpio_class_init(ObjectClass *klass, const void *data)
     //device_class_set_props(dc, dragonball_gpio_properties);
     dc->vmsd = &vmstate_sifive_gpio;
     dc->realize = dragonball_gpio_realize;
-    dc->legacy_reset = dragonball_gpio_reset;
+    device_class_set_legacy_reset(dc, dragonball_gpio_reset);
 }
 
 static const TypeInfo dragonball_gpio_info = {
