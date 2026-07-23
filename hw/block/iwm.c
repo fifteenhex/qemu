@@ -1,6 +1,8 @@
 /*
- * IWM (Integrated Woz Machine) floppy controller with one Sony 400K
- * GCR drive, as found in the original Macintosh 128K.
+ * IWM (Integrated Woz Machine) floppy controller with one Sony GCR
+ * drive: the 400K single-sided drive of the original Macintosh 128K,
+ * or the self-speed-regulating 800K double-sided drive of the
+ * Macintosh Plus (the "double-sided" property).
  *
  * The IWM is a bag of one-bit latches toggled by *touching* addresses:
  * register N of the 16 in the decode window is at base + N*512, and an
@@ -125,12 +127,22 @@ static void sony_pwm_init(void)
     }
 }
 
+/*
+ * Nominal spindle speed per 16-track zone.  The 800K double-sided
+ * drive regulates its own speed (no PWM from the Mac), so its tach
+ * always reports the nominal zone speed.
+ */
+static const unsigned sony_zone_rpm[5] = { 394, 429, 472, 525, 590 };
+
 /* current spindle speed in RPM; tach = 60 pulses/rev, so pulses/s == RPM */
 static unsigned sony_rpm(IWMState *s)
 {
     unsigned acc = 0;
     int i;
 
+    if (s->double_sided) {
+        return sony_zone_rpm[s->track >> 4];
+    }
     if (!s->pwm_buf) {
         return 400;
     }
@@ -146,14 +158,21 @@ static int sony_zone_sectors(int track)
     return 12 - (track >> 4);
 }
 
-/* byte offset of a track's first sector in the raw 409600-byte image */
-static int sony_track_offset(int track)
+/*
+ * Byte offset of a track's first sector in the raw image.  Raw 800K
+ * images interleave the sides per cylinder: track 0 side 0, track 0
+ * side 1, track 1 side 0, ...
+ */
+static int sony_track_offset(IWMState *s, int track, int side)
 {
     int zone = track >> 4;
-    /* 16 tracks of 12, then of 11, ... sectors before this zone */
+    /* 16 tracks of 12, then of 11, ... sectors per side before this zone */
     int sectors = 16 * (12 * zone - zone * (zone - 1) / 2);
 
     sectors += (track & 15) * sony_zone_sectors(track);
+    if (s->double_sided) {
+        sectors = 2 * sectors + side * sony_zone_sectors(track);
+    }
     return sectors * IWM_SONY_SECTOR_SIZE;
 }
 
@@ -231,15 +250,20 @@ static void sony_put_sync(uint8_t **p, int n)
     *p += n;
 }
 
+/* address-field format byte: 2:1 interleave, bit 5 = double sided */
+#define SONY_FORMAT_SS  0x02
+#define SONY_FORMAT_DS  0x22
+
 /* GCR-encode one 512-byte sector (with zero tags) onto the track */
-static void sony_encode_sector(uint8_t **pp, int track, int sector,
-                               const uint8_t *data)
+static void sony_encode_sector(uint8_t **pp, int track, int head, int sector,
+                               bool double_sided, const uint8_t *data)
 {
     uint8_t buf[524];
     uint8_t b1[175], b2[175], b3[175], csum[3];
     uint8_t *p = *pp;
-    uint8_t side = (track >> 6) & 1;    /* bit 0 carries track bit 6 */
-    uint8_t format = 0x02;              /* single sided, 2:1 interleave */
+    /* bit 5 = head, bit 0 carries track bit 6 */
+    uint8_t side = (head << 5) | ((track >> 6) & 1);
+    uint8_t format = double_sided ? SONY_FORMAT_DS : SONY_FORMAT_SS;
     int i;
 
     /* address field */
@@ -305,23 +329,24 @@ static bool sony_load_track(IWMState *s)
     if (!sony_disk_in(s)) {
         return false;
     }
-    if (s->cached_track == s->track) {
+    if (s->cached_track == s->track && s->cached_side == s->side) {
         return true;
     }
-    if (blk_pread(s->blk, sony_track_offset(s->track),
+    if (blk_pread(s->blk, sony_track_offset(s, s->track, s->side),
                   nsect * IWM_SONY_SECTOR_SIZE, sectors, 0) < 0) {
-        qemu_log_mask(LOG_GUEST_ERROR, "iwm: read error on track %d\n",
-                      s->track);
+        qemu_log_mask(LOG_GUEST_ERROR, "iwm: read error on track %d side %d\n",
+                      s->track, s->side);
         return false;
     }
     for (i = 0; i < nsect; i++) {
-        sony_encode_sector(&p, s->track, i,
+        sony_encode_sector(&p, s->track, s->side, i, s->double_sided,
                            sectors + i * IWM_SONY_SECTOR_SIZE);
     }
     assert(p - s->track_buf <= IWM_TRACK_BUF_SIZE);
     s->track_len = p - s->track_buf;
     s->track_pos = 0;
     s->cached_track = s->track;
+    s->cached_side = s->side;
     return true;
 }
 
@@ -337,6 +362,20 @@ static void sony_trace(const char *what, int reg, int val)
 }
 
 static int sony_sense_reg(IWMState *s);
+
+/*
+ * Head select on the double-sided drive: the read head follows the
+ * drive-register address lines whenever they point at RDDATA0/RDDATA1
+ * ({CA2,CA1,CA0} = 100, SEL = the head).  The Plus ROM's .Sony driver
+ * parks the lines there while it polls the data register.
+ */
+static void sony_update_side(IWMState *s)
+{
+    if (s->double_sided &&
+        (s->latches & (IWM_CA2 | IWM_CA1 | IWM_CA0)) == IWM_CA2) {
+        s->side = s->sel ? 1 : 0;
+    }
+}
 
 /* status line of the selected drive; the external connector is empty */
 static int sony_sense(IWMState *s)
@@ -389,7 +428,7 @@ static int sony_sense_reg(IWMState *s)
     case SONY_RDDATA1:
         return 0;
     case SONY_SIDES:
-        return 0;               /* single sided */
+        return s->double_sided; /* 0 = single sided drive */
     case SONY_SEEKCOMPL:
         return 1;
     case SONY_DRVIN:
@@ -493,6 +532,8 @@ static void iwm_touch(IWMState *s, hwaddr addr)
         sony_trace("latch", latch, on);
     }
 
+    sony_update_side(s);
+
     if (latch == IWM_L_LSTRB && !(old & IWM_LSTRB) && on) {
         s->lstrb_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         sony_command(s);
@@ -592,15 +633,22 @@ static void iwm_set_sel(void *opaque, int n, int level)
     IWMState *s = opaque;
 
     s->sel = level;
+    sony_update_side(s);
+}
+
+/* size a valid raw image must have for the configured drive */
+static int64_t iwm_image_size(IWMState *s)
+{
+    return s->double_sided ? IWM_SONY_IMAGE_SIZE_DS : IWM_SONY_IMAGE_SIZE;
 }
 
 static void iwm_change_media(void *opaque, bool load, Error **errp)
 {
     IWMState *s = opaque;
 
-    if (load && blk_getlength(s->blk) != IWM_SONY_IMAGE_SIZE) {
-        error_setg(errp, "floppy image must be a raw %d byte 400K image",
-                   IWM_SONY_IMAGE_SIZE);
+    if (load && blk_getlength(s->blk) != iwm_image_size(s)) {
+        error_setg(errp, "floppy image must be a raw %" PRId64 " byte %s image",
+                   iwm_image_size(s), s->double_sided ? "800K" : "400K");
         return;
     }
     s->ejected = false;
@@ -620,11 +668,13 @@ static void iwm_reset(DeviceState *dev)
     s->sel = false;
     s->mode = 0;
     s->track = 0;
+    s->side = 0;
     s->dirtn = false;
     s->motor_on = false;
     s->ejected = false;
     s->switched = false;
     s->cached_track = -1;
+    s->cached_side = -1;
     s->track_len = 0;
     s->track_pos = 0;
 }
@@ -635,9 +685,10 @@ static void iwm_realize(DeviceState *dev, Error **errp)
 
     if (s->blk) {
         if (blk_is_inserted(s->blk) &&
-            blk_getlength(s->blk) != IWM_SONY_IMAGE_SIZE) {
-            error_setg(errp, "floppy image must be a raw %d byte 400K image",
-                       IWM_SONY_IMAGE_SIZE);
+            blk_getlength(s->blk) != iwm_image_size(s)) {
+            error_setg(errp,
+                       "floppy image must be a raw %" PRId64 " byte %s image",
+                       iwm_image_size(s), s->double_sided ? "800K" : "400K");
             return;
         }
         if (blk_set_perm(s->blk, BLK_PERM_CONSISTENT_READ, BLK_PERM_ALL,
@@ -668,6 +719,7 @@ static const VMStateDescription vmstate_iwm = {
         VMSTATE_BOOL(sel, IWMState),
         VMSTATE_UINT8(mode, IWMState),
         VMSTATE_UINT8(track, IWMState),
+        VMSTATE_UINT8(side, IWMState),
         VMSTATE_BOOL(dirtn, IWMState),
         VMSTATE_BOOL(motor_on, IWMState),
         VMSTATE_BOOL(ejected, IWMState),
@@ -678,6 +730,7 @@ static const VMStateDescription vmstate_iwm = {
 
 static const Property iwm_properties[] = {
     DEFINE_PROP_DRIVE("drive", IWMState, blk),
+    DEFINE_PROP_BOOL("double-sided", IWMState, double_sided, false),
 };
 
 static void iwm_class_init(ObjectClass *klass, const void *data)

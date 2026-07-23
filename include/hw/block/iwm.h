@@ -1,6 +1,8 @@
 /*
  * IWM (Integrated Woz Machine) floppy controller with a single Sony
- * 400K GCR drive attached, as found in the original Macintosh 128K.
+ * GCR drive attached: the 400K single-sided drive of the original
+ * Macintosh 128K, or (with the "double-sided" property) the 800K
+ * double-sided drive of the Macintosh Plus.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -14,10 +16,11 @@
 #define TYPE_IWM "iwm"
 OBJECT_DECLARE_SIMPLE_TYPE(IWMState, IWM)
 
-/* 400K single-sided GCR: 80 tracks in 5 speed zones of 16 tracks */
+/* GCR: 80 tracks in 5 speed zones of 16 tracks, one or two sides */
 #define IWM_SONY_TRACKS         80
 #define IWM_SONY_SECTOR_SIZE    512
 #define IWM_SONY_IMAGE_SIZE     409600
+#define IWM_SONY_IMAGE_SIZE_DS  819200
 
 /*
  * Worst case GCR track: 12 sectors of (sync + address field + sync +
@@ -36,8 +39,10 @@ struct IWMState {
     bool sel;                   /* SEL line, driven by VIA port A bit 5 */
     uint8_t mode;
 
-    /* Sony 400K drive mechanism */
+    /* Sony drive mechanism */
+    bool double_sided;          /* property: 800K drive instead of 400K */
     uint8_t track;
+    uint8_t side;               /* head currently addressed by the lines */
     bool dirtn;                 /* 0 = step toward higher tracks */
     bool motor_on;
     bool ejected;
@@ -56,6 +61,7 @@ struct IWMState {
 
     /* GCR-encoded track under the head */
     int cached_track;
+    int cached_side;
     int track_len;
     int track_pos;
     uint8_t track_buf[IWM_TRACK_BUF_SIZE];
