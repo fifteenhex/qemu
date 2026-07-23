@@ -43,6 +43,7 @@ struct SysBusPCNetState {
     SysBusDevice parent_obj;
 
     PCNetState state;
+    bool ssize32;
 };
 
 #endif
