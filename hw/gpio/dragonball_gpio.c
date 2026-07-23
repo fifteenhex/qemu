@@ -17,7 +17,12 @@ static uint64_t dragonball_gpio_read(void *opaque, hwaddr addr, unsigned int siz
     unsigned int reg = DRAGONBALL_GPIO_ADDR2REG(addr);
     uint16_t val;
 
-    //printf("%s:%d %x %u %u\n", __func__, __LINE__, (unsigned) addr, port, size);
+    if (port >= s->num_ports) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad read offset 0x%" HWADDR_PRIx "\n",
+                      __func__, addr);
+        return 0;
+    }
 
     switch (reg) {
     case DRAGONBALL_GPIO_REG_DIR:
@@ -70,8 +75,12 @@ static void dragonball_gpio_write(void *opaque, hwaddr addr,
     unsigned int port = DRAGONBALL_GPIO_ADDR2PORT(addr);
     unsigned int reg = DRAGONBALL_GPIO_ADDR2REG(addr);
 
-    //printf("%s:%d 0x%04x %u %u %04x\n", __func__, __LINE__,
-    //        (unsigned) addr, port, size, (unsigned) value);
+    if (port >= s->num_ports) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad write offset 0x%" HWADDR_PRIx "\n",
+                      __func__, addr);
+        return;
+    }
 
     switch (reg) {
     case DRAGONBALL_GPIO_REG_DIR:
@@ -160,8 +169,9 @@ static const VMStateDescription vmstate_sifive_gpio = {
     }
 };
 
-//static const Property dragonball_gpio_properties[] = {
-//};
+static const Property dragonball_gpio_properties[] = {
+    DEFINE_PROP_UINT8("num-ports", DragonBallGPIOState, num_ports, 7),
+};
 
 static void dragonball_gpio_realize(DeviceState *dev, Error **errp)
 {
@@ -184,7 +194,7 @@ static void dragonball_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    //device_class_set_props(dc, dragonball_gpio_properties);
+    device_class_set_props(dc, dragonball_gpio_properties);
     dc->vmsd = &vmstate_sifive_gpio;
     dc->realize = dragonball_gpio_realize;
     device_class_set_legacy_reset(dc, dragonball_gpio_reset);
