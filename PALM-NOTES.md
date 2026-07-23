@@ -325,7 +325,41 @@ reprograms LGPMR, so it's live there — though most built-in screens
 only show on genuinely shaded content.  qtest-verified against known
 patterns and two LGPMR values.
 
-Still open: the SPI1 FIFO unit, SD card (m500), HotSync over serial.
+### 2026-07-20 — SD card (m500)
+
+The m500's SD slot works: `-drive if=sd,format=raw,file=<img>`.
+PalmOS 4.1 detects and mounts a FAT16 volume.
+
+  - New hw/ssi/dragonball_spi1.c models the VZ's SPI unit 1
+    (0xfffff700): 8-deep TX/RX FIFOs, XCH-triggered exchange,
+    SPIINTCS FIFO-level status/interrupts (per POSE EmRegsVZ).  The
+    SD card (ssi-sd + sd-card-spi) hangs off its bus; chip select is
+    port J bit 3, card detect is port D bit 5 (low = present).
+  - SPI1 interrupt is source 0x15 (21), not 13 — fixed the INTC
+    label (PWM2 is 13).
+  - Sub-byte SPI widths must NOT consume a byte from a byte-oriented
+    slave (they're timing pulses); matched POSE's EmSPISlaveSD, or
+    the card's byte stream desyncs.
+  - Needed the SD card type TYPE_SD_CARD_SPI (not TYPE_SD_CARD) for
+    ssi-sd.
+  - Core SD fix (hw/sd/sd.c): the SPI R1 illegal-command bit is built
+    from the sticky card_status ILLEGAL_COMMAND field, which was
+    never cleared — so after PalmOS's SDIO probe (CMD5/52/53, which
+    QEMU marks illegal) every later R1 was poisoned and CMD9 (read
+    CSD) looked like it failed -> "Unrecognized Card".  Now the
+    illegal/CRC bits are cleared at the start of each command, per
+    spec.  This was THE blocker; with it, PalmOS reads the CSD and
+    mounts the volume (130+ block reads observed).
+  - m500 SD image needs a FAT16 filesystem (superfloppy or MBR both
+    work now); PalmOS 4.1 speaks SD v1 (no CMD8), QEMU's v2 card
+    still inits via the first SPI-mode ACMD41.
+
+Note: the m500 digitizer calibration during Setup is timing-flaky to
+drive via scripted taps (unrelated to SD) — the card was verified by
+the SD command trace (mount + block reads), not a launcher
+screenshot.
+
+Still open: HotSync over serial.
 
 ## Journal
 
