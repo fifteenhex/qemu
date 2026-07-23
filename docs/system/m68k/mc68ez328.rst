@@ -1,0 +1,43 @@
+MC68EZ328 development board (``mc68ez328``)
+===========================================
+
+The ``mc68ez328`` machine is a generic development board built around
+the Motorola MC68EZ328 "DragonBall EZ" system-on-chip — the SoC also
+used by the :doc:`palm` machines, which grew out of this board's
+device models.  It is not a model of a specific commercial product;
+it exists to run bare-metal and uClinux-style images against the
+DragonBall peripherals.
+
+Emulated hardware
+-----------------
+
+* 68000 core with the DragonBall's 32-bit address bus.
+* 8MB RAM at 0 (``-m``) and 8MB of flash at 0x10000000, loaded from
+  ``-bios``.
+* The DragonBall on-chip peripherals: PLL, interrupt controller,
+  GPIO, timer, SPI master, UART (console, ``-serial``), LCD
+  controller and RTC.
+* On the SPI bus: a DS1305 RTC and an SD card
+  (``-drive if=sd,format=raw,file=sd.img``).
+
+Running
+-------
+
+::
+
+   qemu-system-m68k -M mc68ez328 -bios image.bin -serial stdio
+
+The reset handler loads the stack pointer from the start of flash and
+jumps to flash + 0x400, i.e. the image is entered at offset 0x400
+rather than through a reset vector — build bare-metal images
+accordingly.
+
+Known limitations
+-----------------
+
+This is a bring-up vehicle rather than a faithful board model: there
+is no chip-select/DRAM-controller emulation (the boot-time dynamic
+memory map is bypassed by the fixed reset scheme above), and the
+peripheral models implement what the Palm machines and test images
+exercise.  For emulating real DragonBall hardware, prefer the
+:doc:`palm` machines.
