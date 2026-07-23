@@ -24,6 +24,8 @@ struct DragonBallSPIState {
 
     ptimer_state *timer;
     bool running;
+    /* clock single bits over the SSI bus instead of bytes */
+    bool bitwise;
 };
 
 #define DRAGONBALL_SPI_REG_SPIMDATA               0x0

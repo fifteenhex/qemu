@@ -13,6 +13,8 @@
 
 #define DATABITS(_s) ((_s->cont & DRAGONBALL_SPI_REG_SPIMCONT_BITCOUNT_MASK) + 1)
 
+static void dragonball_spi_complete(DragonBallSPIState *s);
+
 static void dragonball_spi_reset(DeviceState *d)
 {
     DragonBallSPIState *s = DRAGONBALL_SPI(d);
@@ -45,16 +47,31 @@ static void dragonball_spi_do_transfer(DragonBallSPIState *s)
 
     /*
      * Any count from 1 to 16 bits is allowed (PalmOS uses odd sizes
-     * to talk to the touchscreen ADC).  Shift out MSB-first in byte
-     * chunks, high byte first when there is more than one.
+     * to talk to the touchscreen ADC).
+     *
+     * In bitwise mode every ssi_transfer() call carries a single bit,
+     * MSB first, which preserves the frame alignment for slaves that
+     * hunt for a start bit in the stream (the ADS7843: PalmOS places
+     * the command at bits 14..7 of a frame, which byte chunking would
+     * mangle).  Otherwise transfer byte-wise, high byte first, for
+     * conventional slaves like the SD card or DS1305.
      */
     s->data_in = 0;
-    if (bits > 8) {
-        s->data_in = ssi_transfer(s->spi, (out >> 8) & 0xff);
-        s->data_in <<= 8;
+    if (s->bitwise) {
+        int i;
+
+        for (i = bits - 1; i >= 0; i--) {
+            s->data_in = (s->data_in << 1) |
+                         (ssi_transfer(s->spi, (out >> i) & 1) & 1);
+        }
+    } else {
+        if (bits > 8) {
+            s->data_in = ssi_transfer(s->spi, (out >> 8) & 0xff);
+            s->data_in <<= 8;
+        }
+        s->data_in |= ssi_transfer(s->spi, out & 0xff);
+        s->data_in &= 0xffff >> (16 - bits);
     }
-    s->data_in |= ssi_transfer(s->spi, out & 0xff);
-    s->data_in &= 0xffff >> (16 - bits);
 
     //printf("out: 0x%04x in: 0x%04x (%d bits)\n",
     //        (unsigned) s->data_out, (unsigned) s->data_in, DATABITS(s));
@@ -88,8 +105,22 @@ static void dragonball_spi_write(void *opaque, hwaddr addr,
              if (!(s->cont & DRAGONBALL_SPI_REG_SPIMCONT_ENABLE))
 		break;
              /* Has the XCH bit toggled ? */
-             if(!s->running && (value & DRAGONBALL_SPI_REG_SPIMCONT_XCH))
+             if (value & DRAGONBALL_SPI_REG_SPIMCONT_XCH) {
+                 /*
+                  * The data was exchanged synchronously; only the
+                  * completion flag is delayed.  A new exchange while
+                  * the flag is pending must not be lost — flush the
+                  * old completion and start over, like real silicon
+                  * that is simply clocked by the new request.
+                  */
+                 if (s->running) {
+                     ptimer_transaction_begin(s->timer);
+                     ptimer_stop(s->timer);
+                     ptimer_transaction_commit(s->timer);
+                     dragonball_spi_complete(s);
+                 }
                  dragonball_spi_do_transfer(s);
+             }
         break;
     }
 }
@@ -100,16 +131,19 @@ static const MemoryRegionOps dragonball_spi_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static void dragonball_spi_timer_cb(void *opaque)
+static void dragonball_spi_complete(DragonBallSPIState *s)
 {
-    DragonBallSPIState *s = opaque;
-
     s->running = false;
 
     if (s->cont & DRAGONBALL_SPI_REG_SPIMCONT_IRQEN) {
         s->cont |= DRAGONBALL_SPI_REG_SPIMCONT_IRQ;
         qemu_set_irq(s->irq, 1);
     }
+}
+
+static void dragonball_spi_timer_cb(void *opaque)
+{
+    dragonball_spi_complete(opaque);
 }
 
 static void dragonball_spi_realize(DeviceState *dev, Error **errp)
@@ -126,16 +160,16 @@ static void dragonball_spi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->mmio);
 }
 
-//static const Property dragonball_spi_properties[] = {
-//    DEFINE_PROP_END_OF_LIST(),
-//};
+static const Property dragonball_spi_properties[] = {
+    DEFINE_PROP_BOOL("bitwise", DragonBallSPIState, bitwise, false),
+};
 
 static void dragonball_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-//    device_class_set_props(dc, dragonball_spi_properties);
-    dc->legacy_reset = dragonball_spi_reset;
+    device_class_set_props(dc, dragonball_spi_properties);
+    device_class_set_legacy_reset(dc, dragonball_spi_reset);
     dc->realize = dragonball_spi_realize;
 }
 
