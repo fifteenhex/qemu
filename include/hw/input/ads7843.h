@@ -26,6 +26,10 @@ struct ADS7843State {
     uint16_t y;
     bool pen_down;
 
+    /* board-specific idle levels */
+    uint16_t battery;
+    uint16_t dock;
+
     /* command byte being shifted in */
     uint8_t cmd;
     int cmdbits;

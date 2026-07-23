@@ -28,6 +28,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/input/ads7843.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -65,12 +66,13 @@ static uint16_t ads7843_sample(ADS7843State *s, int channel)
         return s->pen_down ? 0x600 : ADS7843_MAX;
     case ADS7843_CHANNEL_BATT:
         /* a healthy battery, or PalmOS goes straight to sleep */
-        return 0xbd0;
+        return s->battery;
     case ADS7843_CHANNEL_DOCK:
-        /* dock sense: reads 0 when undocked */
-        return 0;
+        /* dock sense; the idle level is board specific */
+        return s->dock;
     default:
-        return 0;
+        /* temperature sensors on some boards */
+        return ADS7843_MAX;
     }
 }
 
@@ -195,10 +197,17 @@ static const VMStateDescription vmstate_ads7843 = {
     }
 };
 
+static const Property ads7843_properties[] = {
+    DEFINE_PROP_UINT16("battery-value", ADS7843State, battery, 0xbd0),
+    DEFINE_PROP_UINT16("dock-value", ADS7843State, dock, 0),
+};
+
 static void ads7843_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+
+    device_class_set_props(dc, ads7843_properties);
 
     k->realize = ads7843_realize;
     k->transfer = ads7843_transfer;
