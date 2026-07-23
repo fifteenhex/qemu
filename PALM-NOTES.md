@@ -279,9 +279,34 @@ VZ facts used (sources: POSE EmRegsVZ*/M68VZ328Hwr.h in
     match), tick-polls the matrix while awake, and tristate-selects
     one row at a time to disambiguate.
 
-Still open for both machines: the SPI1 FIFO unit, 8/16-gray screen
-modes' palette registers (LGPMR is stored but not applied
-per-shade), sound (PWM), watchdog, SD card (m500).
+### 2026-07-20 (still later) — PWM sound + silkscreen taps
+
+  - PWM sound: new hw/audio/dragonball_pwm.c models PWM unit 1 at
+    0xfffff500 as PalmOS uses it — a tone generator whose carrier IS
+    the tone (freq = clk/(presc+1)/(2<<clksel)/(period+2), duty from
+    the sample reg, per POSE DispatchPwmChange).  Synthesizes a
+    square wave into an audio voice.  Enable with
+    `-machine palmv,audiodev=<id> -audiodev <driver>,id=<id>`.
+    Verified with qtest (accel=qtest + writeb to the PWM regs +
+    clock_step, WAV backend): 1kHz/50% and 2kHz/25% carriers come
+    out as matching tones.  NOTE: PalmOS 3.1/4.1 don't play UI click
+    sounds by default (System Sound = alarms only), so you won't
+    hear taps — alarms and SndDoCmd tones are what exercise it.
+    The sample FIFO / DMA path (true PCM) is not modelled, as in POSE.
+  - Silkscreen buttons: the four icons below the LCD
+    (Applications/Menu/Calc/Find) are on the digitizer, not the key
+    matrix.  F7-F10 now inject pen taps on their hotspots via the
+    keypad "silk" outputs into the ADS7843.
+
+Gotcha for testers: audio needs BOTH `-audiodev X,id=snd0` AND
+`-machine palmv,audiodev=snd0` — the device uses the machine's
+audiodev, not a bare -audiodev.  The WAV backend only finalises its
+header on clean exit; a killed capture still has valid PCM after the
+44-byte header (resampled to 44.1kHz stereo s16).
+
+Still open for both machines: the SPI1 FIFO unit, per-shade grey
+palette (LGPMR stored, not applied), watchdog, SD card (m500),
+HotSync over serial.
 
 ## Journal
 
