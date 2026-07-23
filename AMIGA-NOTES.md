@@ -118,8 +118,14 @@ callbacks run inside the timer's transaction).
   (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
+- Zorro: II autoconfig works (hw/m68k/amiga_a2065.c) with the A2065
+  Ethernet card (Am7990 LANCE via QEMU's pcnet core, 32KB onboard
+  RAM, MAC 00:80:10:<serial>).  AmigaOS autoconfigures it at 0xe90000
+  (ConfigDev + CSR0=STOP verified); real TX/RX untested (needs a
+  SANA-II driver + TCP stack, not in stock WB).  Base write is a plain
+  byte to config reg 0x48 (NOT nibble-encoded like the read side).
 - Not modelled: battery clock (RP5C01 at 0xdc0000, currently open
-  bus), Zorro slots.  Floppy: only 880KB DD ADFs.  Disk swap works
+  bus), Zorro III cards.  Floppy: only 880KB DD ADFs.  Disk swap works
   now (blockdev-change-medium device=floppy0 filename=... format=raw
   -> /CHNG latch -> Workbench remounts); needed for the HD install.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit

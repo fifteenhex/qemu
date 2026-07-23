@@ -96,8 +96,9 @@ modelled:
 -  The A3000's Ramsey memory controller and Fat Gary bus glue
    (identification and control registers only).
 
--  Empty Zorro II/III expansion space, reading as open bus so the
-   expansion library sees "no board present".
+-  Zorro II autoconfig, with the Commodore A2065 Ethernet card (an
+   Am7990 LANCE) as an autoconfigured board.  Zorro III config space
+   still reads open bus.
 
 Notably missing: the battery-backed clock and Zorro expansion
 boards.  Kickstart finds attached SCSI
