@@ -157,3 +157,6 @@ config MAC_PVG_PCI
 config DRAGONBALL_LCDC
     bool
     select FRAMEBUFFER
+
+config SED1376
+    bool
