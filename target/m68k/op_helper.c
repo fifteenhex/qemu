@@ -24,6 +24,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "semihosting/semihost.h"
 #include "qemu/plugin.h"
+#include "system/memory.h"
 
 #if !defined(CONFIG_USER_ONLY)
 
@@ -372,7 +373,24 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         }
         env->mmu.fault = true;
         if (!m68k_feature(env, M68K_FEATURE_M68040)) {
-            /* 68020/030 short bus cycle fault, format A */
+            /*
+             * 68020/030 bus cycle fault.  Data faults occur mid
+             * instruction and use the long format B frame (the extra
+             * internal state is not modelled and reads as zero);
+             * instruction faults use the short format A frame.  MacOS
+             * bus-error catchers check the frame format and SSW to
+             * decide whether a fault is recoverable.
+             */
+            bool long_frame = env->mmu.ssw & M68K_SSW_DF_030;
+            int i;
+
+            if (long_frame) {
+                /* version# and internal registers, frame+0x20..0x53 */
+                for (i = 0; i < 15; i++) {
+                    sp -= 4;
+                    cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+                }
+            }
             /* internal registers */
             sp -= 4;
             cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
@@ -398,7 +416,8 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             sp -= 2;
             cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
 
-            do_stack_frame(env, &sp, 0xa, oldsr, 0, env->pc);
+            do_stack_frame(env, &sp, long_frame ? 0xb : 0xa, oldsr, 0,
+                           env->pc);
             env->mmu.fault = false;
             break;
         }
@@ -526,6 +545,27 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
     CPUM68KState *env = cpu_env(cs);
 
     cpu_restore_state(cs, retaddr);
+
+    qemu_log_mask(CPU_LOG_MMU,
+                  "txn fail: phys=%08x addr=%08x size=%u type=%d resp=%d "
+                  "pc=%08x\n", (uint32_t)physaddr, (uint32_t)addr, size,
+                  (int)access_type, (int)response, env->pc);
+    if (qemu_loglevel_mask(CPU_LOG_MMU) && (uint32_t)addr == 0xffffffce) {
+        uint32_t cb4 = address_space_ldl(cs->as, 0xcb4, MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t cb8 = address_space_ldl(cs->as, 0xcb8, MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t ddc = address_space_ldl(cs->as, 0xddc, MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t b10c = address_space_ldl(cs->as, 0x10c, MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t vcb4 = cpu_ldl_be_mmuidx_ra(env, 0xcb4, MMU_KERNEL_IDX, 0);
+
+        qemu_log("  crash state: a0=%08x a1=%08x a4=%08x a5=%08x sp=%08x "
+                 "d0=%08x d1=%08x cb4=%08x vcb4=%08x cb8=%08x ddc=%08x "
+                 "10c=%08x tc030=%08x tt0=%08x tt1=%08x crp=%08x/%08x\n",
+                 env->aregs[0], env->aregs[1], env->aregs[4], env->aregs[5],
+                 env->aregs[7], env->dregs[0], env->dregs[1],
+                 cb4, vcb4, cb8, ddc, b10c, env->mmu.tc030,
+                 env->mmu.tt030[0], env->mmu.tt030[1],
+                 env->mmu.crp030[0], env->mmu.crp030[1]);
+    }
 
     if (m68k_feature(env, M68K_FEATURE_M68040)) {
         env->mmu.mmusr = 0;

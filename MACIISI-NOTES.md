@@ -108,6 +108,56 @@ gdb against the running ROM:
   target/m68k (TT regs, IS shift, early-termination page descriptors,
   short+long formats, WP; flush TLB on pmove/pflush).
 
+### MMU + Egret round (2026-07-20, later)
+
+The rebase onto origin/amiga brought a full 68030 table-walk implementation
+(get_physical_address_030, wired into tlb_fill) from the parallel session.
+Remaining target bugs found & fixed here while chasing the boot:
+
+- **PLOAD decode desync**: pmmu030's PFLUSH/PLOAD case returned without
+  consuming the effective-address extension words — the instruction stream
+  slipped 2 bytes inside SwapMMUMode and executed garbage.  Now gen_lea
+  consumes the EA for PLOAD and the PFLUSH ea-form.
+- **TLB flush on PMOVE**: MMU register writes and PFLUSH now flush the QEMU
+  TLB and end the TB — EXCEPT writes with the FD (flush-disable) bit set:
+  MacOS's SwapMMUMode does PMOVEFD to CRP then PMOVE to TC, deliberately
+  relying on cached translations across the transiently mismatched state.
+- **Format B bus-fault frames**: 030 data faults now push the long format
+  $B frame (84-byte payload, extra internal words zero) instead of format
+  $A; instruction faults keep $A.  The ROM's recoverable-bus-error catcher
+  (vector 2 → 0x40806cb0) checks SSW&0xF1C0==0x140 AND format==$B before
+  resuming at the recovery address — with format A it fell through to
+  SysError 1.  Also the 030 tlb_fill miss path now sets 030-style SSW
+  (DF/RW) instead of 040 bits.
+- SwapMMUMode = ROM 0x40803ed8/0x40803ea0; MMU config blocks live at
+  *(0xDDC)-46 (24-bit, TC=0x80F84500: IS=8 → high byte ignored, TIA=4,
+  TIB=5, PS=32K) and *(0xDDC)-66 (32-bit, TC=0x80F05480: IS=0, TIA=5,
+  TIB=4, TIC=8), pointers cached at lowmem 0xcb4/0xcb8, mode flag 0xcb2.
+  The 32-bit root: 32 long-format descriptors, top entries early-terminated
+  identity (incl. 0xF8000000+ → NuBus/compat identity).
+- **Slot scan**: probes 0xFEFFFFFF down to 0xF1FFFFFF (14 slots) with the
+  bus-error catcher installed via the table at *(0xdb8); empty slots fault
+  and recover to the "absent" path — works now with format B frames.
+- **Egret**: talks via VIA1 shift register, external clock.  Port B pins
+  (active low): PB5=/TIP (host session), PB4=/TACK (host byte ack),
+  PB3=/TREQ (Egret has data).  ROM driver at 0x4080a600-0x4080a7xx is an
+  SR_INT-driven state machine: continuation address saved at glob+312,
+  SR-int dispatch (0x4080a700) re-checks PB3 each byte.  Host sends
+  packet [0x00] (ADB?) then turns ACR to shift-in and expects a response;
+  current model answers [00 00 00] but the ROM only consumes 2 bytes and
+  then re-opens a receive session and polls forever at 0x4080a8e6 — the
+  packet framing/attention semantics still need work (next: check MAME
+  egret.cpp semantics — needs Daniel's OK to fetch — or reverse
+  0x4080a7xx-0x4080a9xx fully).
+- Added VIA1 CA1 60.15Hz VBL tick + CA2 1Hz (mac_via-style); with them the
+  boot services thousands of level-1 interrupts and runs RAM-RESIDENT code
+  (A-line traps from ~0x86d8c0 with the stack up at 0x4008xx) — the OS
+  boot world is executing; video/VDAC still untouched.
+- Debug aids: -icount shift=1 makes the RTC bit-bang delays fast and the
+  boot deterministic; gdb remote needs `set endian big` FIRST or all
+  values appear byte-swapped.  Temporary CPU_LOG_MMU instrumentation in
+  tlb_fill/transaction_failed (left in tree for now).
+
 ### v1 skeleton (2026-07-20)
 
 - hw/m68k/maciisi.c: m68030, ramio container (unbacked reads return 0 for RAM

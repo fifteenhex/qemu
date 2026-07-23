@@ -172,9 +172,12 @@ enum {
 #define TYPE_MOS6522_MACIISI "mos6522-maciisi"
 OBJECT_DECLARE_SIMPLE_TYPE(MOS6522MacIIsiState, MOS6522_MACIISI)
 
+struct MacIIsiMachineState;
+
 struct MOS6522MacIIsiState {
     MOS6522State parent_obj;
 
+    struct MacIIsiMachineState *machine;
     uint8_t pins_a;
     uint8_t pins_b;
     uint8_t last_b;
@@ -347,6 +350,23 @@ static void via1_rtc_update(MOS6522MacIIsiState *v1s)
     v1s->cmd = REG_EMPTY;
 }
 
+/*
+ * Egret handshake lines on VIA1 port B (all active low):
+ *   PB5 out  /SYS_SESSION  host requests a session
+ *   PB4 out  /VIA_FULL     host byte-level handshake
+ *   PB3 in   /XCVR_SESSION driven by the Egret
+ * Data moves through the VIA shift register with the Egret as the
+ * external clock source.
+ */
+#define EGRET_SYS_SESSION  0x20
+#define EGRET_VIA_FULL     0x10
+#define EGRET_XCVR         0x08
+
+static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s);
+static void maciisi_egret_sr_written(MOS6522MacIIsiState *v1s);
+static void maciisi_egret_sr_read(MOS6522MacIIsiState *v1s);
+static void maciisi_egret_acr_changed(MOS6522MacIIsiState *v1s);
+
 static void maciisi_via1_portA_write(MOS6522State *s)
 {
     qemu_log_mask(LOG_UNIMP, "maciisi %s: portA <- 0x%02x (dir 0x%02x)\n",
@@ -356,9 +376,15 @@ static void maciisi_via1_portA_write(MOS6522State *s)
 
 static void maciisi_via1_portB_write(MOS6522State *s)
 {
+    MOS6522MacIIsiState *v1s = MOS6522_MACIISI(s);
+
     qemu_log_mask(LOG_UNIMP, "maciisi %s: portB <- 0x%02x (dir 0x%02x)\n",
                   object_get_canonical_path_component(OBJECT(s)),
                   s->b, s->dirb);
+
+    if (v1s->machine) {
+        maciisi_egret_session_update(v1s);
+    }
 }
 
 static void mos6522_maciisi_init(Object *obj)
@@ -443,6 +469,19 @@ struct MacIIsiMachineState {
     uint8_t rbv_sier;
     uint8_t rbv_via2_regs[16];
     uint8_t vdac_regs[0x40];
+
+    /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
+    QEMUTimer *sixty_hz_timer;
+    QEMUTimer *one_second_timer;
+
+    /* Egret ADB/system MCU on the VIA1 shift register */
+    QEMUTimer *egret_timer;
+    uint8_t egret_cmd[16];
+    int egret_cmd_len;
+    uint8_t egret_resp[16];
+    int egret_resp_len;
+    int egret_resp_idx;
+    bool egret_session;
 };
 
 #define TYPE_MACIISI_MACHINE MACHINE_TYPE_NAME("maciisi")
@@ -604,6 +643,10 @@ static uint64_t maciisi_via1_read(void *opaque, hwaddr addr, unsigned size)
         val = (val & s->dira) | (v1s->pins_a & ~s->dira);
     }
 
+    if (reg == VIA_REG_SR && v1s->machine) {
+        maciisi_egret_sr_read(v1s);
+    }
+
     return val;
 }
 
@@ -620,6 +663,13 @@ static void maciisi_via1_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_log_mask(LOG_UNIMP,
                       "maciisi via1: reg%d <- 0x%02" PRIx64 " pc=0x%08x\n",
                       (int)reg, val, maciisi_trace_pc());
+    }
+
+    if (reg == VIA_REG_SR && v1s->machine) {
+        maciisi_egret_sr_written(v1s);
+    }
+    if (reg == VIA_REG_ACR && v1s->machine) {
+        maciisi_egret_acr_changed(v1s);
     }
 
     if (reg == VIA_REG_B) {
@@ -731,6 +781,190 @@ static const MemoryRegionOps maciisi_rbv_ops = {
         .max_access_size = 1,
     },
 };
+
+/* 60.15Hz VBL tick on CA1 and one-second tick on CA2, as on mac_via */
+
+#define VIA_60HZ_TIMER_PERIOD_NS   16625800
+
+static void maciisi_sixty_hz(void *opaque)
+{
+    MacIIsiMachineState *m = opaque;
+    qemu_irq irq = qdev_get_gpio_in(DEVICE(&m->via1), CA1_INT_BIT);
+
+    qemu_irq_lower(irq);
+    qemu_irq_raise(irq);
+
+    timer_mod(m->sixty_hz_timer,
+              (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+               VIA_60HZ_TIMER_PERIOD_NS) /
+              VIA_60HZ_TIMER_PERIOD_NS * VIA_60HZ_TIMER_PERIOD_NS);
+}
+
+static void maciisi_one_second(void *opaque)
+{
+    MacIIsiMachineState *m = opaque;
+    qemu_irq irq = qdev_get_gpio_in(DEVICE(&m->via1), CA2_INT_BIT);
+
+    qemu_irq_lower(irq);
+    qemu_irq_raise(irq);
+
+    timer_mod(m->one_second_timer,
+              (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000) / 1000 * 1000);
+}
+
+/* Egret microcontroller behaviour (grown empirically against the ROM) */
+
+static void maciisi_egret_set_xcvr(MOS6522MacIIsiState *v1s, bool assert)
+{
+    MOS6522State *s = MOS6522(v1s);
+
+    if (assert) {
+        s->b &= ~EGRET_XCVR;            /* active low */
+    } else {
+        s->b |= EGRET_XCVR;
+    }
+}
+
+static void maciisi_egret_schedule_int(MacIIsiMachineState *m)
+{
+    timer_mod(m->egret_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * 1000);
+}
+
+static void maciisi_egret_timer_cb(void *opaque)
+{
+    MacIIsiMachineState *m = opaque;
+    qemu_irq irq = qdev_get_gpio_in(DEVICE(&m->via1), SR_INT_BIT);
+
+    qemu_set_irq(irq, 1);
+}
+
+static void maciisi_egret_process(MacIIsiMachineState *m)
+{
+    uint8_t *c = m->egret_cmd;
+    int n = m->egret_cmd_len;
+
+    m->egret_resp_len = 0;
+    m->egret_resp_idx = 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "maciisi egret: cmd len=%d [%02x %02x %02x %02x]\n",
+                  n, n > 0 ? c[0] : 0, n > 1 ? c[1] : 0, n > 2 ? c[2] : 0,
+                  n > 3 ? c[3] : 0);
+
+    if (n == 0) {
+        return;
+    }
+
+    switch (c[0]) {
+    case 0x01:                          /* pseudo/system command */
+        m->egret_resp[m->egret_resp_len++] = c[0];
+        m->egret_resp[m->egret_resp_len++] = n > 1 ? c[1] : 0;
+        m->egret_resp[m->egret_resp_len++] = 0;         /* status ok */
+        break;
+    case 0x00:                          /* ADB command */
+        m->egret_resp[m->egret_resp_len++] = c[0];
+        m->egret_resp[m->egret_resp_len++] = 0x00;      /* status ok */
+        m->egret_resp[m->egret_resp_len++] = n > 1 ? c[1] : 0;
+        break;
+    default:
+        m->egret_resp[m->egret_resp_len++] = c[0];
+        break;
+    }
+}
+
+static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
+{
+    MacIIsiMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+    bool sys = !(s->b & EGRET_SYS_SESSION);
+
+    if (sys && !m->egret_session) {
+        m->egret_session = true;
+        m->egret_cmd_len = 0;
+        m->egret_resp_len = 0;
+        maciisi_egret_set_xcvr(v1s, true);
+        /* the ROM preloads the first byte before asserting the session */
+        if (s->acr & SR_OUT) {
+            maciisi_egret_sr_written(v1s);
+        }
+    } else if (!sys && m->egret_session) {
+        m->egret_session = false;
+        maciisi_egret_process(m);
+        if (m->egret_resp_len > 0) {
+            /* Egret turns around and streams the response */
+            maciisi_egret_set_xcvr(v1s, true);
+            s->sr = m->egret_resp[0];
+            m->egret_resp_idx = 1;
+            maciisi_egret_schedule_int(m);
+        } else {
+            maciisi_egret_set_xcvr(v1s, false);
+        }
+    }
+}
+
+static void maciisi_egret_sr_written(MOS6522MacIIsiState *v1s)
+{
+    MacIIsiMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    if (!m->egret_session || !(s->acr & SR_OUT)) {
+        return;
+    }
+    if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
+        m->egret_cmd[m->egret_cmd_len++] = s->sr;
+    }
+    qemu_log_mask(LOG_UNIMP, "maciisi egret: <- 0x%02x (#%d)\n", s->sr,
+                  m->egret_cmd_len);
+    maciisi_egret_schedule_int(m);
+}
+
+static void maciisi_egret_acr_changed(MOS6522MacIIsiState *v1s)
+{
+    MacIIsiMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    /*
+     * The host turns the shifter around to receive while still holding
+     * the session: treat the bytes collected so far as the command and
+     * start streaming the response.
+     */
+    if (m->egret_session && !(s->acr & SR_OUT) && m->egret_resp_len == 0
+        && m->egret_cmd_len > 0) {
+        maciisi_egret_process(m);
+        m->egret_cmd_len = 0;
+        if (m->egret_resp_len > 0) {
+            s->sr = m->egret_resp[0];
+            m->egret_resp_idx = 1;
+            /* TREQ low = more bytes follow the one now in SR */
+            maciisi_egret_set_xcvr(v1s, m->egret_resp_len > 1);
+            maciisi_egret_schedule_int(m);
+        }
+    }
+}
+
+static void maciisi_egret_sr_read(MOS6522MacIIsiState *v1s)
+{
+    MacIIsiMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    if ((s->acr & SR_OUT) || m->egret_resp_len == 0) {
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "maciisi egret: -> 0x%02x (#%d/%d)\n", s->sr,
+                  m->egret_resp_idx, m->egret_resp_len);
+    if (m->egret_resp_idx < m->egret_resp_len) {
+        s->sr = m->egret_resp[m->egret_resp_idx++];
+        /* deassert TREQ along with the final byte */
+        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx < m->egret_resp_len);
+        maciisi_egret_schedule_int(m);
+    } else {
+        /* response fully consumed */
+        m->egret_resp_len = 0;
+        m->egret_resp_idx = 0;
+        maciisi_egret_set_xcvr(v1s, false);
+    }
+}
 
 /*
  * The RBV also emulates a VIA2 at the classic VIA2 site (slice +0x2000):
@@ -971,6 +1205,16 @@ static void maciisi_machine_init(MachineState *machine)
         qemu_get_timedate(&tm, 0);
         m->via1.tick_offset = (uint32_t)mktimegm(&tm) + RTC_OFFSET;
     }
+    m->via1.machine = m;
+    m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
+                                  m);
+    m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_sixty_hz, m);
+    timer_mod(m->sixty_hz_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              VIA_60HZ_TIMER_PERIOD_NS);
+    m->one_second_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, maciisi_one_second,
+                                       m);
+    timer_mod(m->one_second_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
     sysbus_connect_irq(sysbus, 0,
                        qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_VIA1));
     memory_region_init_io(&m->via1mem, OBJECT(machine), &maciisi_via1_ops,
