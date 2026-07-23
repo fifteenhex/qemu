@@ -98,10 +98,9 @@ static void mos8520_ta_hit(void *opaque)
 
     mos8520_post_irq(s, ICR_TA);
     if (s->cra & CR_RUNMODE) {
+        /* the trigger callback runs inside the timer's transaction */
         s->cra &= ~CR_START;
-        ptimer_transaction_begin(s->timer_a);
         ptimer_stop(s->timer_a);
-        ptimer_transaction_commit(s->timer_a);
     }
     /* timer B chained off timer A underflows */
     if ((s->crb & CRB_INMODE_MASK) == CRB_INMODE_TA && (s->crb & CR_START)) {
@@ -121,10 +120,9 @@ static void mos8520_tb_hit(void *opaque)
 
     mos8520_post_irq(s, ICR_TB);
     if (s->crb & CR_RUNMODE) {
+        /* the trigger callback runs inside the timer's transaction */
         s->crb &= ~CR_START;
-        ptimer_transaction_begin(s->timer_b);
         ptimer_stop(s->timer_b);
-        ptimer_transaction_commit(s->timer_b);
     }
 }
 
