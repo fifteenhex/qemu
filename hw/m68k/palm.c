@@ -70,6 +70,7 @@
 #define PALM_MMIO_TIMER2     0xfffff610
 #define PALM_MMIO_SPI        0xfffff800
 #define PALM_MMIO_UART       0xfffff900
+#define PALM_MMIO_UART2      0xfffff910
 #define PALM_MMIO_LCDC       0xfffffa00
 #define PALM_MMIO_RTC        0xfffffb00
 
@@ -260,15 +261,30 @@ static void palm_init(MachineState *machine)
     qdev_connect_gpio_out_named(adc_dev, "penirq", 0,
                                 qdev_get_gpio_in(pen_split, 0));
 
-    /* UART: cradle serial on the EZ devices, IR on the m500 */
+    /*
+     * UART 1: the cradle serial port on the EZ devices, the IR port
+     * on the m500 (whose cradle hangs off UART 2 instead).  The
+     * serial console goes wherever the cradle is.
+     */
     uart_dev = qdev_new(TYPE_DRAGONBALL_UART);
-    qdev_prop_set_chr(uart_dev, "chardev", serial_hd(0));
+    qdev_prop_set_chr(uart_dev, "chardev",
+                      pmc->has_timer2 ? serial_hd(1) : serial_hd(0));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(uart_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(uart_dev), 0, PALM_MMIO_UART);
     qdev_connect_gpio_out_named(uart_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
                                                        DRAGONBALL_INTC_UART));
+    if (pmc->has_timer2) {
+        uart_dev = qdev_new(TYPE_DRAGONBALL_UART);
+        qdev_prop_set_chr(uart_dev, "chardev", serial_hd(0));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(uart_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(uart_dev), 0, PALM_MMIO_UART2);
+        qdev_connect_gpio_out_named(uart_dev, "sysbus-irq", 0,
+                                    qdev_get_gpio_in_named(intc_dev,
+                                                       "peripheral_interrupts",
+                                                       DRAGONBALL_INTC_UART2));
+    }
 
     /* LCDC: 160x160 panel */
     lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
