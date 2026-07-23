@@ -334,6 +334,25 @@ static const MStarRegDefault mstarv7_chipver_defaults[] = {
     { MSTARV7_CHIPVER_REG, MSTARV7_CHIPVER_VALUE },
 };
 
+/*
+ * efuse / OTP config-readback bank (0x1f004000), captured from a real SSD202D
+ * (Miyoo Mini) via contrib/mstarpoker. read_config_word(i) in the IPL reads
+ * MEM16(+lo) | (MEM16(+lo+4) << 16); these words gate and supply the DDR ZQ /
+ * drive-strength calibration and the USB/ETH/MIPI/HDMI analog trims. Only the
+ * non-zero registers are listed (the rest reset to 0). +0x0c is the bank-select
+ * the IPL writes at runtime, so the readback bank just stores it (not seeded).
+ *
+ * Known limitation: the hardware efuse is double-banked (+0x0c bit8 selects
+ * bank 0/1); this single readback bank models only the bank-0 shadow we
+ * captured, so IPL reads of config words >= 8 would see bank-0 data.
+ */
+static const MStarRegDefault mstarv7_efuse_defaults[] = {
+    { 0x014, 0x0809 }, { 0x018, 0xe148 }, { 0x01c, 0x000d },
+    { 0x020, 0x0010 }, { 0x024, 0x0591 }, { 0x028, 0x4210 }, { 0x02c, 0x0f70 },
+    { 0x058, 0x10bd }, { 0x05c, 0x741a }, { 0x060, 0x84d1 },
+    { 0x068, 0x5b65 }, { 0x06c, 0x254a }, { 0x070, 0x4385 }, { 0x074, 0x85cc },
+};
+
 static void mstarv7_soc_init(Object *obj)
 {
     MStarV7SoCState *s = MSTARV7_SOC(obj);
@@ -376,6 +395,11 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "chipver", &s->chipver, TYPE_MSTAR_REGBANK);
     s->chipver.defaults = mstarv7_chipver_defaults;
     s->chipver.num_defaults = ARRAY_SIZE(mstarv7_chipver_defaults);
+    object_initialize_child(obj, "efuse", &s->efuse, TYPE_MSTAR_REGBANK);
+    s->efuse.defaults = mstarv7_efuse_defaults;
+    s->efuse.num_defaults = ARRAY_SIZE(mstarv7_efuse_defaults);
+    s->efuse.base = MSTARV7_EFUSE_BASE;
+    s->efuse.bankname = "efuse";
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         object_initialize_child(obj, "disp-cfg[*]", &s->disp_cfg[i],
                                 TYPE_MSTAR_REGBANK);
@@ -547,6 +571,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->chipver), 0, MSTARV7_CHIPVER_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->efuse), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->efuse), 0, MSTARV7_EFUSE_BASE);
 
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->disp_cfg[i]), errp)) {

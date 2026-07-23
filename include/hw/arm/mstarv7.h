@@ -116,6 +116,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_CHIPVER_BASE    (MSTARV7_RIU_BASE + 0x3c00)
 #define MSTARV7_CHIPVER_REG     0x19c
 #define MSTARV7_CHIPVER_VALUE   0x0100
+/*
+ * The efuse / OTP config-readback bank (RIU bank 0x20, 0x1f004000). The boot
+ * ROM and vendor IPL read it (read_config_word) for the DDR/PHY calibration and
+ * per-board USB/ETH/MIPI/HDMI analog trims. Captured from a real SSD202D via
+ * contrib/mstarpoker; without it these regs read 0 and every trim is skipped.
+ */
+#define MSTARV7_EFUSE_BASE      (MSTARV7_RIU_BASE + 0x4000)
 /* The two HWI2C masters (i2c@223000 and i2c@223200) */
 #define MSTARV7_NUM_I2C         2
 #define MSTARV7_I2C_BASE        (MSTARV7_RIU_BASE + 0x223000)
@@ -280,6 +287,7 @@ struct MStarV7SoCState {
     MStarRegbankState clkgen;
     MStarRegbankState pm_clkgen;
     MStarRegbankState chipver;
+    MStarRegbankState efuse;
     MStarRegbankState disp_cfg[MSTARV7_NUM_DISP_CFG];
     MStarCpupllState cpupll;
     MStarPwmState pwm;
