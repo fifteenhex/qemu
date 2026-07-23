@@ -266,6 +266,9 @@ config MVME147_PCC
 config MVME147_VMECHIP
     bool
 
+config E17_SYSC
+    bool
+
 config MEGADRIVE_EVERDRIVE
     bool
 

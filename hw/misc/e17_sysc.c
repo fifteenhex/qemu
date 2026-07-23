@@ -1,0 +1,398 @@
+/*
+ * ELTEC Eurocom E17 onboard I/O ("system controller" region)
+ *
+ * One device covering the 0xfec00000 window of the Eurocom 17: the
+ * chip select unit, two Z8536 CIOs (POST display, DIP switches,
+ * console select), the RTC/NVRAM, the AT keyboard controller and
+ * stubs for the not-yet-modelled peripherals.  All knowledge here
+ * comes from reverse engineering the RMON 3.1.3 ROM; see E17-NOTES.md
+ * for the evidence.  Register behaviour that RMON does not exercise
+ * is unknown and modelled as plain storage.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/module.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/misc/e17_sysc.h"
+#include "migration/vmstate.h"
+#include "trace.h"
+
+/* Z8536 register numbers used by RMON */
+#define Z8536_MICR          0x00
+#define Z8536_MCCR          0x01
+#define Z8536_PCDDR         0x06
+#define Z8536_PADDR         0x23
+#define Z8536_PBDDR         0x2b
+
+/* AT keyboard controller status bits polled by RMON */
+#define E17_KBC_STAT_OBF    0x01
+#define E17_KBC_STAT_RDY    0x02
+
+#define E17_KBC_CMD_RESET   0xff
+#define E17_KBC_RSP_BAT_OK  0xaa
+
+/* 53C710 registers (native little endian numbering) */
+#define NCR710_SCNTL0       0x00
+#define NCR710_SCNTL0_RESET 0xc0    /* ARB1|ARB0 after reset */
+#define NCR710_DSTAT        0x0c
+#define NCR710_DSTAT_DFE    0x80    /* DMA FIFO empty */
+#define NCR710_ISTAT        0x14
+#define NCR710_ISTAT_SRST   0x40
+
+/*
+ * Chip select controller: reg 0 reads back the region base address,
+ * reg 0xa8 is a status/config register the boot code requires to have
+ * 0x2 in bits 8-11 before it programs the chip select banks.
+ */
+#define E17_CSCTL_BASE_REG  (0x00 / 4)
+#define E17_CSCTL_STATUS    (0xa8 / 4)
+#define E17_CSCTL_STATUS_READY  0x200
+
+#define E17_IO_BASE         0xfec00000
+
+/*
+ * Z8536 CIO.  Control port: first write sets the register pointer,
+ * second writes the register; a read returns the pointed-to register
+ * and resets the pointer state.  Ports A/B/C are data latches; reads
+ * mix the output latch with the input pins according to the data
+ * direction registers (DDR bit set = input).
+ */
+static uint8_t e17_cio_ddr_reg(int port)
+{
+    switch (port) {
+    case E17_CIO_PORTA:
+        return Z8536_PADDR;
+    case E17_CIO_PORTB:
+        return Z8536_PBDDR;
+    default:
+        return Z8536_PCDDR;
+    }
+}
+
+static uint64_t e17_cio_read(E17CIOState *c, hwaddr addr)
+{
+    uint8_t ddr;
+
+    switch (addr) {
+    case E17_CIO_CTRL:
+        c->ctrl_expect_data = false;
+        return c->regs[c->ctrl_ptr];
+    case E17_CIO_PORTA:
+    case E17_CIO_PORTB:
+    case E17_CIO_PORTC:
+        ddr = c->regs[e17_cio_ddr_reg(addr)];
+        return (c->in[addr] & ddr) | (c->out[addr] & ~ddr);
+    }
+    return 0;
+}
+
+static void e17_cio_write(E17CIOState *c, hwaddr addr, uint8_t val)
+{
+    switch (addr) {
+    case E17_CIO_CTRL:
+        if (c->ctrl_expect_data) {
+            c->regs[c->ctrl_ptr] = val;
+            c->ctrl_expect_data = false;
+        } else {
+            c->ctrl_ptr = val & 0x3f;
+            c->ctrl_expect_data = true;
+        }
+        break;
+    case E17_CIO_PORTA:
+    case E17_CIO_PORTB:
+    case E17_CIO_PORTC:
+        c->out[addr] = val;
+        break;
+    }
+}
+
+static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    E17SysCState *s = opaque;
+    hwaddr block = addr & 0x7f000;
+    hwaddr off = addr & 0xfff;
+
+    switch (block) {
+    case E17_SYSC_RTC:
+        /* one byte-wide chip on byte lane 3: register N at N*4+3 */
+        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->rtc_nvram) * 4) {
+            return s->rtc_nvram[off >> 2];
+        }
+        break;
+    case E17_SYSC_DRAMC:
+        if (off == 0xf0 || off == 0xf4) {
+            return s->dramc[(off - 0xf0) / 4];
+        }
+        break;
+    case E17_SYSC_CIO2:
+        return e17_cio_read(&s->cio[1], addr & 3);
+    case E17_SYSC_CIO1:
+        return e17_cio_read(&s->cio[0], addr & 3);
+    case E17_SYSC_SRAM2K:
+        if (off < ARRAY_SIZE(s->sram2k)) {
+            return s->sram2k[off];
+        }
+        break;
+    case E17_SYSC_VID_DAC:
+    case E17_SYSC_VID_CRTC:
+        /*
+         * No video model yet: read as open bus so the RMON probe
+         * fails cleanly and the monitor falls back to the serial
+         * console (POST flag bit 16, "video absent").
+         */
+        return (1ULL << (size * 8)) - 1;
+    case E17_SYSC_ACK:
+        return 0;
+    case E17_SYSC_I2C:
+        /* no IPIN EEPROM: bus reads back released/high */
+        return (1ULL << (size * 8)) - 1;
+    case E17_SYSC_SLAVE:
+        return s->slave_ctl;
+    case E17_SYSC_MISC:
+        return s->misc_5c;
+    case E17_SYSC_CPUTYPE:
+        return s->cputype;
+    case E17_SYSC_KBC:
+        if ((addr & 7) == 0) {
+            s->kbd_status &= ~(E17_KBC_STAT_OBF | E17_KBC_STAT_RDY);
+            return s->kbd_data;
+        } else if ((addr & 7) == 1) {
+            return s->kbd_status;
+        }
+        break;
+    case E17_SYSC_SCSI:
+        /* 53C710 stub; the chip is wired byteswapped within words */
+        if (off < ARRAY_SIZE(s->scsi_regs)) {
+            return s->scsi_regs[(off & ~3) | (3 - (off & 3))];
+        }
+        break;
+    case E17_SYSC_CSCTL:
+        if (off < 0xb0) {
+            if (off / 4 == E17_CSCTL_BASE_REG) {
+                return E17_IO_BASE;
+            }
+            return s->csctl[off / 4];
+        }
+        break;
+    }
+    qemu_log_mask(LOG_UNIMP, "e17-sysc: unimplemented read %u @0x%05"
+                  HWADDR_PRIx "\n", size, addr);
+    return 0;
+}
+
+static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    E17SysCState *s = opaque;
+    hwaddr block = addr & 0x7f000;
+    hwaddr off = addr & 0xfff;
+
+    switch (block) {
+    case E17_SYSC_RTC:
+        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->rtc_nvram) * 4) {
+            s->rtc_nvram[off >> 2] = val;
+            return;
+        }
+        break;
+    case E17_SYSC_DRAMC:
+        if (off == 0xf0 || off == 0xf4) {
+            s->dramc[(off - 0xf0) / 4] = val;
+            return;
+        }
+        break;
+    case E17_SYSC_CIO2:
+        e17_cio_write(&s->cio[1], addr & 3, val);
+        return;
+    case E17_SYSC_CIO1:
+        if ((addr & 3) == E17_CIO_PORTC && val != s->post_code) {
+            /*
+             * Port C drives the POST code display.  The register is
+             * only 4 bits wide on the real chip but RMON writes full
+             * checkpoint bytes; keep them whole for diagnostics.
+             */
+            s->post_code = val;
+            trace_e17_post_code(val);
+        }
+        e17_cio_write(&s->cio[0], addr & 3, val);
+        return;
+    case E17_SYSC_SRAM2K:
+        if (off < ARRAY_SIZE(s->sram2k)) {
+            s->sram2k[off] = val;
+            return;
+        }
+        break;
+    case E17_SYSC_VID_DAC:
+    case E17_SYSC_VID_CRTC:
+    case E17_SYSC_I2C:
+        /* no video / no EEPROM fitted */
+        return;
+    case E17_SYSC_SLAVE:
+        /* 0x20 releases the (absent) secondary CPU */
+        s->slave_ctl = val;
+        return;
+    case E17_SYSC_MISC:
+        s->misc_5c = val;
+        return;
+    case E17_SYSC_CPUTYPE:
+        s->cputype = val;
+        return;
+    case E17_SYSC_KBC:
+        if ((addr & 7) == 0) {
+            if (val == E17_KBC_CMD_RESET) {
+                s->kbd_data = E17_KBC_RSP_BAT_OK;
+                s->kbd_status |= E17_KBC_STAT_OBF | E17_KBC_STAT_RDY;
+            } else {
+                qemu_log_mask(LOG_UNIMP, "e17-sysc: kbd command 0x%02"
+                              PRIx64 "\n", val);
+            }
+            return;
+        }
+        break;
+    case E17_SYSC_SCSI:
+        if (off < ARRAY_SIZE(s->scsi_regs)) {
+            unsigned reg = (off & ~3) | (3 - (off & 3));
+
+            /* software reset self-clears, restoring reset values */
+            if (reg == NCR710_ISTAT && (val & NCR710_ISTAT_SRST)) {
+                s->scsi_regs[NCR710_SCNTL0] = NCR710_SCNTL0_RESET;
+                s->scsi_regs[NCR710_DSTAT] = NCR710_DSTAT_DFE;
+                val = 0;
+            }
+            s->scsi_regs[reg] = val;
+            return;
+        }
+        break;
+    case E17_SYSC_CSCTL:
+        if (off < 0xb0) {
+            s->csctl[off / 4] = val;
+            return;
+        }
+        break;
+    }
+    qemu_log_mask(LOG_UNIMP, "e17-sysc: unimplemented write %u @0x%05"
+                  HWADDR_PRIx " = 0x%" PRIx64 "\n", size, addr, val);
+}
+
+static const MemoryRegionOps e17_sysc_ops = {
+    .read = e17_sysc_read,
+    .write = e17_sysc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void e17_sysc_reset(DeviceState *dev)
+{
+    E17SysCState *s = E17_SYSC(dev);
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        memset(s->cio[i].regs, 0, sizeof(s->cio[i].regs));
+        s->cio[i].ctrl_ptr = 0;
+        s->cio[i].ctrl_expect_data = false;
+        memset(s->cio[i].out, 0, sizeof(s->cio[i].out));
+    }
+    /*
+     * CIO1 port B reads the configuration DIP switches, port A bit 7
+     * a console select input.  All-ones = switches open; tune these
+     * as their meaning becomes known.
+     */
+    s->cio[0].in[E17_CIO_PORTB] = 0xff;
+    s->cio[0].in[E17_CIO_PORTA] = 0x00;
+    s->cio[0].in[E17_CIO_PORTC] = 0x00;
+
+    s->kbd_data = 0;
+    s->kbd_status = 0;
+
+    memset(s->scsi_regs, 0, sizeof(s->scsi_regs));
+    s->scsi_regs[NCR710_SCNTL0] = NCR710_SCNTL0_RESET;
+    s->scsi_regs[NCR710_DSTAT] = NCR710_DSTAT_DFE;
+
+    memset(s->csctl, 0, sizeof(s->csctl));
+    s->csctl[E17_CSCTL_STATUS] = E17_CSCTL_STATUS_READY;
+
+    s->slave_ctl = 0;
+    s->misc_5c = 0;
+    s->cputype = 0;
+    s->post_code = 0;
+    /* rtc_nvram and sram2k are battery backed: not touched on reset */
+}
+
+static void e17_sysc_init(Object *obj)
+{
+    E17SysCState *s = E17_SYSC(obj);
+
+    memory_region_init_io(&s->iomem, obj, &e17_sysc_ops, s, "e17-sysc",
+                          E17_SYSC_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+}
+
+static const VMStateDescription vmstate_e17_cio = {
+    .name = "e17-sysc/cio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(regs, E17CIOState, 64),
+        VMSTATE_UINT8(ctrl_ptr, E17CIOState),
+        VMSTATE_BOOL(ctrl_expect_data, E17CIOState),
+        VMSTATE_UINT8_ARRAY(out, E17CIOState, 3),
+        VMSTATE_UINT8_ARRAY(in, E17CIOState, 3),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_e17_sysc = {
+    .name = "e17-sysc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(cio, E17SysCState, 2, 1, vmstate_e17_cio,
+                             E17CIOState),
+        VMSTATE_UINT8_ARRAY(rtc_nvram, E17SysCState, 256),
+        VMSTATE_UINT8_ARRAY(sram2k, E17SysCState, 0x800),
+        VMSTATE_UINT8(kbd_data, E17SysCState),
+        VMSTATE_UINT8(kbd_status, E17SysCState),
+        VMSTATE_UINT8_ARRAY(scsi_regs, E17SysCState, 0x60),
+        VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),
+        VMSTATE_UINT32_ARRAY(dramc, E17SysCState, 2),
+        VMSTATE_UINT8(slave_ctl, E17SysCState),
+        VMSTATE_UINT8(misc_5c, E17SysCState),
+        VMSTATE_UINT8(cputype, E17SysCState),
+        VMSTATE_UINT8(post_code, E17SysCState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void e17_sysc_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->desc = "ELTEC Eurocom E17 onboard I/O";
+    device_class_set_legacy_reset(dc, e17_sysc_reset);
+    dc->vmsd = &vmstate_e17_sysc;
+}
+
+static const TypeInfo e17_sysc_info = {
+    .name = TYPE_E17_SYSC,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(E17SysCState),
+    .instance_init = e17_sysc_init,
+    .class_init = e17_sysc_class_init,
+};
+
+static void e17_sysc_register_types(void)
+{
+    type_register_static(&e17_sysc_info);
+}
+
+type_init(e17_sysc_register_types)
