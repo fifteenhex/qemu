@@ -27,7 +27,10 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/core/irq.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "hw/char/escc.h"
 #include "hw/misc/mvme147_pcc.h"
 #include "hw/misc/mvme147_vmechip.h"
@@ -123,6 +126,7 @@ static void mvme147_init(MachineState *machine)
     MemoryRegion *rombank2 = g_new(MemoryRegion, 1);
     MemoryRegion *lance_alias = g_new(MemoryRegion, 1);
 
+    DriveInfo *dinfo;
     DeviceState *bbram_dev;
     DeviceState *pcc_dev;
     DeviceState *lance_dev;
@@ -150,8 +154,12 @@ static void mvme147_init(MachineState *machine)
     memory_region_init_rom(rombank2, NULL, "mvme147.rombank2", MVME147_ROM_BANK2_SZ, &error_fatal);
     memory_region_add_subregion(sysmem, MVME147_ROM_BANK2, rombank2);
 
-    /* BBRAM */
+    /* BBRAM, optionally persistent via -drive if=mtd */
     bbram_dev = qdev_new("sysbus-m48t02");
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(bbram_dev, "drive", blk_by_legacy_dinfo(dinfo));
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bbram_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bbram_dev), 0, MVME147_BBRAM);
 
