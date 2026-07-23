@@ -27,6 +27,7 @@
 #include "system/address-spaces.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
+#include "elf.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties-system.h"
@@ -208,6 +209,9 @@ static void e17_init(MachineState *machine)
                             E17_CD2401_BASE, 1);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(serial_dev), 1,
                             E17_CD2401_IACK, 1);
+    /* the CD2401 interrupt line is monitored through VIC068A LICR6 */
+    sysbus_connect_irq(SYS_BUS_DEVICE(serial_dev), 0,
+                       qdev_get_gpio_in_named(sysc_dev, "cd2401-irq", 0));
 }
 
 static void e17_machine_init(MachineClass *mc)

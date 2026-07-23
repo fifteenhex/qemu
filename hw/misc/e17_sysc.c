@@ -118,10 +118,23 @@ static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr off = addr & 0xfff;
 
     switch (block) {
-    case E17_SYSC_RTC:
+    case E17_SYSC_VIC:
+    case E17_SYSC_VIC_MIRR:
         /* one byte-wide chip on byte lane 3: register N at N*4+3 */
-        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->rtc_nvram) * 4) {
-            return s->rtc_nvram[off >> 2];
+        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->vic_regs) * 4) {
+            uint8_t v = s->vic_regs[off >> 2];
+
+            /*
+             * LICR6 monitors the (active low) CD2401 interrupt line:
+             * the STATE bit reads the raw pin level.
+             */
+            if (off == E17_VIC_LICR6) {
+                v &= ~E17_VIC_LICR_STATE;
+                if (!s->cd2401_irq) {
+                    v |= E17_VIC_LICR_STATE;
+                }
+            }
+            return v;
         }
         break;
     case E17_SYSC_DRAMC:
@@ -193,9 +206,10 @@ static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
     hwaddr off = addr & 0xfff;
 
     switch (block) {
-    case E17_SYSC_RTC:
-        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->rtc_nvram) * 4) {
-            s->rtc_nvram[off >> 2] = val;
+    case E17_SYSC_VIC:
+    case E17_SYSC_VIC_MIRR:
+        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->vic_regs) * 4) {
+            s->vic_regs[off >> 2] = val;
             return;
         }
         break;
@@ -328,7 +342,15 @@ static void e17_sysc_reset(DeviceState *dev)
     s->misc_5c = 0;
     s->cputype = 0;
     s->post_code = 0;
-    /* rtc_nvram and sram2k are battery backed: not touched on reset */
+    memset(s->vic_regs, 0, sizeof(s->vic_regs));
+    /* sram2k (the NVRAM/RTC) is battery backed: not touched on reset */
+}
+
+static void e17_sysc_cd2401_irq(void *opaque, int n, int level)
+{
+    E17SysCState *s = E17_SYSC(opaque);
+
+    s->cd2401_irq = level;
 }
 
 static void e17_sysc_init(Object *obj)
@@ -339,6 +361,7 @@ static void e17_sysc_init(Object *obj)
                           E17_SYSC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->slave_run, "slave-run", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), e17_sysc_cd2401_irq, "cd2401-irq", 1);
 }
 
 static const VMStateDescription vmstate_e17_cio = {
@@ -362,7 +385,8 @@ static const VMStateDescription vmstate_e17_sysc = {
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(cio, E17SysCState, 2, 1, vmstate_e17_cio,
                              E17CIOState),
-        VMSTATE_UINT8_ARRAY(rtc_nvram, E17SysCState, 256),
+        VMSTATE_UINT8_ARRAY(vic_regs, E17SysCState, 256),
+        VMSTATE_BOOL(cd2401_irq, E17SysCState),
         VMSTATE_UINT8_ARRAY(sram2k, E17SysCState, 0x800),
         VMSTATE_UINT8(kbd_data, E17SysCState),
         VMSTATE_UINT8(kbd_status, E17SysCState),

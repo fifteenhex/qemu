@@ -18,19 +18,24 @@
 #define TYPE_E17_SYSC "e17-sysc"
 OBJECT_DECLARE_SIMPLE_TYPE(E17SysCState, E17_SYSC)
 
-/* Offsets of the subdevices inside the 0xfec00000 window */
-#define E17_SYSC_RTC       0x01000 /* RTC/NVRAM/watchdog, byte lane 3 */
-#define E17_SYSC_DRAMC     0x08000 /* DRAM controller regs (0xf0/0xf4) */
-#define E17_SYSC_CIO2      0x10000 /* Z8536 CIO #2 */
-#define E17_SYSC_SRAM2K    0x20000 /* small shared RAM, purpose unknown */
-#define E17_SYSC_CIO1      0x30000 /* Z8536 CIO #1 (POST/DIP/console sel) */
+/*
+ * Offsets of the subdevices inside the 0xfec00000 window.  Block
+ * names follow the E17 hardware manual (via the u-boot port); the
+ * register level behaviour is reverse engineered from RMON.
+ */
+#define E17_SYSC_VIC       0x00000 /* VIC068A VMEbus interface ctrl */
+#define E17_SYSC_VIC_MIRR  0x01000 /* ...also decoded here (RMON uses this) */
+#define E17_SYSC_DRAMC     0x08000 /* VMEbus decoder (regs 0xf0/0xf4) */
+#define E17_SYSC_CIO2      0x10000 /* user Z8536 CIO */
+#define E17_SYSC_SRAM2K    0x20000 /* NVRAM/RTC */
+#define E17_SYSC_CIO1      0x30000 /* system Z8536 CIO (POST display/DIP) */
 #define E17_SYSC_VID_DAC   0x40000 /* video RAMDAC + pixel clock PLL */
 #define E17_SYSC_VID_CRTC  0x48000 /* video CRTC */
-#define E17_SYSC_ACK       0x50000 /* read-to-ack status register */
-#define E17_SYSC_I2C       0x54000 /* I2C master (IPIN serial EEPROM) */
+#define E17_SYSC_ACK       0x50000 /* watchdog */
+#define E17_SYSC_I2C       0x54000 /* revision EEPROM / IRQ */
 #define E17_SYSC_SLAVE     0x58000 /* secondary CPU control */
-#define E17_SYSC_MISC      0x5c000 /* unknown byte register */
-#define E17_SYSC_CPUTYPE   0x5e000 /* CPU type latch (1=68040, 4=68060) */
+#define E17_SYSC_MISC      0x5c000 /* slave select */
+#define E17_SYSC_CPUTYPE   0x5e000 /* snoop control (CPU type latch) */
 #define E17_SYSC_KBC       0x60000 /* AT keyboard controller */
 /* 0x64000 CD2401 serial and 0x66000 its IACK port: separate device */
 #define E17_SYSC_LANCE     0x68000 /* Am7990 LANCE (not yet modelled) */
@@ -41,6 +46,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(E17SysCState, E17_SYSC)
 
 /* secondary CPU control register bit */
 #define E17_SYSC_SLAVE_RUN 0x20
+
+/* VIC068A registers (byte offsets; the chip sits on byte lane 3) */
+#define E17_VIC_LICR6      0x3b    /* local interrupt 6: CD2401 IRQ */
+#define E17_VIC_LICR_STATE 0x08    /* raw pin level, interrupts are
+                                      active low so 0 = asserted */
 
 /* Z8536 CIO: A1/A0 wiring is portC/portB/portA/control */
 #define E17_CIO_PORTC      0
@@ -68,8 +78,9 @@ struct E17SysCState {
 
     E17CIOState cio[2];     /* [0] = CIO1 @+0x30000, [1] = CIO2 @+0x10000 */
 
-    uint8_t rtc_nvram[256]; /* RTC/NVRAM chip, one byte per 32bit word */
-    uint8_t sram2k[0x800];
+    uint8_t vic_regs[256];  /* VIC068A, one byte per 32bit word */
+    bool cd2401_irq;        /* level of the CD2401 interrupt line */
+    uint8_t sram2k[0x800];  /* NVRAM/RTC content */
 
     uint8_t kbd_data;       /* AT keyboard controller data register */
     uint8_t kbd_status;
