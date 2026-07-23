@@ -1479,6 +1479,17 @@ static void maciisi_machine_init(MachineState *machine)
         qemu_get_timedate(&tm, 0);
         m->via1.tick_offset = (uint32_t)mktimegm(&tm) + RTC_OFFSET;
     }
+    /*
+     * Seed XPRAM with the validity signature ('NuMc' at 0x0C) and the
+     * 32-bit-addressing flag so the OS does not spend boot rebuilding
+     * an "invalid" PRAM from scratch (observed: full sector 0-7
+     * rewrite cycles, then a 1Hz clock-backup loop at the splash).
+     */
+    m->via1.PRAM[0x0c] = 0x4e;      /* 'N' */
+    m->via1.PRAM[0x0d] = 0x75;      /* 'u' */
+    m->via1.PRAM[0x0e] = 0x4d;      /* 'M' */
+    m->via1.PRAM[0x0f] = 0x63;      /* 'c' */
+    m->via1.PRAM[0x8a] = 0x05;      /* boot 32-bit clean */
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
