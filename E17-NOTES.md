@@ -220,11 +220,10 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
     # rmon.bin: 256KB or the 1MB bitsavers dump, see "Firmware" above
 
 With video fitted (the default) RMON adopts the 800x600 framebuffer
-as its console, so the monitor prompt appears in the QEMU display
-window; serial port 1 is still there (-serial ...).  Keyboard input
-for the video console is NOT modelled yet — for an interactive
-monitor use -nographic (video still probes OK; RMON only switches
-the console to video, output-wise; input handling is the open item).
+as its console and the AT keyboard for input, so the machine is a
+fully interactive monitor in the QEMU display window; serial port 1
+is still there (-serial ...).  With video=off both console
+directions fall back to serial port 1.
 -smp 1 removes the second 68040 ("Secondary CPU : Not installed").
 
 ## Current state (2026-07-20, evening)
@@ -269,8 +268,9 @@ Known issues / next steps, roughly in order:
    below); disk boot now only lacks an OS-9 disk image.
 4. LANCE at 0xfec68000: reuse the existing lance/pcnet core with the
    E17's RDP+2/RAP+6 lane arrangement; MAC PROM nibbles at +0x1d81.
-5. Video (RAMDAC rev 0x3a + CRTC) and the AT keyboard for a console
-   on the framebuffer; VRAM is already mapped at 0x0fc00000.
+5. DONE: video console (e17-vid) and now the AT keyboard too — the
+   framebuffer monitor is fully interactive (see "The AT keyboard"
+   below).  Still open on video: identify the RAMDAC/CRTC chips.
 6. Split the Z8536 out of e17_sysc into a reusable device model.
 7. Secondary CPU: RMON probes for one; find out what a dual-68040
    E17 looks like before modelling anything.
@@ -646,3 +646,33 @@ ROM string addresses to catch prints; -d int shows only real
 exceptions (the hook error prints WITHOUT any logged exception, so
 the "Reserved (1)" report is made up from state, not a taken CPU
 exception).
+
+## The AT keyboard (2026-07-20, night)
+
+The keyboard interface at 0xfec60000 (data +0, status +1) is driven
+by RMON like a raw AT keyboard behind a dumb latch — no 8042-style
+command port, no translation:
+
+- status bit 1 = a scancode/reply byte is waiting (the LED and
+  typematic routines DRAIN the port while it is set); bit 0 =
+  interface ready/present, polled high before commands.
+- reset probe (fe81ac7c): write 0xFF, wait bit 0, wait bit 1, read
+  data until 0xAA (BAT complete) — tolerates the 0xFA ack arriving
+  first.
+- LED update (fe81ad1c): 0xED + LED byte, each expecting 0xFA; the
+  LED shadow lives at DRAM 0x58e8.  Typematic (fe81ae30): 0xF3 +
+  rate byte from the NVRAM config (the SCSI/Keyboard setup menu).
+- reader (fe81af2a): poll bit 1, read the scancode; 0xAA hot-plug
+  re-runs the whole init; everything else goes through the
+  translation object at DRAM 0x3840.  The translation table at ROM
+  fe81b01c is laid out in AT SCAN CODE SET 2 order (0x15='q',
+  0x16='1', 0x1a-0x1e = z s a w 2), i.e. the keyboard talks raw
+  set 2 with F0 break prefixes.
+
+Model: e17-sysc now embeds QEMU's PS2 keyboard core (scan code set
+2, no translation) behind those two registers — the PS2 "irq" line
+is the OBF status bit.  Verified end to end with the QEMU monitor:
+sendkey h/e/l/p/ret against the video console, screendump shows the
+echoed command and the full help screen rendered on the 800x600
+framebuffer.  The machine is now fully interactive in a QEMU
+display window (RMON factory console: video out + AT keyboard in).
