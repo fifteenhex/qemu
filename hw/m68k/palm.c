@@ -47,6 +47,8 @@
 #include "qemu/units.h"
 
 #include "target/m68k/cpu.h"
+#include "hw/core/irq.h"
+#include "hw/core/split-irq.h"
 
 #include "hw/misc/dragonball_pll.h"
 #include "hw/intc/dragonball_intc.h"
@@ -56,6 +58,7 @@
 #include "hw/char/dragonball_uart.h"
 #include "hw/display/dragonball_lcdc.h"
 #include "hw/rtc/dragonball_rtc.h"
+#include "hw/input/ads7843.h"
 
 #define PALM_ROM_BASE        0x10c00000
 #define PALM_ROM_SIZE        (4 * MiB)
@@ -76,6 +79,12 @@
 #define DRAGONBALL_IRQ_UART  2
 #define DRAGONBALL_IRQ_WDT   3
 #define DRAGONBALL_IRQ_RTC   4
+#define DRAGONBALL_IRQ_PEN   20
+
+/* /PENIRQ is also readable as a GPIO: port F bit 1 (low = pen down) */
+#define PALM_PENIRQ_GPIO     (5 * 8 + 1)
+/* /POWERFAIL from the supply supervisor: port G bit 2, low = battery dead */
+#define PALM_POWERFAIL_GPIO  (6 * 8 + 2)
 
 typedef struct PalmMachineState {
     MachineState parent_obj;
@@ -106,7 +115,8 @@ static void palm_init(MachineState *machine)
     PalmMachineState *pms = PALM_MACHINE(machine);
     M68kCPU *cpu;
     DeviceState *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
-                *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev;
+                *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev, *adc_dev,
+                *pen_split;
     MemoryRegion *sysmem = get_system_memory();
     ssize_t size;
 
@@ -161,6 +171,8 @@ static void palm_init(MachineState *machine)
     gpio_dev = qdev_new(TYPE_DRAGONBALL_GPIO);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio_dev), 0, PALM_MMIO_GPIO);
+    /* the battery is always healthy here */
+    qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_POWERFAIL_GPIO));
 
     /* Timer */
     timer_dev = qdev_new(TYPE_DRAGONBALL_TIMER);
@@ -173,12 +185,33 @@ static void palm_init(MachineState *machine)
 
     /* SPI master: the touchscreen ADC lives here on real hardware */
     spi_dev = qdev_new(TYPE_DRAGONBALL_SPI);
+    qdev_prop_set_bit(spi_dev, "bitwise", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(spi_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(spi_dev), 0, PALM_MMIO_SPI);
     qdev_connect_gpio_out_named(spi_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
                                                        DRAGONBALL_IRQ_SPI));
+
+    /*
+     * Touchscreen ADC.  Pen-down asserts the PENIRQ interrupt source
+     * and pulls the /PENIRQ pin (port F bit 1) low — PalmOS polls the
+     * pin state through the GPIO block.
+     */
+    adc_dev = ssi_create_peripheral(
+        (SSIBus *)qdev_get_child_bus(spi_dev, "ssi"), TYPE_ADS7843);
+    pen_split = qdev_new(TYPE_SPLIT_IRQ);
+    qdev_prop_set_uint16(pen_split, "num-lines", 2);
+    qdev_realize_and_unref(pen_split, NULL, &error_fatal);
+    qdev_connect_gpio_out(pen_split, 0,
+                          qdev_get_gpio_in_named(intc_dev,
+                                                 "peripheral_interrupts",
+                                                 DRAGONBALL_IRQ_PEN));
+    qdev_connect_gpio_out(pen_split, 1,
+                          qemu_irq_invert(qdev_get_gpio_in(gpio_dev,
+                                                           PALM_PENIRQ_GPIO)));
+    qdev_connect_gpio_out_named(adc_dev, "penirq", 0,
+                                qdev_get_gpio_in(pen_split, 0));
 
     /* UART: the cradle serial port */
     uart_dev = qdev_new(TYPE_DRAGONBALL_UART);
