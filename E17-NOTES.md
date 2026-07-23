@@ -56,26 +56,33 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
 
 ## 0xfec00000 I/O map
 
-    0xfec01000  RTC/NVRAM/watchdog, byte-wide on byte lane 3 of
-                32-bit words (reg N at N*4+3).  Best guess: Dallas
-                DS1386-style "RAMified watchdog timekeeper" ("SRAM/RTC
-                battery exhausted" + "Watchdog Timer" strings).
-                Init/error paths do: reg 48 (+0xc3) &= 0x3f and
-                reg 10 (+0x2b) = 0x80 (DS1386 command reg, TE bit).
-                Scratch test on reg 54 (+0xdb); +0xaf, +0x77, +0xbb,
-                +0xe7 also accessed.  NVRAM holds the system config
-                (mirrored to/from DRAM 0x800, "system area" 0xdff
-                bytes).
+    0xfec01000  VIC068A VMEbus interface controller (also decoded at
+                0xfec00000), byte-wide on byte lane 3 of 32-bit words
+                (reg N at N*4+3).  The old "DS1386 RTC" guess here was
+                wrong — the real NVRAM/RTC is the M48T02 at 0xfec20000.
+                Init (fe8041f8): regs 9..15 (+0x27..+0x3f) = 0x80
+                (local interrupt control, masked), reg 46 (+0xbb) = 0,
+                scratch test on reg 57 (+0xe7, value 0x55 — VIC
+                presence/variant check), then a table of (value,
+                offset) pairs from the NVRAM config is written out
+                with special-casing for offsets 0xc7/0xcf based on
+                chip-select reg 0xfec700a8 bits 3-4.  LICR6 monitors
+                the CD2401 interrupt line (see the model).
     0xfec080f0  two 32-bit ASIC regs, init 0x000000cc / 0xcccccccc
                 (DRAM refresh/timing? unconfirmed)
     0xfec10000  second Z8536 CIO (control port +3; programmed from a
                 reg/data pair table, 16 pairs, 0xff-terminated — see
                 fe80453c)
-    0xfec20000  byte device: reg 0 read/complement/restore test, reg 4
-                scratch test (flags 0x01000000 / 0x00020000 in d7 on
-                failure).  Also a structured 2KB region (+0x468,
-                +0x5fc, +0x700, +0x7f8) — shared RAM of some kind,
-                function unknown.
+    0xfec20000  M48T02 timekeeper: 2KB battery SRAM with the clock in
+                the top 8 bytes — identified from the OS-9 bootstrap's
+                time-of-day routine, see "The NVRAM/RTC is an M48T02"
+                below.  POST does a reg 0 read/complement/restore test
+                and a reg 4 scratch test (flags 0x01000000/0x00020000
+                in d7 on failure).  Layout: 0x000-0x5fb system config
+                ('we'/'re' copy of DRAM 0x800; inverted 32-bit sum
+                checksum at 0x5fc-0x5ff), +0x468 board ID block,
+                +0x700 OS-9 bootstrap parameter block, +0x7f8 clock
+                registers (ctl/sec/min/hr/dow/date/month/year, BCD).
     0xfec30000  Zilog Z8536 CIO #1.  Standard hookup: +3 control
                 (indexed), +2 port A, +1 port B, +0 port C.
                 Init: PA mode=0, PB mode=0, PA DDR(0x23)=0x80,
@@ -254,11 +261,10 @@ Known issues / next steps, roughly in order:
 1. Boot noise + wrong RAM size — one interlinked problem, partially
    analysed (see "The boot-time hook crash" below for everything
    known).  Continue from there.
-2. NVRAM: `we` at the prompt fixes the "Wrong parameter checksum"
-   warning for the current run; persist the NVRAM (and battery SRAM)
-   via -drive if=mtd like mvme147 so it survives restarts.  Model the
-   RTC time registers (chip still not identified — DS1386-like, byte
-   lane 3).
+2. DONE (except battery SRAM): NVRAM/RTC identified as an M48T02 and
+   modelled with the in-tree sysbus-m48t02, persistent via
+   -drive if=mtd (see "The NVRAM/RTC is an M48T02" below).  Still
+   open: persist the 1MB battery SRAM at 0xfea00000 the same way.
 3. DONE: SCSI modelled (ncr53c720, see "The SCSI chip is a 53C720"
    below); disk boot now only lacks an OS-9 disk image.
 4. LANCE at 0xfec68000: reuse the existing lance/pcnet core with the
@@ -486,6 +492,60 @@ Verified via the RMON CLI (~/e17-re/scsiscan1.py, bootdisk1.py):
 
 Open: which chip errata/registers the LynxOS/OS-9 drivers use once
 an OS runs — SCRIPTS support may become necessary then.
+
+## The NVRAM/RTC is an M48T02 (2026-07-20)
+
+Two stale guesses resolved at once.  The "DS1386 RTC at 0xfec01000"
+entry was wrong twice over: that address is the VIC068A (the 0x80
+writes there are its local interrupt control registers, and the
+"table-driven init" is the VME configuration from NVRAM).  The real
+NVRAM/RTC is the 2KB byte-wide device at 0xfec20000, and the OS-9
+bootstrap identifies it beyond doubt: its time-of-day routine
+(fe83b7d2, in the embedded bootstrap module) does
+
+    or.b  #0x40, (0xfec207f8)   ; control register: set READ latch
+    move.b (0xfec207fb) -> hours   (BCD)
+    move.b (0xfec207fa) -> minutes (BCD)
+    move.b (0xfec207f9) -> seconds (BCD)
+    and.b #~0x40, (0xfec207f8)  ; release the latch
+    -> seconds since midnight
+
+which is exactly the SGS-Thomson/Mostek M48T02 "Timekeeper" — 2KB
+of battery SRAM with control/sec/min/hour/day/date/month/year in
+the top 8 bytes, BCD, READ latch bit 0x40 / WRITE latch bit 0x80 in
+the control byte.  ("SRAM/RTC battery exhausted" refers to this one
+chip, not two devices.)
+
+Also decoded while in there:
+- +0x468: board identification block, written by fe803bb4: 2 bytes
+  + 5 ASCII + 8 bytes (ethernet address material) + 16-bit bytewise
+  sum — the source of the banner's ethernet address / serial number
+  when no IPIN EEPROM answers.
+- +0x700: OS-9 bootstrap parameter block, 16 bytes: 12 data bytes
+  (read/written by fe83b5a0/fe83b6ee; bytes 10-13 hold a 32-bit
+  address validated as >= 0x300000 and 4KB aligned), 16-bit bytewise
+  sum over the first 14 bytes at +0x70e.  Checksum failure prints
+  "Data in battery-backed-up RAM corrupted!".
+
+Model: the machine now instantiates QEMU's sysbus-m48t02 at
+0xfec20000 (replacing the plain-storage block in e17-sysc), so the
+clock runs and the contents can persist:
+
+    -drive if=mtd,format=raw,file=nvram.img     # 2KB raw file
+
+Verified from the RMON CLI (~/e17-re/rtctest1.py, rtcbanner.py):
+`db fec207f8` shows the live clock in BCD matching host UTC
+(00 26 07 08 01 20 07 26 = 08:07:26 Monday 2026-07-20), `we`
+writes the config through to the backing file (checksum fb b3 86
+for the default config, as documented above), and a restart on the
+saved file boots without the "Wrong parameter checksum" warning
+while a blank file shows it once.
+
+Note for scripted runs: with -serial unix:...,server,nowait the
+guest's output before the client's first byte is DROPPED — the
+boot banner is only visible with -serial file:... or if the client
+connects and transmits immediately.  (This is why the driver
+scripts wait for the prompt by sending a CR first.)
 
 ## Netboot plan (for loading u-boot or other payloads)
 
