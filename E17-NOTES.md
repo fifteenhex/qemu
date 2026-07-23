@@ -1093,3 +1093,46 @@ the banner shows revision+serial and a configurable MAC; make the VIC
 register file read back what RMON writes; give fec5e000 the real read
 encoding; seed the M48T02 with the real board-ID defaults.  None are
 required for booting - they are documentation/fidelity items.
+
+## Dual-CPU shared-memory mailbox probe (e17-tools/mboxprobe.py, 2026-07-21)
+
+A probe that loads a tiny payload onto the SECOND CPU and talks to it
+from RMON (CPU1) purely through shared DRAM, to characterise how the
+two 68040s communicate.  Validated in QEMU (-smp 2); the same script
+runs against the real board.  The CPU2 payload (e17-tools/cpu2payload.s)
+is DRAM-only - no I/O, no VMEbus - so it cannot disturb other boards.
+
+Mechanism (this IS the "mailbox" - there is no dedicated hardware one;
+it is shared DRAM + the slave-run register):
+  1. sload the payload; its S-records also set the CPU2 reset vector at
+     physical DRAM 0/4 (SP=0x00010800, PC=0x00010000).  NOTE: the
+     S-record stream needs an S0 header record and CRLF line endings or
+     RMON's sload reports "Transfer complete" but silently loads
+     nothing.
+  2. pulse 0xfec58000: mb 0 (assert slave reset) then mb 0x20 (release).
+     CPU2 comes out of reset, fetches SP/PC from DRAM 0/4 and runs.
+  3. communicate via shared DRAM longwords:
+        0x10100 command   (CPU1 writes with `ml`)
+        0x10104 response  (CPU2 writes = ~command)
+        0x10108 heartbeat (CPU2 increments every loop)
+        0x1010c quit      (CPU1 sets nonzero -> CPU2 STOPs, clean park)
+
+QEMU result (e17-tools/real-board-logs/mboxprobe-qemu-reference.txt):
+  heartbeat advances (0x15dc20 -> 0x2c1fa4 -> ...), command 0x12345678
+  -> response 0xedcba987, command 0xa5a5a5a5 -> 0x5a5a5a5a, and setting
+  the quit flag freezes the heartbeat.  So:
+  - the second CPU boots from a DRAM vector the first CPU plants and
+    runs arbitrary code released via 0xfec58000 (same path RMON's boot
+    probe uses, re-triggerable while CPU2 sits in its trampoline STOP);
+  - the two CPUs exchange data through plain shared DRAM and SEE each
+    other's writes, even though CPU1 runs with caches on and CPU2 comes
+    out of reset with caches off - i.e. the shared-DRAM mailbox is
+    coherent enough in practice (write-through / bus snooping), which is
+    presumably why RMON's own 0x1004 handshake works.
+
+On the real board this resets/restarts CPU2 via 0xfec58000; it is
+DRAM-only and re-parks CPU2 with the quit flag at the end.  Open
+question the real board could answer: whether coherency holds the same
+way on hardware, and whether there is ALSO a hardware mailbox/doorbell
+(e.g. a VIC068A inter-processor interrupt) beyond shared DRAM - the
+probe can be extended to test a VIC IPI once we know it is wanted.
