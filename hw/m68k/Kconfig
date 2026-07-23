@@ -84,12 +84,15 @@ config PALM
     select DRAGONBALL_UART
     select DRAGONBALL_TIMER
     select DRAGONBALL_SPI
+    select DRAGONBALL_SPI1
     select DRAGONBALL_LCDC
     select DRAGONBALL_RTC
     select ADS7843
     select PALM_KEYPAD
     select DRAGONBALL_PWM
     select SPLIT_IRQ
+    select SSI_SD
+    select SD
 
 config MVME147
     bool

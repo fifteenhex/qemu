@@ -63,6 +63,11 @@
 #include "hw/input/ads7843.h"
 #include "hw/input/palm_keypad.h"
 #include "hw/audio/dragonball_pwm.h"
+#include "hw/ssi/dragonball_spi1.h"
+#include "hw/ssi/ssi.h"
+#include "hw/sd/sd.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
@@ -85,6 +90,10 @@
 #define PALM_M500_CARDDET_GPIO (3 * 8 + 5)
 /* m500: AC power sense on port K bit 2, high = not on the charger */
 #define PALM_M500_ACPWR_GPIO   (8 * 8 + 2)
+/* m500: SD card chip select on port J bit 3 (active low) */
+#define PALM_M500_SDCS_GPIO    (7 * 8 + 3)
+
+#define PALM_MMIO_SPI1       0xfffff700
 
 #define EZ_SYSCLK 16580608
 #define VZ_SYSCLK (2 * EZ_SYSCLK)
@@ -321,11 +330,45 @@ static void palm_init(MachineState *machine)
                                                        "peripheral_interrupts",
                                                        DRAGONBALL_INTC_RTC));
 
-    /* board-specific idle pin levels */
+    /* board-specific idle pin levels and the m500 SD slot */
     if (pmc->has_timer2) {
-        /* m500: no SD card inserted, not sitting on the charger */
-        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_CARDDET_GPIO));
+        DeviceState *spi1_dev, *sd_dev;
+        DriveInfo *dinfo;
+
+        /* not sitting on the charger */
         qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_ACPWR_GPIO));
+
+        /* SPI unit 1: the FIFO SPI that carries the SD card */
+        spi1_dev = qdev_new(TYPE_DRAGONBALL_SPI1);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(spi1_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(spi1_dev), 0, PALM_MMIO_SPI1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(spi1_dev), 0,
+                           qdev_get_gpio_in_named(intc_dev,
+                                                  "peripheral_interrupts",
+                                                  DRAGONBALL_INTC_SPI1));
+
+        sd_dev = qdev_new("ssi-sd");
+        ssi_realize_and_unref(sd_dev,
+                              (SSIBus *)qdev_get_child_bus(spi1_dev, "ssi"),
+                              &error_fatal);
+        /* the card chip select is port J bit 3, active low */
+        qdev_connect_gpio_out(gpio_dev, PALM_M500_SDCS_GPIO,
+                              qdev_get_gpio_in_named(sd_dev, SSI_GPIO_CS, 0));
+
+        dinfo = drive_get(IF_SD, 0, 0);
+        if (dinfo) {
+            DeviceState *card;
+
+            card = qdev_new(TYPE_SD_CARD_SPI);
+            qdev_prop_set_drive_err(card, "drive",
+                                    blk_by_legacy_dinfo(dinfo), &error_fatal);
+            qdev_realize_and_unref(card,
+                                   qdev_get_child_bus(sd_dev, "sd-bus"),
+                                   &error_fatal);
+            /* card detect (port D bit 5) reads low when a card is in */
+        } else {
+            qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_CARDDET_GPIO));
+        }
     }
 
     /*
