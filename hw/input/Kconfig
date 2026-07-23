@@ -13,6 +13,10 @@ config PL050
 config PS2
     bool
 
+config ADS7843
+    bool
+    depends on SSI
+
 config STELLARIS_GAMEPAD
     bool
 
