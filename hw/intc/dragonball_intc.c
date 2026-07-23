@@ -66,13 +66,13 @@ static void dragonball_intc_updateirqs(DragonBallINTCState *s)
             if (!irqlevel)
                 irqlevel = 6;
             break;
-        case DRAGONBALL_INTC_SPI1:
+        case DRAGONBALL_INTC_PWM2:
             irqlevel = (s->ilcr >> 4) & 0xf;
             break;
         case DRAGONBALL_INTC_UART2:
             irqlevel = (s->ilcr >> 8) & 0xf;
             break;
-        case DRAGONBALL_INTC_PWM2:
+        case DRAGONBALL_INTC_SPI1:
             irqlevel = (s->ilcr >> 12) & 0xf;
             break;
         default:
@@ -186,7 +186,8 @@ static void dragonball_intc_reset(DeviceState *dev)
     DragonBallINTCState *s = DRAGONBALL_INTC(dev);
 
     s->imr = 0x00ffffff;
-    s->ilcr = 0x5533;
+    /* default levels: SPI1=6, UART2=5, PWM2=3, TMR2=3 */
+    s->ilcr = 0x6533;
     s->cpu_level = 0;
 }
 
