@@ -100,6 +100,8 @@ static void mc68ez328_init(MachineState *machine)
 
     /* CPU init */
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
+    /* the DragonBall's FLX68000 core drives 32 address lines */
+    cpu->env.features &= ~BIT_ULL(M68K_FEATURE_ADDR24);
     qemu_register_reset(main_cpu_reset, cpu);
 
     /* RAM */
