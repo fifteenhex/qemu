@@ -43,6 +43,7 @@ config MAC128K
     select MOS6522
     select ESCC
     select IWM
+    select NCR5380
     select OR_IRQ
     select FRAMEBUFFER
 

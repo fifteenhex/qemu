@@ -43,6 +43,8 @@
 #include "hw/char/escc.h"
 #include "hw/misc/mos6522.h"
 #include "hw/block/iwm.h"
+#include "hw/scsi/ncr5380.h"
+#include "hw/scsi/scsi.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
@@ -59,9 +61,41 @@
 #define MAC128K_ROM_MIRROR    0x100000
 #define MAC128K_ROM_FILENAME  "Mac128K.ROM"
 
+#define MACPLUS_ROM_SIZE      0x20000
+#define MACPLUS_ROM_FILENAME  "macplus_v3.rom"
+
+/*
+ * The Plus decodes the ROM only through the 256KB ROM socket span;
+ * its startup code senses the SCSI hardware by checking that the ROM
+ * does NOT mirror above that (cmpl 0x420000/0x440000 at ROM 0x4003e4:
+ * equal reads mean "512Ke-style decode, no SCSI" and the boot loop
+ * then never scans the bus).
+ */
+#define MACPLUS_ROM_MIRROR    0x40000
+
 #define MAC128K_RAM_WINDOW    0x400000    /* RAM decode, mirrored */
 #define MAC128K_OVL_RAM_BASE  0x600000
 #define MAC128K_OVL_RAM_SIZE  0x200000
+
+/*
+ * Macintosh Plus RAM: two SIMM banks of up to 2MB, bank A at 0 and
+ * bank B at 0x200000, each mirrored through its 2MB half of the RAM
+ * window.  The supported -m sizes are the real SIMM configurations
+ * 1MB (2x512K banks), 2MB, 2.5MB (2MB + 512K) and 4MB.
+ */
+#define MACPLUS_BANK_SIZE     0x200000
+
+/*
+ * Macintosh Plus NCR5380 SCSI.  Register N of the read set decodes at
+ * base + N*16, the write set at base + N*16 + 1 (one memory region
+ * serves both: the low address bits don't reach the chip's A0-A2).
+ * The "DACK" pages at +0x200 move one data byte per access with no
+ * DRQ-gated handshake aperture - the Plus driver polls.
+ */
+#define MACPLUS_SCSI_BASE      0x580000
+#define MACPLUS_SCSI_REG_SHIFT 4
+#define MACPLUS_SCSI_DACK_OFS  0x200
+#define MACPLUS_SCSI_DACK_SIZE 0x200
 
 #define MAC128K_SCC_RD_BASE   0x9ffff8
 #define MAC128K_SCC_WR_BASE   0xbffff8
@@ -466,6 +500,7 @@ struct Mac128kMachineState {
     ESCCState escc;
     OrIRQState escc_orgate;
     IWMState iwm;
+    NCR5380State scsi;          /* macplus only */
     Mac128kFbState fb;
 
     MemoryRegion rom;
@@ -476,6 +511,7 @@ struct Mac128kMachineState {
     MemoryRegion open_bus;
     MemoryRegion viamem;
     MemoryRegion sccwr;
+    MemoryRegion scsi_dack;
 
     bool overlay;
     bool sel_line;
@@ -494,14 +530,33 @@ struct Mac128kMachineState {
     bool mouse_y1;
 };
 
+/*
+ * The board variants: the 512K is the 128K with more RAM; the Plus
+ * adds the 128KB v3 ROM, SIMM sockets, SCSI and the 800K drive.
+ */
+struct Mac128kMachineClass {
+    MachineClass parent_class;
+
+    uint32_t rom_size;
+    uint32_t rom_mirror;        /* span the ROM repeats through */
+    const char *rom_filename;
+    bool has_scsi;              /* NCR5380 at 0x580000 */
+    bool ds_floppy;             /* 800K double-sided Sony drive */
+    bool banked_ram;            /* Plus-style SIMM banks */
+};
+
 #define TYPE_MAC128K_MACHINE MACHINE_TYPE_NAME("mac128k")
-OBJECT_DECLARE_SIMPLE_TYPE(Mac128kMachineState, MAC128K_MACHINE)
+OBJECT_DECLARE_TYPE(Mac128kMachineState, Mac128kMachineClass, MAC128K_MACHINE)
+
+static uint32_t mac128k_trace_pc(void);
 
 static void mac128k_set_overlay(Mac128kMachineState *m, bool overlay)
 {
     if (overlay == m->overlay) {
         return;
     }
+    qemu_log_mask(LOG_UNIMP, "mac128k: overlay -> %d pc=0x%06x\n",
+                  overlay, mac128k_trace_pc());
     m->overlay = overlay;
     memory_region_set_enabled(&m->overlay_rom, overlay);
     memory_region_set_enabled(&m->overlay_ram, overlay);
@@ -558,8 +613,14 @@ static uint64_t mac128k_via_read(void *opaque, hwaddr addr, unsigned size)
 {
     MOS6522State *s = opaque;
     hwaddr reg = (addr >> VIA_SPACING_SHIFT) & 0xf;
+    uint64_t val = mos6522_read(s, reg, size);
 
-    return mos6522_read(s, reg, size);
+    /* port A pins configured as inputs read as pulled up */
+    if (reg == VIA_REG_A || reg == VIA_REG_ANH) {
+        val |= ~s->dira & 0xff;
+    }
+
+    return val;
 }
 
 static void mac128k_via_write(void *opaque, hwaddr addr, uint64_t val,
@@ -570,6 +631,19 @@ static void mac128k_via_write(void *opaque, hwaddr addr, uint64_t val,
     hwaddr reg = (addr >> VIA_SPACING_SHIFT) & 0xf;
 
     mos6522_write(s, reg, val, size);
+
+    /*
+     * The 6522 output register stores ALL written bits; DDRA only
+     * gates which pins are driven (mos6522.c masks the write by the
+     * DDR, but the Mac Plus ROM writes its port A value BEFORE
+     * pointing DDRA at the outputs and relies on the latch).
+     */
+    if (reg == VIA_REG_A || reg == VIA_REG_ANH) {
+        s->a = val;
+        if (v1s->machine) {
+            mac128k_via_portA_update(v1s->machine);
+        }
+    }
 
     /* DDR changes move the pulled-up input pins too */
     if (reg == VIA_REG_DIRA && v1s->machine) {
@@ -609,6 +683,42 @@ static const MemoryRegionOps mac128k_sccwr_ops = {
     .write = mac128k_sccwr_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+/*
+ * Macintosh Plus SCSI "DACK" pages: each access moves one byte
+ * to/from the current SCSI data phase, with no DRQ handshake (the
+ * Plus driver paces itself by polling the 5380's DRQ status bit).
+ */
+
+static uint64_t macplus_scsi_dack_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    return ncr5380_pdma_read(opaque);
+}
+
+static void macplus_scsi_dack_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
+{
+    ncr5380_pdma_write(opaque, val);
+}
+
+static const MemoryRegionOps macplus_scsi_dack_ops = {
+    .read = macplus_scsi_dack_read,
+    .write = macplus_scsi_dack_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    /*
+     * The driver moves data with word instructions too; let the memory
+     * core split them into one SCSI byte per byte lane, MSB first.
+     */
+    .impl = {
         .min_access_size = 1,
         .max_access_size = 1,
     },
@@ -803,18 +913,27 @@ static void main_cpu_reset(void *opaque)
 static void mac128k_machine_init(MachineState *machine)
 {
     Mac128kMachineState *m = MAC128K_MACHINE(machine);
+    Mac128kMachineClass *mmc = MAC128K_MACHINE_GET_CLASS(machine);
     MemoryRegion *sysmem = get_system_memory();
     ram_addr_t ram_size = machine->ram_size;
-    const char *bios_name = machine->firmware ?: MAC128K_ROM_FILENAME;
+    const char *bios_name = machine->firmware ?: mmc->rom_filename;
     char *filename;
     int bios_size;
     unsigned i, n;
+    uint64_t ovl_chunk;
     DriveInfo *dinfo;
     DeviceState *dev;
     SysBusDevice *sysbus;
 
-    if (ram_size < 128 * KiB || ram_size > MAC128K_RAM_WINDOW ||
-        !is_power_of_2(ram_size)) {
+    if (mmc->banked_ram) {
+        /* the SIMM configurations the Plus ROM's bank sizing knows */
+        if (ram_size != 1 * MiB && ram_size != 2 * MiB &&
+            ram_size != 2 * MiB + 512 * KiB && ram_size != 4 * MiB) {
+            error_report("RAM size must be 1M, 2M, 2.5M or 4M");
+            exit(1);
+        }
+    } else if (ram_size < 128 * KiB || ram_size > MAC128K_RAM_WINDOW ||
+               !is_power_of_2(ram_size)) {
         error_report("RAM size must be a power of two between 128K and 4M");
         exit(1);
     }
@@ -831,34 +950,53 @@ static void mac128k_machine_init(MachineState *machine)
     memory_region_add_subregion_overlap(sysmem, 0, &m->open_bus, -2);
 
     /*
-     * RAM: the 128KB mirrors through the whole 4MB RAM window (the ROM
-     * sizes memory by looking for the wrap-around).
+     * RAM mirrors through the whole 4MB RAM window (the ROM sizes
+     * memory by looking for the wrap-around).  Power-of-two sizes
+     * mirror the whole bank; the Plus's 2.5MB configuration is a full
+     * 2MB bank A plus a 512K bank B mirrored through the second bank's
+     * 2MB half of the window.
      */
     memory_region_init(&m->ram_mirrors, OBJECT(machine),
                        "mac128k.ram-mirrors", MAC128K_RAM_WINDOW);
-    n = MAC128K_RAM_WINDOW / ram_size;
     memory_region_add_subregion(&m->ram_mirrors, 0, machine->ram);
-    for (i = 1; i < n; i++) {
-        MemoryRegion *alias = g_new(MemoryRegion, 1);
+    if (is_power_of_2(ram_size)) {
+        n = MAC128K_RAM_WINDOW / ram_size;
+        for (i = 1; i < n; i++) {
+            MemoryRegion *alias = g_new(MemoryRegion, 1);
 
-        memory_region_init_alias(alias, OBJECT(machine), "mac128k.ram-alias",
-                                 machine->ram, 0, ram_size);
-        memory_region_add_subregion(&m->ram_mirrors, i * ram_size, alias);
+            memory_region_init_alias(alias, OBJECT(machine),
+                                     "mac128k.ram-alias",
+                                     machine->ram, 0, ram_size);
+            memory_region_add_subregion(&m->ram_mirrors, i * ram_size, alias);
+        }
+    } else {
+        /* 2.5MB: mirror the 512K bank B through 0x280000..0x3FFFFF */
+        uint64_t bank_b = ram_size - MACPLUS_BANK_SIZE;
+
+        for (i = 1; i < MACPLUS_BANK_SIZE / bank_b; i++) {
+            MemoryRegion *alias = g_new(MemoryRegion, 1);
+
+            memory_region_init_alias(alias, OBJECT(machine),
+                                     "mac128k.ram-alias",
+                                     machine->ram, MACPLUS_BANK_SIZE, bank_b);
+            memory_region_add_subregion(&m->ram_mirrors,
+                                        MACPLUS_BANK_SIZE + i * bank_b, alias);
+        }
     }
     memory_region_add_subregion(sysmem, 0, &m->ram_mirrors);
 
     /* ROM, mirrored through its 1MB block */
-    memory_region_init_rom(&m->rom, NULL, "mac128k.rom", MAC128K_ROM_SIZE,
+    memory_region_init_rom(&m->rom, NULL, "mac128k.rom", mmc->rom_size,
                            &error_abort);
     memory_region_init(&m->rom_mirrors, OBJECT(machine),
-                       "mac128k.rom-mirrors", MAC128K_ROM_MIRROR);
+                       "mac128k.rom-mirrors", mmc->rom_mirror);
     memory_region_add_subregion(&m->rom_mirrors, 0, &m->rom);
-    for (i = 1; i < MAC128K_ROM_MIRROR / MAC128K_ROM_SIZE; i++) {
+    for (i = 1; i < mmc->rom_mirror / mmc->rom_size; i++) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
 
         memory_region_init_alias(alias, OBJECT(machine), "mac128k.rom-alias",
-                                 &m->rom, 0, MAC128K_ROM_SIZE);
-        memory_region_add_subregion(&m->rom_mirrors, i * MAC128K_ROM_SIZE,
+                                 &m->rom, 0, mmc->rom_size);
+        memory_region_add_subregion(&m->rom_mirrors, i * mmc->rom_size,
                                     alias);
     }
     memory_region_add_subregion(sysmem, MAC128K_ROM_ADDR, &m->rom_mirrors);
@@ -866,18 +1004,24 @@ static void mac128k_machine_init(MachineState *machine)
     /* the overlay: ROM at 0 and RAM at 0x600000 until PA4 is cleared */
     memory_region_init_alias(&m->overlay_rom, OBJECT(machine),
                              "mac128k.overlay-rom", &m->rom_mirrors, 0,
-                             MAC128K_ROM_MIRROR);
+                             mmc->rom_mirror);
     memory_region_add_subregion_overlap(sysmem, 0, &m->overlay_rom, 1);
 
+    /*
+     * The overlay RAM window is 2MB; RAM beyond that (Plus 2.5/4MB
+     * configurations) shows only its first 2MB there, which is all the
+     * ROM touches before clearing the overlay.
+     */
+    ovl_chunk = MIN(ram_size, MAC128K_OVL_RAM_SIZE);
     memory_region_init(&m->overlay_ram, OBJECT(machine),
                        "mac128k.overlay-ram", MAC128K_OVL_RAM_SIZE);
-    for (i = 0; i < MAC128K_OVL_RAM_SIZE / ram_size; i++) {
+    for (i = 0; i < MAC128K_OVL_RAM_SIZE / ovl_chunk; i++) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
 
         memory_region_init_alias(alias, OBJECT(machine),
                                  "mac128k.overlay-ram-alias",
-                                 machine->ram, 0, ram_size);
-        memory_region_add_subregion(&m->overlay_ram, i * ram_size, alias);
+                                 machine->ram, 0, ovl_chunk);
+        memory_region_add_subregion(&m->overlay_ram, i * ovl_chunk, alias);
     }
     memory_region_add_subregion(sysmem, MAC128K_OVL_RAM_BASE,
                                 &m->overlay_ram);
@@ -951,8 +1095,9 @@ static void mac128k_machine_init(MachineState *machine)
                           "scc-wr", 8);
     memory_region_add_subregion(sysmem, MAC128K_SCC_WR_BASE, &m->sccwr);
 
-    /* IWM + the internal Sony 400K drive */
+    /* IWM + the internal Sony drive (400K, or 800K on the Plus) */
     object_initialize_child(OBJECT(machine), "iwm", &m->iwm, TYPE_IWM);
+    qdev_prop_set_bit(DEVICE(&m->iwm), "double-sided", mmc->ds_floppy);
     dinfo = drive_get(IF_FLOPPY, 0, 0);
     if (dinfo) {
         qdev_prop_set_drive(DEVICE(&m->iwm), "drive",
@@ -972,6 +1117,25 @@ static void mac128k_machine_init(MachineState *machine)
                      memory_region_get_ram_ptr(machine->ram) +
                      ram_size - 0x300 + 1;
 
+    /* SCSI (Macintosh Plus): polled NCR5380, interrupt line unused */
+    if (mmc->has_scsi) {
+        object_initialize_child(OBJECT(machine), "scsi", &m->scsi,
+                                TYPE_NCR5380);
+        qdev_prop_set_uint8(DEVICE(&m->scsi), "reg-shift",
+                            MACPLUS_SCSI_REG_SHIFT);
+        sysbus = SYS_BUS_DEVICE(&m->scsi);
+        sysbus_realize(sysbus, &error_fatal);
+        memory_region_add_subregion(sysmem, MACPLUS_SCSI_BASE,
+                                    sysbus_mmio_get_region(sysbus, 0));
+        memory_region_init_io(&m->scsi_dack, OBJECT(machine),
+                              &macplus_scsi_dack_ops, &m->scsi, "scsi-dack",
+                              MACPLUS_SCSI_DACK_SIZE);
+        memory_region_add_subregion(sysmem,
+                                    MACPLUS_SCSI_BASE + MACPLUS_SCSI_DACK_OFS,
+                                    &m->scsi_dack);
+        scsi_bus_legacy_handle_cmdline(&m->scsi.bus);
+    }
+
     /* video */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MAC128K_FB);
     m->fb.ram = machine->ram;
@@ -988,7 +1152,7 @@ static void mac128k_machine_init(MachineState *machine)
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
         bios_size = load_image_targphys(filename, MAC128K_ROM_ADDR,
-                                        MAC128K_ROM_SIZE, NULL);
+                                        mmc->rom_size, NULL);
         g_free(filename);
     } else {
         bios_size = -1;
@@ -996,7 +1160,7 @@ static void mac128k_machine_init(MachineState *machine)
     if (!qtest_enabled()) {
         uint8_t *ptr;
 
-        if (bios_size <= 0 || bios_size > MAC128K_ROM_SIZE) {
+        if (bios_size <= 0 || bios_size > mmc->rom_size) {
             error_report("could not load Macintosh ROM '%s'", bios_name);
             exit(1);
         }
@@ -1016,6 +1180,7 @@ static void mac128k_machine_class_init(ObjectClass *oc, const void *data)
         NULL
     };
     MachineClass *mc = MACHINE_CLASS(oc);
+    Mac128kMachineClass *mmc = MAC128K_MACHINE_CLASS(oc);
 
     mc->desc = "Apple Macintosh 128K";
     mc->init = mac128k_machine_init;
@@ -1025,6 +1190,43 @@ static void mac128k_machine_class_init(ObjectClass *oc, const void *data)
     mc->block_default_type = IF_FLOPPY;
     mc->default_ram_size = 128 * KiB;
     mc->default_ram_id = "mac128k.ram";
+    mmc->rom_size = MAC128K_ROM_SIZE;
+    mmc->rom_mirror = MAC128K_ROM_MIRROR;
+    mmc->rom_filename = MAC128K_ROM_FILENAME;
+}
+
+/*
+ * The Macintosh 512K is the same board with more RAM soldered on: the
+ * screen and sound buffers move up with the RAM top (already computed
+ * from ram_size), everything else is identical.
+ */
+static void mac512k_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Apple Macintosh 512K";
+    mc->default_ram_size = 512 * KiB;
+}
+
+/*
+ * The Macintosh Plus: 128KB v3 ROM, SIMM sockets for up to 4MB RAM,
+ * the NCR5380 SCSI port and the 800K double-sided floppy drive on the
+ * same VIA/SCC/IWM core.
+ */
+static void macplus_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    Mac128kMachineClass *mmc = MAC128K_MACHINE_CLASS(oc);
+
+    mc->desc = "Apple Macintosh Plus";
+    mc->block_default_type = IF_SCSI;
+    mc->default_ram_size = 4 * MiB;
+    mmc->rom_size = MACPLUS_ROM_SIZE;
+    mmc->rom_mirror = MACPLUS_ROM_MIRROR;
+    mmc->rom_filename = MACPLUS_ROM_FILENAME;
+    mmc->has_scsi = true;
+    mmc->ds_floppy = true;
+    mmc->banked_ram = true;
 }
 
 static const TypeInfo mac128k_machine_typeinfo[] = {
@@ -1052,7 +1254,18 @@ static const TypeInfo mac128k_machine_typeinfo[] = {
         .name       = TYPE_MAC128K_MACHINE,
         .parent     = TYPE_MACHINE,
         .instance_size = sizeof(Mac128kMachineState),
+        .class_size = sizeof(Mac128kMachineClass),
         .class_init = mac128k_machine_class_init,
+    },
+    {
+        .name       = MACHINE_TYPE_NAME("mac512k"),
+        .parent     = TYPE_MAC128K_MACHINE,
+        .class_init = mac512k_machine_class_init,
+    },
+    {
+        .name       = MACHINE_TYPE_NAME("macplus"),
+        .parent     = TYPE_MAC128K_MACHINE,
+        .class_init = macplus_machine_class_init,
     },
 };
 
