@@ -113,9 +113,9 @@ callbacks run inside the timer's transaction).
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
 - Not modelled: battery clock (RP5C01 at 0xdc0000, currently open
-  bus), Zorro slots.  Floppy: no disk change/eject at runtime yet
-  (fixed media; two-disk games can put disk 2 in DF1 instead), only
-  880KB DD ADFs.
+  bus), Zorro slots.  Floppy: only 880KB DD ADFs.  Disk swap works
+  now (blockdev-change-medium device=floppy0 filename=... format=raw
+  -> /CHNG latch -> Workbench remounts); needed for the HD install.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 

@@ -68,7 +68,9 @@ modelled:
    drive).  Reads encode the track into standard AmigaDOS MFM on the
    fly (both trackdisk.device and custom trackloaders work), writes
    decode it back into the image.  External drive detection through
-   the drive ID shifter works, so DF1 is bootable too.
+   the drive ID shifter works, so DF1 is bootable too.  Disks can be
+   swapped at runtime (``blockdev-change-medium``); the drive latches
+   /CHNG so trackdisk.device notices.
 
 -  A mouse in gameport 0: counters in JOY0DAT, left button on CIA-A
    PA6, right button on the POTGOR Y line.
