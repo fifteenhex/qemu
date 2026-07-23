@@ -148,6 +148,8 @@ config AMIGA
     select PCNET_COMMON
     select WD33C93
     select IDE_GAYLE
+    select BITBANG_I2C
+    select AT24C
 
 config ATARIST
     bool
