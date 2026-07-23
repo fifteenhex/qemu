@@ -202,9 +202,62 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
    floppy controller location (TEAC FC-1 strings — maybe via the
    SCSI/Keyboard interface µC?).
 
-## Current state (2026-07-20)
+## Running it
 
-RE pass over the boot path complete; I/O map above.  No QEMU code
-yet — next step is the machine skeleton (hw/m68k/e17.c).
+    qemu-system-m68k -M e17 -bios rmon.bin -nographic
+    # rmon.bin: 256KB or the 1MB bitsavers dump, see "Firmware" above
+
+## Current state (2026-07-20, evening)
+
+RMON 3.1.3 boots to a fully interactive monitor prompt on serial
+port 1 (CD2401 channel 0): banner, help, memory display, setup menus
+all work.  POST runs clean through all checkpoints (watch with
+-trace e17_post_code).
+
+Code so far:
+- hw/m68k/e17.c — machine (68040, memory map per this file)
+- hw/misc/e17_sysc.c — everything in the 0xfec00000 window except
+  the CD2401: CS controller, 2x Z8536, RTC/NVRAM as plain storage,
+  AT kbd self test, 53C710 probe stub, video absent (open bus reads
+  make RMON fall back to the serial console)
+- hw/char/cd2401.c — async subset: CAR banking, CCR commands
+  complete instantly, polled interrupt dispatch via the 0xfec660fb
+  acknowledge byte (LIVR | type), TDR/TFTC/RFOC/RDR/EOI in service
+  context
+- target/m68k/helper.c — movec to PCR/BUSCR now raises the illegal
+  instruction exception on non-060 CPUs (RMON's CPU-type probe)
+
+Things learned while bringing it up:
+- machine-init qemu_register_reset handlers run BEFORE ROM blobs are
+  copied into their regions (rom_check_and_register_reset runs after
+  machine init), so the e17 reset hook takes SP/PC from the ROM file,
+  not guest memory.
+- CD2401 CCR (0x13): firmware polls it until the chip clears it —
+  commands must complete.
+- RMON programs LIVR = 0x50 | channel << 2; the acknowledge byte at
+  0xfec660fb is LIVR with the interrupt type in bits 1:0.
+
+Known issues / next steps, roughly in order:
+1. "RAM available : 65535 MBytes": the firmware sizes DRAM by writing
+   at 1MB steps expecting a bus error past the end; accesses beyond
+   -m size need to fault (map a bus-error region or check the
+   transaction-failed path) so sizing terminates.
+2. "### Error in hook initialization routine" + one bus error at a
+   garbage address + "Wrong parameter checksum": fresh/empty NVRAM.
+   Understand the NVRAM layout (config block checksummed at 0x800 in
+   DRAM, "system area" 0xdff bytes), consider persisting via
+   -drive if=mtd like mvme147, and model the RTC time registers
+   (chip still not identified — DS1386-like, byte lane 3).
+3. Real 53C710 model for SCSI disk boot ("boot" command, LynxOS),
+   or port/extend an existing 53c9x-family model — QEMU has none for
+   the 710.
+4. LANCE at 0xfec68000: reuse the existing lance/pcnet core with the
+   E17's RDP+2/RAP+6 lane arrangement; MAC PROM nibbles at +0x1d81.
+5. Video (RAMDAC rev 0x3a + CRTC) and the AT keyboard for a console
+   on the framebuffer; VRAM is already mapped at 0x0fc00000.
+6. Split the Z8536 out of e17_sysc into a reusable device model.
+7. Secondary CPU: RMON probes for one; find out what a dual-68040
+   E17 looks like before modelling anything.
+
 NOTE: another session is working on this same branch — always
 `git pull --rebase` before pushing.
