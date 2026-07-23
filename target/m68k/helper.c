@@ -1046,8 +1046,20 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
     }
 
     /* whatever address bits the index fields did not consume are offset */
-    *page_size = 1u << shift;
-    *physical = (table & ~(*page_size - 1)) | (address & (*page_size - 1));
+    if (shift >= 32) {
+        /*
+         * Early termination in the root pointer with IS=0: one "page"
+         * spans the whole 4G space and the descriptor address is added
+         * to the full logical address (147Bug's MMU register test uses
+         * this as an identity map while the test patterns are live).
+         * 1u << 32 is undefined C, so special-case it.
+         */
+        *physical = table + address;
+        *page_size = TARGET_PAGE_SIZE;
+    } else {
+        *page_size = 1u << shift;
+        *physical = (table & ~(*page_size - 1)) | (address & (*page_size - 1));
+    }
     *prot = PAGE_READ | PAGE_EXEC;
     if (!wp) {
         *prot |= PAGE_WRITE;
