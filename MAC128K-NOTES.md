@@ -174,7 +174,123 @@ Known gaps / shortcuts (documented in the code):
   Finder cannot save to floppy (fine for locked-floppy boots).
 - Eject auto-reinserts after 1s whenever the image stays attached - a
   Finder-menu Eject puts the disk back in shortly after.
-- Keyboard not modelled (the ROM's model query times out harmlessly).
 - Sound not modelled (the PWM bytes only feed the drive speed).
 - The IWM data path ignores bit-level timing (always-valid bytes,
   position advances per read); writes are logged and dropped.
+
+## MAC512K + MACPLUS (2026-07-23)
+
+Extended the machine file into a small family: a Mac128kMachineClass
+carries the per-variant knobs (ROM size / mirror span / filename,
+SCSI present, 800K drive, SIMM-bank RAM rules).  `mac512k` and
+`macplus` are subtypes of the `mac128k` machine type.
+
+### mac512k — milestone (a)
+
+Trivial: same 64K ROM, `default_ram_size = 512K`.  The screen/sound
+buffers already track ram_top via ram_size, so nothing else changed.
+Boots System 1.1 to the Finder identically to mac128k
+(/tmp/macfam-reg-512.png).
+
+### macplus
+
+Hardware deltas from the 128K, each verified against the v3 ROM:
+
+- **ROM**: 128KB v3 "Loud Harmonicas" (checksum 4D1F8172) at
+  0x400000.  Crucially it mirrors *only* through the 256KB socket span
+  (0x400000-0x43FFFF), not the 128K's 1MB block: the startup code at
+  ROM 0x4003e4 does `cmpl 0x420000,0x440000` and treats equal reads as
+  "512Ke decode, no SCSI".  Mirror the ROM to 0x40000 and the SCSI
+  boot path arms; mirror it to 1MB and the ROM never scans the bus.
+- **VIA port A latch**: the ROM writes its full port A value (overlay
+  bit included) through register 15 (ORA-no-handshake) BEFORE it
+  configures DDRA (ROM 0x4000ce `moveb %d2,%a5@(7680)`).  mos6522.c
+  masks ORA writes by DDRA, so the overlay never cleared and the ROM
+  looped on open-bus reads at 0x3fd5xx forever.  Fix in the machine's
+  VIA frontend: store all bits into s->a on a reg-A/reg-15 write
+  regardless of DDRA (the drivers, not the latch, are direction-gated),
+  and read input pins as pulled up.  Overlay then clears at 0x4000d2.
+- **SCSI**: NCR5380 (reg-shift 4) at 0x580000, polled "DACK" data
+  pages at 0x580200 wired to ncr5380_pdma_read/write.  The Plus has NO
+  DRQ-gated handshake aperture (unlike the IIsi) — the driver paces on
+  the 5380 DRQ status bit.  Boot device is SCSI (`block_default_type =
+  IF_SCSI`).  Two 5380 discoveries:
+    - the ROM boot reader (0x417480..) arbitrates (ICR AIP/lost-arb
+      read-only bits are polled — already right from the IIsi work),
+      selects target 6 with correct selection-timeout, then reads via
+      the DACK pages; the existing synchronous whole-transfer model
+      served it byte-exact on the first try.
+    - **data-out hang**: the ROM's blind writer (0x417418) waits for a
+      TRAILING DRQ after its byte counter empties, before dropping DMA
+      mode — it spun forever in the BSR poll at 0x41744e on the first
+      WRITE.  Fix: re-assert BSR_DRQ at the end of a DMA-mode
+      flush_data_out (the empty ODR re-raises DRQ once the target
+      takes the last byte).  After that the whole boot chain streams.
+- **800K double-sided drive**: iwm.c gained a `double-sided` property.
+  Head select follows the drive-register lines parked at RDDATA0/1
+  (CA2=1,CA1=CA0=0, SEL=head); raw 800K images interleave sides per
+  cylinder; address fields carry head in side-byte bit 5 + format
+  0x22; SONY_SIDES reports two-sided; the tach reports the nominal
+  zone speed (the 800K drive self-regulates, no Mac PWM).  The ROM's
+  power-on eject/probe dance runs on it; 400K images are rejected.
+- **RAM**: SIMM banks, `-m` restricted to 1M/2M/2.5M/4M (default 4M).
+  2.5M = full 2MB bank A + 512K bank B mirrored through its 2MB half.
+  Power-of-two sizes mirror the whole bank as before.
+
+- **M0110 keyboard** (all three machines): HLE over the VIA shift
+  register.  The ROM driver (0x402568..) shifts a command byte out
+  under the keyboard's external clock (ACR mode 7), takes an SR
+  interrupt, flips ACR to shift-in, and receives one byte.  Model:
+  a reg-SR write in shift-out-ext mode is a command; a timer pulses
+  SR_INT, loads the response (Inquiry → queued key transition
+  (code<<1)|1, bit7=release, or Null 0x7b after a 0.25s wait; Model
+  resets; Test acks), pulses SR_INT again with the byte in s->sr.
+  Verified: pressing 'A' on the mac128k Finder sets/clears the right
+  KeyMap (0x174) bit; shift is held live in KeyMap on the Plus.
+
+### macplus boot state — milestone (c)+ reached, (d) blocked by the disk
+
+Boots the v3 ROM to the **happy Mac** (/tmp/macfam-plus3.png), scans
+SCSI (the 800K probe eject dance included), loads the Apple driver
+partition and the System, runs the startup extension parade and
+renders System 7.5.3 dialogs — the "File System Access modules / Apple
+Photo Access" alert draws and its Continue button is **clickable with
+the working mouse** (RR15 fix below).  So the OS is live: video, SCSI
+read/write, mouse and keyboard all exercised past "Welcome".
+
+Then it **SysError bombs "illegal instruction"** in a loaded system
+module (crash PC in RAM; the 64-byte code block matches the disk's
+AppleShare / File Sharing Extension region at image offset 0x86465a).
+Disassembly of that code shows `4e74 0008` = **RTD #8, a 68010+
+instruction** — illegal on the 68000.  The macos753.hda was installed
+for the 68030 Mac IIsi, so its system software carries 68020/030 code
+a real 68000 Mac Plus cannot execute either.  Holding Shift keeps the
+KeyMap disable-extensions bit set the whole time (confirmed 0x17b bit
+0 = 1 through the parade) but this System still loads the module and
+bombs.  **This is a disk/CPU-compat blocker, not a hardware-model
+bug** — a 68000-clean 7.5.x install (or an older System that fits the
+Plus) should reach the Finder on this exact machine model.  NEXT for
+milestone (d): obtain/build a Mac-Plus-blessed System disk image
+(needs Daniel's OK to fetch), or a 6.0.x/7.0 install; the model is
+ready for it.
+
+- **escc RR15**: the Z8530 returns WR15 when RR15 is read; the model
+  never mirrored it, so RR15 read 0.  The Mac SCC ISR reads RR15 as
+  its DCD-changed mask (`eorb old,new; andb RR15`), so with a zero
+  mask every mouse quadrature edge dispatched to the non-DCD handler
+  and *vertical* mouse motion vanished (horizontal survived only
+  because channel A's two handler slots point at the same routine).
+  Fixed in escc.c (mirror WR15→RR15 on write and at reset); vertical
+  mouse now moves on the Plus.
+
+Run recipe (macplus SCSI boot):
+  build/qemu-system-m68k -M macplus \
+    -bios _mac_assets/macplus_v3.rom \
+    -drive file=/workspace/src/qemu-maciisi/_maciisi_assets/macos753.hda,\
+format=raw,if=none,id=hd0,snapshot=on \
+    -device scsi-hd,drive=hd0,scsi-id=0 \
+    -icount shift=7 -display none \
+    -qmp unix:/tmp/qmp-macfam-plus.qmp,server,nowait
+
+Sockets used this session: /tmp/qmp-macfam-{128,512,plus}.qmp
+(own processes only; never touched other agents' qemus).
