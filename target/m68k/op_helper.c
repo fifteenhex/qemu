@@ -635,7 +635,8 @@ bool m68k_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     CPUM68KState *env = cpu_env(cs);
 
     if (interrupt_request & CPU_INTERRUPT_HARD
-        && ((env->sr & SR_I) >> SR_I_SHIFT) < env->pending_level) {
+        && (((env->sr & SR_I) >> SR_I_SHIFT) < env->pending_level
+            || (env->pending_level == 7 && env->nmi_edge_pending))) {
         /*
          * Real hardware gets the interrupt vector via an IACK cycle
          * at this point.  Current emulated hardware doesn't rely on
@@ -646,6 +647,9 @@ bool m68k_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         int level = env->pending_level;
 
         cs->exception_index = env->pending_vector;
+        if (level == 7) {
+            env->nmi_edge_pending = 0;
+        }
         do_interrupt_m68k_hardirq(env);
         /*
          * The IACK cycle: sources that are cleared by the acknowledge
