@@ -7,6 +7,6 @@ m68k_ss.add(when: 'CONFIG_M68K_VIRT', if_true: files('virt.c'))
 m68k_ss.add(when: 'CONFIG_MC68EZ328', if_true: files('mc68ez328.c'))
 m68k_ss.add(when: 'CONFIG_MVME147', if_true: files('mvme147.c'))
 m68k_ss.add(when: 'CONFIG_MEGADRIVE', if_true: files('megadrive.c'))
-m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('mos8520.c'))
+m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga_custom.c', 'mos8520.c'))
 
 hw_arch += {'m68k': m68k_ss}
