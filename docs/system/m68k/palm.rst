@@ -1,5 +1,5 @@
-Palm PDAs (``palmv``, ``palmiiix``, ``palmvx``, ``palmm100``, ``palmm500``)
-===========================================================================
+Palm PDAs (``palmv``, ``palmiiix``, ``palmvx``, ``palmm100``, ``palmm500``, ``palmm515``)
+=========================================================================================
 
 Palm handhelds built on Motorola DragonBall system-on-chips:
 
@@ -14,6 +14,8 @@ Palm handhelds built on Motorola DragonBall system-on-chips:
   bezel).
 * ``palmm500`` — Palm m500: MC68VZ328 "DragonBall VZ" at 33.16MHz,
   8MB RAM, an SD card slot, runs PalmOS 4.x.
+* ``palmm515`` — Palm m515: like the m500 but 16MB RAM and a *color*
+  160x160 panel on an Epson SED1376 companion LCD controller.
 
 Emulated hardware
 -----------------
@@ -35,8 +37,11 @@ Emulated hardware
   sounds alarms and explicit tones by default, not UI taps).
 * Serial cradle on the UART (``-serial``); on the m500 the cradle is
   UART2 and UART1 is the IR port.
-* m500 only: the SD slot on the VZ's SPI1 unit
+* m500/m515: the SD slot on the VZ's SPI1 unit
   (``-drive if=sd,format=raw,file=sd.img``).
+* m515: the SED1376 color LCD controller with its embedded display
+  SRAM and 256-entry color look-up table (the launcher and apps run
+  in 8-bit color).
 
 Firmware
 --------
@@ -69,9 +74,17 @@ as archive.org item ``20250707_20250707_0134``:
    * - Palm-m500-4.1-en.rom
      - ``palmm500``
      - dc8f0f8a6ffed58764065a7abe468ce4
+   * - Palm-m515-4.1-en.rom
+     - ``palmm515``
+     - 412557a221933a8be12622de7a21320a
 
 (The item's ``Palm-IIIx-4.0.rom`` is not a ROM at all but a truncated
 HTML error page — don't use it.)
+
+The m515 image is a whole-flash dump including the small (boot) ROM;
+the machine still enters through the big ROM's reset vectors because
+the small ROM's boot path waits on the m515's USB cradle controller,
+which is not modelled.
 
 Running
 -------
@@ -102,7 +115,10 @@ an SD image builder.
 Known limitations
 -----------------
 
-* HotSync over the serial cradle has not been brought up.
+* HotSync over the serial cradle has not been brought up; the m515's
+  USB cradle controller is not modelled at all.
+* The SED1376's 16bpp mode and SwivelView start-address arithmetic
+  are best-effort (PalmOS 4.1 runs the m515 at 8bpp).
 * Sound is the PWM tone generator only; the sample-FIFO PCM path is
   not modelled.
 * The m500's digitizer calibration is sensitive to exact tap

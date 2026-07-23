@@ -428,6 +428,66 @@ Machine descs and docs/system/m68k/palm.rst updated; palmctl.py
 `dump:` emits PNG when the path ends in .png (QMP screendump format
 argument).
 
+## 2026-07-23 — palmm515: COLOR, via a new SED1376 model
+
+`palmm515` — Palm m515, VZ like the m500 but 16MB RAM and the color
+panel.  ROM `Palm-m515-4.1-en.rom` (4MB, md5
+412557a221933a8be12622de7a21320a).  Boots to the launcher in 8-bit
+color: colored launcher icons, Note Pad's welcome note in magenta
+ink, Date Book's red weekend headers; pen calibration and hard
+buttons work as on the m500.
+
+The color path is NOT the VZ LCDC: the m505/m515 use an Epson
+SED1376 companion LCD controller with embedded display SRAM (POSE
+models it as EmRegsSED1376 — worked this out from
+EmRegsVZPalmM505.cpp, the only piece of it in our pose-ref extract).
+Facts established by booting the ROM against a probe region (no
+datasheet on hand):
+
+  - The m515 image is a *whole-flash* dump: small ROM at file offset
+    0 with its own card header (reset PC 0x100002a2 into the small
+    ROM), big ROM at +0x10000.  New PalmMachineClass field
+    rom_load_offset separates "where the file lands in the window"
+    from bigrom_offset (where the reset vectors come from).
+  - The small ROM's boot path polls a USB device controller at
+    0x10400000 forever (small-ROM functions UsbHwrSetMode/
+    UsbHwrReadInterruptRegister — the m515 cradle is USB).  Not
+    modelled: the machine enters through the big ROM's vectors like
+    the other Palms, skipping the small ROM.
+  - HAL chip select: CSGBB = 0xffc0 << 13 -> SED1376 registers at
+    0x1ff80000; the 80KB display SRAM decodes at +0x20000
+    (0x1ffa0000; the boot memory-probe pokes its top at 0x1ffb3e80).
+  - Register file (all byte-wide): panel timings at 0x10..0x27
+    (HDP=(0x13+1)*8=160, VDP=0x9f+1=160), LUT written as R/G/B data
+    to 0x08/09/0a with the entry index written to 0x0b as commit
+    (PalmOS loads a 216-color web-safe cube + greys; entry 0 white),
+    display mode 0x70 (bpp select 0..4 = 1/2/4/8/16bpp; PalmOS uses
+    3 = 8bpp), "special effects" 0x71 = 0x10 (SwivelView — panel
+    mounted rotated), start address 0x74-76 (dwords), line offset
+    0x80/81 (dwords, 0x28*4 = 160 bytes), PWM/backlight block at
+    0xa0-0xb1.
+  - HwrDisplayDrawBootScreen polls 0xa0 bit 7 before every LUT write
+    (vertical-non-display status); the model keeps it always set —
+    scan-out is instant for us.  Without it the boot hangs there.
+  - The HAL never reads an ID/revision register, so a write-mostly
+    model suffices.
+  - SwivelView start-address arithmetic: REG[74..76] reads 0x4eb0
+    (dwords) but the frame PalmOS renders sits at SRAM offset 0,
+    linear, upright, stride 160 (verified by dumping the SRAM and
+    re-laying it out).  The model doesn't reproduce the rotated
+    addressing; with any SwivelView mode bits set it scans from
+    offset 0.  Revisit with a real datasheet if some other ROM
+    programs it differently.  16bpp is implemented (big-endian
+    RGB565) but nothing exercises it yet — PalmOS 4.1 runs 8bpp.
+
+New device hw/display/sed1376.c (+ include/hw/display/sed1376.h),
+CONFIG_SED1376; the m515 machine maps it instead of the DragonBall
+LCDC (whose register page stays no-fault via
+ignore_memory_transaction_failures).
+
+Untested/open on the m515: SD slot (should match the m500), 16bpp,
+brightness/backlight PWM, USB cradle.
+
 ## Journal
 
 ### 2026-07-20 (evening) — pen works; Setup advances on OS 3.1
