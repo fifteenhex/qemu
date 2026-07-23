@@ -94,15 +94,18 @@
 #define SUN3_CTL_BUSERR         0x6
 #define SUN3_CTL_DIAG           0x7
 
-/* system enable register */
-#define SUN3_ENA_NOTBOOT        0x01
+/*
+ * System enable register.  The monitor leaves the boot state by
+ * writing 0xA0 (NOTBOOT | SDVMA), so NOTBOOT is bit 7.
+ */
+#define SUN3_ENA_RES            0x01
 #define SUN3_ENA_FPA            0x02
 #define SUN3_ENA_COPY           0x04
 #define SUN3_ENA_VIDEO          0x08
 #define SUN3_ENA_CACHE          0x10
 #define SUN3_ENA_SDVMA          0x20
 #define SUN3_ENA_FPP            0x40
-#define SUN3_ENA_DVMA           0x80
+#define SUN3_ENA_NOTBOOT        0x80
 
 /* bus error register (PROM self-test: masks with 0xFC, expects these) */
 #define SUN3_BUSERR_WATCHDOG    0x01
@@ -181,8 +184,10 @@
 
 /* interrupt sources (several share a level, so they get own lines) */
 enum {
-    SUN3_IRQ_SRC_ZS_TTY,
-    SUN3_IRQ_SRC_ZS_KBD,
+    SUN3_IRQ_SRC_ZS_TTY_B,
+    SUN3_IRQ_SRC_ZS_TTY_A,
+    SUN3_IRQ_SRC_ZS_KBD_B,
+    SUN3_IRQ_SRC_ZS_KBD_A,
     SUN3_IRQ_SRC_SI,
     SUN3_IRQ_SRC_LANCE,
     SUN3_IRQ_SRC_MEMERR,
@@ -190,11 +195,13 @@ enum {
 };
 
 static const uint8_t sun3_irq_src_level[SUN3_IRQ_NUM_SRCS] = {
-    [SUN3_IRQ_SRC_ZS_TTY] = SUN3_IPL_ZS,
-    [SUN3_IRQ_SRC_ZS_KBD] = SUN3_IPL_ZS,
-    [SUN3_IRQ_SRC_SI]     = SUN3_IPL_SI,
-    [SUN3_IRQ_SRC_LANCE]  = SUN3_IPL_LANCE,
-    [SUN3_IRQ_SRC_MEMERR] = SUN3_IPL_MEMERR,
+    [SUN3_IRQ_SRC_ZS_TTY_B] = SUN3_IPL_ZS,
+    [SUN3_IRQ_SRC_ZS_TTY_A] = SUN3_IPL_ZS,
+    [SUN3_IRQ_SRC_ZS_KBD_B] = SUN3_IPL_ZS,
+    [SUN3_IRQ_SRC_ZS_KBD_A] = SUN3_IPL_ZS,
+    [SUN3_IRQ_SRC_SI]       = SUN3_IPL_SI,
+    [SUN3_IRQ_SRC_LANCE]    = SUN3_IPL_LANCE,
+    [SUN3_IRQ_SRC_MEMERR]   = SUN3_IPL_MEMERR,
 };
 
 /* IDPROM */
@@ -673,6 +680,9 @@ static bool sun3_control_space(Sun3MachineState *m, vaddr addr, unsigned size,
             sun3_flush_va_aliases(m, va);
         } else {
             *val = sun3_reg32_read(m->pgmap[idx], va, size);
+            qemu_log_mask(CPU_LOG_INT,
+                          "sun3: pgmap[va %08x idx %x] -> %08x\n",
+                          va, idx, (uint32_t)*val);
         }
         return true;
     case SUN3_CTL_SEGMAP:
@@ -685,6 +695,9 @@ static bool sun3_control_space(Sun3MachineState *m, vaddr addr, unsigned size,
             tlb_flush(CPU(m->cpu));
         } else {
             *val = m->segmap[m->context][idx];
+            qemu_log_mask(CPU_LOG_INT,
+                          "sun3: segmap[ctx %d seg %03x] -> %02x\n",
+                          m->context, idx, (uint8_t)*val);
         }
         return true;
     case SUN3_CTL_CONTEXT:
@@ -732,68 +745,64 @@ static bool sun3_control_space(Sun3MachineState *m, vaddr addr, unsigned size,
     }
 }
 
-static MemTxResult sun3_phys_access(hwaddr pa, unsigned size, uint64_t *val,
-                                    bool is_store)
+/*
+ * A MOVES access that crosses an 8KB page boundary is split into two
+ * bus cycles on hardware, each individually translated; mirror that
+ * by chunking the access at page boundaries.
+ */
+static bool sun3_moves_data(Sun3MachineState *m, int fc, vaddr addr,
+                            unsigned size, uint64_t *val, bool is_store)
 {
     MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
-    AddressSpace *as = &address_space_memory;
-    MemTxResult res = MEMTX_OK;
+    MMUAccessType access_type = is_store ? MMU_DATA_STORE : MMU_DATA_LOAD;
+    bool super = fc & 4;
+    bool program = fc == 2 || fc == 6;
+    uint8_t bytes[8];
+    unsigned off = 0;
 
     if (is_store) {
-        switch (size) {
-        case 1:
-            address_space_stb(as, pa, *val, attrs, &res);
-            break;
-        case 2:
-            address_space_stw(as, pa, *val, attrs, &res);
-            break;
-        default:
-            address_space_stl(as, pa, *val, attrs, &res);
-            break;
-        }
-    } else {
-        switch (size) {
-        case 1:
-            *val = address_space_ldub(as, pa, attrs, &res);
-            break;
-        case 2:
-            *val = address_space_lduw(as, pa, attrs, &res);
-            break;
-        default:
-            *val = address_space_ldl(as, pa, attrs, &res);
-            break;
-        }
+        stn_be_p(bytes, size, *val);
     }
-    return res;
+    while (off < size) {
+        vaddr cur = addr + off;
+        unsigned chunk = MIN(size - off,
+                             SUN3_PAGE_SIZE - (cur & SUN3_PAGE_MASK));
+        hwaddr pa;
+        int prot;
+
+        if (program && sun3_boot_state_fetch(m, super, MMU_INST_FETCH) &&
+            !is_store) {
+            pa = SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) + SUN3_OBIO_EPROM +
+                 (cur & (SUN3_ROM_SIZE - 1));
+        } else if (!sun3_mmu_translate(m, cur, access_type, super,
+                                       &pa, &prot)) {
+            return false;
+        }
+        if (address_space_rw(&address_space_memory, pa, attrs,
+                             &bytes[off], chunk, is_store) != MEMTX_OK) {
+            return false;
+        }
+        off += chunk;
+    }
+    if (!is_store) {
+        *val = ldn_be_p(bytes, size);
+    }
+    return true;
 }
 
 static bool sun3_fc_moves(void *opaque, int fc, vaddr addr, unsigned size,
                           uint64_t *val, bool is_store)
 {
     Sun3MachineState *m = opaque;
-    MMUAccessType access_type = is_store ? MMU_DATA_STORE : MMU_DATA_LOAD;
-    bool super = fc & 4;
-    hwaddr pa;
-    int prot;
 
     switch (fc) {
     case 3:
         return sun3_control_space(m, addr, size, val, is_store);
-    case 2:
-    case 6:
-        /* program space: subject to the boot-state EPROM redirect */
-        if (sun3_boot_state_fetch(m, super, MMU_INST_FETCH) && !is_store) {
-            pa = SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) + SUN3_OBIO_EPROM +
-                 (addr & (SUN3_ROM_SIZE - 1));
-            return sun3_phys_access(pa, size, val, false) == MEMTX_OK;
-        }
-        /* fall through */
     case 1:
+    case 2:
     case 5:
-        if (!sun3_mmu_translate(m, addr, access_type, super, &pa, &prot)) {
-            return false;
-        }
-        return sun3_phys_access(pa, size, val, is_store) == MEMTX_OK;
+    case 6:
+        return sun3_moves_data(m, fc, addr, size, val, is_store);
     default:
         return false;
     }
@@ -977,7 +986,15 @@ static void sun3_init(MachineState *machine)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
                             SUN3_OBIO_ZS_TTY);
-    sysbus_connect_irq(sbd, 0, m->irqs[SUN3_IRQ_SRC_ZS_TTY]);
+    sysbus_connect_irq(sbd, 0, m->irqs[SUN3_IRQ_SRC_ZS_TTY_B]);
+    sysbus_connect_irq(sbd, 1, m->irqs[SUN3_IRQ_SRC_ZS_TTY_A]);
+    /*
+     * Carrier is hardwired on the Sun-3 serial ports; without it the
+     * NetBSD console open sleeps in the carrier wait forever (the
+     * chardev backend may look disconnected, e.g. a listening socket).
+     */
+    qemu_irq_raise(qdev_get_gpio_in_named(dev, "dcd", 0));
+    qemu_irq_raise(qdev_get_gpio_in_named(dev, "dcd", 1));
 
     /*
      * zs1: keyboard/mouse.  Left as plain unconnected serial channels
@@ -996,7 +1013,8 @@ static void sun3_init(MachineState *machine)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
                             SUN3_OBIO_ZS_KBD_MS);
-    sysbus_connect_irq(sbd, 0, m->irqs[SUN3_IRQ_SRC_ZS_KBD]);
+    sysbus_connect_irq(sbd, 0, m->irqs[SUN3_IRQ_SRC_ZS_KBD_B]);
+    sysbus_connect_irq(sbd, 1, m->irqs[SUN3_IRQ_SRC_ZS_KBD_A]);
 
     /* Intersil ICM7170 clock */
     dev = qdev_new(TYPE_ICM7170);
