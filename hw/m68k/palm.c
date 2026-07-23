@@ -62,6 +62,7 @@
 #include "hw/ssi/dragonball_spi.h"
 #include "hw/char/dragonball_uart.h"
 #include "hw/display/dragonball_lcdc.h"
+#include "hw/display/sed1376.h"
 #include "hw/rtc/dragonball_rtc.h"
 #include "hw/input/ads7843.h"
 #include "hw/input/palm_keypad.h"
@@ -115,6 +116,9 @@ typedef struct PalmMachineClass {
 
     hwaddr rom_base;
     uint32_t rom_size;
+    /* where in the window the ROM file is loaded */
+    uint32_t rom_load_offset;
+    /* the big ROM (whose card header holds the reset vectors) */
     uint32_t bigrom_offset;
     uint32_t sysclk;
     uint8_t chip_id;
@@ -123,6 +127,8 @@ typedef struct PalmMachineClass {
     uint16_t adc_dock_value;
     /* gpio lines of the keyboard rows */
     uint16_t kbd_row_gpio[PALM_KEYPAD_ROWS];
+    /* SED1376 color LCD controller chip select base, 0 = none */
+    hwaddr sed1376_base;
     bool has_timer2;
 } PalmMachineClass;
 
@@ -203,8 +209,8 @@ static void palm_init(MachineState *machine)
      */
     size = load_image_size(machine->firmware,
                            (uint8_t *)memory_region_get_ram_ptr(&pms->rom) +
-                           pmc->bigrom_offset,
-                           pmc->rom_size - pmc->bigrom_offset);
+                           pmc->rom_load_offset,
+                           pmc->rom_size - pmc->rom_load_offset);
     if (size < 0) {
         error_report("palm: could not load ROM '%s'", machine->firmware);
         exit(1);
@@ -324,12 +330,26 @@ static void palm_init(MachineState *machine)
                                                        DRAGONBALL_INTC_UART2));
     }
 
-    /* LCDC: 160x160 panel */
-    lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
-    object_property_set_link(OBJECT(lcdc_dev), "framebuffer-memory",
-                             OBJECT(sysmem), &error_fatal);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(lcdc_dev), 0, PALM_MMIO_LCDC);
+    if (pmc->sed1376_base) {
+        /*
+         * Color panel on a SED1376 companion controller; the on-chip
+         * LCDC is unused on those devices (its register page still
+         * doesn't fault, via ignore_memory_transaction_failures).
+         */
+        DeviceState *sed_dev = qdev_new(TYPE_SED1376);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sed_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sed_dev), 0, pmc->sed1376_base);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sed_dev), 1,
+                        pmc->sed1376_base + SED1376_VMEM_OFFSET);
+    } else {
+        /* LCDC: 160x160 panel */
+        lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
+        object_property_set_link(OBJECT(lcdc_dev), "framebuffer-memory",
+                                 OBJECT(sysmem), &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lcdc_dev), 0, PALM_MMIO_LCDC);
+    }
 
     /* RTC */
     rtc_dev = qdev_new(TYPE_DRAGONBALL_RTC);
@@ -454,6 +474,7 @@ static void palm_ez_machine_class_init(ObjectClass *oc)
     mc->default_ram_size = 2 * MiB;
     pmc->rom_base = 0x10c00000;
     pmc->rom_size = 4 * MiB;
+    pmc->rom_load_offset = 0x8000;
     pmc->bigrom_offset = 0x8000;
     pmc->sysclk = EZ_SYSCLK;
     pmc->chip_id = 0x43;        /* EZ */
@@ -527,6 +548,7 @@ static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_size = 8 * MiB;
     pmc->rom_base = 0x10000000;
     pmc->rom_size = 4 * MiB;
+    pmc->rom_load_offset = 0x10000;
     pmc->bigrom_offset = 0x10000;
     pmc->sysclk = VZ_SYSCLK;
     pmc->chip_id = 0x56;        /* VZ */
@@ -536,6 +558,25 @@ static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
     /* rows on port K (block 8) bits 5-7 */
     palm_set_kbd_rows(pmc, 8 * 8 + 5, 8 * 8 + 6, 8 * 8 + 7);
     pmc->has_timer2 = true;
+}
+
+static void palmm515_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    palmm500_machine_class_init(oc, data);
+    mc->desc = "Palm m515 (MC68VZ328)";
+    mc->default_ram_size = 16 * MiB;
+    /*
+     * The m515 image is a whole-flash dump, small ROM at file offset
+     * 0, big ROM at +0x10000.  Boot through the big ROM's vectors as
+     * on the other machines: the small ROM's boot path polls the
+     * (unmodelled) USB device controller at 0x10400000 forever.
+     */
+    pmc->rom_load_offset = 0;
+    /* color panel; the HAL points CSGBB (0xffc0 << 13) at the chip */
+    pmc->sed1376_base = 0x1ff80000;
 }
 
 static const TypeInfo palm_machine_types[] = {
@@ -571,6 +612,11 @@ static const TypeInfo palm_machine_types[] = {
         .name          = MACHINE_TYPE_NAME("palmm500"),
         .parent        = TYPE_PALM_MACHINE,
         .class_init    = palmm500_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmm515"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmm515_machine_class_init,
     },
 };
 
