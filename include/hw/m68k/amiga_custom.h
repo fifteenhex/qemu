@@ -56,7 +56,7 @@ struct AmigaCustomState {
     uint16_t serper, potgo;
     uint8_t serial_rx;
 
-    AmigaFDCState *fdc;         /* DF0, the source of disk DMA data */
+    AmigaFDCState *fdc[AMIGA_FLOPPY_DRIVES];    /* disk DMA data sources */
     uint16_t dsklen;
     bool dsklen_armed;          /* one DMAEN write seen, one to go */
     QEMUTimer disk_timer;

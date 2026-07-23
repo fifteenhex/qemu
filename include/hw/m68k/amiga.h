@@ -8,12 +8,24 @@
 #define HW_M68K_AMIGA_H
 
 #include "hw/core/boards.h"
+#include "hw/core/irq.h"
+#include "hw/m68k/amiga_fdc.h"
 #include "target/m68k/cpu-qom.h"
 #include "system/memory.h"
 #include "qom/object.h"
 
 #define TYPE_AMIGA_MACHINE MACHINE_TYPE_NAME("amiga-common")
 OBJECT_DECLARE_TYPE(AmigaMachineState, AmigaMachineClass, AMIGA_MACHINE)
+
+/* the open-collector lines the floppy drives share */
+enum {
+    FLOPPY_LINE_CHNG,
+    FLOPPY_LINE_WPRO,
+    FLOPPY_LINE_TK0,
+    FLOPPY_LINE_RDY,
+    FLOPPY_LINE_INDEX,
+    FLOPPY_LINE_COUNT,
+};
 
 struct AmigaMachineState {
     MachineState parent_obj;
@@ -25,7 +37,16 @@ struct AmigaMachineState {
     MemoryRegion open_bus;
     DeviceState *ciaa, *ciab;
     DeviceState *custom;
-    DeviceState *fdc;
+    DeviceState *fdc[AMIGA_FLOPPY_DRIVES];
+
+    /*
+     * The floppy status lines are open collector and shared by all
+     * drives: a wired AND of the per-drive levels feeds the CIA.
+     */
+    struct AmigaFloppyLine {
+        uint8_t released;       /* one bit per drive */
+        qemu_irq out;
+    } floppy_line[FLOPPY_LINE_COUNT];
 };
 
 struct AmigaMachineClass {

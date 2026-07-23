@@ -23,6 +23,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/m68k/amiga.h"
 #include "hw/m68k/amiga_custom.h"
 #include "hw/m68k/amiga_fdc.h"
@@ -33,6 +34,38 @@
 #define AMIGA_CIAB_BASE     0xbfd000
 #define AMIGA_CIAA_BASE     0xbfe000
 #define AMIGA_CUSTOM_BASE   0xdff000
+
+static const char *const floppy_line_name[FLOPPY_LINE_COUNT] = {
+    [FLOPPY_LINE_CHNG] = "chng",
+    [FLOPPY_LINE_WPRO] = "wpro",
+    [FLOPPY_LINE_TK0] = "tk0",
+    [FLOPPY_LINE_RDY] = "rdy",
+    [FLOPPY_LINE_INDEX] = "index",
+};
+
+static void amiga_floppy_line_set(void *opaque, int n, int level)
+{
+    struct AmigaFloppyLine *l = opaque;
+
+    l->released = deposit32(l->released, n, 1, level);
+    qemu_set_irq(l->out, l->released == (1 << AMIGA_FLOPPY_DRIVES) - 1);
+}
+
+/* fan one CIA output out to every drive */
+static qemu_irq amiga_floppy_split_in(AmigaMachineState *ams,
+                                      const char *name)
+{
+    DeviceState *split = qdev_new(TYPE_SPLIT_IRQ);
+    int d;
+
+    qdev_prop_set_uint16(split, "num-lines", AMIGA_FLOPPY_DRIVES);
+    qdev_realize_and_unref(split, NULL, &error_fatal);
+    for (d = 0; d < AMIGA_FLOPPY_DRIVES; d++) {
+        qdev_connect_gpio_out(split, d,
+                              qdev_get_gpio_in_named(ams->fdc[d], name, 0));
+    }
+    return qdev_get_gpio_in(split, 0);
+}
 
 /* Paula presents interrupts on the 68k autovectors */
 static void amiga_set_ipl(void *opaque, int n, int level)
@@ -103,6 +136,7 @@ static void amiga_machine_init(MachineState *machine)
     ssize_t rom_loaded;
     DriveInfo *dinfo;
     char *filename;
+    int i;
 
     /*
      * Register the overlay reset before creating the CPU so the ROM is
@@ -155,20 +189,25 @@ static void amiga_machine_init(MachineState *machine)
                              amc->rom_size);
     memory_region_add_subregion_overlap(sysmem, 0, &ams->rom_overlay, 1);
 
-    /* DF0, the internal floppy drive */
-    ams->fdc = qdev_new(TYPE_AMIGA_FDC);
-    dinfo = drive_get(IF_FLOPPY, 0, 0);
-    if (dinfo) {
-        qdev_prop_set_drive(ams->fdc, "drive", blk_by_legacy_dinfo(dinfo));
+    /* the floppy drives, DF0 and DF1 */
+    for (i = 0; i < AMIGA_FLOPPY_DRIVES; i++) {
+        ams->fdc[i] = qdev_new(TYPE_AMIGA_FDC);
+        dinfo = drive_get(IF_FLOPPY, 0, i);
+        if (dinfo) {
+            qdev_prop_set_drive(ams->fdc[i], "drive",
+                                blk_by_legacy_dinfo(dinfo));
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->fdc[i]), &error_fatal);
     }
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->fdc), &error_fatal);
 
     /* custom chips */
     ams->custom = qdev_new(TYPE_AMIGA_CUSTOM);
     qdev_prop_set_chr(ams->custom, "chardev", serial_hd(0));
     qdev_prop_set_uint32(ams->custom, "agnus-id", amc->agnus_id);
-    object_property_set_link(OBJECT(ams->custom), "fdc", OBJECT(ams->fdc),
-                             &error_abort);
+    object_property_set_link(OBJECT(ams->custom), "fdc0",
+                             OBJECT(ams->fdc[0]), &error_abort);
+    object_property_set_link(OBJECT(ams->custom), "fdc1",
+                             OBJECT(ams->fdc[1]), &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->custom), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(ams->custom), 0, AMIGA_CUSTOM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(ams->custom), 0,
@@ -198,33 +237,47 @@ static void amiga_machine_init(MachineState *machine)
                        qdev_get_gpio_in_named(ams->custom, "cia-irq", 1));
 
     /*
-     * DF0: control lines on CIA-B port B, status lines on CIA-A port
-     * A, and the index pulse on CIA-B FLAG.
+     * The floppy drives: control lines on CIA-B port B (the four
+     * shared lines fanned out to every drive, one select line each),
+     * the wired-AND status lines on CIA-A port A, and the index
+     * pulse on CIA-B FLAG.
      */
-    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_SEL0,
-                                qdev_get_gpio_in_named(ams->fdc, "sel", 0));
     qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_MTR,
-                                qdev_get_gpio_in_named(ams->fdc, "mtr", 0));
+                                amiga_floppy_split_in(ams, "mtr"));
     qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_STEP,
-                                qdev_get_gpio_in_named(ams->fdc, "step", 0));
+                                amiga_floppy_split_in(ams, "step"));
     qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_DIR,
-                                qdev_get_gpio_in_named(ams->fdc, "dir", 0));
+                                amiga_floppy_split_in(ams, "dir"));
     qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_SIDE,
-                                qdev_get_gpio_in_named(ams->fdc, "side", 0));
-    qdev_connect_gpio_out_named(ams->fdc, "chng", 0,
-                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
-                                                       AMIGA_CIAA_PA_CHNG));
-    qdev_connect_gpio_out_named(ams->fdc, "wpro", 0,
-                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
-                                                       AMIGA_CIAA_PA_WPRO));
-    qdev_connect_gpio_out_named(ams->fdc, "tk0", 0,
-                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
-                                                       AMIGA_CIAA_PA_TK0));
-    qdev_connect_gpio_out_named(ams->fdc, "rdy", 0,
-                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
-                                                       AMIGA_CIAA_PA_RDY));
-    qdev_connect_gpio_out_named(ams->fdc, "index", 0,
-                                qdev_get_gpio_in_named(ams->ciab, "flag", 0));
+                                amiga_floppy_split_in(ams, "side"));
+    for (i = 0; i < AMIGA_FLOPPY_DRIVES; i++) {
+        qdev_connect_gpio_out_named(ams->ciab, "port-b-out",
+                                    AMIGA_CIAB_PB_SEL0 + i,
+                                    qdev_get_gpio_in_named(ams->fdc[i],
+                                                           "sel", 0));
+    }
+
+    ams->floppy_line[FLOPPY_LINE_CHNG].out =
+        qdev_get_gpio_in_named(ams->ciaa, "port-in", AMIGA_CIAA_PA_CHNG);
+    ams->floppy_line[FLOPPY_LINE_WPRO].out =
+        qdev_get_gpio_in_named(ams->ciaa, "port-in", AMIGA_CIAA_PA_WPRO);
+    ams->floppy_line[FLOPPY_LINE_TK0].out =
+        qdev_get_gpio_in_named(ams->ciaa, "port-in", AMIGA_CIAA_PA_TK0);
+    ams->floppy_line[FLOPPY_LINE_RDY].out =
+        qdev_get_gpio_in_named(ams->ciaa, "port-in", AMIGA_CIAA_PA_RDY);
+    ams->floppy_line[FLOPPY_LINE_INDEX].out =
+        qdev_get_gpio_in_named(ams->ciab, "flag", 0);
+    for (i = 0; i < FLOPPY_LINE_COUNT; i++) {
+        struct AmigaFloppyLine *l = &ams->floppy_line[i];
+        int d;
+
+        l->released = (1 << AMIGA_FLOPPY_DRIVES) - 1;
+        for (d = 0; d < AMIGA_FLOPPY_DRIVES; d++) {
+            qdev_connect_gpio_out_named(ams->fdc[d], floppy_line_name[i], 0,
+                                        qemu_allocate_irq(
+                                            amiga_floppy_line_set, l, d));
+        }
+    }
 
     if (amc->board_init) {
         amc->board_init(ams);

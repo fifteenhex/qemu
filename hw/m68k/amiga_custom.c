@@ -823,15 +823,12 @@ static void amiga_custom_disk_dma(AmigaCustomState *s)
     unsigned words = s->dsklen & DSKLEN_LENGTH;
     uint32_t ptr = amiga_custom_ptr(s, REG_DSKPTH);
     const uint8_t *track;
-    int tracklen, offset, i;
+    int tracklen, offset, i, d;
 
     if ((s->dmacon & (DMACON_DMAEN | DMACON_DSKEN)) !=
         (DMACON_DMAEN | DMACON_DSKEN)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "amiga-custom: disk DMA started while disabled\n");
-        return;
-    }
-    if (!s->fdc) {
         return;
     }
 
@@ -840,9 +837,21 @@ static void amiga_custom_disk_dma(AmigaCustomState *s)
 
         dma_memory_read(&address_space_memory, ptr & CHIP_MASK, buf,
                         words * 2, MEMTXATTRS_UNSPECIFIED);
-        amiga_fdc_write_track(s->fdc, buf, words * 2);
+        /* only the selected, spinning drive takes the data */
+        for (d = 0; d < AMIGA_FLOPPY_DRIVES; d++) {
+            if (s->fdc[d]) {
+                amiga_fdc_write_track(s->fdc[d], buf, words * 2);
+            }
+        }
     } else {
-        if (!amiga_fdc_read_track(s->fdc, &track, &tracklen)) {
+        track = NULL;
+        for (d = 0; d < AMIGA_FLOPPY_DRIVES; d++) {
+            if (s->fdc[d] &&
+                amiga_fdc_read_track(s->fdc[d], &track, &tracklen)) {
+                break;
+            }
+        }
+        if (!track) {
             return;
         }
         offset = 0;
@@ -1166,7 +1175,9 @@ static const Property amiga_custom_properties[] = {
     /* PAL ECS 2MB Agnus / ECS Denise by default */
     DEFINE_PROP_UINT32("agnus-id", AmigaCustomState, agnus_id, 0x22),
     DEFINE_PROP_UINT32("denise-id", AmigaCustomState, denise_id, 0xfc),
-    DEFINE_PROP_LINK("fdc", AmigaCustomState, fdc, TYPE_AMIGA_FDC,
+    DEFINE_PROP_LINK("fdc0", AmigaCustomState, fdc[0], TYPE_AMIGA_FDC,
+                     AmigaFDCState *),
+    DEFINE_PROP_LINK("fdc1", AmigaCustomState, fdc[1], TYPE_AMIGA_FDC,
                      AmigaFDCState *),
 };
 
