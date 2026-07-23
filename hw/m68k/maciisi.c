@@ -561,6 +561,7 @@ struct MacIIsiMachineState {
     MemoryRegion rbvmem;
     MemoryRegion vdacmem;
     MemoryRegion scsi_pdma;
+    MemoryRegion scsi_hsk;
     MemoryRegion iotrace;
 
     uint8_t rbv_regs[0x100];
@@ -1275,6 +1276,67 @@ static const MemoryRegionOps maciisi_scsi_pdma_ops = {
         .min_access_size = 1,
         .max_access_size = 4,
     },
+    /*
+     * The Mac SCSI drivers move pseudo-DMA data with word and longword
+     * instructions; each such access must clock out one SCSI byte per
+     * byte lane, MSB first.  Let the memory core split wide accesses
+     * into single-byte handshakes.
+     */
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+/*
+ * Handshake ("SCSI+DRQ") pseudo-DMA aperture at slice +0x6000: on real
+ * hardware an access here stalls until the 5380 raises DRQ and takes a
+ * bus error if it never does.  The ROM's multi-block blind transfer
+ * loop reads through this window and RELIES on the bus error to detect
+ * the end of the data phase.  Our data phases are fully synchronous, so
+ * a byte is either ready now or never will be: fault when no byte is
+ * available in the current phase.
+ */
+
+static MemTxResult maciisi_scsi_hsk_read(void *opaque, hwaddr addr,
+                                         uint64_t *data, unsigned size,
+                                         MemTxAttrs attrs)
+{
+    NCR5380State *s = opaque;
+
+    if (!ncr5380_pdma_ready(s, false)) {
+        *data = 0;
+        return MEMTX_DECODE_ERROR;
+    }
+    *data = ncr5380_pdma_read(s);
+    return MEMTX_OK;
+}
+
+static MemTxResult maciisi_scsi_hsk_write(void *opaque, hwaddr addr,
+                                          uint64_t val, unsigned size,
+                                          MemTxAttrs attrs)
+{
+    NCR5380State *s = opaque;
+
+    if (!ncr5380_pdma_ready(s, true)) {
+        return MEMTX_DECODE_ERROR;
+    }
+    ncr5380_pdma_write(s, val);
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps maciisi_scsi_hsk_ops = {
+    .read_with_attrs = maciisi_scsi_hsk_read,
+    .write_with_attrs = maciisi_scsi_hsk_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
 };
 
 /* catch-all for everything else in the I/O slice */
@@ -1511,6 +1573,11 @@ static void maciisi_machine_init(MachineState *machine)
     memory_region_init_io(&m->scsi_pdma, OBJECT(machine),
                           &maciisi_scsi_pdma_ops, &m->scsi, "scsi-pdma", 0x2000);
     memory_region_add_subregion(&m->macio, SCSI_OFS + 0x2000, &m->scsi_pdma);
+
+    /* handshake pseudo-DMA aperture ("SCSI+DRQ", 0x50F06000) */
+    memory_region_init_io(&m->scsi_hsk, OBJECT(machine),
+                          &maciisi_scsi_hsk_ops, &m->scsi, "scsi-hsk", 0x2000);
+    memory_region_add_subregion(&m->macio, 0x6000, &m->scsi_hsk);
 
     scsi_bus_legacy_handle_cmdline(&m->scsi.bus);
 
