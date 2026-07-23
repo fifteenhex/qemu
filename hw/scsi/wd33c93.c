@@ -292,11 +292,9 @@ static void wd33c93_handle_data_write(WD33C93State *s, uint8_t value)
 	}
 }
 
-static uint64_t wd33c93_read(void *opaque, hwaddr addr, unsigned size)
+uint8_t wd33c93_io_read(WD33C93State *s, unsigned bus_addr)
 {
-	WD33C93State *s = WD33C93(opaque);
-
-    switch(addr){
+    switch(bus_addr){
     case WD33C93_REG_BUS_ADDR:
     	return wd33c93_read_aux_stat(s);
     case WD33C93_REG_BUS_DATA: {
@@ -342,6 +340,11 @@ static uint64_t wd33c93_read(void *opaque, hwaddr addr, unsigned size)
     }
 
     return 0;
+}
+
+static uint64_t wd33c93_read(void *opaque, hwaddr addr, unsigned size)
+{
+	return wd33c93_io_read(WD33C93(opaque), addr);
 }
 
 static void wd33c93_cmd_reset(WD33C93State *s)
@@ -661,12 +664,9 @@ static void wd33c93_do_cmd(WD33C93State *s, uint8_t cmd)
 	}
 }
 
-static void wd33c93_write(void *opaque, hwaddr addr, uint64_t value,
-        unsigned size)
+void wd33c93_io_write(WD33C93State *s, unsigned bus_addr, uint8_t value)
 {
-	WD33C93State *s = WD33C93(opaque);
-
-    switch(addr){
+    switch(bus_addr){
     case WD33C93_REG_BUS_ADDR:
     	s->reg_addr = value;
         break;
@@ -782,6 +782,12 @@ static void wd33c93_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     }
     }
+}
+
+static void wd33c93_write(void *opaque, hwaddr addr, uint64_t value,
+        unsigned size)
+{
+	wd33c93_io_write(WD33C93(opaque), addr, value);
 }
 
 static const MemoryRegionOps wd33c93_ops = {

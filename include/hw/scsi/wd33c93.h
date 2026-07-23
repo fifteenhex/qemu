@@ -197,6 +197,13 @@ struct WD33C93State {
 #define WD33C93_SCSISTATUS_SRV_REQ             0x88 /* | phase */
 
 /*
+ * Host bus interface (WD33C93_REG_BUS_ADDR / WD33C93_REG_BUS_DATA),
+ * for boards whose glue chip decodes the SBIC itself.
+ */
+uint8_t wd33c93_io_read(WD33C93State *s, unsigned bus_addr);
+void wd33c93_io_write(WD33C93State *s, unsigned bus_addr, uint8_t value);
+
+/*
  * DMA port for the board dma engine: direction of the active
  * transfer (1 = device to memory, -1 = memory to device, 0 = idle)
  * and byte pull/push.
