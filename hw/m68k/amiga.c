@@ -27,6 +27,7 @@
 #include "hw/m68k/amiga.h"
 #include "hw/m68k/amiga_custom.h"
 #include "hw/m68k/amiga_fdc.h"
+#include "hw/m68k/amiga_kbd.h"
 #include "hw/m68k/mos8520.h"
 #include "system/blockdev.h"
 #include "target/m68k/cpu.h"
@@ -229,6 +230,14 @@ static void amiga_machine_init(MachineState *machine)
     qdev_connect_gpio_out_named(ams->custom, "mouse-btn", 0,
                                 qdev_get_gpio_in_named(ams->ciaa, "port-in",
                                                        AMIGA_CIAA_PA_FIR0));
+
+    /* keyboard: clocks codes into CIA-A's SDR, acked by its SP output */
+    ams->kbd = qdev_new(TYPE_AMIGA_KBD);
+    object_property_set_link(OBJECT(ams->kbd), "cia", OBJECT(ams->ciaa),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->kbd), &error_fatal);
+    qdev_connect_gpio_out_named(ams->ciaa, "sp-out", 0,
+                                qdev_get_gpio_in_named(ams->kbd, "ack", 0));
 
     /* CIA-B: TOD counts horizontal sync */
     ams->ciab = qdev_new(TYPE_MOS8520);

@@ -10,6 +10,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/m68k/amiga_fdc.h"
+#include "hw/m68k/amiga_kbd.h"
 #include "target/m68k/cpu-qom.h"
 #include "system/memory.h"
 #include "qom/object.h"
@@ -37,6 +38,7 @@ struct AmigaMachineState {
     MemoryRegion open_bus;
     DeviceState *ciaa, *ciab;
     DeviceState *custom;
+    DeviceState *kbd;
     DeviceState *fdc[AMIGA_FLOPPY_DRIVES];
 
     /*

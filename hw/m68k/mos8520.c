@@ -388,6 +388,14 @@ static void mos8520_write(void *opaque, hwaddr addr, uint64_t val,
         if (v & CRA_INMODE) {
             qemu_log_mask(LOG_UNIMP, "mos8520: timer A CNT mode\n");
         }
+        /*
+         * Driving the serial port to output pulses the SP pin; on the
+         * Amiga this is CIA-A's keyboard acknowledge handshake.
+         */
+        if ((s->cra & CRA_SPMODE) && !(old & CRA_SPMODE)) {
+            qemu_set_irq(s->sp_out, 1);
+            qemu_set_irq(s->sp_out, 0);
+        }
         mos8520_timer_write_cr(s, s->timer_a, s->ta_latch, v, old);
         break;
     case CIA_CRB:
@@ -508,6 +516,7 @@ static void mos8520_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_out_named(dev, s->port_a_out, "port-a-out", 8);
     qdev_init_gpio_out_named(dev, s->port_b_out, "port-b-out", 8);
+    qdev_init_gpio_out_named(dev, &s->sp_out, "sp-out", 1);
     qdev_init_gpio_in_named(dev, mos8520_port_in, "port-in", 16);
     qdev_init_gpio_in_named(dev, mos8520_flag_in, "flag", 1);
 }
