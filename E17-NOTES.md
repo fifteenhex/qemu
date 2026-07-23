@@ -703,3 +703,49 @@ QEMU's m68060 model needed fixes for RMON's very first instructions
   identification 0x0430, revision 1, writable EDEBUG/dFP/ESS bits
   (0x83); BUSCR is plain storage.  RMON's CPU probe reads PCR and
   runs the 68060 setup path with it.
+
+## VxWorks bring-up (2026-07-20, late night — in progress)
+
+Daniel found a VxWorks image on bitsavers:
+
+    http://bitsavers.informatik.uni-stuttgart.de/pdf//eltec/EUROCOM-27/e17vxworks.bin
+    md5 b61db2fe930477f8f6421176d4a95f3e, 256KB (EPROM sized)
+    -> /workspace/src/qemu-e17-re/e17vxworks.bin
+
+It is a VxWorks 5.3.1 COMPRESSED BOOT ROM (zlib strings, built
+"Mar 30 1998"), i.e. the boot loader with the interactive [VxWorks
+Boot] shell.  Layout: reset-vector pair at +0 (SP=0x1000,
+PC=0xfea00008 — it lives in the battery SRAM/EPROM sockets at
+0xfea00000), two movew #0x3700,%sr entries at +8/+0x10, stub sets
+the 040 TTRs, copies+inflates itself to DRAM ~0xd0000-0x13c000 and
+runs there.  NOT wrapped in the RMON netboot header.
+
+Run it by injection (no RMON):  ~/e17-re/vxrun.py — qemu -S, gdb
+restore of the image at 0xfea00000, set $sp=0x1000 $pc=0xfea00008,
+continue.  (vxinspect.py / vxstep.py for poking at it.)
+
+What its BSP taught us (all now modelled, see the interrupt commit):
+- system clock = CIO2 CT3, 60Hz (TC 41666 => CIO PCLK 2.5MHz),
+  CT vector 0x50, MICR=0x84 (MIE + CT VIS), MCCR CT3 enable;
+- VIC068A LICR1 = 0x11 (CIO tick), LICR6 = 0x05 (CD2401, level 5);
+- reads the M48T02 clock through the +0x7ff8 mirror;
+- runs the kernel in MASTER MODE (SR.M) — which flushed out two
+  target/m68k bugs (vectored-interrupt entry ignored SR.M; format 1
+  throwaway RTE unwound through the stale stack pointer).
+
+Current state: kernel boots, reaches the windExit idle loop, takes
+60Hz tick interrupts with a perfectly stable stack (interrupt log
+shows constant sp across ticks).  At exactly tick 60 (1 second) a
+kernel-context callout jumps through a poisoned pointer (0x0f0f0f0f
+pattern) landing mid-instruction in a fill loop at 0xe19f0 =>
+F-line => vector-table corruption cascade => double fault.  Smells
+like a watchdog/callout armed with a garbage routine during driver
+init — possibly the console (CD2401) or another device probe
+returning something the BSP dislikes.  No console output yet (the
+banner would come from usrRoot, exactly what dies).
+
+Next steps: catch the wdStart/callout with a watchpoint on the
+kernel work queue, or breakpoint f836c (TCB context save) and walk
+taskIdCurrent; compare what sysHwInit reads from our devices vs a
+real board (VIC/CIO/CD2401 probe results).  The RMON regression
+suite still passes (netboot, scsi, video console).
