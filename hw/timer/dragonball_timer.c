@@ -14,8 +14,6 @@
 #include "hw/timer/dragonball_timer.h"
 
 #define OSCFREQ 32768
-/* SYSCLK out of the PLL; both Palm and the devboard run the stock rate */
-#define SYSCLKFREQ 16580608
 
 /* Input clock as selected by TCTL.CLKSOURCE, after the prescaler */
 static uint32_t dragonball_timer_freq(DragonBallTimerState *t)
@@ -26,10 +24,10 @@ static uint32_t dragonball_timer_freq(DragonBallTimerState *t)
 
     switch (source) {
     case 1:
-        freq = SYSCLKFREQ;
+        freq = t->sysclk;
         break;
     case 2:
-        freq = SYSCLKFREQ / 16;
+        freq = t->sysclk / 16;
         break;
     case 3:
         /* TIN pin, not wired to anything */
@@ -149,7 +147,8 @@ static void dragonball_timer_realize(DeviceState *dev, Error **errp)
 {
     DragonBallTimerState *t = DRAGONBALL_TIMER(dev);
 
-    memory_region_init_io(&t->iomem, OBJECT(t), &timer_ops, t, "dragonball.timer",0x100);
+    memory_region_init_io(&t->iomem, OBJECT(t), &timer_ops, t,
+                          "dragonball.timer", 0x10);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &t->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &t->irq);
 }
@@ -178,10 +177,16 @@ static void dragonball_timer_reset(DeviceState *dev)
     t->tcmp = ~0;
 }
 
+static const Property dragonball_timer_properties[] = {
+    /* SYSCLK out of the PLL: 16.58MHz on the EZ, 33.16MHz on the VZ */
+    DEFINE_PROP_UINT32("sysclk", DragonBallTimerState, sysclk, 16580608),
+};
+
 static void dragonball_timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, dragonball_timer_properties);
     dc->realize = dragonball_timer_realize;
     device_class_set_legacy_reset(dc, dragonball_timer_reset);
 }
