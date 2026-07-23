@@ -24,6 +24,7 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "ui/console.h"
 
 /* PAL timing: 227 colour clocks (~64us) per line, 312 lines per frame */
 #define LINE_NS         64000
@@ -66,6 +67,15 @@
 #define REG_BLTBDAT     0x072
 #define REG_BLTADAT     0x074
 #define REG_DENISEID    0x07c
+#define REG_DIWSTRT     0x08e
+#define REG_DIWSTOP     0x090
+#define REG_DDFSTRT     0x092
+#define REG_DDFSTOP     0x094
+#define REG_BPL1PT      0x0e0
+#define REG_BPLCON0     0x100
+#define REG_BPL1MOD     0x108
+#define REG_BPL2MOD     0x10a
+#define REG_COLOR00     0x180
 #define REG_COP1LC      0x080
 #define REG_COP2LC      0x084
 #define REG_COPJMP1     0x088
@@ -514,6 +524,145 @@ static void amiga_custom_vblank(void *opaque)
     amiga_custom_post_int(s, INT_VERTB);
 }
 
+/* --- display --- */
+
+#define DMACON_BPLEN    (1 << 8)
+
+#define BPLCON0_HIRES   (1 << 15)
+#define BPLCON0_HAM     (1 << 11)
+#define BPLCON0_DBLPF   (1 << 10)
+
+#define MAX_PLANES      6
+
+static uint32_t amiga_rgb4(uint16_t c)
+{
+    return (((c >> 8) & 0xf) * 0x11 << 16) |
+           (((c >> 4) & 0xf) * 0x11 << 8) |
+           ((c & 0xf) * 0x11);
+}
+
+/*
+ * Render the current frame from the bitplane pointers, which the
+ * copper has just reloaded for this frame.  The geometry comes from
+ * the data fetch registers; display window clipping is ignored.
+ */
+static bool amiga_custom_gfx_update(void *opaque)
+{
+    AmigaCustomState *s = opaque;
+    DisplaySurface *surface = qemu_console_surface(s->con);
+    uint16_t bplcon0 = amiga_custom_reg(s, REG_BPLCON0);
+    uint16_t ddfstrt = amiga_custom_reg(s, REG_DDFSTRT) & 0xfc;
+    uint16_t ddfstop = amiga_custom_reg(s, REG_DDFSTOP) & 0xfc;
+    uint16_t diwstrt = amiga_custom_reg(s, REG_DIWSTRT);
+    uint16_t diwstop = amiga_custom_reg(s, REG_DIWSTOP);
+    bool hires = bplcon0 & BPLCON0_HIRES;
+    int planes = (bplcon0 >> 12) & 7;
+    uint32_t palette[64];
+    uint32_t bplpt[MAX_PLANES];
+    uint8_t rowbuf[MAX_PLANES][1024 / 8];
+    int words, width, height, vstart, vstop;
+    int p, x, y;
+
+    if (!s->con || !surface) {
+        return true;
+    }
+
+    vstart = diwstrt >> 8;
+    vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
+    height = vstop - vstart;
+    if (hires) {
+        words = ((ddfstop - ddfstrt) >> 2) + 2;
+    } else {
+        words = ((ddfstop - ddfstrt) >> 3) + 1;
+    }
+    width = words * 16;
+    /* clip the fetch overrun to the display window width */
+    {
+        int hstart = diwstrt & 0xff;
+        int hstop = (diwstop & 0xff) | 0x100;
+        int diw_width = (hstop - hstart) << (hires ? 1 : 0);
+
+        if (diw_width > 0 && diw_width < width) {
+            width = diw_width;
+        }
+    }
+
+    if (planes == 0 || planes > MAX_PLANES ||
+        (s->dmacon & (DMACON_DMAEN | DMACON_BPLEN)) !=
+            (DMACON_DMAEN | DMACON_BPLEN) ||
+        width < 16 || width > 1024 || height < 16 || height > 313) {
+        /* no active display: show the background colour */
+        uint32_t bg = amiga_rgb4(amiga_custom_reg(s, REG_COLOR00));
+        uint32_t *dst;
+
+        for (y = 0; y < surface_height(surface); y++) {
+            dst = (uint32_t *)(surface_data(surface) +
+                               y * surface_stride(surface));
+            for (x = 0; x < surface_width(surface); x++) {
+                *dst++ = bg;
+            }
+        }
+        qemu_console_update(s->con, 0, 0, surface_width(surface),
+                            surface_height(surface));
+        return true;
+    }
+
+    if (bplcon0 & (BPLCON0_HAM | BPLCON0_DBLPF)) {
+        qemu_log_mask(LOG_UNIMP, "amiga-custom: HAM/dual-playfield mode\n");
+    }
+
+    if (surface_width(surface) != width ||
+        surface_height(surface) != height) {
+        qemu_console_resize(s->con, width, height);
+        surface = qemu_console_surface(s->con);
+    }
+
+    for (p = 0; p < 32; p++) {
+        palette[p] = amiga_rgb4(amiga_custom_reg(s, REG_COLOR00 + p * 2));
+    }
+    /* extra-half-brite */
+    for (p = 32; p < 64; p++) {
+        palette[p] = (palette[p - 32] >> 1) & 0x7f7f7f;
+    }
+
+    for (p = 0; p < planes; p++) {
+        bplpt[p] = amiga_custom_ptr(s, REG_BPL1PT + p * 4);
+    }
+
+    for (y = 0; y < height; y++) {
+        uint32_t *dst = (uint32_t *)(surface_data(surface) +
+                                     y * surface_stride(surface));
+
+        for (p = 0; p < planes; p++) {
+            int16_t mod = amiga_custom_reg(s, (p & 1) ? REG_BPL2MOD
+                                                      : REG_BPL1MOD);
+
+            dma_memory_read(&address_space_memory, bplpt[p] & CHIP_MASK,
+                            rowbuf[p], words * 2, MEMTXATTRS_UNSPECIFIED);
+            bplpt[p] += words * 2 + mod;
+        }
+        for (x = 0; x < width; x++) {
+            int idx = 0;
+
+            for (p = 0; p < planes; p++) {
+                idx |= ((rowbuf[p][x >> 3] >> (7 - (x & 7))) & 1) << p;
+            }
+            *dst++ = palette[idx];
+        }
+    }
+    qemu_console_update(s->con, 0, 0, width, height);
+    return true;
+}
+
+static void amiga_custom_invalidate(void *opaque)
+{
+}
+
+static const GraphicHwOps amiga_custom_gfx_ops = {
+    .invalidate = amiga_custom_invalidate,
+    .gfx_update = amiga_custom_gfx_update,
+};
+
 /* --- serial port --- */
 
 static int amiga_custom_serial_can_receive(void *opaque)
@@ -726,6 +875,8 @@ static void amiga_custom_realize(DeviceState *dev, Error **errp)
     qemu_chr_fe_set_handlers(&s->chr, amiga_custom_serial_can_receive,
                              amiga_custom_serial_receive, NULL, NULL,
                              s, NULL, true);
+    s->con = qemu_graphic_console_create(dev, 0, &amiga_custom_gfx_ops, s);
+    qemu_console_resize(s->con, 640, 256);
 }
 
 static void amiga_custom_init(Object *obj)

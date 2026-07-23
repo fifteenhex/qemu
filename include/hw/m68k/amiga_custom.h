@@ -10,6 +10,7 @@
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
+#include "ui/console.h"
 #include "qom/object.h"
 
 #define TYPE_AMIGA_CUSTOM "amiga-custom"
@@ -60,6 +61,8 @@ struct AmigaCustomState {
 
     int64_t frame_origin_ns;
     QEMUTimer vblank_timer;
+
+    QemuConsole *con;
 };
 
 #endif
