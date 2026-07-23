@@ -341,3 +341,86 @@ coherent across sustained multi-block transfers — completes:commands is
    pre-reading the whole transfer into the buffer on do_command.
 4. Only then will the loaded System boot; may also need real ADB (mouse/kbd
    via Egret) for the Finder.
+
+### WELCOME TO MACINTOSH (2026-07-22, session 6) — SCSI data path fixed
+
+MILESTONE: **"Welcome to Macintosh" renders** (screenshot
+/tmp/shots/scsifix-10a.png) — the ROM boot, the disk's Apple_Driver43
+and the System file all load over the 5380.  Three separate bugs stood
+between the insert-disk icon and the splash; all found by tracing with
+guest PCs on every register access and then reading the ROM at those
+PCs.
+
+1. **Async data-in raced the blind reader** (hw/scsi/ncr5380.c).  The
+   old chunked-async path waited on the aiocb to flip DI→ST.  The ROM's
+   blind loop counts its bytes and then polls for STATUS *immediately*;
+   while the phase change sat in the aio queue, SCSIComplete's
+   wrong-phase handler (ROM 0x408078c8: TCR=3 phase check, TCR=1,
+   CSD read, ACK pulse, repeat) clocked in PHANTOM stale bytes — 515
+   extra after a 512-byte READ → guest buffer overrun → the double MMU
+   fault / sad macs, and completes:commands ~1:2.  Fix: pre-read the
+   ENTIRE transfer synchronously in do_command (pump blk_drain until
+   the completion callback fires), enter STATUS the moment the guest
+   consumes the last byte (pdma read, or ACK-release after the last CSD
+   read).  Data-out mirrors this: collect whole transfer, then feed the
+   device in one synchronous pump.  Also: bus-free must clear ALL of
+   CSB (stale phase bits 0x1c made the driver's wait-for-bus-free poll
+   time out and fail perfect transfers).
+2. **Wide pseudo-DMA accesses** (hw/m68k/maciisi.c): the pdma region
+   handlers ignored access size (1 byte per move.w/move.l!).  .impl
+   min/max = 1 lets the memory core split them MSB-first.
+3. **The handshake aperture was unmapped** — THE big one.  The IIsi has
+   TWO pdma windows: +0x12000 (plain, polled; the ROM's single-block
+   reads) and +0x6000 = 0x50F06000 ("SCSI+DRQ", Linux mac_scsi's drq
+   region).  The multi-block blind routine (ROM 0x4080924e, aperture
+   ptr = SCSIGlobals+72 + 0x60) reads through the handshake window and
+   *expects a bus error* when DRQ stops (bus-error handler 0x40808a64
+   with a retry counter, gives up via rte→0x40808a9c → error 5).
+   Unmapped, every access BERR'd, the transfer moved 0 bytes, the data
+   was silently DRAINED by SCSIComplete (looked perfect on the wire!)
+   and the ROM re-read the boot blocks 20x → X-floppy.  Mapped it to
+   the same byte pump; it faults only when no byte is available in the
+   current data phase (= real timeout semantics under the synchronous
+   model).  Diagnosis trick: trace ncr5380_datain (whole-transfer
+   lba/len/checksum at do_command) proved the SCSI layer byte-exact
+   while the guest still failed — the bug HAD to be in delivery.
+
+Egret, post-splash: the OS-level ADB manager (RAM driver at ~0x15000-
+0x19700, globals ptr lowmem 0xB78) is stricter than the ROM driver:
+- /XCVR_SESSION must go idle when the host releases the session (model
+  parked it low = "response pending" forever; OS never started the next
+  exchange).
+- After release, the Egret clocks one final SR interrupt ("session
+  closed"); the OS parks its state machine on it.
+Both added.  OS-era Egret flow observed: Talk R3 probes 0x0f..0xff,
+then 0xfc, then the classic RTC bit-bang from ROM 0x4080b240 — the OS
+runs a 1Hz loop backing the time up into XPRAM 0xB8-0xBB (write,
+verify, +1s, repeat).  Whether that loop is normal or a failed clock
+init is still open — the boot sits at the splash with SCSI idle
+(198 commands, all complete) while it runs.
+
+RAM sizing mystery (open): lowmem MemTop reads 0x5A00000 (90MB!) on
+the 8MB machine — BufPtr/boot stacks point into unbacked space (only
+'Tina' bank-B probes at 0x4000000 ever touch the holes though).  With
+-m 64M/-m 128M MemTop comes out exactly right (0x4000000/0x8000000)
+but the System boot then crash-loops (X-floppy, endless retries) —
+worse than 8MB.  Mirroring the 8MB bank across the 64MB bank-A window
+(real SIMM partial decode) did NOT change the 90MB result and turned
+the harmless phantom reads into aliased writes = memory corruption →
+reboot loops; reverted.  The ROM's size decision is NOT a plain
+pattern probe — needs the sizing routine (around pc 0x4084a390) read
+properly next time.
+
+Boots are somewhat FLAKY run-to-run (same build: Welcome+stall one
+run, early X-floppy the next) — suspect marginal Egret/RTC timing
+feeding the ROM garbage PRAM occasionally.  NEXT:
+1. Decode the 1Hz XPRAM loop's exit condition (is it SetDateTime
+   verify?  does it want Egret packet-time commands answered?), and
+   what the boot waits for after ADB probe 0xfc.
+2. RAM sizing: find where 0x5A00000 comes from (watch lowmem 0x108
+   writes; gdb watchpoint works but PCs come back garbled — use the
+   ram-hole/pc logs instead).
+3. ADB devices behind the Egret (QEMU adb-kbd/adb-mouse via
+   adb_request, cuda.c-style) for Finder input once the desktop shows.
+4. The 5380 model is solid now — don't suspect it first anymore
+   (commands:completes 1:1, byte-exact, ncr5380_datain proves it).
