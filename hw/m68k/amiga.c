@@ -231,6 +231,9 @@ static void amiga_machine_init(MachineState *machine)
     qdev_connect_gpio_out_named(ams->custom, "mouse-btn", 0,
                                 qdev_get_gpio_in_named(ams->ciaa, "port-in",
                                                        AMIGA_CIAA_PA_FIR0));
+    qdev_connect_gpio_out_named(ams->custom, "joy2-btn", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_FIR1));
 
     /* keyboard: clocks codes into CIA-A's SDR, acked by its SP output */
     ams->kbd = qdev_new(TYPE_AMIGA_KBD);

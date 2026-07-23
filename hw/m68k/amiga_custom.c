@@ -1057,6 +1057,9 @@ static void amiga_custom_mouse_event(DeviceState *dev, QemuConsole *src,
             qemu_set_irq(s->mouse_btn, !evt->btn.down);
         } else if (evt->btn.button == INPUT_BUTTON_RIGHT) {
             s->mouse_rmb = evt->btn.down;
+        } else if (evt->btn.button == INPUT_BUTTON_MIDDLE) {
+            /* stands in for the port 2 joystick fire button */
+            qemu_set_irq(s->joy2_btn, !evt->btn.down);
         }
         break;
     default:
@@ -1449,12 +1452,13 @@ static void amiga_custom_init(Object *obj)
     qdev_init_gpio_in_named(dev, amiga_custom_ports_irq, "ports-irq", 1);
     qdev_init_gpio_in_named(dev, amiga_custom_exter_irq, "exter-irq", 1);
     qdev_init_gpio_out_named(dev, &s->mouse_btn, "mouse-btn", 1);
+    qdev_init_gpio_out_named(dev, &s->joy2_btn, "joy2-btn", 1);
 }
 
 static const VMStateDescription vmstate_amiga_custom = {
     .name = "amiga-custom",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(dsklen, AmigaCustomState),
         VMSTATE_BOOL(dsklen_armed, AmigaCustomState),

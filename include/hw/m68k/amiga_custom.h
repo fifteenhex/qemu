@@ -22,8 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmigaCustomState, AMIGA_CUSTOM)
 /* plenty for the few hundred entries a busy per-line copper list makes */
 #define AMIGA_COPPER_JOURNAL_MAX    4096
 
-/* gameport 0 fire button / left mouse button input on CIA-A port A */
+/* gameport fire buttons on CIA-A port A: port 0 (mouse) and port 1 (joy) */
 #define AMIGA_CIAA_PA_FIR0          6
+#define AMIGA_CIAA_PA_FIR1          7
 
 /* INTENA/INTREQ bits */
 #define INT_TBE     (1 << 0)
@@ -64,6 +65,7 @@ struct AmigaCustomState {
 
     /* mouse in gameport 0: counters in JOY0DAT, buttons on the CIA/POT */
     qemu_irq mouse_btn;         /* left button, CIA-A PA6, active low */
+    qemu_irq joy2_btn;          /* port 2 joystick fire, CIA-A PA7, low */
     QemuInputHandlerState *mouse_hs;
     uint8_t mouse_x, mouse_y;
     bool mouse_rmb;
