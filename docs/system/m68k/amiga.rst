@@ -1,5 +1,5 @@
-Commodore Amiga (``a500``, ``a500plus``, ``a600``, ``a1000``, ``a1200``, ``a2000``, ``a3000``, ``a4000``, ``cd32``)
-===================================================================================================================
+Commodore Amiga (``a500``, ``a500plus``, ``a600``, ``a1000``, ``a1200``, ``a2000``, ``a3000``, ``a4000``, ``a4000t``, ``cd32``)
+===============================================================================================================================
 
 QEMU emulates eight classic Commodore Amiga models and the CD32
 console.  They share a
@@ -65,6 +65,12 @@ layout and I/O:
      - 2MB
      - motherboard fast RAM, max 16MB (8MB)
      - 3.1 (A4000)
+   * - ``a4000t``
+     - 68040
+     - AGA
+     - 2MB
+     - motherboard fast RAM, max 16MB (8MB)
+     - 3.1 (A4000T)
    * - ``cd32``
      - 68020 [2]_
      - AGA
@@ -161,6 +167,9 @@ machines were developed and tested against:
    * - 3.1 r40.068 (A4000)
      - ``a4000``
      - 9bdedde6a4f33555b4a270c8ca53297d
+   * - 3.1 r40.070 (A4000T)
+     - ``a4000t``
+     - e873c43040b4d7a9c65f37cf2da2158f
    * - 3.1 r40.060 (CD32)
      - ``cd32``
      - 5f8924d013dd57a89cf349f4cdedc6b1
@@ -242,6 +251,12 @@ Known limitations
 * PCMCIA on the ``a600``/``a1200`` and the A4000's onboard IDE are
   not modelled, and the CD32 has no CD drive yet (the console runs
   its "no disc" startup screen).
+* The A4000T's onboard NCR 53C710 SCSI is not modelled; its vacant
+  slot latches a Fat Gary bus timeout so Kickstart 3.1 r40.070
+  detects the absence and boots on.  The machine reaches the
+  insert-disk screen, but booting Workbench from floppy currently
+  stalls at an empty Workbench screen (under investigation; the
+  ``a4000`` boots it fine).
 * Floppies are 880KB double-density ADFs only.
 * Joystick directions in gameport 1 are not wired (only the fire
   button is).

@@ -427,3 +427,26 @@ starfield).  All verified by screendump.
 - Gayle/board reset: AmigaMachineState gained rsto_dev[], board
   devices the RESET instruction cold-resets along with the shared
   chips (gayle on a600/a1200, akiko on cd32).
+- a4000t (stretch): machine added (hw/m68k/a4000.c, subclass of the
+  a4000).  KS 3.1 r40.070 probes the onboard NCR 53C710 by touching
+  its registers under a Fat Gary bus-timeout watch (write 0 to
+  0xde0000, access 0xdd0078, read 0xde0000 bit 7, write 0x80): plain
+  open bus reads as "chip present" and the boot then hangs forever in
+  the A4000T SCSI handler task.  amiga_mobo now models the Gary
+  timeout latch (reg 0x0000) plus a "vacant slot" region (sysbus mmio
+  1) the a4000t maps over 0xdd0000, so the probe sees the timeout and
+  scsi.device skips the controller; KS boots to the insert-disk
+  screen.  WIRING THE REAL NCR WAS TRIED and reverted: the in-tree
+  GSoC 53C710 (hw/scsi/ncr53c710.c, + a lasi-style ^3 byte-lane
+  swizzle for the BE bus) gets through scsi.device's reset/config
+  dialogue (ISTAT abort/reset, CTEST7/CTEST0/SCNTL0 setup all traced
+  sane) but then the driver polls ISTAT reading 0x20 (SIGP) forever
+  with SCRIPTS never started - real 710 bring-up work, not a drop-in;
+  a future session could resume from that trace.
+  OPEN ITEM: WB 3.1 floppy boot on a4000t stalls at an empty
+  "Workbench Screen" (startup-sequence runs to the end - ConClip,
+  IPrefs, RAM disk all up - but no Workbench task appears after
+  LoadWB; no guru).  The same disk boots to the desktop on -M a4000
+  (40.068), so it is 40.070-specific.  Not caused by the timeout slot
+  (same stall before it was added... actually pre-timeout the machine
+  hung earlier, in scsi.device; the LoadWB stall is the next layer).

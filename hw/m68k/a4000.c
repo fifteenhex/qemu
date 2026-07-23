@@ -22,6 +22,8 @@
 #define A4000_FASTRAM_BASE      0x07000000
 #define A4000_RAMSEY_BASE       0xde0000
 #define A4000_ROM_BASE          0xf80000
+/* A4000T: the (vacant) onboard NCR 53C710 slot page */
+#define A4000T_NCR_SLOT_BASE    0xdd0000
 
 #define TYPE_A4000_MACHINE MACHINE_TYPE_NAME("a4000")
 OBJECT_DECLARE_SIMPLE_TYPE(A4000MachineState, A4000_MACHINE)
@@ -30,6 +32,7 @@ struct A4000MachineState {
     AmigaMachineState parent_obj;
 
     MemoryRegion z3_open_bus;
+    DeviceState *mobo;
 };
 
 static void a4000_board_init(AmigaMachineState *ams)
@@ -52,6 +55,7 @@ static void a4000_board_init(AmigaMachineState *ams)
     mobo_dev = qdev_new(TYPE_AMIGA_MOBO);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mobo_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(mobo_dev), 0, A4000_RAMSEY_BASE);
+    s->mobo = mobo_dev;
 
     /*
      * Zorro III configuration space reads open bus so the OS's config
@@ -82,12 +86,50 @@ static void a4000_machine_class_init(ObjectClass *oc, const void *data)
     amc->board_init = a4000_board_init;
 }
 
+#define TYPE_A4000T_MACHINE MACHINE_TYPE_NAME("a4000t")
+
+static void a4000t_board_init(AmigaMachineState *ams)
+{
+    A4000MachineState *s = A4000_MACHINE(ams);
+
+    a4000_board_init(ams);
+
+    /*
+     * The onboard NCR 53C710 is not modelled.  Kickstart 3.1
+     * r40.070's scsi.device probes for it by touching its register
+     * space under Fat Gary's bus-timeout watch, so the vacant slot
+     * must latch a Gary timeout - plain open bus would read as a
+     * present chip and hang the boot in the SCSI handler task.
+     */
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->mobo), 1, A4000T_NCR_SLOT_BASE);
+}
+
+static void a4000t_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    AmigaMachineClass *amc = AMIGA_MACHINE_CLASS(oc);
+
+    /*
+     * The tower variant: the A4000 desktop's chipset with Kickstart
+     * 3.1 r40.070.  The onboard NCR 53C710 SCSI is absent (and its
+     * absence detected, see above), so it boots from floppy only.
+     */
+    mc->desc = "Commodore Amiga 4000T (68040, AGA)";
+    amc->board_init = a4000t_board_init;
+}
+
 static const TypeInfo a4000_machine_types[] = {
     {
         .name          = TYPE_A4000_MACHINE,
         .parent        = TYPE_AMIGA_MACHINE,
         .instance_size = sizeof(A4000MachineState),
         .class_init    = a4000_machine_class_init,
+    },
+    {
+        .name          = TYPE_A4000T_MACHINE,
+        .parent        = TYPE_A4000_MACHINE,
+        .instance_size = sizeof(A4000MachineState),
+        .class_init    = a4000t_machine_class_init,
     },
 };
 
