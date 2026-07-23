@@ -584,7 +584,18 @@ static void escc_mem_write(void *opaque, hwaddr addr,
                 s->rregs[R_STATUS] |= STATUS_SYNC;
             }
             break;
-        case W_INTR ... W_IVEC:
+        case W_IVEC:
+            /*
+             * WR2 is shared between both channels; RR2 returns it
+             * unmodified on channel A (channel B sees the modified
+             * vector set on interrupt acknowledge).
+             */
+            s->wregs[s->reg] = val;
+            s->otherchn->wregs[W_IVEC] = val;
+            s->rregs[R_IVEC] = val;
+            s->otherchn->rregs[R_IVEC] = val;
+            break;
+        case W_INTR:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
         case W_MISC2 ... W_EXTINT:

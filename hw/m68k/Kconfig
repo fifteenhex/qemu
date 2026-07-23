@@ -36,6 +36,16 @@ config Q800
     select IOSB
     select ASC
 
+config MACIISI
+    bool
+    default y
+    depends on M68K
+    select MOS6522
+    select ESCC
+    select SWIM
+    select ASC
+    select OR_IRQ
+
 config M68K_VIRT
     bool
     default y
