@@ -105,8 +105,14 @@
 #define VIA_60HZ_TIMER_PERIOD_NS 16625800
 
 /*
- * Interrupt glue: the VIA drives /IPL0 and the SCC /IPL1, so the CPU
- * sees level 1 (VIA), level 2 (SCC) or level 3 (both), autovectored.
+ * Interrupt glue: VIA at level 1, SCC at level 2, autovectored.
+ *
+ * The naive model - VIA on /IPL0, SCC on /IPL1, both asserted = level
+ * 3 - livelocks: the ROM's level-3 autovector points at a bare RTE
+ * (the tail of its SCC ISR), so with level-triggered re-sampling the
+ * CPU takes level 3 forever and neither device ever gets serviced.
+ * Behave like a priority encoder instead: SCC pending wins at level
+ * 2, the VIA waits at level 1 and is taken once the SCC clears.
  */
 #define TYPE_MAC128K_GLUE "mac128k-glue"
 OBJECT_DECLARE_SIMPLE_TYPE(Mac128kGlueState, MAC128K_GLUE)
@@ -131,7 +137,7 @@ static void mac128k_glue_set_irq(void *opaque, int irq, int level)
         s->levels &= ~(1 << irq);
     }
 
-    ipl = ((s->levels & 1) ? 1 : 0) | ((s->levels & 2) ? 2 : 0);
+    ipl = (s->levels & 2) ? 2 : (s->levels & 1) ? 1 : 0;
     if (ipl) {
         m68k_set_irq_level(s->cpu, ipl, 24 + ipl);
     } else {
@@ -678,7 +684,8 @@ static void mac128k_one_second(void *opaque)
  * gets its interrupt serviced.
  */
 
-#define MOUSE_STEP_NS  400000   /* 2500 quadrature counts/s */
+#define MOUSE_STEP_NS  1500000  /* ~666 counts/s: the 7.8MHz guest must
+                                 * service an SCC interrupt per edge */
 
 /* DCD gpio lines on the ESCC are indexed like chn[]: 0 = B, 1 = A */
 #define ESCC_DCD_B     0
@@ -693,8 +700,9 @@ static void mac128k_mouse_step(Mac128kMachineState *m)
 
         m->mouse_dx -= dir;
         m->mouse_x1 = !m->mouse_x1;
-        /* phase of X2 relative to X1 encodes the direction */
-        if ((dir > 0) == m->mouse_x1) {
+        /* phase of X2 relative to X1 encodes the direction (found
+         * empirically: X counts positive when X2 != X1 at the edge) */
+        if ((dir > 0) != m->mouse_x1) {
             s->b |= VIA_B_MOUSEX2;
         } else {
             s->b &= ~VIA_B_MOUSEX2;
