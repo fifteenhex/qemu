@@ -33,6 +33,16 @@ The `a4000` machine needs the A4000 Kickstart 3.1 r40.068 instead (also
 
 Run it with `-M a4000 -bios kick31_a4000.rom`; disks attach the same way.
 
+The `a500` machine needs the A500/A600/A2000 Kickstart 3.1 r40.63 (512KB,
+same `commodore-amiga-firmware` item, file `Kickstart v3.1 r40.063
+(1993-07)(Commodore)(A500-A600-A2000)[!].zip`):
+
+    md5  e40a5dfb3d017ba8779faba30cbd1c8e
+    sha1 3b7f1493b27e212830f989f26ca76c02049f09ca
+
+Run it with `-M a500 -bios kick31_a500.rom` (default 1MB; `-m 1536k` for
+a maxed trapdoor).  Floppies attach as `if=floppy` like the others.
+
 ## Running
 
     qemu-system-m68k -M a3000 -bios kick31_a3000.rom
@@ -41,9 +51,11 @@ Run it with `-M a4000 -bios kick31_a4000.rom`; disks attach the same way.
 
 ## Current state (2026-07-20)
 
-Two machines now: `a3000` (68030, ECS) and `a4000` (68040, AGA).  Both
-boot Kickstart 3.1 to the insert-floppy screen and run Workbench 3.1
-from a floppy; the A4000 needs its own Kickstart (see above).  The
+Three machines now: `a500` (68000, OCS/ECS), `a3000` (68030, ECS) and
+`a4000` (68040, AGA).  All boot Kickstart 3.1 to the insert-floppy
+screen and run Workbench 3.1 from a floppy; the A4000 needs its own
+Kickstart and the A500 needs the A500/A600/A2000 3.1 r40.63 ROM (see
+above).  The
 A4000 renders through the ECS display path for now (no real AGA), and
 its onboard IDE is not modelled, so it has no hard disk yet — the two
 open follow-ups for a "real" A4000.  See the A4000 item under "Open
@@ -77,6 +89,15 @@ clock, Agnus/Denise IDs, open-bus extent) and a board_init hook.
 and the SCSI subsystem; `a4000` (hw/m68k/a4000.c) adds the 68040, fast
 RAM and the AGA chip IDs.  The Ramsey memory controller + Fat Gary glue
 they share is the TYPE_AMIGA_MOBO device (hw/m68k/amiga_mobo.c).
+`a500` (hw/m68k/a500.c) is the minimal case: a 68000 with 512KB chip
+RAM and, via `-m` (default 512KB, max 1.5MB), the A501 trapdoor "slow"
+RAM at 0x00C00000.  No fast RAM (the 68000 is 24-bit), no Ramsey/Gary,
+no Zorro III — just the shared base plus the trapdoor region.  It runs
+the A500/A600/A2000 Kickstart 3.1 r40.63 (md5 e40a5dfb3d017ba8779faba
+30cbd1c8e); chipset IDs are inherited from the base (ECS), modelling an
+ECS-upgraded A500.  Verified: KS3.1 reaches the insert-disk screen and
+Workbench 3.1 boots to the desktop with the default 1MB (512 chip + 512
+slow) config.
 Devices: hw/m68k/mos8520.c (CIA), hw/m68k/amiga_custom.c (interrupts,
 beam counters, serial, blitter incl. line mode and fills, frame-atomic
 copper, split-window-clipped bitplane display renderer),
