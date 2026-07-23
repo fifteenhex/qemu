@@ -46,6 +46,7 @@
 #define REG_SERDAT      0x030
 #define REG_SERPER      0x032
 #define REG_POTGO       0x034
+#define REG_COPCON      0x02e
 #define REG_BLTCON0     0x040
 #define REG_BLTCON1     0x042
 #define REG_BLTAFWM     0x044
@@ -65,6 +66,10 @@
 #define REG_BLTBDAT     0x072
 #define REG_BLTADAT     0x074
 #define REG_DENISEID    0x07c
+#define REG_COP1LC      0x080
+#define REG_COP2LC      0x084
+#define REG_COPJMP1     0x088
+#define REG_COPJMP2     0x08a
 #define REG_DMACON      0x096
 #define REG_INTENA      0x09a
 #define REG_INTREQ      0x09c
@@ -324,6 +329,62 @@ static void amiga_custom_do_blit(AmigaCustomState *s, int width, int height)
     amiga_custom_post_int(s, INT_BLIT);
 }
 
+/* --- copper --- */
+
+#define DMACON_DMAEN    (1 << 9)
+#define DMACON_COPEN    (1 << 7)
+
+static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
+                                   uint16_t val);
+
+/*
+ * Frame-atomic copper: the whole list is executed at the vertical
+ * blank with every WAIT considered satisfied, so all the MOVEs for a
+ * frame are applied in one go.  That is enough for displays that only
+ * use the copper to reload pointers and palettes per frame; mid-frame
+ * raster effects would need a beam-synchronous model.
+ */
+static void amiga_custom_run_copper(AmigaCustomState *s, uint32_t pc)
+{
+    int budget = 20000;
+
+    if ((s->dmacon & (DMACON_DMAEN | DMACON_COPEN)) !=
+        (DMACON_DMAEN | DMACON_COPEN)) {
+        return;
+    }
+
+    while (budget-- > 0) {
+        uint16_t ir1 = chip_read16(pc);
+        uint16_t ir2 = chip_read16(pc + 2);
+
+        pc += 4;
+        if (!(ir1 & 1)) {
+            unsigned reg = ir1 & 0x1fe;
+
+            if (reg < 0x80 && reg != REG_COPJMP1 && reg != REG_COPJMP2 &&
+                !(amiga_custom_reg(s, REG_COPCON) & 2)) {
+                /* illegal MOVE halts the copper */
+                break;
+            }
+            if (reg == REG_COPJMP1) {
+                pc = amiga_custom_ptr(s, REG_COP1LC);
+            } else if (reg == REG_COPJMP2) {
+                pc = amiga_custom_ptr(s, REG_COP2LC);
+            } else {
+                amiga_custom_reg_write(s, reg, ir2);
+            }
+        } else if (!(ir2 & 1)) {
+            /* WAIT: the conventional end-of-list marker never matches */
+            if ((ir1 >> 8) == 0xff && (ir1 & 0xfe) == 0xfe) {
+                break;
+            }
+        } else {
+            /* SKIP: by end of frame the position has been reached */
+            pc += 4;
+        }
+    }
+}
+
 /* --- beam counters --- */
 
 static void amiga_custom_beam_pos(AmigaCustomState *s, uint32_t *vpos,
@@ -345,6 +406,8 @@ static void amiga_custom_vblank(void *opaque)
 
     s->frame_origin_ns += FRAME_NS;
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
+    /* the copper restarts from the top of its list every frame */
+    amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
     amiga_custom_post_int(s, INT_VERTB);
 }
 
@@ -413,13 +476,12 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
-static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
+static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
+                                   uint16_t val)
 {
-    AmigaCustomState *s = opaque;
     uint8_t ch;
 
-    switch (addr & 0x1fe) {
+    switch (reg) {
     case REG_SERDAT:
         ch = val & 0xff;
         qemu_chr_fe_write_all(&s->chr, &ch, 1);
@@ -466,10 +528,22 @@ static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
         amiga_custom_do_blit(s, w ? w : 2048, h ? h : 32768);
         break;
     }
+    case REG_COPJMP1:
+        amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
+        break;
+    case REG_COPJMP2:
+        amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP2LC));
+        break;
     default:
-        s->regs[(addr & 0x1fe) >> 1] = val;
+        s->regs[reg >> 1] = val;
         break;
     }
+}
+
+static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    amiga_custom_reg_write(opaque, addr & 0x1fe, val);
 }
 
 static const MemoryRegionOps amiga_custom_ops = {
