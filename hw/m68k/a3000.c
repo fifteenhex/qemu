@@ -22,11 +22,11 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
-#include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "hw/core/boards.h"
 #include "hw/m68k/amiga.h"
+#include "hw/m68k/amiga_mobo.h"
 #include "hw/m68k/a3000_sdmac.h"
 #include "hw/scsi/wd33c93.h"
 #include "hw/core/or-irq.h"
@@ -38,83 +38,13 @@
 #define A3000_RAMSEY_BASE       0xde0000
 #define A3000_FASTRAM_TOP       0x08000000
 
-#define RAMSEY_CTRL             0x0003
-#define RAMSEY_VERSION          0x0043
-#define GARY_TOENB              0x1000
-#define GARY_TOLW               0x1001
-#define GARY_DEB                0x1002
-
-#define RAMSEY_VERSION_07       0x0f
-
 #define TYPE_A3000_MACHINE MACHINE_TYPE_NAME("a3000")
 OBJECT_DECLARE_SIMPLE_TYPE(A3000MachineState, A3000_MACHINE)
 
 struct A3000MachineState {
     AmigaMachineState parent_obj;
 
-    MemoryRegion mobo;
     MemoryRegion z3_open_bus;
-    uint8_t ramsey_ctrl;
-    uint8_t gary[3];
-};
-
-/* Ramsey memory controller and Fat Gary bus glue */
-static uint64_t a3000_mobo_read(void *opaque, hwaddr addr, unsigned size)
-{
-    A3000MachineState *s = opaque;
-
-    switch (addr) {
-    case RAMSEY_CTRL:
-        return s->ramsey_ctrl;
-    case RAMSEY_VERSION:
-        return RAMSEY_VERSION_07;
-    case GARY_TOENB:
-    case GARY_TOLW:
-    case GARY_DEB:
-        return s->gary[addr - GARY_TOENB];
-    default:
-        qemu_log_mask(LOG_UNIMP,
-                      "a3000: unimplemented mobo read 0x%04" HWADDR_PRIx "\n",
-                      addr);
-        return 0;
-    }
-}
-
-static void a3000_mobo_write(void *opaque, hwaddr addr, uint64_t val,
-                             unsigned size)
-{
-    A3000MachineState *s = opaque;
-
-    switch (addr) {
-    case RAMSEY_CTRL:
-        s->ramsey_ctrl = val;
-        break;
-    case GARY_TOENB:
-    case GARY_TOLW:
-    case GARY_DEB:
-        /* only bit 7 is implemented in Gary's registers */
-        s->gary[addr - GARY_TOENB] = val & 0x80;
-        break;
-    default:
-        qemu_log_mask(LOG_UNIMP,
-                      "a3000: unimplemented mobo write 0x%04" HWADDR_PRIx
-                      " = 0x%" PRIx64 "\n", addr, val);
-        break;
-    }
-}
-
-static const MemoryRegionOps a3000_mobo_ops = {
-    .read = a3000_mobo_read,
-    .write = a3000_mobo_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 2,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 1,
-    },
 };
 
 static void a3000_board_init(AmigaMachineState *ams)
@@ -122,7 +52,7 @@ static void a3000_board_init(AmigaMachineState *ams)
     A3000MachineState *s = A3000_MACHINE(ams);
     MachineState *machine = MACHINE(ams);
     MemoryRegion *sysmem = get_system_memory();
-    DeviceState *sbic_dev, *sdmac_dev, *a2065_dev, *int2_dev;
+    DeviceState *sbic_dev, *sdmac_dev, *a2065_dev, *int2_dev, *mobo_dev;
     NICInfo *nd;
 
     /* motherboard fast RAM sits below 0x08000000, sized by Kickstart */
@@ -136,9 +66,10 @@ static void a3000_board_init(AmigaMachineState *ams)
                                     machine->ram);
     }
 
-    memory_region_init_io(&s->mobo, OBJECT(s), &a3000_mobo_ops, s,
-                          "a3000.mobo", 0x2000);
-    memory_region_add_subregion(sysmem, A3000_RAMSEY_BASE, &s->mobo);
+    /* Ramsey memory controller and Fat Gary bus glue */
+    mobo_dev = qdev_new(TYPE_AMIGA_MOBO);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(mobo_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(mobo_dev), 0, A3000_RAMSEY_BASE);
 
     /* WD33C93A SBIC behind the SuperDMAC, interrupting on INT2 */
     sbic_dev = qdev_new(TYPE_WD33C93);
