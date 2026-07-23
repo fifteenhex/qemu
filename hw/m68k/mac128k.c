@@ -954,6 +954,15 @@ static void mac128k_machine_init(MachineState *machine)
     sysbus_realize(sysbus, &error_fatal);
     memory_region_add_subregion(sysmem, MAC128K_IWM_BASE,
                                 sysbus_mmio_get_region(sysbus, 0));
+    /*
+     * Drive-speed PWM: the spindle speed comes from the low bytes of
+     * the words in the main sound page (ram top - 0x300); point the
+     * drive at them so its tachometer answers with the speed the ROM
+     * dialled in.
+     */
+    m->iwm.pwm_buf = (const uint8_t *)
+                     memory_region_get_ram_ptr(machine->ram) +
+                     ram_size - 0x300 + 1;
 
     /* video */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MAC128K_FB);

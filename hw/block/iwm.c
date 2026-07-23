@@ -80,7 +80,10 @@
 #define SONY_RDDATA0    0x8     /* instantaneous read head, side 0 */
 #define SONY_RDDATA1    0x9     /* instantaneous read head, side 1 */
 #define SONY_SIDES      0xc     /* 0 = single sided drive */
-#define SONY_DRVIN      0xf     /* 0 = drive present */
+#define SONY_SEEKCOMPL  0xd     /* 1 = seek complete (SWIM-era name) */
+#define SONY_DRVIN      0xe     /* 0 = drive present (cf. linux swim.c
+                                 * SWIM_DRIVE_PRESENT select 0x077) */
+#define SONY_ONEMEG     0xf
 
 /* Sony drive control registers, {CA1,CA0,SEL} with CA2 as the data */
 #define SONY_CMD_DIRTN      0x0 /* CA2=0: step up-track, CA2=1: down */
@@ -90,10 +93,53 @@
 #define SONY_CMD_EJECT      0x6 /* CA2=1: eject the disk */
 
 /*
- * Nominal spindle speed per 16-track zone, in RPM.  The tach emits 60
- * pulses per revolution, so pulses/second == RPM.
+ * Drive speed.  The 128K has no speed servo in the drive: the Mac
+ * itself drives the spindle motor with a PWM signal scanned from the
+ * low bytes of the sound page, and the ROM calibrates a PWM-to-speed
+ * table at boot by measuring the tachometer at two PWM settings (a
+ * zero speed *difference* is a boot-time sad mac 0F0004, divide by
+ * zero - so "always report the nominal zone speed" is not an option).
+ *
+ * The PWM bytes are 6-bit LFSR states: the ROM's SetSpeed steps
+ *   next = (s >> 1) | (((s ^ (s >> 1)) & 1) << 5)
+ * from state 11 once per 10 units of its 0..399 speed index, and
+ * dithers between two adjacent states across the 370-byte buffer for
+ * intermediate values.  We invert that: map each buffer byte back to
+ * its step count, average a handful of bytes for the dither, and make
+ * the spindle speed a linear function of the result.  The exact slope
+ * is uncritical - the ROM calibrates whatever curve it measures - it
+ * only has to be monotonic and to cover the nominal 394..590 RPM of
+ * the five 400K zones.
  */
-static const unsigned sony_zone_rpm[5] = { 394, 429, 472, 525, 590 };
+static uint8_t sony_pwm_step[64];
+
+static void sony_pwm_init(void)
+{
+    uint8_t state = 11;
+    int i;
+
+    memset(sony_pwm_step, 20, sizeof(sony_pwm_step));
+    for (i = 0; i < 40; i++) {
+        sony_pwm_step[state] = i;
+        state = (state >> 1) | (((state ^ (state >> 1)) & 1) << 5);
+    }
+}
+
+/* current spindle speed in RPM; tach = 60 pulses/rev, so pulses/s == RPM */
+static unsigned sony_rpm(IWMState *s)
+{
+    unsigned acc = 0;
+    int i;
+
+    if (!s->pwm_buf) {
+        return 400;
+    }
+    for (i = 0; i < 32; i++) {
+        acc += sony_pwm_step[s->pwm_buf[2 * i] & 0x3f];
+    }
+    /* 0 steps (speed index 399) -> 695 RPM, 39 steps -> 305 RPM */
+    return 695 - (10 * acc + 16) / 32;
+}
 
 static int sony_zone_sectors(int track)
 {
@@ -279,8 +325,33 @@ static bool sony_load_track(IWMState *s)
     return true;
 }
 
+/* debug tracing of the ROM's drive-register traffic */
+static void sony_trace(const char *what, int reg, int val)
+{
+    static int count;
+
+    if (count < 4000) {
+        count++;
+        qemu_log_mask(LOG_UNIMP, "iwm: %s reg 0x%x -> %d\n", what, reg, val);
+    }
+}
+
+static int sony_sense_reg(IWMState *s);
+
 /* status line of the selected drive; the external connector is empty */
 static int sony_sense(IWMState *s)
+{
+    /* {CA2,CA1,CA0,SEL} */
+    int reg = (!!(s->latches & IWM_CA2) << 3) |
+              (!!(s->latches & IWM_CA1) << 2) |
+              (!!(s->latches & IWM_CA0) << 1) | !!s->sel;
+    int val = sony_sense_reg(s);
+
+    sony_trace((s->latches & IWM_EXTDRIVE) ? "sense-ext" : "sense", reg, val);
+    return val;
+}
+
+static int sony_sense_reg(IWMState *s)
 {
     /* {CA2,CA1,CA0,SEL} */
     int reg = (!!(s->latches & IWM_CA2) << 3) |
@@ -308,7 +379,7 @@ static int sony_sense(IWMState *s)
         return s->switched;
     case SONY_TACH:
         if (s->motor_on) {
-            unsigned rpm = sony_zone_rpm[s->track >> 4];
+            unsigned rpm = sony_rpm(s);
             int64_t half = NANOSECONDS_PER_SECOND / (2 * rpm);
 
             return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / half) & 1;
@@ -319,8 +390,13 @@ static int sony_sense(IWMState *s)
         return 0;
     case SONY_SIDES:
         return 0;               /* single sided */
+    case SONY_SEEKCOMPL:
+        return 1;
     case SONY_DRVIN:
-        return 0;               /* internal drive present */
+        /* the boot-time drive probe checks this and gives up on 1 */
+        return 0;
+    case SONY_ONEMEG:
+        return 1;
     default:
         qemu_log_mask(LOG_UNIMP, "iwm: sense of unknown reg 0x%x\n", reg);
         return 1;
@@ -332,6 +408,8 @@ static void sony_command(IWMState *s)
     int reg = (!!(s->latches & IWM_CA1) << 2) |
               (!!(s->latches & IWM_CA0) << 1) | !!s->sel;
     int val = !!(s->latches & IWM_CA2);
+
+    sony_trace("command", reg, val);
 
     if (s->latches & IWM_EXTDRIVE) {
         return;
@@ -365,10 +443,12 @@ static void sony_command(IWMState *s)
         s->motor_on = false;
         break;
     case (SONY_CMD_EJECT << 1) | 1:
-        if (sony_disk_in(s)) {
-            s->ejected = true;
-            s->switched = true;
-        }
+        /*
+         * A real drive only ejects when LSTRB is held for ~half a
+         * millisecond; the ROM's drive probe strobes this register
+         * briefly and expects the disk to stay in.  Handled on the
+         * LSTRB falling edge (iwm_touch) with a pulse-width check.
+         */
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "iwm: unknown command reg %d val %d\n",
@@ -392,6 +472,9 @@ static uint8_t iwm_data_read(IWMState *s)
     return val;
 }
 
+/* the eject command only takes effect after LSTRB is held this long */
+#define SONY_EJECT_PULSE_NS 400000
+
 /* every access, read or write, moves the addressed latch */
 static void iwm_touch(IWMState *s, hwaddr addr)
 {
@@ -406,8 +489,50 @@ static void iwm_touch(IWMState *s, hwaddr addr)
         s->latches &= ~(1 << latch);
     }
 
+    if (old != s->latches && latch != IWM_L_Q6 && latch != IWM_L_Q7) {
+        sony_trace("latch", latch, on);
+    }
+
     if (latch == IWM_L_LSTRB && !(old & IWM_LSTRB) && on) {
+        s->lstrb_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         sony_command(s);
+    }
+    /* moving the address lines mid-strobe disarms the command */
+    if ((s->latches & IWM_LSTRB) && latch <= IWM_L_CA2 &&
+        (old != s->latches)) {
+        s->lstrb_time = INT64_MAX;
+    }
+    if (latch == IWM_L_LSTRB && (old & IWM_LSTRB) && !on) {
+        /* falling edge: a long-held strobe of the eject register */
+        if (!(s->latches & IWM_EXTDRIVE) && (s->latches & IWM_CA2) &&
+            (s->latches & IWM_CA1) && (s->latches & IWM_CA0) && !s->sel &&
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->lstrb_time >=
+            SONY_EJECT_PULSE_NS && sony_disk_in(s)) {
+            sony_trace("eject", 0xd, 1);
+            s->ejected = true;
+            s->switched = true;
+            /*
+             * The power-on probe ejects whatever is in the drive and
+             * then waits for an insertion.  Model the user pushing the
+             * disk straight back in: without it a -drive floppy could
+             * never boot.
+             */
+            timer_mod(s->reinsert_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NANOSECONDS_PER_SECOND);
+        }
+    }
+}
+
+static void iwm_reinsert(void *opaque)
+{
+    IWMState *s = opaque;
+
+    if (s->blk && blk_is_inserted(s->blk)) {
+        sony_trace("reinsert", 0, 0);
+        s->ejected = false;
+        s->switched = true;
+        s->cached_track = -1;
     }
 }
 
@@ -531,6 +656,7 @@ static void iwm_init(Object *obj)
     memory_region_init_io(&s->mem, obj, &iwm_ops, s, "iwm", 0x2000);
     sysbus_init_mmio(sbd, &s->mem);
     qdev_init_gpio_in_named(DEVICE(obj), iwm_set_sel, "sel", 1);
+    s->reinsert_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, iwm_reinsert, s);
 }
 
 static const VMStateDescription vmstate_iwm = {
@@ -574,6 +700,7 @@ static const TypeInfo iwm_info = {
 
 static void iwm_register_types(void)
 {
+    sony_pwm_init();
     type_register_static(&iwm_info);
 }
 
