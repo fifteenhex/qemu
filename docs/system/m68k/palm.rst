@@ -1,10 +1,17 @@
-Palm PDAs (``palmv``, ``palmm500``)
-===================================
+Palm PDAs (``palmv``, ``palmiiix``, ``palmvx``, ``palmm100``, ``palmm500``)
+===========================================================================
 
-Two Palm handhelds built on Motorola DragonBall system-on-chips:
+Palm handhelds built on Motorola DragonBall system-on-chips:
 
 * ``palmv`` — Palm V: MC68EZ328 "DragonBall EZ" at 16.58MHz, 2MB RAM,
   runs PalmOS 3.x.
+* ``palmiiix`` — Palm IIIx: MC68EZ328 at 16.58MHz, 4MB RAM, runs
+  PalmOS 3.x.
+* ``palmvx`` — Palm Vx: MC68EZ328 at 20MHz, 8MB RAM, runs PalmOS
+  3.x/4.x.
+* ``palmm100`` — Palm m100: MC68EZ328 at 16.58MHz, 2MB RAM, runs
+  PalmOS 3.5 (same 160x160 panel as the others behind the smaller
+  bezel).
 * ``palmm500`` — Palm m500: MC68VZ328 "DragonBall VZ" at 33.16MHz,
   8MB RAM, an SD card slot, runs PalmOS 4.x.
 
@@ -50,9 +57,21 @@ as archive.org item ``20250707_20250707_0134``:
    * - Palm-V-3.3-en.rom
      - ``palmv``
      - 6b347dada1c8b6bbc7546cc0f7281990
+   * - Palm-IIIx-3.1.rom
+     - ``palmiiix``
+     - 1022a3ecca4e18e212956a4f5cb79fb4
+   * - Palm-Vx-4.1-en.rom
+     - ``palmvx``
+     - e56adbdffb6420725b0dc5b6fa95b36c
+   * - Palm-m100-3.51-en.rom
+     - ``palmm100``
+     - d5eaa0eb27e1ae35b33f04dd7b762ad6
    * - Palm-m500-4.1-en.rom
      - ``palmm500``
      - dc8f0f8a6ffed58764065a7abe468ce4
+
+(The item's ``Palm-IIIx-4.0.rom`` is not a ROM at all but a truncated
+HTML error page — don't use it.)
 
 Running
 -------
@@ -68,7 +87,7 @@ Running
 What works
 ----------
 
-Both machines boot PalmOS to the launcher with a working pen: the
+All machines boot PalmOS to the launcher with a working pen: the
 whole Setup wizard completes, including the digitizer calibration
 screen, and the built-in applications run (Memo Pad shows its
 welcome memos on the V, Note Pad its handwritten note on the m500).

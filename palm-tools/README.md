@@ -1,8 +1,9 @@
 # Palm machine test tooling
 
-Helpers for bringing up and testing the `palmv` (Palm V, MC68EZ328)
-and `palmm500` (Palm m500, MC68VZ328) machines.  The full design and
-RE journal is in `../PALM-NOTES.md`; this is the how-to-test crib.
+Helpers for bringing up and testing the Palm machines (`palmv`,
+`palmiiix`, `palmvx`, `palmm100` on the MC68EZ328; `palmm500` on the
+MC68VZ328).  The full design and RE journal is in `../PALM-NOTES.md`;
+this is the how-to-test crib.
 
 ## ROMs
 
@@ -10,8 +11,19 @@ Not in git (see PALM-NOTES.md "ROMs").  Fetched into
 `/workspace/src/palm-roms/` from archive.org item
 `20250707_20250707_0134`:
 
-    Palm-V-3.1-en.rom     (Palm V, PalmOS 3.1)   md5 c575ebb95f736e389d9c29ad919b4753
-    Palm-m500-4.1-en.rom  (m500,   PalmOS 4.1)   md5 dc8f0f8a6ffed58764065a7abe468ce4
+    Palm-V-3.1-en.rom      (Palm V,  PalmOS 3.1)    md5 c575ebb95f736e389d9c29ad919b4753
+    Palm-IIIx-3.1.rom      (IIIx,    PalmOS 3.1)    md5 1022a3ecca4e18e212956a4f5cb79fb4
+    Palm-Vx-4.1-en.rom     (Vx,      PalmOS 4.1)    md5 e56adbdffb6420725b0dc5b6fa95b36c
+    Palm-m100-3.51-en.rom  (m100,    PalmOS 3.5.1)  md5 d5eaa0eb27e1ae35b33f04dd7b762ad6
+    Palm-m500-4.1-en.rom   (m500,    PalmOS 4.1)    md5 dc8f0f8a6ffed58764065a7abe468ce4
+
+(`Palm-IIIx-4.0.rom` in the item is a truncated HTML page, not a ROM.)
+
+After the digitizer is calibrated, the Setup wizard's buttons sit at
+the bottom of the form: Previous (20,152), Next (62,152), Done
+(97,152) in screen pixels — multiply by 204.8 for `tap:` coords.
+Idle machines auto-off after ~2 minutes and then ignore pen taps;
+send `key:f5` (power) to wake them first.
 
 POSE-derived reference sources live in `/workspace/src/pose-ref/`
 (from github.com/cloudpilot-emu/cloudpilot-emu).

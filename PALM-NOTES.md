@@ -369,6 +369,65 @@ screenshot.
 
 Still open: HotSync over serial.
 
+## 2026-07-23 — EZ model variants: palmiiix, palmvx, palmm100
+
+Three more machines, pure PalmMachineClass parameterization (plus the
+keyboard-row generalization below).  ROMs from the same archive.org
+item (`20250707_20250707_0134`), fetched into
+`/workspace/src/palm-roms/`:
+
+    Palm-IIIx-3.1.rom      1212416  md5 1022a3ecca4e18e212956a4f5cb79fb4
+    Palm-Vx-4.1-en.rom     2097152  md5 e56adbdffb6420725b0dc5b6fa95b36c
+    Palm-m100-3.51-en.rom  2097152  md5 d5eaa0eb27e1ae35b33f04dd7b762ad6
+
+`Palm-IIIx-4.0.rom` in the item is a truncated HTML error page, not a
+ROM (starts `<!DOCTYPE html>`); the 3.1 image is the usable IIIx ROM.
+
+Card headers all match the Palm V scheme: reset PC 0x10c08xxx,
+bigROMOffset (header +0x68) = 0x10c08000, so ROM base 0x10c00000 and
+image at +0x8000 for all three EZ machines.
+
+  - palmiiix ("Brad"): identical wiring to the V, 4MB RAM.  Verified:
+    Setup incl. calibration, launcher, Memo Pad from F4.
+  - palmvx ("Cobra 2"): 8MB RAM, keyboard rows one bit up (port F
+    bits 5-7, HardwareEZ.h hwrEZPortFCobra2KbdRow*), SYSCLK
+    32768*612 = 20054016 (the HAL's 20MHz PLL entry P=0x2a/Q=0x09).
+    Two clocking discoveries, from the PLL printfs + reading the
+    timer regs at runtime:
+      1. The Vx 4.1 big ROM never *programs* a 20MHz PLL (no 0x092a
+         constant anywhere in the image) — the small ROM must do it
+         on silicon.  The big-ROM HAL just assumes ~20MHz: it runs
+         the tick at SYSCLK/3 with TCMP=0 (65536-count wrap), which
+         is 100Hz only near 19.66MHz (102Hz at 20.05MHz; a 16.58MHz
+         part would tick 16% slow).
+      2. mask_id matters: with mask 1 the HAL "knows better" and
+         throttles the PLL to 13.5MHz (PLLFSR=0x071c, the
+         old-processor entry in HardwareEZ.h — only "0J83C"/id 4+
+         parts are rated for more), so the Vx machine reports
+         mask_id 4.
+    Verified: Setup incl. calibration, launcher, Memo from F4.
+    Gotcha rediscovered along the way: PalmOS auto-off (2 min) makes
+    an idle machine ignore pen taps — press F5 (power) to wake
+    before scripting taps at an old instance.
+  - palmm100 ("Calvin"): 2MB RAM, OS 3.5.1.  Buttons did nothing
+    with Sumo wiring; traced the ROM's GPIO writes (temporary logging
+    in dragonball_gpio_write) — the m100 scans its rows on PORT B
+    bits 0/3/6 (non-consecutive!), tristate-deselected as usual, with
+    the columns still port D bits 0-3 but taken as INT0-3 *edges*
+    (PDIRQEN=0x0f, PDIRQEG=0x0f, PDKBEN never written).  The GPIO
+    model's level-only port D interrupts are close enough.
+    PalmMachineClass now carries per-row GPIO numbers
+    (kbd_row_gpio[]) instead of a consecutive base.  Verified: Setup,
+    Basic Skills tutorial, launcher, Date Book from F1.
+    The m100 3.51 ROM also takes the 13.5MHz throttle path (mask 1);
+    on the real (later) m100 the mask is presumably new enough, but
+    the tick constants come out right either way at 16.58MHz — left
+    at mask 1 like the V.
+
+Machine descs and docs/system/m68k/palm.rst updated; palmctl.py
+`dump:` emits PNG when the path ends in .png (QMP screendump format
+argument).
+
 ## Journal
 
 ### 2026-07-20 (evening) — pen works; Setup advances on OS 3.1
