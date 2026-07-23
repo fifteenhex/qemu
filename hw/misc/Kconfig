@@ -260,6 +260,9 @@ config XLNX_ZYNQ_DDRC
 config DRAGONBALL_PLL
     bool
 
+config DRAGONBALL_SCR
+    bool
+
 config MVME147_PCC
     bool
 
