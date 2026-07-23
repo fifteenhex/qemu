@@ -21,6 +21,7 @@ struct DragonBallTimerState
     MemoryRegion iomem;
     qemu_irq irq;
     ptimer_state *timer;
+    uint32_t sysclk;
 
     uint16_t tctl;
     uint16_t tprer;
