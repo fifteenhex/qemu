@@ -258,3 +258,31 @@ loops rescanning = normal no-boot-disk behaviour.
 - Run recipe (headless probe):
   `build-maciisi/qemu-system-m68k -M maciisi -bios _maciisi_assets/maciisi.rom \
    -d unimp,guest_errors -display none -serial mon:stdio`
+
+### FIRST PIXELS (2026-07-20, session 4) — sad mac rendered!
+
+Video works end to end: ScrnBase = 0xFEE00000 (slot $E aperture), 640x480
+1-bit rowbytes 80, drawn by the new maciisi-fb console device.  Current
+screen: sad mac 0000000F/00000001 (SysError 1, bus error).  Screenshots
+in /tmp/shots/maciisi-*.png; take them via QMP screendump (see below).
+
+The crash: startup-screen gray fill (ROM 0x4084ad0a-ad14, pattern
+0xAAAAAA in d3) derefs a TAGGED master pointer a3=0x800050b4 under the
+32-bit MMU root (0x80000000+ early-terminated identity) → fault.  This
+code path expects 24-bit addressing where IS=8 ignores the tag byte.
+Crash regs are saved by SysError at lowmem 0xC30 (d0-d7, then a0-sp at
+0xC50); error code word at 0xAF0.
+
+Tried: forcing XPRAM 0x8A |= 0x05 ("32-bit addressing") in the RTC
+sector-read path — no change (flag location/semantics wrong for this
+ROM, or the decision is made elsewhere).  NEXT: trace who reads the
+addressing-mode decision (watch SwapMMUMode d0 arguments over the boot;
+find the boot's 24-bit switch that SHOULD have happened before
+DrawStartupScreen — on real HW this fill runs in 24-bit mode).  Two
+options: (a) make the 24-bit switch happen (find why it didn't), or
+(b) find the real 32-bit-boot flag for ROM $067C.
+
+Screendump recipe:
+  qemu ... -qmp unix:/tmp/maciisi-qmp.sock,server,nowait
+  then QMP: qmp_capabilities; screendump filename=/tmp/shots/x.ppm
+Boot to sad mac takes ~4min real time at -icount shift=7.
