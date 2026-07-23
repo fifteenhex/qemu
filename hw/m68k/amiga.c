@@ -184,6 +184,9 @@ static void amiga_machine_init(MachineState *machine)
                        qdev_get_gpio_in_named(ams->custom, "cia-irq", 0));
     qdev_connect_gpio_out_named(ams->ciaa, "port-a-out", 0,
                                 qemu_allocate_irq(amiga_overlay_set, ams, 0));
+    qdev_connect_gpio_out_named(ams->custom, "mouse-btn", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_FIR0));
 
     /* CIA-B: TOD counts horizontal sync */
     ams->ciab = qdev_new(TYPE_MOS8520);

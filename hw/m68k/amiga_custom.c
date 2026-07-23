@@ -25,6 +25,7 @@
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "ui/console.h"
+#include "ui/input.h"
 
 /* PAL timing: 227 colour clocks (~64us) per line, 312 lines per frame */
 #define LINE_NS         64000
@@ -103,6 +104,9 @@
 #define ADKCON_WORDSYNC (1 << 10)
 
 #define DMACON_DSKEN    (1 << 4)
+
+/* POTGOR: the port 0 Y pot line doubles as the right mouse button */
+#define POTGOR_DATLY    (1 << 10)
 
 /*
  * Paula funnels the fifteen interrupt sources onto six 68k levels.
@@ -747,6 +751,39 @@ static const GraphicHwOps amiga_custom_gfx_ops = {
     .gfx_update = amiga_custom_gfx_update,
 };
 
+/* --- mouse --- */
+
+static void amiga_custom_mouse_event(DeviceState *dev, QemuConsole *src,
+                                     QemuInputEvent *evt)
+{
+    AmigaCustomState *s = AMIGA_CUSTOM(dev);
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+        if (evt->rel.axis == INPUT_AXIS_X) {
+            s->mouse_x += evt->rel.value;
+        } else if (evt->rel.axis == INPUT_AXIS_Y) {
+            s->mouse_y += evt->rel.value;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        if (evt->btn.button == INPUT_BUTTON_LEFT) {
+            qemu_set_irq(s->mouse_btn, !evt->btn.down);
+        } else if (evt->btn.button == INPUT_BUTTON_RIGHT) {
+            s->mouse_rmb = evt->btn.down;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const QemuInputHandler amiga_custom_mouse_handler = {
+    .name = "Amiga mouse",
+    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
+    .event = amiga_custom_mouse_event,
+};
+
 /* --- serial port --- */
 
 static int amiga_custom_serial_can_receive(void *opaque)
@@ -869,13 +906,15 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
         amiga_custom_beam_pos(s, &vpos, &hpos);
         return ((vpos & 0xff) << 8) | (hpos & 0xff);
     case REG_JOY0DAT:
+        /* the mouse counters, vertical in the high byte */
+        return (s->mouse_y << 8) | s->mouse_x;
     case REG_JOY1DAT:
         return 0;
     case REG_ADKCONR:
         return s->adkcon;
     case REG_POTGOR:
-        /* all pot lines high: no mouse buttons pressed */
-        return 0xffff;
+        /* pot lines are pulled high, buttons short them to ground */
+        return 0xffff & ~(s->mouse_rmb ? POTGOR_DATLY : 0);
     case REG_SERDATR:
         return SERDATR_TBE | SERDATR_TSRE |
                ((s->intreq & INT_RBF) ? SERDATR_RBF | 0x100 | s->serial_rx
@@ -1059,6 +1098,8 @@ static void amiga_custom_realize(DeviceState *dev, Error **errp)
                              s, NULL, true);
     s->con = qemu_graphic_console_create(dev, 0, &amiga_custom_gfx_ops, s);
     qemu_console_resize(s->con, 640, 256);
+    s->mouse_hs = qemu_input_handler_register(dev,
+                                              &amiga_custom_mouse_handler);
 }
 
 static void amiga_custom_init(Object *obj)
@@ -1074,6 +1115,7 @@ static void amiga_custom_init(Object *obj)
     qdev_init_gpio_in_named(dev, amiga_custom_cia_irq, "cia-irq", 2);
     qdev_init_gpio_in_named(dev, amiga_custom_ports_irq, "ports-irq", 1);
     qdev_init_gpio_in_named(dev, amiga_custom_exter_irq, "exter-irq", 1);
+    qdev_init_gpio_out_named(dev, &s->mouse_btn, "mouse-btn", 1);
 }
 
 static const VMStateDescription vmstate_amiga_custom = {
@@ -1084,6 +1126,9 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT16(dsklen, AmigaCustomState),
         VMSTATE_BOOL(dsklen_armed, AmigaCustomState),
         VMSTATE_TIMER(disk_timer, AmigaCustomState),
+        VMSTATE_UINT8(mouse_x, AmigaCustomState),
+        VMSTATE_UINT8(mouse_y, AmigaCustomState),
+        VMSTATE_BOOL(mouse_rmb, AmigaCustomState),
         VMSTATE_UINT16(intena, AmigaCustomState),
         VMSTATE_UINT16(intreq, AmigaCustomState),
         VMSTATE_UINT16(dmacon, AmigaCustomState),
