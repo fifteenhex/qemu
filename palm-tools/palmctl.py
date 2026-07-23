@@ -16,7 +16,7 @@ Actions (applied in order):
     down:X,Y     pen down and hold (no release)
     up           pen up
     sleep:S      wait S seconds
-    dump:PATH    screendump to PATH (PPM)
+    dump:PATH    screendump to PATH (PPM, or PNG for a .png path)
 
 Host key -> Palm mapping (see hw/input/palm_keypad.c):
     f1-f4  application buttons   f5 power   f6 contrast
@@ -69,7 +69,10 @@ class Qmp:
             time.sleep(0.05)
 
     def screendump(self, path):
-        self.cmd({'execute': 'screendump', 'arguments': {'filename': path}})
+        args = {'filename': path}
+        if path.endswith('.png'):
+            args['format'] = 'png'
+        self.cmd({'execute': 'screendump', 'arguments': args})
         time.sleep(0.3)
 
 
