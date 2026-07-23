@@ -52,11 +52,12 @@ modelled:
 -  The blitter, including line mode and area fill.  Blits complete
    instantly.
 
--  A line-granular copper: the list is executed at each vertical
-   blank with every WAIT considered satisfied, but display register
-   writes are replayed by the renderer at the line of the preceding
-   WAIT, so per-line palettes and mid-frame screen splits render.
-   Effects keyed to the horizontal beam position do not.
+-  A line-granular copper: the list is executed once per displayed
+   frame (at render time) with every WAIT considered satisfied, but
+   display register writes are replayed by the renderer at the line of
+   the preceding WAIT, so per-line palettes and mid-frame screen
+   splits render.  Effects keyed to the horizontal beam position do
+   not.
 
 -  A bitplane display: lores and hires (mixable within a frame), up
    to 6 planes with extra-half-brite, rendered to a QEMU console.
