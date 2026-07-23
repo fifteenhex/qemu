@@ -14,12 +14,40 @@
 #include "hw/timer/dragonball_timer.h"
 
 #define OSCFREQ 32768
-#define NSPERTICK (NANOSECONDS_PER_SECOND / 32768)
+/* SYSCLK out of the PLL; both Palm and the devboard run the stock rate */
+#define SYSCLKFREQ 16580608
+
+/* Input clock as selected by TCTL.CLKSOURCE, after the prescaler */
+static uint32_t dragonball_timer_freq(DragonBallTimerState *t)
+{
+    unsigned int source = (t->tctl >> DRAGONBALL_TIMER_TCTL_CLKSOURCE_SHIFT) &
+                          DRAGONBALL_TIMER_TCTL_CLKSOURCE_MASK;
+    uint32_t freq;
+
+    switch (source) {
+    case 1:
+        freq = SYSCLKFREQ;
+        break;
+    case 2:
+        freq = SYSCLKFREQ / 16;
+        break;
+    case 3:
+        /* TIN pin, not wired to anything */
+        qemu_log_mask(LOG_UNIMP, "dragonball_timer: TIN clock unimplemented\n");
+        freq = 0;
+        break;
+    default:
+        /* 1xx: 32.768kHz crystal */
+        freq = OSCFREQ;
+        break;
+    }
+
+    return freq / (t->tprer + 1);
+}
 
 static uint64_t dragonball_timer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     DragonBallTimerState *t = opaque;
-    uint16_t ticks = (((qemu_clock_get_ns(rtc_clock) - t->start_offset) / NSPERTICK) / (t->tprer + 1)) & 0xffff;
 
     switch(addr) {
     case DRAGONBALL_TIMER_TCTL:
@@ -27,7 +55,8 @@ static uint64_t dragonball_timer_read(void *opaque, hwaddr addr, unsigned int si
     case DRAGONBALL_TIMER_TPRER:
         return t->tprer;
     case DRAGONBALL_TIMER_TCN:
-        return ticks;
+        /* the ptimer counts down from TCMP; TCN counts up */
+        return (t->tcmp - ptimer_get_count(t->timer)) & 0xffff;
     case DRAGONBALL_TIMER_TSTAT:
         return t->tstat;
     }
@@ -61,17 +90,20 @@ static bool dragonball_timer_running(DragonBallTimerState *t)
 
 static void dragonball_timer_update(DragonBallTimerState *t)
 {
+    uint32_t freq = dragonball_timer_freq(t);
+
     /* Stop the IRQ if IRQEN has been cleared */
     if (!(t->tctl & DRAGONBALL_TIMER_TCTL_IRQEN))
         qemu_set_irq(t->irq, 0);
 
     ptimer_transaction_begin(t->timer);
     /* Configure the frequency and compare value */
-    ptimer_set_freq(t->timer, OSCFREQ / (t->tprer + 1));
+    if (freq)
+        ptimer_set_freq(t->timer, freq);
     ptimer_set_limit(t->timer, t->tcmp, 1);
 
     /* Start or stop the timer */
-    if (dragonball_timer_running(t) && t->tcmp)
+    if (dragonball_timer_running(t) && t->tcmp && freq)
         ptimer_run(t->timer, 0);
     else
         ptimer_stop(t->timer);
@@ -151,7 +183,7 @@ static void dragonball_timer_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = dragonball_timer_realize;
-    dc->legacy_reset = dragonball_timer_reset;
+    device_class_set_legacy_reset(dc, dragonball_timer_reset);
 }
 
 static const TypeInfo dragonball_timer_info = {
