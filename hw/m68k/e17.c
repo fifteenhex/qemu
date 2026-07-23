@@ -34,6 +34,8 @@
 #include "hw/char/cd2401.h"
 #include "hw/display/e17_vid.h"
 #include "hw/misc/e17_sysc.h"
+#include "hw/net/lance.h"
+#include "system/dma.h"
 #include "target/m68k/cpu.h"
 
 #define E17_VRAM_BASE       0x0fc00000
@@ -47,6 +49,8 @@
 #define E17_IO_BASE         0xfec00000
 #define E17_CD2401_BASE     0xfec64000
 #define E17_CD2401_IACK     0xfec66000
+#define E17_LANCE_RDP       0xfec68002
+#define E17_LANCE_RAP       0xfec68006
 
 #define E17_DEFAULT_RAM_SIZE (16 * MiB)
 
@@ -77,6 +81,50 @@ static void e17_cpu_reset(void *opaque)
      */
     ri->cpu->env.aregs[7] = ri->initial_sp;
     ri->cpu->env.pc = ri->initial_pc;
+}
+
+/*
+ * The ethernet chip is an Am79C900 ILACC (the 32-bit LANCE) wired
+ * onto the big endian bus with full byte lane reversal, and the chip
+ * compensates on the frame data path so bytes end up on the wire in
+ * memory order.  Model: reverse every 32-bit group for descriptor
+ * and initialization block DMA, pass frame data through.  The pcnet
+ * core gives no direct descriptor-vs-data indication, but its
+ * descriptor accesses are always exactly sizeof(initblk16/32) or
+ * sizeof(xmd) — 12, 16 or 28 bytes — and frames are at least 60.
+ */
+static void e17_lance_swap(uint8_t *buf, int len)
+{
+    int i;
+
+    if (len != 12 && len != 16 && len != 28) {
+        return;
+    }
+    for (i = 0; i + 3 < len; i += 4) {
+        uint8_t t = buf[i];
+
+        buf[i] = buf[i + 3];
+        buf[i + 3] = t;
+        t = buf[i + 1];
+        buf[i + 1] = buf[i + 2];
+        buf[i + 2] = t;
+    }
+}
+
+static void e17_lance_dma_read(void *opaque, hwaddr addr,
+                               uint8_t *buf, int len, int do_bswap)
+{
+    dma_memory_read(&address_space_memory, addr, buf, len,
+                    MEMTXATTRS_UNSPECIFIED);
+    e17_lance_swap(buf, len);
+}
+
+static void e17_lance_dma_write(void *opaque, hwaddr addr,
+                                uint8_t *buf, int len, int do_bswap)
+{
+    e17_lance_swap(buf, len);
+    dma_memory_write(&address_space_memory, addr, buf, len,
+                     MEMTXATTRS_UNSPECIFIED);
 }
 
 /* The secondary CPU is held in halt until released via the sysc */
@@ -122,6 +170,9 @@ static void e17_init(MachineState *machine)
     DeviceState *sysc_dev;
     DeviceState *serial_dev;
     DeviceState *vid_dev;
+    DeviceState *lance_dev;
+    MemoryRegion *lance_rdp = g_new(MemoryRegion, 1);
+    MemoryRegion *lance_rap = g_new(MemoryRegion, 1);
     gchar *bios_size_err;
     int64_t bios_size = -1;
     int i;
@@ -230,6 +281,32 @@ static void e17_init(MachineState *machine)
                                 E17_VID_CRTC_BASE, 1);
         sysbus_mmio_map(SYS_BUS_DEVICE(vid_dev), 2, E17_VRAM_BASE);
     }
+
+    /*
+     * LANCE ethernet.  The 16-bit RDP and RAP registers live in the
+     * low halves of the first two 32-bit words at 0xfec68000, so
+     * alias them onto the generic model's RDP+0/RAP+2 layout.
+     */
+    lance_dev = qdev_new(TYPE_LANCE);
+    qdev_prop_set_bit(lance_dev, "ssize32", true);
+    qemu_configure_nic_device(lance_dev, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(lance_dev), &error_fatal);
+    {
+        SysBusPCNetState *d = SYSBUS_PCNET(lance_dev);
+
+        d->state.phys_mem_read = e17_lance_dma_read;
+        d->state.phys_mem_write = e17_lance_dma_write;
+    }
+    memory_region_init_alias(lance_rdp, NULL, "e17.lance-rdp",
+                             SYS_BUS_DEVICE(lance_dev)->mmio[0].memory,
+                             0, 2);
+    memory_region_add_subregion_overlap(sysmem, E17_LANCE_RDP,
+                                        lance_rdp, 1);
+    memory_region_init_alias(lance_rap, NULL, "e17.lance-rap",
+                             SYS_BUS_DEVICE(lance_dev)->mmio[0].memory,
+                             2, 2);
+    memory_region_add_subregion_overlap(sysmem, E17_LANCE_RAP,
+                                        lance_rap, 1);
 
     /* CD2401, serial ports 1-4; sits inside the e17-sysc window */
     serial_dev = qdev_new(TYPE_CD2401);

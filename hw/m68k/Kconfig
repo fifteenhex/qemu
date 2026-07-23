@@ -98,6 +98,7 @@ config ELTEC_E17
     select E17_SYSC
     select E17_VID
     select CD2401
+    select LANCE
 
 config AMIGA
     bool

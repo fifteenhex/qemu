@@ -46,11 +46,26 @@
 #include "system/system.h"
 
 
+/*
+ * Some boards (the ELTEC E17) carry the 32-bit ILACC variant, which
+ * uses the 32-bit initialization block and descriptor layout; the
+ * guest never programs BCR20 on those, so apply the software style
+ * at reset from a property.
+ */
+static void lance_apply_ssize32(SysBusPCNetState *d)
+{
+    if (d->ssize32) {
+        d->state.bcr[BCR_SWS] |= 0x0100;
+    }
+}
+
 static void parent_lance_reset(void *opaque, int irq, int level)
 {
     SysBusPCNetState *d = opaque;
-    if (level)
+    if (level) {
         pcnet_h_reset(&d->state);
+        lance_apply_ssize32(d);
+    }
 }
 
 static void lance_mem_write(void *opaque, hwaddr addr,
@@ -125,6 +140,7 @@ static void lance_reset(DeviceState *dev)
     SysBusPCNetState *d = SYSBUS_PCNET(dev);
 
     pcnet_h_reset(&d->state);
+    lance_apply_ssize32(d);
 }
 
 static void lance_instance_init(Object *obj)
@@ -138,6 +154,7 @@ static void lance_instance_init(Object *obj)
 }
 
 static const Property lance_properties[] = {
+    DEFINE_PROP_BOOL("ssize32", SysBusPCNetState, ssize32, false),
     DEFINE_PROP_LINK("dma", SysBusPCNetState, state.dma_opaque,
                      TYPE_DEVICE, DeviceState *),
     DEFINE_NIC_PROPERTIES(SysBusPCNetState, state.conf),
