@@ -258,9 +258,9 @@ Things learned while bringing it up:
   0xfec660fb is LIVR with the interrupt type in bits 1:0.
 
 Known issues / next steps, roughly in order:
-1. Boot noise + wrong RAM size — one interlinked problem, partially
-   analysed (see "The boot-time hook crash" below for everything
-   known).  Continue from there.
+1. DONE: boot noise + wrong RAM size — root cause was missing DRAM
+   mirroring plus a Z8536 reset-protocol bug, see "The boot-time
+   hook crash: SOLVED" below.
 2. DONE (except battery SRAM): NVRAM/RTC identified as an M48T02 and
    modelled with the in-tree sysbus-m48t02, persistent via
    -drive if=mtd (see "The NVRAM/RTC is an M48T02" below).  Still
@@ -585,56 +585,60 @@ PILR-matched IACK, VIC LICR6 line readback), so once it builds the
 UART should work — test with:
     qemu-system-m68k -M e17,video=off -kernel u-boot -serial stdio
 
-## The boot-time hook crash (open investigation)
+## The boot-time hook crash: SOLVED (2026-07-20, night)
 
-Symptom, in serial output order: "### Reserved (1) Exception",
-"### Error in hook initialization routine", (first boot only:
-"Wrong parameter checksum" + "Reading default configuration values
-from EPROM"), "### Bus Error Exception at address 2f0841ee", and
-"RAM available : 65535 MBytes".  The monitor is fully usable
-afterwards; bus errors at the prompt recover cleanly.
+The "### Reserved (1) Exception / ### Error in hook initialization
+routine / ### Bus Error Exception at address 2f0841ee / RAM
+available : 65535 MBytes" cascade had ONE root cause with a second
+bug hiding behind it:
 
-What was established (all in rmon 3.1.3 addresses):
+1. DRAM mirroring.  RMON sizes memory (fe8045ca) by planting
+   0x55555555 at 0 and probing at doubling addresses for the DRAM
+   controller's wrap (verified with 0xAAAAAAAA).  On real hardware
+   the fitted RAM aliases across the decode window, the probe finds
+   the mirror and returns cleanly — NO exception is ever taken.  In
+   QEMU the RAM just ended: the probe ran into unassigned space,
+   faulted, and the longjmp recovery popped the saved a0 from a
+   skewed stack slot — the routine returned d0=-1 ("65535 MBytes")
+   with a0=0 instead of the config base.  Everything after in
+   fe807cc6 then read config fields from the low vector table:
+   hook pointer config[0x348] -> vector 210 (= the generic
+   exception handler, whose call longjmps straight back — the
+   "Reserved (1)" + "hook initialization" pair), banner strings
+   blanked ("for the  - 68040"), and the autostart context filled
+   from garbage (the 2f0841ee bus error).  Fix: the machine now
+   mirrors RAM across the DRAM window (0..VRAM base) like the
+   hardware; RAM size must be a power of two.
 
-- fe807cc6 is the startup/configuration routine, called once from
-  fe800d88 with the POST flags.  It reads the DIP switches (CIO1
-  port B), copies a configuration profile to DRAM 0x800 (profiles at
-  ROM fe801f5e/fe80275e/fe802f5e/fe800f5e, chosen by the jump table
-  at fe807d78 on the switch low nibble; out-of-range goes through
-  fe804096 = read-from-NVRAM with the checksum warning), forces the
-  console device byte config[0x459] to 0x11 (= serial) when the
-  video-absent POST flag is set, runs the device inits
-  (fe8041f8/fe804380/fe804490/fe80453c/fe8045b4/fe804698), then:
-  - config[0x348] "Additional Init" hook: if != 0xffffffff, call it
-    under a setjmp (fe806f06 = setjmp: saves full context at
-    fp+0x2338, returns 0; the generic exception handler fe806f88
-    longjmps back with the exception number in d0).  On error:
-    fe808288 prints "### <name> Exception" (names at fe807644,
-    16-byte entries) and fe81e03c prints the string at fe807b98
-    ("hook initialization" error).
-  - then a user-module autostart: pointer = config[0x34c], defaulting
-    to 0xfea00000 (battery SRAM!) when 0xffffffff; launched through
-    setjmp + fe80714c, gated by config[0x370] bits and the warm-boot
-    flag (checks around fe808128).
-  - RAM sizing (fe8045ca) runs only AFTER all this and stores the
-    size in config[0x496]; the "65535 MBytes" is its 0xffff error
-    return, a consequence of the earlier crash (vector 2 in DRAM
-    holds garbage 0x2f0841ee at that point — instruction bytes from
-    fe806f8c, i.e. from inside the generic exception handler — so
-    the sizing bus error at end-of-DRAM double-faults).
-- The setup menu ("setup" -> f Hooks) shows all four hook parameters
-  as ffffffff, and a gdb breakpoint confirms config[0x348..0x357] ==
-  ffffffff right before the hook check on the first pass — yet the
-  hook error still prints, and a breakpoint at fe808050 fires with
-  a1=fe806f88 (the generic exception handler!) and a0=0.  So some
-  path reaches the hook-call code with a0 (config base) = 0, reading
-  the "hook pointer" from DRAM 0x348 = the exception vector table
-  (vector 210), which holds fe806f88.  Who calls fe807cc6 (or jumps
-  into its middle) with a0=0 is THE open question.  Next session:
-  breakpoint fe808044 with a proper register dump each hit (it fires
-  more than once), and/or watch DRAM 0x8 for the write of 0x2f0841ee
-  (gdb: set endian big!  the qemu stub + gdb-multiarch otherwise
-  byte-swaps register values).
+2. Z8536 reset-state protocol (uncovered by fix 1).  With the boot
+   no longer poisoned, a "### Line 1111 Emulator Exception"
+   appeared: the DIP-switch read returned 0xff instead of 0x00.
+   RMON initialises the CIO with the documented reset dance —
+   pointer 0x00, data 0x01 (MICR RESET), then a bare 0x00 that the
+   chip must route to the MICR (while RESET is set every control
+   write addresses the MICR).  The model treated that 0x00 as a new
+   pointer, desyncing every subsequent pointer/data pair: the DDRs
+   never loaded and port B reads returned the 0xff output latch.
+   Switch nibble 0xf >= 8 enables the battery-SRAM AUTOSTART
+   (fe8080c8: nibble 0-3 = NVRAM config, 4-7 = forced ROM profiles
+   1-4, >= 8 = NVRAM config + autostart), which jumped to
+   *(0xfea00000) = 0 and executed vector 0 (0xfea01000 = an F-line
+   opcode).  Fix: the CIO model now implements the reset state
+   (powers up with MICR.RESET set).
+
+With both fixed the boot is clean: RAM available : 16 MBytes, full
+banner (Eurocom 27, ELTEC copyright), no spurious exceptions; the
+first boot on a blank NVRAM warns about the parameter checksum once,
+as the real board does.  The "Extended slave address : 0x80000000"
+line is the EPROM default configuration, not a bug.
+
+Autostart, decoded along the way (fe8080c8-fe80811a): with switch
+nibble >= 8, RMON builds a launch context with PC = ISP = USP =
+VBR = *(module), MSP = *(module+4) from the pointer in
+config[0x34c] (default 0xfea00000 = battery SRAM) and runs it via
+the fe80714c RTE launcher under a setjmp — no header validation at
+all.  A future "boot from battery SRAM" payload path, essentially
+free once the SRAM persists.
 
 Debug tips that work: qemu -gdb tcp::PORT -S plus gdb-multiarch
 batch scripts ("set architecture m68k" + "set endian big"); rwatch on
