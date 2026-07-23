@@ -95,6 +95,31 @@ static void amiga_overlay_reset(void *opaque)
     memory_region_set_enabled(&ams->rom_overlay, true);
 }
 
+/*
+ * The RESET instruction: /RSTO resets every chip on the board except
+ * the CPU, which carries on with the next instruction.  Crucially the
+ * CIA reset floats PA0 back high, so the Kickstart overlay returns:
+ * the ROM reboot sequence is "reset" followed by a jump through the
+ * initial-PC vector at address 4, which must read the ROM again.
+ */
+static void amiga_reset_out(void *opaque, int n, int level)
+{
+    AmigaMachineState *ams = opaque;
+    int i;
+
+    if (!level) {
+        return;
+    }
+    device_cold_reset(ams->ciaa);
+    device_cold_reset(ams->ciab);
+    device_cold_reset(ams->custom);
+    device_cold_reset(ams->kbd);
+    for (i = 0; i < AMIGA_FLOPPY_DRIVES; i++) {
+        device_cold_reset(ams->fdc[i]);
+    }
+    memory_region_set_enabled(&ams->rom_overlay, true);
+}
+
 static void amiga_cpu_reset(void *opaque)
 {
     AmigaMachineState *ams = opaque;
@@ -147,6 +172,8 @@ static void amiga_machine_init(MachineState *machine)
 
     ams->cpu = M68K_CPU(cpu_create(machine->cpu_type));
     qemu_register_reset(amiga_cpu_reset, ams);
+    qdev_connect_gpio_out_named(DEVICE(ams->cpu), "reset-out", 0,
+                                qemu_allocate_irq(amiga_reset_out, ams, 0));
 
     if (amc->open_bus_size) {
         memory_region_init_io(&ams->open_bus, OBJECT(machine),
