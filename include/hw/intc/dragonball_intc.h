@@ -25,7 +25,8 @@ struct DragonBallINTCState {
     uint32_t imr;
     uint32_t ipr;
 
-    int levelstates[8];
+    /* interrupt level currently presented to the cpu */
+    int cpu_level;
 
     ArchCPU *cpu;
 };

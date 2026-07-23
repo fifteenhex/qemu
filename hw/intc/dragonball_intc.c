@@ -15,86 +15,125 @@
 #include "migration/vmstate.h"
 
  /* A bit is set when the irq is active and not masked */
-#define ISRVAL(_s) ((~s->imr) & s->ipr)
+#define ISRVAL(_s) ((~(_s)->imr) & (_s)->ipr)
 
+/* Interrupt levels are fixed on the DragonBall EZ */
 static const uint8_t dragonball_irq_levels[32] = {
     [DRAGONBALL_INTC_SPI] = 4,
     [DRAGONBALL_INTC_TMR] = 6,
     [DRAGONBALL_INTC_UART] = 4,
+    [DRAGONBALL_INTC_WDT] = 4,
+    [DRAGONBALL_INTC_RTC] = 4,
+    [DRAGONBALL_INTC_KB] = 4,
+    [DRAGONBALL_INTC_PWM] = 4,
+    [DRAGONBALL_INTC_INT0] = 4,
+    [DRAGONBALL_INTC_INT1] = 4,
+    [DRAGONBALL_INTC_INT2] = 4,
+    [DRAGONBALL_INTC_INT3] = 4,
+    [DRAGONBALL_INTC_IRQ1] = 1,
+    [DRAGONBALL_INTC_IRQ2] = 2,
+    [DRAGONBALL_INTC_IRQ3] = 3,
+    [DRAGONBALL_INTC_IRQ6] = 6,
+    [DRAGONBALL_INTC_IRQ5] = 5,
+    [DRAGONBALL_INTC_SAM] = 4,
+    [DRAGONBALL_INTC_EMIQ] = 7,
 };
 
 static void dragonball_intc_updateirqs(DragonBallINTCState *s)
 {
     M68kCPU *cpu = M68K_CPU(s->cpu);
     uint32_t isr = ISRVAL(s);
-    int i;
-    int newlevelstates[8] = { 0 };
+    int i, top = 0;
 
     /*
-     * For each of the irqs figure out the state
-     * and trigger that level if needed.
+     * The core sees a single interrupt level: the highest active one.
+     * Presenting each level separately loses interrupts, because the
+     * cpu only latches one pending level/vector pair — a lower level
+     * being deasserted would cancel a still-pending higher one.
      */
     for (i = 0; i < 32; i++) {
         uint8_t irqlevel = dragonball_irq_levels[i];
-        int thislevel = (isr >> i) & 1;
 
-        /* Skip anything with the level 0 */
-        if (!dragonball_irq_levels[i])
-            continue;
-
-        newlevelstates[irqlevel] |= thislevel;
+        if (((isr >> i) & 1) && irqlevel > top)
+            top = irqlevel;
     }
 
-    /* Now set the new state of each of the levels from 1 to 7 */
-    for (i = 1; i < ARRAY_SIZE(newlevelstates); i++) {
-        uint8_t vector = s->ivr + i;
-        int level = newlevelstates[i];
-
-        /* Reduce noise by only doing anything if a change has happened */
-        if (level == s->levelstates[i])
-            continue;
-
-        //if (vector != 70)
-        //    printf("%d:%d\n", vector, level);
-        m68k_set_irq_level(cpu, level, vector);
+    if (top != s->cpu_level) {
+        m68k_set_irq_level(cpu, top, s->ivr + top);
+        s->cpu_level = top;
     }
-
-    memcpy(s->levelstates, newlevelstates, sizeof(s->levelstates));
 }
 
+/*
+ * Sources that can latch on an edge and are then cleared by writing a
+ * one to their ISR bit: the external IRQ pins.  Note that PEN is NOT
+ * one of these — its IPR bit follows the /PENIRQ pin level and PalmOS
+ * polls it to track the pen, silencing the interrupt via IMR instead.
+ */
+#define DRAGONBALL_INTC_EDGE_SOURCES \
+    ((1 << DRAGONBALL_INTC_IRQ1) | (1 << DRAGONBALL_INTC_IRQ2) | \
+     (1 << DRAGONBALL_INTC_IRQ3) | (1 << DRAGONBALL_INTC_IRQ6) | \
+     (1 << DRAGONBALL_INTC_EMIQ))
+
+/*
+ * PalmOS accesses the 32-bit registers as 8/16/32-bit chunks at any
+ * offset within the register (the IMR notably as two 16-bit halves),
+ * so the handlers reassemble full register values by hand.
+ */
 static uint64_t dragonball_intc_read(void *opaque, hwaddr addr, unsigned size)
 {
     DragonBallINTCState *s = opaque;
+    uint32_t reg;
 
-    //printf("%s:%d %04x\n", __func__, __LINE__, (unsigned int) addr);
-
-    switch(addr){
+    switch (addr & ~3) {
+    case DRAGONBALL_INTC_IVR & ~3: /* IVR (8) at +0, ICR (16) at +2 */
+        reg = ((uint32_t)s->ivr << 24) | s->icr;
+        break;
     case DRAGONBALL_INTC_IMR:
-        return s->imr;
+        reg = s->imr;
+        break;
     case DRAGONBALL_INTC_ISR:
-        return ISRVAL(_s);
+        reg = ISRVAL(s);
+        break;
     case DRAGONBALL_INTC_IPR:
-        return s->ipr;
+        reg = s->ipr;
+        break;
+    default:
+        return 0;
     }
 
-    return 0;
+    return extract32(reg, (4 - size - (addr & 3)) * 8, size * 8);
 }
 
 static void dragonball_intc_write(void *opaque, hwaddr addr, uint64_t value,
         unsigned size)
 {
     DragonBallINTCState *s = opaque;
+    unsigned int shift = (4 - size - (addr & 3)) * 8;
+    uint32_t mask = ((size == 4) ? 0xffffffff : ((1u << (size * 8)) - 1))
+                    << shift;
+    uint32_t val = ((uint32_t)value << shift) & mask;
 
-    //printf("%s:%d %04x:%08x\n", __func__, __LINE__,
-    //           (unsigned int) addr, (unsigned int) value);
-
-    switch(addr){
-    case DRAGONBALL_INTC_IVR:
-        s->ivr = value;
+    switch (addr & ~3) {
+    case DRAGONBALL_INTC_IVR & ~3:
+        if (mask & 0xff000000)
+            s->ivr = val >> 24;
+        if (mask & 0x0000ffff)
+            s->icr = val & 0xffff;
         break;
     case DRAGONBALL_INTC_IMR:
-        s->imr = value;
+        s->imr = (s->imr & ~mask) | val;
         dragonball_intc_updateirqs(s);
+        break;
+    case DRAGONBALL_INTC_ISR:
+        /* writing ones acks latched edge sources */
+        s->ipr &= ~(val & DRAGONBALL_INTC_EDGE_SOURCES);
+        dragonball_intc_updateirqs(s);
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: bad write offset 0x%" HWADDR_PRIx "\n",
+                      __func__, addr);
         break;
     }
 }
@@ -102,6 +141,8 @@ static void dragonball_intc_write(void *opaque, hwaddr addr, uint64_t value,
 static const MemoryRegionOps dragonball_intc_ops = {
     .read = dragonball_intc_read,
     .write = dragonball_intc_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -110,7 +151,7 @@ static void dragonball_intc_reset(DeviceState *dev)
     DragonBallINTCState *s = DRAGONBALL_INTC(dev);
 
     s->imr = 0x00ffffff;
-    memset(s->levelstates, 0, sizeof(s->levelstates));
+    s->cpu_level = 0;
 }
 
 //static void dragonball_intc_irq_request(void *opaque, int irq, int level)
@@ -164,7 +205,7 @@ static void dragonball_intc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->legacy_reset = dragonball_intc_reset;
+    device_class_set_legacy_reset(dc, dragonball_intc_reset);
     device_class_set_props(dc, dragonball_intc_properties);
     dc->realize = dragonball_intc_realize;
     dc->vmsd = &vmstate_dragonball_intc;
