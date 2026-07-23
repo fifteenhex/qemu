@@ -132,13 +132,18 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
                 Station MAC read as low nibbles from a PROM at
                 +0x1d01/+0x1d81 area (odd byte lanes).  Strings also
                 mention ILACC (Am79C900) — the E27 variant, maybe.
-    0xfec6c000  NCR 53C710 SCSI, byte-swapped/big-endian wiring:
-                probe writes ISTAT(BE +0x17)=0x40 (SRST) then 0,
-                checks SCNTL0(BE +0x03)==0xc0 and DSTAT(BE +0x0f)
-                ==0x80 (the 53C710 reset values).  While probing, the
-                CS timing reg 0xfec70034 is temporarily set to 0xbe7.
-                Absence flag 0x00080000 -> "### No SCSI controller
-                installed".
+    0xfec6c000  NCR 53C720 SCSI (NOT a 53C710: the register map RMON
+                uses is the second generation 720/8xx layout — ISTAT
+                at 0x14, STEST0-3 at 0x4c, SIDL/SODL/SBDL at
+                0x50/0x54/0x58).  Byte lanes reversed within 32-bit
+                words: BE offset = LE register ^ 3.  Probe: ISTAT
+                (BE +0x17) = 0x40 (SRST) then 0, then SCNTL0
+                (BE +0x03) == 0xc0 and DSTAT (BE +0x0f) == 0x80, the
+                reset values.  While probing, the CS timing reg
+                0xfec70034 is temporarily set to 0xbe7.  Absence flag
+                0x00080000 -> "### No SCSI controller installed".
+                Driven exclusively in low level (bit-bang) mode, see
+                "The SCSI driver protocol" below.
     0xfec70000  chip-select / memory controller.
                 reg 0x00 = own base address (reads 0xfec00000)
                 regs 0x04..0x38 = timing/control (values 0x0f30,
@@ -254,9 +259,8 @@ Known issues / next steps, roughly in order:
    via -drive if=mtd like mvme147 so it survives restarts.  Model the
    RTC time registers (chip still not identified — DS1386-like, byte
    lane 3).
-3. Real 53C710 model for SCSI disk boot ("boot" command, LynxOS),
-   or port/extend an existing 53c9x-family model — QEMU has none for
-   the 710.
+3. DONE: SCSI modelled (ncr53c720, see "The SCSI chip is a 53C720"
+   below); disk boot now only lacks an OS-9 disk image.
 4. LANCE at 0xfec68000: reuse the existing lance/pcnet core with the
    E17's RDP+2/RAP+6 lane arrangement; MAC PROM nibbles at +0x1d81.
 5. Video (RAMDAC rev 0x3a + CRTC) and the AT keyboard for a console
@@ -275,15 +279,14 @@ script, and watch the model traces (-trace 'e17_sysc_*' for
 everything — beware, the idle loop makes that huge — or the targeted
 -trace 'e17_nvram_*').  What the RMON drivers did against the stubs:
 
-- `scsi` (bus scan) exercises the 53C710 like this: ISTAT SRST
+- `scsi` (bus scan) exercises the SCSI chip with an ISTAT SRST
   pulse; SCNTL1 = 0x08 pulse (SCSI bus reset), SCID = 7, SCNTL0 =
-  0xc4, DCNTL pokes; then per target ID: SODL/SOCL writes (0x20,
-  then a bus-ID bitmask 0x80|target to BE offset +0x57, SCNTL1 =
-  0x50, 0x30, 0x10) and ~786000 polls of SBCL waiting for the target
-  to respond before timing out.  A future 53C710 model must make
-  selection timeouts fail fast (SBCL stays 0) or implement SCRIPTS
-  properly.  All offsets confirm the byteswapped-within-longword
-  wiring.
+  0xc4, DCNTL pokes; then per target ID a manual low-level
+  selection and ~786000 polls of SBCL waiting for the target to
+  respond before timing out.  (These accesses originally suggested
+  a 53C710; decoding the full driver later proved the register map
+  is the 53C720/8xx one — see "The SCSI chip is a 53C720" below,
+  which documents the whole protocol.)
 - NVRAM (0xfec20000 block): the "system area" is 0x000-0x5ff,
   written wholesale by `we` (copy of the DRAM config at 0x800) with
   a checksum in the last bytes (0x5fd-0x5ff: fb b3 86 for the
@@ -300,14 +303,12 @@ everything — beware, the idle loop makes that huge — or the targeted
   both to Serial Port 1.  SCSI/Keyboard: typematic rate, language,
   SCSI own ID 7, "SCSI Reset on startup".
 - `boot` with device=Harddisk (the default, OS "OS-9"): runs an
-  embedded "OS-9/68K System Bootstrap" which endlessly retries
+  embedded "OS-9/68K System Bootstrap" which endlessly retried
   "boot: Can't initialize the boot device / Boot failed, error
-  status $00F6" against the SCSI stub.  So the road to booting an
-  OS is: make the 53C710 model real.  RMON/the bootstrap drive it
-  with manual register-level selection (see the scsi trace above),
-  not SCRIPTS, so a phase-engine model in the style of the other
-  QEMU SCSI HBAs should be enough to boot OS-9 from a disk image.
-  THIS IS THE HIGHEST-PAYOFF NEXT TASK.
+  status $00F6" against the old SCSI stub.  DONE since: the
+  ncr53c720 model (see "The SCSI chip is a 53C720" below) takes it
+  all the way to reading the disk — only an OS-9 disk image is
+  missing now.
 - Beware when scripting the setup menus: exiting setup after changes
   raises a strict "Save parameters (y/n)?" prompt that eats any
   other keystrokes — the earlier "netboot hangs silently" was this
@@ -419,6 +420,72 @@ Daniel).  Once it builds: wrap u-boot.bin with mke17boot.py at
 TEXT_BASE 0x600000 (entry = start), serve via netserv.py, and it
 should get control in supervisor mode with caches off — exactly
 what its start.S expects.
+
+## The SCSI chip is a 53C720, and RMON bit-bangs it (2026-07-20)
+
+The earlier "NCR 53C710" identification was wrong.  Tracing the
+`scsi` bus scan against the stub (all accesses byte-sized; BE
+offset = LE register ^ 3) and decoding the driver at fe81a380..
+fe81a6dc gives a register map that only fits the second generation
+"SCSI SCRIPTS" family, i.e. the 53C720 (the 68k-bus member; the
+PCI 53C8xx parts share the map):
+
+    ISTAT at 0x14 (SRST=0x40 soft reset — 710 has ISTAT at 0x21)
+    STEST2 at 0x4e, written 0x03 = EXT|LOW: LOW LEVEL MODE enable
+    SODL   at 0x54 (selection ID bitmask goes here)
+    SBDL   at 0x58 (incoming bytes are read from the live bus)
+    SOCL   at 0x09, SBCL at 0x0b, SCID at 0x04, SCNTL0/1 at 0/1
+
+### The RMON driver protocol (all polled, no SCRIPTS, no IRQs)
+
+init (fe81a398): DCNTL=0x20; optional SCNTL1 RST pulse (bit 3);
+SCID = own id (7); SCNTL0 = 0xc4; STEST2 = 0x03 (low level mode).
+
+selection (fe81a402): wait for bus free (SBCL BSY clear); SOCL =
+0x20 (BSY), SODL = (1<<own)|(1<<target), SCNTL1 = 0x50 (ADB|CON),
+SOCL = 0x30 (SEL|BSY), SOCL = 0x10 (release BSY, keep SEL); then
+up to 786432 polls of SBCL waiting for the target's BSY.  Timeout:
+SOCL = 0x02, SCNTL1 = 0, error.  Success: SOCL = 0x02, enter the
+phase loop.  No ATN — the target goes straight to COMMAND phase.
+
+phase loop: wait REQ (SBCL bit 7); phase = SBCL & 7; per byte the
+initiator writes SODL (out phases) or reads SBDL (in phases), then
+pulses ACK by writing SOCL = 0x40|phase followed by SOCL = phase,
+waiting for REQ to drop in between.  Phases handled: 0 data out,
+1 data in, 2 command, 3 status, 6 msg out (sends NOP 0x08 with
+ATN), 7 msg in.  After the msg-in byte (command complete) the
+driver waits for BSY to drop = bus free.  The LUN travels in CDB
+byte 1 bits 7:5, SCSI-1 style — no IDENTIFY message is ever sent.
+
+### The model (hw/scsi/ncr53c720.c)
+
+New sysbus device "ncr53c720": the 0x60-byte register file with a
+target phase engine behind SOCL/SBCL/SODL/SBDL implementing
+exactly the low level mode — one REQ/ACK handshake per byte
+against the QEMU SCSI bus (scsi_req_new/enqueue/continue, like a
+miniature esp).  SCRIPTS, DMA and interrupts are intentionally
+absent until some guest uses them; all other registers are plain
+storage.  A "lane-swap" property applies the E17's reversed byte
+lanes; the e17 machine maps it at 0xfec6c000 over the sysc block
+(stub now removed) and services -device scsi-hd/-drive if=scsi.
+
+Verified via the RMON CLI (~/e17-re/scsiscan1.py, bootdisk1.py):
+
+    -device scsi-hd,scsi-id=6,drive=hd0 \
+    -drive id=hd0,file=disk.img,format=raw,if=none
+
+- `scsi` scan: "6 : + - - - <vendor> <product>" — INQUIRY data
+  arrives byte-banged; absent LUNs (CHECK CONDITION) print "-",
+  absent targets time out via the SBCL poll counter.
+- `boot` (Harddisk, ID 6 default): OS-9 bootstrap reads sector 0:
+  empty disk -> "No bootfile installed on disk" ($00F0); planting
+  DD_BT/DD_BSZ (offsets 0x15/0x18 in sector 0) makes it read the
+  bootfile LSN and verify the 0x4AFC module sync ("Kernel has bad
+  module header" on a dummy).  A real OS-9 boot now only needs a
+  real OS-9/68K disk image (kernel + bootfile).
+
+Open: which chip errata/registers the LynxOS/OS-9 drivers use once
+an OS runs — SCRIPTS support may become necessary then.
 
 ## Netboot plan (for loading u-boot or other payloads)
 
