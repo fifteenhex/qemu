@@ -26,55 +26,112 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/cd2401.h"
 #include "migration/vmstate.h"
 
+#define CD2401_LIVR     0x09    /* local interrupt vector, per channel */
+#define CD2401_IER      0x11    /* interrupt enable, per channel */
+#define CD2401_CCR      0x13    /* channel command register */
+#define CD2401_LICR     0x26    /* local interrupting channel (ch << 2) */
 #define CD2401_RFOC     0x30    /* receive FIFO output count */
 #define CD2401_TFTC     0x80    /* transmit FIFO transfer count */
 #define CD2401_GFRCR    0x81    /* global firmware revision code */
 #define CD2401_REOIR    0x84    /* receive end of interrupt */
 #define CD2401_TEOIR    0x85    /* transmit end of interrupt */
 #define CD2401_MEOIR    0x86    /* modem end of interrupt */
-#define CD2401_LIVR     0x09    /* local interrupt vector, per channel */
-#define CD2401_IER      0x11    /* interrupt enable, per channel */
-#define CD2401_CCR      0x13    /* channel command register */
+#define CD2401_TISR     0x8a    /* transmit interrupt status */
+#define CD2401_TPILR    0xe0    /* tx priority interrupt level */
+#define CD2401_RPILR    0xe1    /* rx priority interrupt level */
+#define CD2401_MPILR    0xe3    /* modem priority interrupt level */
+#define CD2401_TIR      0xec    /* transmit interrupt register */
+#define CD2401_RIR      0xed    /* receive interrupt register */
 #define CD2401_CAR      0xee    /* channel access register */
 #define CD2401_DR       0xf8    /* rx/tx data register */
 
 #define CD2401_GFRCR_REV    0x26    /* any nonzero revision will do */
 #define CD2401_IER_TXD      0x01    /* tx data interrupt enable */
+#define CD2401_IER_RXD      0x08    /* rx data interrupt enable */
+#define CD2401_TISR_TXEMPTY 0x02    /* tx shift register empty */
+#define CD2401_TIR_TACT     0x40    /* tx interrupt context active */
+#define CD2401_RIR_RACT     0x40    /* rx interrupt context active */
+#define CD2401_RIR_REN      0x80    /* rx interrupts enabled */
 #define CD2401_TX_FIFO_LEN  16
+
+static uint8_t cd2401_greg(CD2401State *s, uint8_t reg)
+{
+    return s->gregs[reg & 0x7f];
+}
 
 static CD2401Channel *cd2401_car_chan(CD2401State *s)
 {
     return &s->chan[s->gregs[CD2401_CAR & 0x7f] & (CD2401_NR_CHAN - 1)];
 }
 
-/*
- * Find the highest priority pending interrupt: receive data beats
- * transmit ready, lower channels beat higher ones.  Returns the
- * acknowledge byte — the channel's LIVR with the interrupt type in
- * bits 1:0 — or 0 if nothing is pending.  (RMON sets LIVR to
- * 0x50 | channel << 2, so the channel rides along in bits 3:2.)
- */
-static uint8_t cd2401_pending(CD2401State *s, int *chan, int *type)
+static int cd2401_rx_pending_chan(CD2401State *s)
 {
     int i;
 
     for (i = 0; i < CD2401_NR_CHAN; i++) {
-        if (s->chan[i].rx_count > 0) {
-            *chan = i;
-            *type = CD2401_INT_RX;
-            return (s->chan[i].regs[CD2401_LIVR] & ~3) | CD2401_INT_RX;
+        if (s->chan[i].rx_count > 0 &&
+            (s->chan[i].regs[CD2401_IER] & CD2401_IER_RXD)) {
+            return i;
         }
     }
+    return -1;
+}
+
+static int cd2401_tx_pending_chan(CD2401State *s)
+{
+    int i;
+
     for (i = 0; i < CD2401_NR_CHAN; i++) {
         if (s->chan[i].regs[CD2401_IER] & CD2401_IER_TXD) {
-            *chan = i;
-            *type = CD2401_INT_TX;
-            return (s->chan[i].regs[CD2401_LIVR] & ~3) | CD2401_INT_TX;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* The interrupt request pin: asserted while anything is pending */
+static void cd2401_update_irq(CD2401State *s)
+{
+    qemu_set_irq(s->irq, cd2401_rx_pending_chan(s) >= 0 ||
+                         cd2401_tx_pending_chan(s) >= 0);
+}
+
+static uint8_t cd2401_ack(CD2401State *s, int chan, int type)
+{
+    s->svc_chan = chan;
+    s->svc_type = type;
+    return (s->chan[chan].regs[CD2401_LIVR] & ~3) | type;
+}
+
+/*
+ * An interrupt acknowledge cycle.  The board decodes reads in a
+ * window where address bits 0-6 carry the acknowledged priority
+ * level; the chip matches that against its three PILRs to decide
+ * which interrupt type is being acknowledged (RMON programs all
+ * three to 0xfb and acknowledges at +0xfb; the u-boot port uses
+ * distinct levels per type).  Returns the acknowledged channel's
+ * LIVR with the interrupt type in bits 1:0, 0 if nothing matches.
+ */
+static uint8_t cd2401_iack(CD2401State *s, uint8_t level)
+{
+    int chan;
+
+    if (level == (cd2401_greg(s, CD2401_RPILR) & 0x7f)) {
+        chan = cd2401_rx_pending_chan(s);
+        if (chan >= 0) {
+            return cd2401_ack(s, chan, CD2401_INT_RX);
+        }
+    }
+    if (level == (cd2401_greg(s, CD2401_TPILR) & 0x7f)) {
+        chan = cd2401_tx_pending_chan(s);
+        if (chan >= 0) {
+            return cd2401_ack(s, chan, CD2401_INT_TX);
         }
     }
     return 0;
@@ -92,6 +149,25 @@ static uint64_t cd2401_read(void *opaque, hwaddr addr, unsigned size)
         return s->svc_type == CD2401_INT_RX ? svc->rx_count : 0;
     case CD2401_TFTC:
         return s->svc_type == CD2401_INT_TX ? CD2401_TX_FIFO_LEN : 0;
+    case CD2401_LICR:
+        return s->svc_chan << 2;
+    case CD2401_TISR:
+        /* transmission is instantaneous here */
+        return CD2401_TISR_TXEMPTY;
+    case CD2401_TIR:
+        if (s->svc_type == CD2401_INT_TX) {
+            return CD2401_TIR_TACT | s->svc_chan;
+        }
+        return 0;
+    case CD2401_RIR:
+        val = 0;
+        if (cd2401_car_chan(s)->regs[CD2401_IER] & CD2401_IER_RXD) {
+            val |= CD2401_RIR_REN;
+        }
+        if (s->svc_type == CD2401_INT_RX) {
+            val |= CD2401_RIR_RACT | s->svc_chan;
+        }
+        return val;
     case CD2401_DR:
         if (s->svc_type == CD2401_INT_RX && svc->rx_count > 0) {
             val = svc->rx_fifo[0];
@@ -118,16 +194,22 @@ static void cd2401_write(void *opaque, hwaddr addr, uint64_t val,
     addr &= 0xff;
     switch (addr) {
     case CD2401_DR:
+        /*
+         * In transmit service context the data goes to the
+         * acknowledged channel, in polled operation (TISR TXEMPTY
+         * spinning) to the CAR-selected one.
+         */
         if (s->svc_type == CD2401_INT_TX) {
             qemu_chr_fe_write_all(&svc->chr, &b, 1);
-            return;
+        } else {
+            qemu_chr_fe_write_all(&cd2401_car_chan(s)->chr, &b, 1);
         }
-        qemu_log_mask(LOG_UNIMP, "cd2401: data write outside tx service\n");
         return;
     case CD2401_REOIR:
     case CD2401_TEOIR:
     case CD2401_MEOIR:
         s->svc_type = CD2401_INT_NONE;
+        cd2401_update_irq(s);
         return;
     case CD2401_GFRCR:
         /* read only: keep the revision visible */
@@ -138,6 +220,10 @@ static void cd2401_write(void *opaque, hwaddr addr, uint64_t val,
          * work to do here; the chip clears the register on completion
          * and the firmware polls for that.
          */
+        return;
+    case CD2401_IER:
+        cd2401_car_chan(s)->regs[CD2401_IER] = b;
+        cd2401_update_irq(s);
         return;
     }
     if (addr < 0x80) {
@@ -162,19 +248,14 @@ static const MemoryRegionOps cd2401_ops = {
 };
 
 /*
- * The board's interrupt acknowledge port: reading it latches the
- * highest priority pending interrupt as the current service context.
+ * The board's interrupt acknowledge window: reading it performs an
+ * acknowledge cycle with the low 7 address bits as the level.
  */
 static uint64_t cd2401_iack_read(void *opaque, hwaddr addr, unsigned size)
 {
     CD2401State *s = opaque;
 
-    if (addr == 0xfb) {
-        return cd2401_pending(s, &s->svc_chan, &s->svc_type);
-    }
-    qemu_log_mask(LOG_UNIMP, "cd2401: iack read @0x%02" HWADDR_PRIx "\n",
-                  addr);
-    return 0;
+    return cd2401_iack(s, addr & 0x7f);
 }
 
 static void cd2401_iack_write(void *opaque, hwaddr addr, uint64_t val,
@@ -208,6 +289,7 @@ static void cd2401_receive(void *opaque, const uint8_t *buf, int size)
 
     memcpy(c->rx_fifo + c->rx_count, buf, n);
     c->rx_count += n;
+    cd2401_update_irq(c->parent);
 }
 
 static void cd2401_reset(DeviceState *dev)
@@ -231,6 +313,7 @@ static void cd2401_realize(DeviceState *dev, Error **errp)
     int i;
 
     for (i = 0; i < CD2401_NR_CHAN; i++) {
+        s->chan[i].parent = s;
         qemu_chr_fe_set_handlers(&s->chan[i].chr, cd2401_can_receive,
                                  cd2401_receive, NULL, NULL,
                                  &s->chan[i], NULL, true);
@@ -247,6 +330,7 @@ static void cd2401_init(Object *obj)
     memory_region_init_io(&s->iack, obj, &cd2401_iack_ops, s,
                           "cd2401.iack", 0x100);
     sysbus_init_mmio(sbd, &s->iack);
+    sysbus_init_irq(sbd, &s->irq);
 }
 
 static const VMStateDescription vmstate_cd2401_chan = {

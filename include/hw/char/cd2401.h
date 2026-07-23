@@ -27,7 +27,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(CD2401State, CD2401)
 #define CD2401_INT_TX       2
 #define CD2401_INT_RX       3
 
+typedef struct CD2401State CD2401State;
+
 typedef struct {
+    CD2401State *parent;
     uint8_t regs[0x80];     /* per channel bank of the register file */
     uint8_t rx_fifo[CD2401_RX_FIFO_LEN];
     int rx_count;
@@ -39,6 +42,7 @@ struct CD2401State {
 
     MemoryRegion iomem;
     MemoryRegion iack;
+    qemu_irq irq;
 
     CD2401Channel chan[CD2401_NR_CHAN];
     uint8_t gregs[0x80];    /* global registers, offsets 0x80-0xff */
