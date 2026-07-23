@@ -61,6 +61,7 @@
 #include "hw/display/dragonball_lcdc.h"
 #include "hw/rtc/dragonball_rtc.h"
 #include "hw/input/ads7843.h"
+#include "hw/input/palm_keypad.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
@@ -97,6 +98,8 @@ typedef struct PalmMachineClass {
     uint8_t mask_id;
     uint8_t gpio_ports;
     uint16_t adc_dock_value;
+    /* gpio line of keyboard row 0 (rows are consecutive pins) */
+    uint16_t kbd_row0_gpio;
     bool has_timer2;
 } PalmMachineClass;
 
@@ -138,9 +141,10 @@ static void palm_init(MachineState *machine)
     PalmResetInfo *ri;
     DeviceState *scr_dev, *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
                 *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev, *adc_dev,
-                *pen_split;
+                *pen_split, *kpd_dev;
     MemoryRegion *sysmem = get_system_memory();
     ssize_t size;
+    int i;
 
     if (!machine->firmware) {
         error_report("%s: a PalmOS ROM must be given with -bios",
@@ -312,6 +316,30 @@ static void palm_init(MachineState *machine)
         qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_CARDDET_GPIO));
         qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_ACPWR_GPIO));
     }
+
+    /*
+     * Hard buttons: rows scanned from GPIO outputs, columns read on
+     * port D bits 0-3 which are also the INT0-3 interrupt pins; the
+     * OR of the columns feeds the KB interrupt source.
+     */
+    kpd_dev = qdev_new(TYPE_PALM_KEYPAD);
+    qdev_realize_and_unref(kpd_dev, NULL, &error_fatal);
+    for (i = 0; i < PALM_KEYPAD_ROWS; i++) {
+        qdev_connect_gpio_out(gpio_dev, pmc->kbd_row0_gpio + i,
+                              qdev_get_gpio_in_named(kpd_dev, "rows", i));
+    }
+    for (i = 0; i < PALM_KEYPAD_COLS; i++) {
+        qdev_connect_gpio_out_named(kpd_dev, "cols", i,
+                                    qdev_get_gpio_in(gpio_dev, 3 * 8 + i));
+        qdev_connect_gpio_out_named(gpio_dev, "portd-int", i,
+                                    qdev_get_gpio_in_named(intc_dev,
+                                                     "peripheral_interrupts",
+                                                     DRAGONBALL_INTC_INT0 + i));
+    }
+    qdev_connect_gpio_out_named(gpio_dev, "kb-int", 0,
+                                qdev_get_gpio_in_named(intc_dev,
+                                                       "peripheral_interrupts",
+                                                       DRAGONBALL_INTC_KB));
 }
 
 static void palm_machine_common_class_init(ObjectClass *oc, const void *data)
@@ -344,6 +372,7 @@ static void palmv_machine_class_init(ObjectClass *oc, const void *data)
     pmc->mask_id = 0x01;
     pmc->gpio_ports = 7;
     pmc->adc_dock_value = 0;    /* serial dock sense idles low */
+    pmc->kbd_row0_gpio = 5 * 8 + 4; /* rows on port F bits 4-6 */
     pmc->has_timer2 = false;
 }
 
@@ -362,6 +391,7 @@ static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
     pmc->mask_id = 0x01;
     pmc->gpio_ports = 10;
     pmc->adc_dock_value = 0xfff; /* "twister" dock sense idles high */
+    pmc->kbd_row0_gpio = 8 * 8 + 5; /* rows on port K bits 5-7 */
     pmc->has_timer2 = true;
 }
 
