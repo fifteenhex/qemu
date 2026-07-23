@@ -37,6 +37,14 @@ struct DragonBallGPIOState {
     uint8_t num_ports;
 
     struct DragonBallGPIOPort ports[DRAGONBALL_GPIO_PORTS];
+
+    /* port D doubles as the INT0-3/keyboard interrupt inputs */
+    uint8_t pdpol;
+    uint8_t pdirqen;
+    uint8_t pdkben;
+    uint8_t pdirqeg;
+    qemu_irq portd_int[4];
+    qemu_irq kb_int;
 };
 
 #define DRAGONBALL_GPIO_ADDR2PORT(_addr) (_addr >> 3)
@@ -46,6 +54,11 @@ struct DragonBallGPIOState {
 #define DRAGONBALL_GPIO_REG_DATA          0x1
 #define DRAGONBALL_GPIO_REG_PUDEN         0x2
 #define DRAGONBALL_GPIO_REG_SEL           0x3
+/* port D only */
+#define DRAGONBALL_GPIO_REG_POL           0x4
+#define DRAGONBALL_GPIO_REG_IRQEN         0x5
+#define DRAGONBALL_GPIO_REG_KBEN          0x6
+#define DRAGONBALL_GPIO_REG_IRQEG         0x7
 
 /* PORT A */
 #define DRAGONBALL_GPIO_PADIR           0x0

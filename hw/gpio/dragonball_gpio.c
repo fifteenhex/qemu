@@ -10,12 +10,38 @@
 #include "migration/vmstate.h"
 #include "trace.h"
 
+/* the level a DATA read would return: latch for outputs, pin for inputs */
+static uint8_t dragonball_gpio_pins(DragonBallGPIOState *s, unsigned int port)
+{
+    return (s->ports[port].data & s->ports[port].dir) |
+           (s->ports[port].ext & ~s->ports[port].dir);
+}
+
+/*
+ * Port D pins feed the INT0-3 and keyboard interrupt sources, gated
+ * by the polarity/enable registers.  Level semantics only — the
+ * edge configuration (PDIRQEG) is not modelled.
+ */
+static void dragonball_gpio_update_portd_irqs(DragonBallGPIOState *s)
+{
+    uint8_t dir = s->ports[DRAGONBALL_GPIO_PORTD].dir;
+    uint8_t pins = s->ports[DRAGONBALL_GPIO_PORTD].ext & ~dir;
+    /* a level interrupt fires while the pin matches the polarity */
+    uint8_t active = ~(pins ^ s->pdpol) & s->pdirqen & ~dir;
+    /* the keyboard interrupt is the OR of the raw enabled pins */
+    uint8_t kb = pins & s->pdkben;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        qemu_set_irq(s->portd_int[i], (active >> i) & 1);
+    qemu_set_irq(s->kb_int, kb != 0);
+}
+
 static uint64_t dragonball_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     DragonBallGPIOState *s = DRAGONBALL_GPIO(opaque);
     unsigned int port = DRAGONBALL_GPIO_ADDR2PORT(addr);
     unsigned int reg = DRAGONBALL_GPIO_ADDR2REG(addr);
-    uint16_t val;
 
     if (port >= s->num_ports) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -26,27 +52,35 @@ static uint64_t dragonball_gpio_read(void *opaque, hwaddr addr, unsigned int siz
 
     switch (reg) {
     case DRAGONBALL_GPIO_REG_DIR:
-        val = s->ports[port].data;
-        val |= ((uint16_t)s->ports[port].dir) << 8;
-        return val;
+        return s->ports[port].dir;
     case DRAGONBALL_GPIO_REG_DATA:
         /* input pins read the external level, output pins the latch */
-        val = (s->ports[port].data & s->ports[port].dir) |
-              (s->ports[port].ext & ~s->ports[port].dir);
-        return val;
+        return dragonball_gpio_pins(s, port);
     case DRAGONBALL_GPIO_REG_PUDEN:
-        val = s->ports[port].sel;
-        val |= ((uint16_t)s->ports[port].puden) << 8;
-	//printf("0x%04x\n", (unsigned) val);
-        return val;
+        return s->ports[port].puden;
     case DRAGONBALL_GPIO_REG_SEL:
         return s->ports[port].sel;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                "%s: bad read offset 0x%" HWADDR_PRIx "\n",
-                      __func__, addr);
+    case DRAGONBALL_GPIO_REG_POL:
+        if (port == DRAGONBALL_GPIO_PORTD)
+            return s->pdpol;
+        break;
+    case DRAGONBALL_GPIO_REG_IRQEN:
+        if (port == DRAGONBALL_GPIO_PORTD)
+            return s->pdirqen;
+        break;
+    case DRAGONBALL_GPIO_REG_KBEN:
+        if (port == DRAGONBALL_GPIO_PORTD)
+            return s->pdkben;
+        break;
+    case DRAGONBALL_GPIO_REG_IRQEG:
+        if (port == DRAGONBALL_GPIO_PORTD)
+            return s->pdirqeg;
+        break;
     }
 
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "%s: bad read offset 0x%" HWADDR_PRIx "\n",
+                  __func__, addr);
     return 0;
 }
 
@@ -57,14 +91,20 @@ static void dragonball_gpio_update_outputs(DragonBallGPIOState *s, unsigned int 
     for (i = 0; i < DRAGONBALL_GPIO_NGPIOPERPORT; i++) {
         uint8_t mask = 1 << i;
         unsigned int pin = p * DRAGONBALL_GPIO_NGPIOPERPORT + i;
-        int level = (mask & s->ports[p].data) ? 1 : 0;
+        int level;
 
-        /* Is this pin an output? */
-        if (s->ports[p].dir & mask) {
-            qemu_set_irq(s->output[pin], level);
-            //printf("%s:%d %u %02x %02x %d\n", __func__, __LINE__,
-            //       pin, s->ports[p].dir, s->ports[p].data, level);
-        }
+        /*
+         * Outputs drive the latch; pins tristated back to inputs rise
+         * to the pull-up level (port C has pull-downs instead).  The
+         * Palm keyboard scanner deselects matrix rows exactly that
+         * way, by flipping them to inputs.
+         */
+        if (s->ports[p].dir & mask)
+            level = (mask & s->ports[p].data) ? 1 : 0;
+        else
+            level = (p == 2) ? 0 : 1;
+
+        qemu_set_irq(s->output[pin], level);
     }
 }
 
@@ -84,36 +124,65 @@ static void dragonball_gpio_write(void *opaque, hwaddr addr,
 
     switch (reg) {
     case DRAGONBALL_GPIO_REG_DIR:
-        s->ports[port].dir = (value >> 8) & 0xff;
-        s->ports[port].data = value & 0xff;
+        s->ports[port].dir = value;
         dragonball_gpio_update_outputs(s, port);
         break;
     case DRAGONBALL_GPIO_REG_DATA:
-        s->ports[port].data = value & 0xff;
+        s->ports[port].data = value;
         dragonball_gpio_update_outputs(s, port);
         break;
     case DRAGONBALL_GPIO_REG_PUDEN:
-        s->ports[port].puden = (value >> 8) & 0xff;
-        s->ports[port].sel = value & 0xff;
+        s->ports[port].puden = value;
         break;
     case DRAGONBALL_GPIO_REG_SEL:
-        s->ports[port].sel = value & 0xff;
+        s->ports[port].sel = value;
         break;
+    case DRAGONBALL_GPIO_REG_POL:
+        if (port == DRAGONBALL_GPIO_PORTD) {
+            s->pdpol = value;
+            break;
+        }
+        /* fallthrough */
+    case DRAGONBALL_GPIO_REG_IRQEN:
+        if (port == DRAGONBALL_GPIO_PORTD) {
+            s->pdirqen = value;
+            break;
+        }
+        /* fallthrough */
+    case DRAGONBALL_GPIO_REG_KBEN:
+        if (port == DRAGONBALL_GPIO_PORTD) {
+            s->pdkben = value;
+            break;
+        }
+        /* fallthrough */
+    case DRAGONBALL_GPIO_REG_IRQEG:
+        if (port == DRAGONBALL_GPIO_PORTD) {
+            s->pdirqeg = value;
+            break;
+        }
+        /* fallthrough */
     default:
-    printf("%s:%d %x %u\n", __func__, __LINE__, (unsigned) addr, port);
         qemu_log_mask(LOG_GUEST_ERROR,
                 "%s: bad write offset 0x%" HWADDR_PRIx "\n",
                       __func__, addr);
     }
 
-    if (port == DRAGONBALL_GPIO_PORTD)
+    if (port == DRAGONBALL_GPIO_PORTD) {
         /* Bottom four bits of sel in port D are hardwire to zero */
         s->ports[port].sel &= ~0xf;
+        dragonball_gpio_update_portd_irqs(s);
+    }
 }
 
 static const MemoryRegionOps gpio_ops = {
     .read =  dragonball_gpio_read,
     .write = dragonball_gpio_write,
+    /*
+     * Every register is one byte at its own address; wider guest
+     * accesses are split by the core.
+     */
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -127,6 +196,9 @@ static void dragonball_gpio_set(void *opaque, int line, int value)
         s->ports[port].ext |= mask;
     else
         s->ports[port].ext &= ~mask;
+
+    if (port == DRAGONBALL_GPIO_PORTD)
+        dragonball_gpio_update_portd_irqs(s);
 }
 
 static void dragonball_gpio_reset(DeviceState *dev)
@@ -145,6 +217,11 @@ static void dragonball_gpio_reset(DeviceState *dev)
         s->ports[i].puden = 0;
         s->ports[i].sel = 0;
     }
+
+    s->pdpol = 0;
+    s->pdirqen = 0;
+    s->pdkben = 0;
+    s->pdirqeg = 0;
 
     s->ports[0].puden = DRAGONBALL_GPIO_PAPUEN_RESET;
     s->ports[1].puden = DRAGONBALL_GPIO_PBPUEN_RESET;
@@ -188,6 +265,8 @@ static void dragonball_gpio_realize(DeviceState *dev, Error **errp)
 
     qdev_init_gpio_in(DEVICE(s), dragonball_gpio_set, DRAGONBALL_GPIO_NGPIO);
     qdev_init_gpio_out(DEVICE(s), s->output, DRAGONBALL_GPIO_NGPIO);
+    qdev_init_gpio_out_named(DEVICE(s), s->portd_int, "portd-int", 4);
+    qdev_init_gpio_out_named(DEVICE(s), &s->kb_int, "kb-int", 1);
 }
 
 static void dragonball_gpio_class_init(ObjectClass *klass, const void *data)
