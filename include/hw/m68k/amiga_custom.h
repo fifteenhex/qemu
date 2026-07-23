@@ -10,6 +10,7 @@
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
 #include "hw/m68k/amiga_fdc.h"
+#include "qemu/audio.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/input.h"
@@ -66,6 +67,18 @@ struct AmigaCustomState {
     QemuInputHandlerState *mouse_hs;
     uint8_t mouse_x, mouse_y;
     bool mouse_rmb;
+
+    /* Paula audio: four DMA-fed sample channels */
+    AudioBackend *audio_be;
+    SWVoiceOut *voice;
+    struct {
+        uint32_t ptr;           /* current fetch address */
+        uint32_t len;           /* words left in the buffer */
+        uint32_t frac;          /* colour clocks into the sample, 16.16 */
+        uint16_t dat;           /* the fetched word */
+        uint8_t bytepos;        /* which byte of it is playing */
+        int8_t sample;
+    } aud[4];
     /*
      * INT2/INT6 are open-drain lines shared by the CIAs (bit 0) and
      * board hardware (bit 1); INTREQ re-latches while any source holds

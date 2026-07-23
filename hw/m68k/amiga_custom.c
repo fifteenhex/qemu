@@ -49,6 +49,11 @@
 #define REG_DSKPTL      0x022
 #define REG_DSKLEN      0x024
 #define REG_DSKSYNC     0x07e
+#define REG_AUD0LC      0x0a0
+#define AUD_CH_SIZE     0x010
+#define AUD_LEN         0x004
+#define AUD_PER         0x006
+#define AUD_VOL         0x008
 #define REG_SERDAT      0x030
 #define REG_SERPER      0x032
 #define REG_POTGO       0x034
@@ -105,6 +110,7 @@
 #define ADKCON_WORDSYNC (1 << 10)
 
 #define DMACON_DSKEN    (1 << 4)
+#define DMACON_AUD0EN   (1 << 0)
 
 /* POTGOR: the port 0 Y pot line doubles as the right mouse button */
 #define POTGOR_DATLY    (1 << 10)
@@ -899,6 +905,115 @@ static const GraphicHwOps amiga_custom_gfx_ops = {
     .gfx_update = amiga_custom_gfx_update,
 };
 
+/* --- audio --- */
+
+/* PAL colour clock; a sample lasts AUDxPER of its ticks */
+#define PAULA_COLOR_HZ      3546895
+#define PAULA_OUT_HZ        44100
+/* Paula can't fetch faster than one word per two scanlines */
+#define PAULA_MIN_PERIOD    124
+#define PAULA_MIX_FRAMES    256
+
+static void amiga_audio_reload(AmigaCustomState *s, int ch)
+{
+    unsigned base = REG_AUD0LC + ch * AUD_CH_SIZE;
+
+    s->aud[ch].ptr = amiga_custom_ptr(s, base);
+    s->aud[ch].len = amiga_custom_reg(s, base + AUD_LEN);
+    if (!s->aud[ch].len) {
+        s->aud[ch].len = 0x10000;
+    }
+    s->aud[ch].dat = chip_read16(s->aud[ch].ptr);
+    s->aud[ch].bytepos = 0;
+    s->aud[ch].sample = s->aud[ch].dat >> 8;
+}
+
+static void amiga_audio_advance(AmigaCustomState *s, int ch)
+{
+    if (s->aud[ch].bytepos == 0) {
+        s->aud[ch].bytepos = 1;
+        s->aud[ch].sample = s->aud[ch].dat;
+        return;
+    }
+    s->aud[ch].ptr += 2;
+    if (--s->aud[ch].len == 0) {
+        /* the buffer is done: latch the pointers again and interrupt */
+        amiga_audio_reload(s, ch);
+        amiga_custom_post_int(s, INT_AUD0 << ch);
+        return;
+    }
+    s->aud[ch].dat = chip_read16(s->aud[ch].ptr);
+    s->aud[ch].bytepos = 0;
+    s->aud[ch].sample = s->aud[ch].dat >> 8;
+}
+
+static void amiga_audio_callback(void *opaque, int avail)
+{
+    AmigaCustomState *s = opaque;
+    int16_t buf[PAULA_MIX_FRAMES * 2];
+    const uint32_t step = (uint64_t)PAULA_COLOR_HZ * 0x10000 / PAULA_OUT_HZ;
+    int frames = avail / (int)(2 * sizeof(int16_t));
+
+    while (frames > 0) {
+        int n = MIN(frames, PAULA_MIX_FRAMES);
+        int i, ch;
+
+        for (i = 0; i < n; i++) {
+            int left = 0, right = 0;
+
+            for (ch = 0; ch < 4; ch++) {
+                unsigned base = REG_AUD0LC + ch * AUD_CH_SIZE;
+                uint32_t period;
+                int vol;
+
+                if ((s->dmacon & (DMACON_DMAEN | (DMACON_AUD0EN << ch))) !=
+                    (DMACON_DMAEN | (DMACON_AUD0EN << ch))) {
+                    continue;
+                }
+                period = amiga_custom_reg(s, base + AUD_PER);
+                if (period < PAULA_MIN_PERIOD) {
+                    period = PAULA_MIN_PERIOD;
+                }
+                s->aud[ch].frac += step;
+                while (s->aud[ch].frac >= period << 16) {
+                    s->aud[ch].frac -= period << 16;
+                    amiga_audio_advance(s, ch);
+                }
+                vol = amiga_custom_reg(s, base + AUD_VOL) & 0x7f;
+                if (vol > 64) {
+                    vol = 64;
+                }
+                /* channels 0 and 3 play left, 1 and 2 right */
+                if (ch == 0 || ch == 3) {
+                    left += s->aud[ch].sample * vol;
+                } else {
+                    right += s->aud[ch].sample * vol;
+                }
+            }
+            buf[i * 2] = left * 2;
+            buf[i * 2 + 1] = right * 2;
+        }
+        audio_be_write(s->audio_be, s->voice, buf,
+                       n * 2 * sizeof(int16_t));
+        frames -= n;
+    }
+}
+
+/* rising edges on the audio DMA enables latch the channel pointers */
+static void amiga_custom_audio_dmacon(AmigaCustomState *s, uint16_t old)
+{
+    int ch;
+
+    for (ch = 0; ch < 4; ch++) {
+        uint16_t bit = DMACON_AUD0EN << ch;
+
+        if ((s->dmacon & bit) && !(old & bit)) {
+            amiga_audio_reload(s, ch);
+            s->aud[ch].frac = 0;
+        }
+    }
+}
+
 /* --- mouse --- */
 
 static void amiga_custom_mouse_event(DeviceState *dev, QemuConsole *src,
@@ -1127,9 +1242,13 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
     case REG_POTGO:
         s->potgo = val;
         break;
-    case REG_DMACON:
+    case REG_DMACON: {
+        uint16_t old = s->dmacon;
+
         s->dmacon = setclr(s->dmacon, val, 0x07ff);
+        amiga_custom_audio_dmacon(s, old);
         break;
+    }
     case REG_INTENA:
         s->intena = setclr(s->intena, val, 0x7fff);
         amiga_custom_update_irq(s);
@@ -1251,6 +1370,7 @@ static void amiga_custom_reset(DeviceState *dev)
     s->dsklen = 0;
     s->dsklen_armed = false;
     timer_del(&s->disk_timer);
+    memset(s->aud, 0, sizeof(s->aud));
     memset(s->regs, 0, sizeof(s->regs));
     s->frame_origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
@@ -1260,6 +1380,19 @@ static void amiga_custom_reset(DeviceState *dev)
 static void amiga_custom_realize(DeviceState *dev, Error **errp)
 {
     AmigaCustomState *s = AMIGA_CUSTOM(dev);
+    struct audsettings as = {
+        .freq = PAULA_OUT_HZ,
+        .nchannels = 2,
+        .fmt = AUDIO_FORMAT_S16,
+        .big_endian = false,
+    };
+
+    if (!audio_be_check(&s->audio_be, errp)) {
+        return;
+    }
+    s->voice = audio_be_open_out(s->audio_be, s->voice, "amiga-paula", s,
+                                 amiga_audio_callback, &as);
+    audio_be_set_active_out(s->audio_be, s->voice, true);
 
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL,
                   amiga_custom_vblank, s);
@@ -1301,6 +1434,14 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT8(mouse_x, AmigaCustomState),
         VMSTATE_UINT8(mouse_y, AmigaCustomState),
         VMSTATE_BOOL(mouse_rmb, AmigaCustomState),
+        VMSTATE_UINT32(aud[0].ptr, AmigaCustomState),
+        VMSTATE_UINT32(aud[0].len, AmigaCustomState),
+        VMSTATE_UINT32(aud[1].ptr, AmigaCustomState),
+        VMSTATE_UINT32(aud[1].len, AmigaCustomState),
+        VMSTATE_UINT32(aud[2].ptr, AmigaCustomState),
+        VMSTATE_UINT32(aud[2].len, AmigaCustomState),
+        VMSTATE_UINT32(aud[3].ptr, AmigaCustomState),
+        VMSTATE_UINT32(aud[3].len, AmigaCustomState),
         VMSTATE_UINT16(intena, AmigaCustomState),
         VMSTATE_UINT16(intreq, AmigaCustomState),
         VMSTATE_UINT16(dmacon, AmigaCustomState),
@@ -1320,6 +1461,7 @@ static const VMStateDescription vmstate_amiga_custom = {
 
 static const Property amiga_custom_properties[] = {
     DEFINE_PROP_CHR("chardev", AmigaCustomState, chr),
+    DEFINE_AUDIO_PROPERTIES(AmigaCustomState, audio_be),
     /* PAL ECS 2MB Agnus / ECS Denise by default */
     DEFINE_PROP_UINT32("agnus-id", AmigaCustomState, agnus_id, 0x22),
     DEFINE_PROP_UINT32("denise-id", AmigaCustomState, denise_id, 0xfc),

@@ -203,6 +203,9 @@ static void amiga_machine_init(MachineState *machine)
     /* custom chips */
     ams->custom = qdev_new(TYPE_AMIGA_CUSTOM);
     qdev_prop_set_chr(ams->custom, "chardev", serial_hd(0));
+    if (machine->audiodev) {
+        qdev_prop_set_string(ams->custom, "audiodev", machine->audiodev);
+    }
     qdev_prop_set_uint32(ams->custom, "agnus-id", amc->agnus_id);
     object_property_set_link(OBJECT(ams->custom), "fdc0",
                              OBJECT(ams->fdc[0]), &error_abort);
@@ -293,6 +296,7 @@ static void amiga_machine_class_init(ObjectClass *oc, const void *data)
     mc->block_default_type = IF_NONE;
     mc->no_parallel = 1;
     mc->no_cdrom = 1;
+    machine_add_audiodev_property(mc);
 
     /* PAL defaults */
     amc->cia_clock_hz = 709379;     /* E clock: 7.09MHz / 10 */
