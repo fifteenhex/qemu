@@ -42,6 +42,7 @@
 #include "target/m68k/cpu.h"
 
 #define E17_VRAM_BASE       0x0fc00000
+#define E17_DRAM_WINDOW     E17_VRAM_BASE   /* DRAM decode: 0 .. VRAM */
 #define E17_VID_DAC_BASE    0xfec40000
 #define E17_VID_CRTC_BASE   0xfec48000
 #define E17_ROM_BASE        0xfe800000
@@ -195,6 +196,32 @@ static void e17_init(MachineState *machine)
 
     /* DRAM */
     memory_region_add_subregion(sysmem, 0, machine->ram);
+
+    /*
+     * The DRAM controller decodes the whole window below the video
+     * RAM and the fitted memory aliases within it.  RMON depends on
+     * that: it sizes memory by planting a pattern at 0 and probing
+     * for the wrap at doubling addresses (fe8045ca).  Without the
+     * mirrors the probe runs off the end of RAM and faults, and the
+     * recovery path poisons the rest of the boot ("### Reserved (1)
+     * Exception", "hook initialization" error, "RAM available :
+     * 65535 MBytes").  Mirror the RAM like the hardware does; the
+     * sizing (and the mirroring) assumes a power of two size.
+     */
+    if (!is_power_of_2(machine->ram_size)) {
+        error_report("RAM size must be a power of two (the firmware "
+                     "sizes memory by wrap detection)");
+        exit(1);
+    }
+    for (hwaddr base = machine->ram_size; base < E17_DRAM_WINDOW;
+         base += machine->ram_size) {
+        MemoryRegion *mirror = g_new(MemoryRegion, 1);
+        uint64_t span = MIN(machine->ram_size, E17_DRAM_WINDOW - base);
+
+        memory_region_init_alias(mirror, NULL, "e17.dram-mirror",
+                                 machine->ram, 0, span);
+        memory_region_add_subregion(sysmem, base, mirror);
+    }
 
     /* battery backed SRAM */
     memory_region_init_ram(sram, NULL, "e17.sram", E17_SRAM_SIZE,
