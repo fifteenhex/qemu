@@ -290,12 +290,15 @@ void HELPER(m68k_movec_to)(CPUM68KState *env, uint32_t reg, uint32_t val)
             return;
         }
         break;
-    /* Unimplemented Registers */
+    /* MC68060 only, unimplemented */
     case M68K_CR_PCR:
     case M68K_CR_BUSCR:
-        cpu_abort(env_cpu(env),
-                  "Unimplemented control register write 0x%x = 0x%x\n",
-                  reg, val);
+        if (m68k_feature(env, M68K_FEATURE_M68060)) {
+            cpu_abort(env_cpu(env),
+                      "Unimplemented control register write 0x%x = 0x%x\n",
+                      reg, val);
+        }
+        break;
     }
 
     /* Invalid control registers will generate an exception. */
@@ -400,11 +403,14 @@ uint32_t HELPER(m68k_movec_from)(CPUM68KState *env, uint32_t reg)
             return env->caar;
         }
 	break;
-    /* Unimplemented Registers */
+    /* MC68060 only, unimplemented */
     case M68K_CR_PCR:
     case M68K_CR_BUSCR:
-        cpu_abort(env_cpu(env), "Unimplemented control register read 0x%x\n",
-                  reg);
+        if (m68k_feature(env, M68K_FEATURE_M68060)) {
+            cpu_abort(env_cpu(env),
+                      "Unimplemented control register read 0x%x\n", reg);
+        }
+        break;
     }
 
     /* Invalid control registers will generate an exception. */
