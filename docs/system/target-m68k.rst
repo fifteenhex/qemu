@@ -26,13 +26,13 @@ Amiga System emulator
 ---------------------
 
 Use the executable ``qemu-system-m68k`` to emulate machines from the
-Commodore Amiga family.  The only board implemented so far is the
-Amiga 3000 (machine ``a3000``).
+Commodore Amiga family.  Two boards are implemented: the Amiga 3000
+(machine ``a3000``) and the Amiga 4000 (machine ``a4000``).
 
 The emulation is at an early stage.  The following hardware is
 modelled:
 
--  68030 CPU.
+-  68030 CPU (68040 on the A4000).
 
 -  2MB of chip RAM, and up to 16MB of motherboard fast RAM below
    0x08000000 (set with ``-m``, default 8MB).
@@ -93,8 +93,8 @@ modelled:
    INT2, with the SDMAC DMA engine.  ``-drive if=scsi`` disks appear
    on its bus.
 
--  The A3000's Ramsey memory controller and Fat Gary bus glue
-   (identification and control registers only).
+-  The Ramsey memory controller and Fat Gary bus glue shared by the
+   A3000 and A4000 (identification and control registers only).
 
 -  Zorro II autoconfig, with the Commodore A2065 Ethernet card (an
    Am7990 LANCE) as an autoconfigured board.  Zorro III config space
@@ -125,6 +125,21 @@ floppy::
    qemu-system-m68k -M a3000 -bios kick.rom \
        -drive if=floppy,file=game.adf,format=raw
 
+The Amiga 4000
+~~~~~~~~~~~~~~
+
+The ``a4000`` machine is a 68040 with the AGA chipset IDs and 2MB of
+chip RAM.  It needs the A4000 Kickstart (release 40.068 for the A4000,
+also 512KB) and boots to the insert-floppy screen and Workbench in the
+same way::
+
+   qemu-system-m68k -M a4000 -bios kick_a4000.rom \
+       -drive if=floppy,file=disk.adf,format=raw
+
+The AGA display features (eight bitplanes, the 256-entry 24-bit
+palette, HAM8) and the onboard IDE interface are not modelled yet, so
+the OS falls back to the ECS display path and finds no hard disk.
+
 Adding other Amiga models
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -133,6 +148,7 @@ The Amiga boards share the abstract ``amiga-common`` machine class
 Amiga has: chip RAM, the Kickstart ROM and its overlay, the CIA pair
 and the custom chip register block.  A board variant subclasses it,
 fills in the class parameters (ROM base and size, chip RAM size, CIA
-clock, Agnus ID, open-bus extent) and creates its board-specific
-devices in the ``board_init`` hook; see ``hw/m68k/a3000.c`` for an
-example.
+clock, Agnus and Denise IDs, open-bus extent) and creates its
+board-specific devices in the ``board_init`` hook.  See
+``hw/m68k/a3000.c`` and ``hw/m68k/a4000.c`` for examples; the
+Ramsey/Fat Gary glue they share lives in ``hw/m68k/amiga_mobo.c``.

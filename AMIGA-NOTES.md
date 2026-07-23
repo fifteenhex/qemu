@@ -1,4 +1,4 @@
-# Amiga 3000 emulation — working notes
+# Amiga 3000/4000 emulation — working notes
 
 Status and hand-off notes for the `amiga` branch (based on `mvme147`,
 which contributes the 68030 bus-error/trace fixes and the WD33C93
@@ -25,6 +25,13 @@ Checksums of the known-good image (512KiB):
 Sanity check: starts `11 14 4e f9 00 f8 00 d2` (Kickstart magic +
 reset PC 0xf800d2), contains "AMIGA ROM Operating System and
 Libraries".  SuperKickstart (disk-loaded) images are not supported.
+
+The `a4000` machine needs the A4000 Kickstart 3.1 r40.068 instead (also
+512KB, same `commodore-amiga-firmware` item):
+
+    md5  9bdedde6a4f33555b4a270c8ca53297d
+
+Run it with `-M a4000 -bios kick31_a4000.rom`; disks attach the same way.
 
 ## Running
 
@@ -128,6 +135,19 @@ callbacks run inside the timer's transaction).
   bus), Zorro III cards.  Floppy: only 880KB DD ADFs.  Disk swap works
   now (blockdev-change-medium device=floppy0 filename=... format=raw
   -> /CHNG latch -> Workbench remounts); needed for the HD install.
+- A4000: an `a4000` machine (hw/m68k/a4000.c) boots.  It is a 68040
+  with 2MB chip RAM, the AGA chipset IDs (Alice VPOSR 0x23, Lisa Denise
+  0xf8), motherboard fast RAM at 0x07000000, and the shared Ramsey/Fat
+  Gary glue (now TYPE_AMIGA_MOBO in hw/m68k/amiga_mobo.c, used by both
+  big-box machines).  QEMU's m68040 boots the A4000 Kickstart to the
+  insert-disk prompt and runs Workbench 3.1 from floppy — so the 68040
+  MMU and the AGA chip IDs are fine.  Two follow-ups for a "real" A4000:
+  (1) the onboard IDE (an ATA port at 0xdd2020, Gayle-ish; currently
+  open bus so no HD), and (2) AGA display (8 bitplanes, 256-colour
+  24-bit palette, HAM8, FMODE/sprite-res) in amiga_custom.c — for now
+  the OS renders through the ECS path.  Note: the insert-disk boot
+  screen renders tiled horizontally on AGA IDs (a display-setup quirk),
+  but Workbench itself renders correctly.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 
