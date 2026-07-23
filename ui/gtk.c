@@ -1361,6 +1361,21 @@ static gboolean gd_key_event(GtkWidget *widget, GdkEventKey *key, void *opaque)
         return TRUE;
     }
 
+    /*
+     * The seat grab delivers key events straight to the drawing area,
+     * which can bypass the window accelerator that implements the
+     * Ctrl+Alt+G toggle; handle the release hotkey here so a grab can
+     * always be escaped.
+     */
+    if (key->type == GDK_KEY_PRESS &&
+        (key->keyval == GDK_KEY_g || key->keyval == GDK_KEY_G) &&
+        (key->state & HOTKEY_MODIFIERS) == HOTKEY_MODIFIERS &&
+        gd_is_grab_active(vc->s)) {
+        gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(vc->s->grab_item),
+                                       FALSE);
+        return TRUE;
+    }
+
     keycode = gd_get_keycode(key);
     lnx = gd_map_keycode(keycode);
 
