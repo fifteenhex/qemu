@@ -109,6 +109,8 @@ typedef struct MOS6522Timer {
     int64_t next_irq_time;
     uint64_t frequency;
     QEMUTimer *timer;
+    /* T2 one-shot: IFR is set once per T2CH load, not on every wrap */
+    bool oneshot_fired;
 } MOS6522Timer;
 
 /**
