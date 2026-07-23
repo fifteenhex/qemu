@@ -125,6 +125,15 @@ callbacks run inside the timer's transaction).
   (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
+- Split-window widths: the surface is now clipped to the widest display
+  window the copper opens across the frame (DIWSTRT/DIWSTOP tracked
+  through the journal, sampled at DIWSTOP where both halves are fresh),
+  not the word-granular fetch width.  This fixed the insert-disk screen,
+  a copper split whose lower panel over-fetches its window: the overrun
+  used to spill and draw the whole screen twice side by side.  A few
+  pixels of off-window fetch still show at the far-left edge — the
+  renderer doesn't model the cycle-exact DDF-to-DIW fetch delay, so it
+  can't hide the last word of left overscan.
 - Zorro: II autoconfig works (hw/m68k/amiga_a2065.c) with the A2065
   Ethernet card (Am7990 LANCE via QEMU's pcnet core, 32KB onboard
   RAM, MAC 00:80:10:<serial>).  AmigaOS autoconfigures it at 0xe90000
@@ -145,9 +154,7 @@ callbacks run inside the timer's transaction).
   (1) the onboard IDE (an ATA port at 0xdd2020, Gayle-ish; currently
   open bus so no HD), and (2) AGA display (8 bitplanes, 256-colour
   24-bit palette, HAM8, FMODE/sprite-res) in amiga_custom.c — for now
-  the OS renders through the ECS path.  Note: the insert-disk boot
-  screen renders tiled horizontally on AGA IDs (a display-setup quirk),
-  but Workbench itself renders correctly.
+  the OS renders through the ECS path.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 
