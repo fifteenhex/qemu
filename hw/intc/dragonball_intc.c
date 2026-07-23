@@ -52,7 +52,33 @@ static void dragonball_intc_updateirqs(DragonBallINTCState *s)
      * being deasserted would cancel a still-pending higher one.
      */
     for (i = 0; i < 32; i++) {
-        uint8_t irqlevel = dragonball_irq_levels[i];
+        uint8_t irqlevel;
+
+        /*
+         * The VZ's ILCR sets the levels for TMR2/SPI1/UART2/PWM2; a
+         * TMR2 field of 0 (the reset value, illegal to program) acts
+         * as level 6 — PalmOS clears it before setting it and must
+         * not lose ticks in between.
+         */
+        switch (i) {
+        case DRAGONBALL_INTC_TMR2:
+            irqlevel = s->ilcr & 0xf;
+            if (!irqlevel)
+                irqlevel = 6;
+            break;
+        case DRAGONBALL_INTC_SPI1:
+            irqlevel = (s->ilcr >> 4) & 0xf;
+            break;
+        case DRAGONBALL_INTC_UART2:
+            irqlevel = (s->ilcr >> 8) & 0xf;
+            break;
+        case DRAGONBALL_INTC_PWM2:
+            irqlevel = (s->ilcr >> 12) & 0xf;
+            break;
+        default:
+            irqlevel = dragonball_irq_levels[i];
+            break;
+        }
 
         if (((isr >> i) & 1) && irqlevel > top)
             top = irqlevel;
@@ -98,6 +124,9 @@ static uint64_t dragonball_intc_read(void *opaque, hwaddr addr, unsigned size)
     case DRAGONBALL_INTC_IPR:
         reg = s->ipr;
         break;
+    case DRAGONBALL_INTC_ILCR:
+        reg = (uint32_t)s->ilcr << 16;
+        break;
     default:
         return 0;
     }
@@ -130,6 +159,12 @@ static void dragonball_intc_write(void *opaque, hwaddr addr, uint64_t value,
         s->ipr &= ~(val & DRAGONBALL_INTC_EDGE_SOURCES);
         dragonball_intc_updateirqs(s);
         break;
+    case DRAGONBALL_INTC_ILCR:
+        if (mask & 0xffff0000) {
+            s->ilcr = val >> 16;
+            dragonball_intc_updateirqs(s);
+        }
+        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: bad write offset 0x%" HWADDR_PRIx "\n",
@@ -151,6 +186,7 @@ static void dragonball_intc_reset(DeviceState *dev)
     DragonBallINTCState *s = DRAGONBALL_INTC(dev);
 
     s->imr = 0x00ffffff;
+    s->ilcr = 0x5533;
     s->cpu_level = 0;
 }
 

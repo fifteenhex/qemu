@@ -24,6 +24,7 @@ struct DragonBallINTCState {
     uint16_t icr;
     uint32_t imr;
     uint32_t ipr;
+    uint16_t ilcr;
 
     /* interrupt level currently presented to the cpu */
     int cpu_level;
@@ -31,28 +32,34 @@ struct DragonBallINTCState {
     ArchCPU *cpu;
 };
 
-#define DRAGONBALL_INTC_IVR 0x0
-#define DRAGONBALL_INTC_ICR 0x2
-#define DRAGONBALL_INTC_IMR 0x4
-#define DRAGONBALL_INTC_ISR 0xc
-#define DRAGONBALL_INTC_IPR 0x10
+#define DRAGONBALL_INTC_IVR  0x0
+#define DRAGONBALL_INTC_ICR  0x2
+#define DRAGONBALL_INTC_IMR  0x4
+#define DRAGONBALL_INTC_ISR  0xc
+#define DRAGONBALL_INTC_IPR  0x10
+/* VZ only: interrupt level control for the configurable sources */
+#define DRAGONBALL_INTC_ILCR 0x14
 
 #define DRAGONBALL_INTC_SPI  0
 #define DRAGONBALL_INTC_TMR  1
 #define DRAGONBALL_INTC_UART 2
 #define DRAGONBALL_INTC_WDT  3
 #define DRAGONBALL_INTC_RTC  4
+#define DRAGONBALL_INTC_TMR2 5
 #define DRAGONBALL_INTC_KB   6
 #define DRAGONBALL_INTC_PWM  7
 #define DRAGONBALL_INTC_INT0 8
 #define DRAGONBALL_INTC_INT1 9
 #define DRAGONBALL_INTC_INT2 10
 #define DRAGONBALL_INTC_INT3 11
+#define DRAGONBALL_INTC_UART2 12
+#define DRAGONBALL_INTC_SPI1  13
 #define DRAGONBALL_INTC_IRQ1 16
 #define DRAGONBALL_INTC_IRQ2 17
 #define DRAGONBALL_INTC_IRQ3 18
 #define DRAGONBALL_INTC_IRQ6 19
 #define DRAGONBALL_INTC_IRQ5 20
+#define DRAGONBALL_INTC_PWM2 21
 #define DRAGONBALL_INTC_SAM  22
 #define DRAGONBALL_INTC_EMIQ 23
 
