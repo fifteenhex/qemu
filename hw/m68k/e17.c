@@ -35,6 +35,7 @@
 #include "hw/display/e17_vid.h"
 #include "hw/misc/e17_sysc.h"
 #include "hw/net/lance.h"
+#include "hw/scsi/ncr53c720.h"
 #include "system/dma.h"
 #include "target/m68k/cpu.h"
 
@@ -51,6 +52,7 @@
 #define E17_CD2401_IACK     0xfec66000
 #define E17_LANCE_RDP       0xfec68002
 #define E17_LANCE_RAP       0xfec68006
+#define E17_SCSI_BASE       0xfec6c000
 
 #define E17_DEFAULT_RAM_SIZE (16 * MiB)
 
@@ -171,6 +173,7 @@ static void e17_init(MachineState *machine)
     DeviceState *serial_dev;
     DeviceState *vid_dev;
     DeviceState *lance_dev;
+    DeviceState *scsi_dev;
     MemoryRegion *lance_rdp = g_new(MemoryRegion, 1);
     MemoryRegion *lance_rap = g_new(MemoryRegion, 1);
     gchar *bios_size_err;
@@ -308,6 +311,19 @@ static void e17_init(MachineState *machine)
     memory_region_add_subregion_overlap(sysmem, E17_LANCE_RAP,
                                         lance_rap, 1);
 
+    /*
+     * NCR 53C720 SCSI (the register map RMON drives is the 720/8xx
+     * one, not the 710's — see E17-NOTES.md).  Wired with the byte
+     * lanes reversed within 32-bit words like the descriptor path of
+     * the LANCE.  RMON boots from SCSI ID 6 by default:
+     *   -device scsi-hd,scsi-id=6,drive=...
+     */
+    scsi_dev = qdev_new(TYPE_NCR53C720);
+    qdev_prop_set_bit(scsi_dev, "lane-swap", true);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(scsi_dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(scsi_dev), 0, E17_SCSI_BASE, 1);
+    scsi_bus_legacy_handle_cmdline(&NCR53C720(scsi_dev)->bus);
+
     /* CD2401, serial ports 1-4; sits inside the e17-sysc window */
     serial_dev = qdev_new(TYPE_CD2401);
     qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
@@ -351,6 +367,7 @@ static void e17_machine_class_init(ObjectClass *oc, const void *data)
     /* the board carries a second 68040; -smp 1 removes it */
     mc->max_cpus = 2;
     mc->default_cpus = 2;
+    mc->block_default_type = IF_SCSI;
 
     object_class_property_add_bool(oc, "video", e17_get_video,
                                    e17_set_video);

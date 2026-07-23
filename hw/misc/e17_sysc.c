@@ -36,14 +36,6 @@
 #define E17_KBC_CMD_RESET   0xff
 #define E17_KBC_RSP_BAT_OK  0xaa
 
-/* 53C710 registers (native little endian numbering) */
-#define NCR710_SCNTL0       0x00
-#define NCR710_SCNTL0_RESET 0xc0    /* ARB1|ARB0 after reset */
-#define NCR710_DSTAT        0x0c
-#define NCR710_DSTAT_DFE    0x80    /* DMA FIFO empty */
-#define NCR710_ISTAT        0x14
-#define NCR710_ISTAT_SRST   0x40
-
 /*
  * Chip select controller: reg 0 reads back the region base address,
  * reg 0xa8 is a status/config register the boot code requires to have
@@ -179,12 +171,6 @@ static uint64_t e17_sysc_read_impl(void *opaque, hwaddr addr, unsigned size)
             return s->kbd_status;
         }
         break;
-    case E17_SYSC_SCSI:
-        /* 53C710 stub; the chip is wired byteswapped within words */
-        if (off < ARRAY_SIZE(s->scsi_regs)) {
-            return s->scsi_regs[(off & ~3) | (3 - (off & 3))];
-        }
-        break;
     case E17_SYSC_CSCTL:
         if (off < 0xb0) {
             if (off / 4 == E17_CSCTL_BASE_REG) {
@@ -272,20 +258,6 @@ static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
             return;
         }
         break;
-    case E17_SYSC_SCSI:
-        if (off < ARRAY_SIZE(s->scsi_regs)) {
-            unsigned reg = (off & ~3) | (3 - (off & 3));
-
-            /* software reset self-clears, restoring reset values */
-            if (reg == NCR710_ISTAT && (val & NCR710_ISTAT_SRST)) {
-                s->scsi_regs[NCR710_SCNTL0] = NCR710_SCNTL0_RESET;
-                s->scsi_regs[NCR710_DSTAT] = NCR710_DSTAT_DFE;
-                val = 0;
-            }
-            s->scsi_regs[reg] = val;
-            return;
-        }
-        break;
     case E17_SYSC_CSCTL:
         if (off < 0xb0) {
             s->csctl[off / 4] = val;
@@ -349,10 +321,6 @@ static void e17_sysc_reset(DeviceState *dev)
     s->kbd_data = 0;
     s->kbd_status = 0;
 
-    memset(s->scsi_regs, 0, sizeof(s->scsi_regs));
-    s->scsi_regs[NCR710_SCNTL0] = NCR710_SCNTL0_RESET;
-    s->scsi_regs[NCR710_DSTAT] = NCR710_DSTAT_DFE;
-
     memset(s->csctl, 0, sizeof(s->csctl));
     s->csctl[E17_CSCTL_STATUS] = E17_CSCTL_STATUS_READY;
 
@@ -408,7 +376,6 @@ static const VMStateDescription vmstate_e17_sysc = {
         VMSTATE_UINT8_ARRAY(sram2k, E17SysCState, 0x800),
         VMSTATE_UINT8(kbd_data, E17SysCState),
         VMSTATE_UINT8(kbd_status, E17SysCState),
-        VMSTATE_UINT8_ARRAY(scsi_regs, E17SysCState, 0x60),
         VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),
         VMSTATE_UINT32_ARRAY(dramc, E17SysCState, 2),
         VMSTATE_UINT8(slave_ctl, E17SysCState),

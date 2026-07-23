@@ -39,7 +39,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(E17SysCState, E17_SYSC)
 #define E17_SYSC_KBC       0x60000 /* AT keyboard controller */
 /* 0x64000 CD2401 serial and 0x66000 its IACK port: separate device */
 #define E17_SYSC_LANCE     0x68000 /* Am7990 LANCE (not yet modelled) */
-#define E17_SYSC_SCSI      0x6c000 /* NCR 53C710 (stub, byteswapped) */
+#define E17_SYSC_SCSI      0x6c000 /* NCR 53C720: separate device */
 #define E17_SYSC_CSCTL     0x70000 /* chip select / memory controller */
 
 #define E17_SYSC_SIZE      0x80000
@@ -84,8 +84,6 @@ struct E17SysCState {
 
     uint8_t kbd_data;       /* AT keyboard controller data register */
     uint8_t kbd_status;
-
-    uint8_t scsi_regs[0x60];/* 53C710 register stub */
 
     uint32_t csctl[0x2c];   /* chip select controller, 0xb0 bytes */
     uint32_t dramc[2];      /* 0x080f0/0x080f4 */
