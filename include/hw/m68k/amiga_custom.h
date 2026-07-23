@@ -46,7 +46,12 @@ struct AmigaCustomState {
     uint16_t dmacon, adkcon;
     uint16_t serper, potgo;
     uint8_t serial_rx;
-    bool ciaa_level, ciab_level;
+    /*
+     * INT2/INT6 are open-drain lines shared by the CIAs (bit 0) and
+     * board hardware (bit 1); INTREQ re-latches while any source holds
+     * its line.
+     */
+    uint8_t ports_levels, exter_levels;
 
     /* backing store for the (mostly write-only) chipset registers */
     uint16_t regs[0x100];

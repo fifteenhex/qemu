@@ -213,10 +213,10 @@ static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
     case REG_INTREQ:
         s->intreq = setclr(s->intreq, val, 0x7fff);
         /* level-sensitive sources re-latch immediately */
-        if (s->ciaa_level) {
+        if (s->ports_levels) {
             s->intreq |= INT_PORTS;
         }
-        if (s->ciab_level) {
+        if (s->exter_levels) {
             s->intreq |= INT_EXTER;
         }
         amiga_custom_update_irq(s);
@@ -244,21 +244,38 @@ static const MemoryRegionOps amiga_custom_ops = {
     },
 };
 
+static void amiga_custom_level_irq(AmigaCustomState *s, uint8_t *levels,
+                                   int source, int level, uint16_t intbit)
+{
+    *levels = deposit32(*levels, source, 1, level);
+    if (level) {
+        amiga_custom_post_int(s, intbit);
+    }
+}
+
 static void amiga_custom_cia_irq(void *opaque, int n, int level)
 {
     AmigaCustomState *s = opaque;
 
     if (n == 0) {
-        s->ciaa_level = level;
-        if (level) {
-            amiga_custom_post_int(s, INT_PORTS);
-        }
+        amiga_custom_level_irq(s, &s->ports_levels, 0, level, INT_PORTS);
     } else {
-        s->ciab_level = level;
-        if (level) {
-            amiga_custom_post_int(s, INT_EXTER);
-        }
+        amiga_custom_level_irq(s, &s->exter_levels, 0, level, INT_EXTER);
     }
+}
+
+static void amiga_custom_ports_irq(void *opaque, int n, int level)
+{
+    AmigaCustomState *s = opaque;
+
+    amiga_custom_level_irq(s, &s->ports_levels, 1, level, INT_PORTS);
+}
+
+static void amiga_custom_exter_irq(void *opaque, int n, int level)
+{
+    AmigaCustomState *s = opaque;
+
+    amiga_custom_level_irq(s, &s->exter_levels, 1, level, INT_EXTER);
 }
 
 static void amiga_custom_reset(DeviceState *dev)
@@ -272,8 +289,8 @@ static void amiga_custom_reset(DeviceState *dev)
     s->serper = 0;
     s->potgo = 0;
     s->serial_rx = 0;
-    s->ciaa_level = false;
-    s->ciab_level = false;
+    s->ports_levels = 0;
+    s->exter_levels = 0;
     memset(s->regs, 0, sizeof(s->regs));
     s->frame_origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
@@ -302,6 +319,8 @@ static void amiga_custom_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->ipl);
     qdev_init_gpio_in_named(dev, amiga_custom_cia_irq, "cia-irq", 2);
+    qdev_init_gpio_in_named(dev, amiga_custom_ports_irq, "ports-irq", 1);
+    qdev_init_gpio_in_named(dev, amiga_custom_exter_irq, "exter-irq", 1);
 }
 
 static const VMStateDescription vmstate_amiga_custom = {
@@ -316,8 +335,8 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT16(serper, AmigaCustomState),
         VMSTATE_UINT16(potgo, AmigaCustomState),
         VMSTATE_UINT8(serial_rx, AmigaCustomState),
-        VMSTATE_BOOL(ciaa_level, AmigaCustomState),
-        VMSTATE_BOOL(ciab_level, AmigaCustomState),
+        VMSTATE_UINT8(ports_levels, AmigaCustomState),
+        VMSTATE_UINT8(exter_levels, AmigaCustomState),
         VMSTATE_UINT16_ARRAY(regs, AmigaCustomState, 0x100),
         VMSTATE_INT64(frame_origin_ns, AmigaCustomState),
         VMSTATE_TIMER(vblank_timer, AmigaCustomState),
