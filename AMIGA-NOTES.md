@@ -78,14 +78,13 @@ callbacks run inside the timer's transaction).
   driver completes commands from.  Both fixed; the full probe runs
   and an RDB + FFS disk (see _amiga_assets/make_rdb_disk.py) mounts
   on the Workbench desktop.  HD *boot* (no floppy) untested.
-- Workbench text is invisible: every glyph blit arrives with
-  minterm 0x0a on every plane (fg pen 0 on bg 0), i.e. Text() runs
-  with unset RastPort pens — the blitter executes it faithfully, and
-  nothing glyph-shaped lands in the bitplanes.  Intuition's pen
-  setup (DrawInfo?) goes wrong somewhere upstream; needs gdb into
-  graphics Text() to see rp_FgPen.  Glyph staging buffer for text
-  blits lives around chip 0xee0 (B channel, cookie-cut 0xca/0x0a
-  pairs, h=8).
+- Workbench text: FIXED — graphics.library uses the ECS BLTCON0L
+  register (0x5a, minterm-byte-only write) once it sees our ECS
+  chipset IDs; it was landing in the bare backing store.  Beware of
+  other silently-swallowed ECS registers.  gdb notes: the gdbstub
+  byte-swaps REGISTER values and MEMORY reads both (reverse each
+  long); breakpoint addresses are fine; read guest memory via QMP
+  pmemsave while stopped for untangled bytes.
 - Keyboard: input path is CIA-A's serial register; the model already
   has mos8520_sdr_input() for injection.  Needs the handshake
   protocol and a QEMU keyboard event handler wiring scancodes.
