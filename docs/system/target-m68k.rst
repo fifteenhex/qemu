@@ -49,8 +49,24 @@ modelled:
 -  The Agnus beam counters (VPOSR/VHPOSR) with PAL timing, and the
    vertical blank interrupt.
 
+-  The blitter, including line mode and area fill.  Blits complete
+   instantly.
+
+-  A frame-atomic copper: the list is executed at each vertical
+   blank with every WAIT considered satisfied, which is enough for
+   displays that reload pointers and palettes per frame but not for
+   beam-synchronous raster effects.
+
+-  A bitplane display: lores and hires, up to 6 planes with
+   extra-half-brite, rendered from the current frame's registers to a
+   QEMU console.  Sprites, HAM and dual playfield are not drawn.
+
 -  The Paula serial port, connected to the first QEMU serial device
    (``-serial``).
+
+-  The WD33C93A SCSI controller behind the SuperDMAC, interrupting on
+   INT2, with the SDMAC DMA engine.  ``-drive if=scsi`` disks appear
+   on its bus.
 
 -  The A3000's Ramsey memory controller and Fat Gary bus glue
    (identification and control registers only).
@@ -58,9 +74,11 @@ modelled:
 -  Empty Zorro II/III expansion space, reading as open bus so the
    expansion library sees "no board present".
 
-Notably missing: the display (Denise), blitter, copper, audio and
-floppy DMA, keyboard and mouse, the WD33C93A SCSI controller behind
-the SuperDMAC, the battery-backed clock, and Zorro expansion boards.
+Notably missing: keyboard and mouse input, sprites, audio and floppy
+DMA, the battery-backed clock, and Zorro expansion boards.  Kickstart
+finds attached SCSI disks but does not yet boot from them: the first
+TEST UNIT READY fails with a power-on unit attention that scsi.device
+treats as "no disk".
 
 Booting
 ~~~~~~~
@@ -74,9 +92,8 @@ Kickstart 3.1 (release 40.068 for the A3000).  "SuperKickstart"
 setups, where a bonus ROM loads the real Kickstart from disk, are not
 supported.
 
-With the display not yet modelled there is no video output; Kickstart
-3.1 boots to a running exec with the boot process stalled on the
-missing SCSI controller.
+Kickstart 3.1 boots to the insert-floppy screen, with the animation
+running on the QEMU console.
 
 Adding other Amiga models
 ~~~~~~~~~~~~~~~~~~~~~~~~~
