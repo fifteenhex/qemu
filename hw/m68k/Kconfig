@@ -138,6 +138,12 @@ config AMIGA
     select PCNET_COMMON
     select WD33C93
 
+config ATARIST
+    bool
+    default y
+    depends on M68K
+    select FRAMEBUFFER
+
 config MEGADRIVE
     bool
     default y
