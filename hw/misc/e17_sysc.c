@@ -111,7 +111,7 @@ static void e17_cio_write(E17CIOState *c, hwaddr addr, uint8_t val)
     }
 }
 
-static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t e17_sysc_read_impl(void *opaque, hwaddr addr, unsigned size)
 {
     E17SysCState *s = opaque;
     hwaddr block = addr & 0x7f000;
@@ -148,6 +148,7 @@ static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
         return e17_cio_read(&s->cio[0], addr & 3);
     case E17_SYSC_SRAM2K:
         if (off < ARRAY_SIZE(s->sram2k)) {
+            trace_e17_nvram_read(off, s->sram2k[off]);
             return s->sram2k[off];
         }
         break;
@@ -198,8 +199,8 @@ static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
     return 0;
 }
 
-static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
-                           unsigned size)
+static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
 {
     E17SysCState *s = opaque;
     hwaddr block = addr & 0x7f000;
@@ -236,6 +237,7 @@ static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     case E17_SYSC_SRAM2K:
         if (off < ARRAY_SIZE(s->sram2k)) {
+            trace_e17_nvram_write(off, val);
             s->sram2k[off] = val;
             return;
         }
@@ -293,6 +295,22 @@ static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
     }
     qemu_log_mask(LOG_UNIMP, "e17-sysc: unimplemented write %u @0x%05"
                   HWADDR_PRIx " = 0x%" PRIx64 "\n", size, addr, val);
+}
+
+/* every access can be traced: handy while reverse engineering RMON */
+static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t val = e17_sysc_read_impl(opaque, addr, size);
+
+    trace_e17_sysc_read(addr, size, val);
+    return val;
+}
+
+static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    trace_e17_sysc_write(addr, size, val);
+    e17_sysc_write_impl(opaque, addr, val, size);
 }
 
 static const MemoryRegionOps e17_sysc_ops = {

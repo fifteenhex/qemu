@@ -268,6 +268,60 @@ Known issues / next steps, roughly in order:
 NOTE: another session is working on this same branch — always
 `git pull --rebase` before pushing.
 
+## Findings from driving the RMON command line (2026-07-20, night)
+
+Method: run with -M e17,video=off, drive the serial console from a
+script, and watch the model traces (-trace 'e17_sysc_*' for
+everything — beware, the idle loop makes that huge — or the targeted
+-trace 'e17_nvram_*').  What the RMON drivers did against the stubs:
+
+- `scsi` (bus scan) exercises the 53C710 like this: ISTAT SRST
+  pulse; SCNTL1 = 0x08 pulse (SCSI bus reset), SCID = 7, SCNTL0 =
+  0xc4, DCNTL pokes; then per target ID: SODL/SOCL writes (0x20,
+  then a bus-ID bitmask 0x80|target to BE offset +0x57, SCNTL1 =
+  0x50, 0x30, 0x10) and ~786000 polls of SBCL waiting for the target
+  to respond before timing out.  A future 53C710 model must make
+  selection timeouts fail fast (SBCL stays 0) or implement SCRIPTS
+  properly.  All offsets confirm the byteswapped-within-longword
+  wiring.
+- NVRAM (0xfec20000 block): the "system area" is 0x000-0x5ff,
+  written wholesale by `we` (copy of the DRAM config at 0x800) with
+  a checksum in the last bytes (0x5fd-0x5ff: fb b3 86 for the
+  default config); `re` reads it back and validates.  POST's reg
+  0/4 pokes are just the presence scratch test.  No RTC registers
+  are touched by RMON at all — the clock layout stays unknown until
+  an OS driver or the manual tells us.
+- setup menus (full screens captured): Video Interface says the mode
+  is "800x600 35kHz 56Hz", sync H/Neg V/Neg, 8bpp, fg black bg
+  white.  Boot Parameters: OS "OS-9" (default), device
+  Harddisk/Floppy/Streamer Tape/Ethernet, ID 06, LUN 00.  Special:
+  Input Port (factory AT-KBD) and Output Port (factory Graphic
+  Adapter) are the console selection — with video absent RMON forces
+  both to Serial Port 1.  SCSI/Keyboard: typematic rate, language,
+  SCSI own ID 7, "SCSI Reset on startup".
+- `boot` with device=Ethernet: hangs producing no output and never
+  touching the LANCE.  Prime suspect: the boot paths need a working
+  Z8536 CIO counter/timer for their delays/timeouts (the u-boot DTS
+  also uses cio0 as tick-timer) — the CIO model has no counters yet.
+  Model the three 16-bit counters next, then retry netboot (which
+  should then fail over to the LANCE register trace) and `boot` from
+  Harddisk (SCSI).
+
+## The u-boot port (branch e17 in /workspace/src/uboot-e17)
+
+Daniel's port lives on origin/mc68000_megadrive (checked out as
+`e17`); board files board/eltec/e17, configs/eltec-e17_defconfig,
+DTS arch/m68k/dts/eltec-e17.dts, chip headers include/cd2401.h and
+include/vic068a.h (from the hardware manual — these named the sysc
+blocks, see the VIC068A commit).  TEXT_BASE 0x600000, SPL 0x400000;
+the machine's new -kernel option loads an ELF and jumps to it.
+Building is BLOCKED on missing bison/flex (+m4) in the sandbox —
+waiting for Daniel on how to provide them.  The CD2401 model now
+covers everything the u-boot serial driver does (polled TISR,
+PILR-matched IACK, VIC LICR6 line readback), so once it builds the
+UART should work — test with:
+    qemu-system-m68k -M e17,video=off -kernel u-boot -serial stdio
+
 ## The boot-time hook crash (open investigation)
 
 Symptom, in serial output order: "### Reserved (1) Exception",
