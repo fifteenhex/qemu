@@ -145,3 +145,10 @@ config AMIGA
     select AT24C
     select PCI
     imply PCI_DEVICES
+
+config MEGADRIVE
+    bool
+    default y
+    select M68K_IRQC
+    select MEGADRIVE_VDP
+    select MEGADRIVE_EVERDRIVE

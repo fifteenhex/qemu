@@ -179,3 +179,7 @@ system_ss.add(when: 'CONFIG_MVME147_VMECHIP', if_true: files('mvme147_vmechip.c'
 
 # ELTEC Eurocom E17
 system_ss.add(when: 'CONFIG_E17_SYSC', if_true: files('e17_sysc.c'))
+
+# MegaDrive
+system_ss.add(when: 'CONFIG_MEGADRIVE_EVERDRIVE', if_true: files('md_everdrive.c'))
+system_ss.add(when: 'CONFIG_MEGADRIVE', if_true: files('md_sys.c'))

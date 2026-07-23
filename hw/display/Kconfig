@@ -163,3 +163,7 @@ config DRAGONBALL_LCDC
 
 config SED1376
     bool
+
+config MEGADRIVE_VDP
+    bool
+    select FRAMEBUFFER
