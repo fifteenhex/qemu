@@ -182,3 +182,4 @@ system_ss.add(when: 'CONFIG_E17_SYSC', if_true: files('e17_sysc.c'))
 
 # MegaDrive
 system_ss.add(when: 'CONFIG_MEGADRIVE_EVERDRIVE', if_true: files('md_everdrive.c'))
+system_ss.add(when: 'CONFIG_MEGADRIVE', if_true: files('md_sys.c'))

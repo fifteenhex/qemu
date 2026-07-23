@@ -3,11 +3,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "qom/object.h"
 #include "migration/vmstate.h"
 #include "system/reset.h"
+#include "ui/input.h"
 
 #include "hw/input/md_io.h"
 
@@ -32,10 +34,11 @@ static void md_io_reset(void *opaque);
 #define MD_IO_TH        0x40    /* TH select line (bit 6) */
 
 /*
- * Read a controller data port.  No input is wired yet, so an idle 3-button
- * pad is reported (all buttons released = 1, active-low).  The value the CPU
- * drives on output pins is read back; input pins return the pad state, which
- * is multiplexed by the TH line (bit 6):
+ * Read a controller data port.  A 3-button pad on port 1 is fed from the
+ * host keyboard; the other ports report an idle pad (all buttons released
+ * = 1, active-low).  The value the CPU drives on output pins is read back;
+ * input pins return the pad state, which is multiplexed by the TH line
+ * (bit 6):
  *
  *   TH = 1:  -  -  C  B  R  L  D  U
  *   TH = 0:  -  -  St A  0  0  D  U
@@ -44,10 +47,67 @@ static uint8_t md_io_pad_read(MDIOState *s, int port)
 {
     uint8_t ctrl = s->ctrl[port];
     uint8_t out  = s->data_out[port];
-    uint8_t in   = (out & MD_IO_TH) ? 0x3F : 0x33;
+    uint8_t pad  = (port == 0) ? s->pad : 0;
+    uint8_t in;
+
+    if (out & MD_IO_TH) {
+        in = 0x3F & ~(((pad & MD_PAD_C)     ? 0x20 : 0) |
+                      ((pad & MD_PAD_B)     ? 0x10 : 0) |
+                      ((pad & MD_PAD_RIGHT) ? 0x08 : 0) |
+                      ((pad & MD_PAD_LEFT)  ? 0x04 : 0) |
+                      ((pad & MD_PAD_DOWN)  ? 0x02 : 0) |
+                      ((pad & MD_PAD_UP)    ? 0x01 : 0));
+    } else {
+        in = 0x33 & ~(((pad & MD_PAD_START) ? 0x20 : 0) |
+                      ((pad & MD_PAD_A)     ? 0x10 : 0) |
+                      ((pad & MD_PAD_DOWN)  ? 0x02 : 0) |
+                      ((pad & MD_PAD_UP)    ? 0x01 : 0));
+    }
 
     return (out & ctrl) | (in & ~ctrl);
 }
+
+/* Host keyboard -> pad: arrows, A/S/D = A/B/C, Enter = Start */
+static void md_io_kbd_event(DeviceState *dev, QemuConsole *src,
+                            QemuInputEvent *evt)
+{
+    MDIOState *s = MD_IO(dev);
+    int qcode;
+    uint8_t bit;
+
+    if (evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+    qcode = qemu_input_linux_to_qcode(evt->key.key);
+
+    switch (qcode) {
+    case Q_KEY_CODE_UP:    bit = MD_PAD_UP;    break;
+    case Q_KEY_CODE_DOWN:  bit = MD_PAD_DOWN;  break;
+    case Q_KEY_CODE_LEFT:  bit = MD_PAD_LEFT;  break;
+    case Q_KEY_CODE_RIGHT: bit = MD_PAD_RIGHT; break;
+    case Q_KEY_CODE_A:     bit = MD_PAD_A;     break;
+    case Q_KEY_CODE_S:     bit = MD_PAD_B;     break;
+    case Q_KEY_CODE_D:     bit = MD_PAD_C;     break;
+    case Q_KEY_CODE_RET:
+    case Q_KEY_CODE_KP_ENTER:
+        bit = MD_PAD_START;
+        break;
+    default:
+        return;
+    }
+
+    if (evt->key.down) {
+        s->pad |= bit;
+    } else {
+        s->pad &= ~bit;
+    }
+}
+
+static const QemuInputHandler md_io_kbd_handler = {
+    .name = "MegaDrive pad",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = md_io_kbd_event,
+};
 
 static uint8_t md_io_reg_read(MDIOState *s, unsigned off)
 {
@@ -125,14 +185,15 @@ static const MemoryRegionOps md_io_ops = {
 
 static const VMStateDescription vmstate_md_io = {
     .name    = "md-io",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(version,         MDIOState),
         VMSTATE_UINT8_ARRAY(ctrl,      MDIOState, MD_IO_NUM_PORTS),
         VMSTATE_UINT8_ARRAY(data_out,  MDIOState, MD_IO_NUM_PORTS),
         VMSTATE_UINT8_ARRAY(txdata,    MDIOState, MD_IO_NUM_PORTS),
         VMSTATE_UINT8_ARRAY(sctrl,     MDIOState, MD_IO_NUM_PORTS),
+        VMSTATE_UINT8(pad,             MDIOState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -145,6 +206,11 @@ static void md_io_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &md_io_ops, s,
                           "md-io", 0x20);
     sysbus_init_mmio(sbd, &s->iomem);
+
+    if (!qemu_input_handler_register(dev, &md_io_kbd_handler)) {
+        error_setg(errp, "md_io: failed to register input handler");
+        return;
+    }
 
     qemu_register_reset(md_io_reset, s);
 }

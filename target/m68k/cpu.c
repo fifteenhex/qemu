@@ -224,6 +224,7 @@ static void m68000_cpu_initfn(Object *obj)
     m68k_set_feature(env, M68K_FEATURE_USP);
     m68k_set_feature(env, M68K_FEATURE_WORD_INDEX);
     m68k_set_feature(env, M68K_FEATURE_MOVEP);
+    m68k_set_feature(env, M68K_FEATURE_ADDR24);
 }
 
 /*
@@ -256,6 +257,7 @@ static void m68020_cpu_initfn(Object *obj)
 
     m68010_cpu_initfn(obj);
     m68k_unset_feature(env, M68K_FEATURE_M68010);
+    m68k_unset_feature(env, M68K_FEATURE_ADDR24);
     m68k_set_feature(env, M68K_FEATURE_M68020);
     m68k_set_feature(env, M68K_FEATURE_QUAD_MULDIV);
     m68k_set_feature(env, M68K_FEATURE_BRAL);

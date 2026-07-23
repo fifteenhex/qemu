@@ -17,6 +17,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MDVDPState, MD_VDP)
 #define MD_VDP_CRAM_SIZE  (64)
 #define MD_VDP_VSRAM_SIZE (40)
 
+#define MD_VDP_MAX_H      320
+
 struct MDVDPState {
     SysBusDevice parent_obj;
 
@@ -34,11 +36,19 @@ struct MDVDPState {
     uint32_t addr;
     uint8_t  code;
 
+    bool     dma_fill_pending;
+    uint32_t dma_fill_len;
+
     qemu_irq irq_vint;
     qemu_irq irq_hint;
 
     QEMUTimer *vint_timer;
     bool       vint_pending;
+    int64_t    vint_time_ns;    /* when the frame timer last fired */
+
+    QEMUTimer *hline_timer;     /* per-scanline timer, runs while IE1 set */
+    uint8_t    hint_counter;
+    bool       hint_asserted;
 
     uint32_t   scale;
 

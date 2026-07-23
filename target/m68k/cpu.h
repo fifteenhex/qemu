@@ -542,6 +542,8 @@ void do_m68k_semihosting(CPUM68KState *env, int nr);
 enum m68k_features {
     /* Base Motorola CPU set (not set for Coldfire CPUs) */
     M68K_FEATURE_M68K,
+    /* 24-bit address bus: the upper address byte is ignored (68000/010) */
+    M68K_FEATURE_ADDR24,
     /* Motorola CPU feature sets */
     M68K_FEATURE_M68010,
     M68K_FEATURE_M68020,

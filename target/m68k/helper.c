@@ -1119,8 +1119,14 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     if (!mmu_enabled) {
         /* MMU disabled */
+        hwaddr phys = address;
+
+        if (m68k_feature(env, M68K_FEATURE_ADDR24)) {
+            /* only 24 address lines leave the chip */
+            phys &= 0x00FFFFFF;
+        }
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
-                     address & TARGET_PAGE_MASK,
+                     phys & TARGET_PAGE_MASK,
                      PAGE_READ | PAGE_WRITE | PAGE_EXEC,
                      mmu_idx, TARGET_PAGE_SIZE);
         return true;
