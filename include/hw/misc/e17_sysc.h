@@ -27,7 +27,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(E17SysCState, E17_SYSC)
 #define E17_SYSC_VIC_MIRR  0x01000 /* ...also decoded here (RMON uses this) */
 #define E17_SYSC_DRAMC     0x08000 /* VMEbus decoder (regs 0xf0/0xf4) */
 #define E17_SYSC_CIO2      0x10000 /* user Z8536 CIO */
-#define E17_SYSC_SRAM2K    0x20000 /* NVRAM/RTC */
+#define E17_SYSC_SRAM2K    0x20000 /* M48T02 NVRAM/RTC: separate device */
 #define E17_SYSC_CIO1      0x30000 /* system Z8536 CIO (POST display/DIP) */
 #define E17_SYSC_VID_DAC   0x40000 /* video RAMDAC + pixel clock PLL */
 #define E17_SYSC_VID_CRTC  0x48000 /* video CRTC */
@@ -80,7 +80,6 @@ struct E17SysCState {
 
     uint8_t vic_regs[256];  /* VIC068A, one byte per 32bit word */
     bool cd2401_irq;        /* level of the CD2401 interrupt line */
-    uint8_t sram2k[0x800];  /* NVRAM/RTC content */
 
     uint8_t kbd_data;       /* AT keyboard controller data register */
     uint8_t kbd_status;

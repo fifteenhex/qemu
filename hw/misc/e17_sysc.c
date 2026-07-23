@@ -138,12 +138,6 @@ static uint64_t e17_sysc_read_impl(void *opaque, hwaddr addr, unsigned size)
         return e17_cio_read(&s->cio[1], addr & 3);
     case E17_SYSC_CIO1:
         return e17_cio_read(&s->cio[0], addr & 3);
-    case E17_SYSC_SRAM2K:
-        if (off < ARRAY_SIZE(s->sram2k)) {
-            trace_e17_nvram_read(off, s->sram2k[off]);
-            return s->sram2k[off];
-        }
-        break;
     case E17_SYSC_VID_DAC:
     case E17_SYSC_VID_CRTC:
         /*
@@ -221,13 +215,6 @@ static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
         }
         e17_cio_write(&s->cio[0], addr & 3, val);
         return;
-    case E17_SYSC_SRAM2K:
-        if (off < ARRAY_SIZE(s->sram2k)) {
-            trace_e17_nvram_write(off, val);
-            s->sram2k[off] = val;
-            return;
-        }
-        break;
     case E17_SYSC_VID_DAC:
     case E17_SYSC_VID_CRTC:
         /* open bus unless the e17-vid device overlays these blocks */
@@ -329,7 +316,6 @@ static void e17_sysc_reset(DeviceState *dev)
     s->cputype = 0;
     s->post_code = 0;
     memset(s->vic_regs, 0, sizeof(s->vic_regs));
-    /* sram2k (the NVRAM/RTC) is battery backed: not touched on reset */
 }
 
 static void e17_sysc_cd2401_irq(void *opaque, int n, int level)
@@ -373,7 +359,6 @@ static const VMStateDescription vmstate_e17_sysc = {
                              E17CIOState),
         VMSTATE_UINT8_ARRAY(vic_regs, E17SysCState, 256),
         VMSTATE_BOOL(cd2401_irq, E17SysCState),
-        VMSTATE_UINT8_ARRAY(sram2k, E17SysCState, 0x800),
         VMSTATE_UINT8(kbd_data, E17SysCState),
         VMSTATE_UINT8(kbd_status, E17SysCState),
         VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),

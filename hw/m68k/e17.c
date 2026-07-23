@@ -36,6 +36,8 @@
 #include "hw/misc/e17_sysc.h"
 #include "hw/net/lance.h"
 #include "hw/scsi/ncr53c720.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "system/dma.h"
 #include "target/m68k/cpu.h"
 
@@ -53,6 +55,7 @@
 #define E17_LANCE_RDP       0xfec68002
 #define E17_LANCE_RAP       0xfec68006
 #define E17_SCSI_BASE       0xfec6c000
+#define E17_NVRAM_BASE      0xfec20000
 
 #define E17_DEFAULT_RAM_SIZE (16 * MiB)
 
@@ -174,6 +177,8 @@ static void e17_init(MachineState *machine)
     DeviceState *vid_dev;
     DeviceState *lance_dev;
     DeviceState *scsi_dev;
+    DeviceState *nvram_dev;
+    DriveInfo *dinfo;
     MemoryRegion *lance_rdp = g_new(MemoryRegion, 1);
     MemoryRegion *lance_rap = g_new(MemoryRegion, 1);
     gchar *bios_size_err;
@@ -310,6 +315,23 @@ static void e17_init(MachineState *machine)
                              2, 2);
     memory_region_add_subregion_overlap(sysmem, E17_LANCE_RAP,
                                         lance_rap, 1);
+
+    /*
+     * NVRAM/RTC: M48T02 timekeeper — 2KB battery SRAM with the clock
+     * registers in the top 8 bytes (the OS-9 bootstrap reads the time
+     * of day through the +0x7f8 READ latch; RMON only uses the RAM:
+     * system configuration at 0x000-0x5ff with an inverted-sum
+     * checksum at 0x5fc, board ID block at +0x468, and the OS-9
+     * bootstrap parameter block at +0x700).  Persist the contents
+     * with -drive if=mtd,format=raw,file=nvram.img (2KB).
+     */
+    nvram_dev = qdev_new("sysbus-m48t02");
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(nvram_dev, "drive", blk_by_legacy_dinfo(dinfo));
+    }
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(nvram_dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(nvram_dev), 0, E17_NVRAM_BASE, 1);
 
     /*
      * NCR 53C720 SCSI (the register map RMON drives is the 720/8xx

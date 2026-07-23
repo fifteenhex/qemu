@@ -114,6 +114,7 @@ config ELTEC_E17
     select CD2401
     select LANCE
     select NCR53C720
+    select M48T59
 
 config AMIGA
     bool
