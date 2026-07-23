@@ -215,11 +215,38 @@ time the Egret/ADB layer wants a delay — possibly our Egret exchange
 timing (100us/byte) diverts the ADB layer into a timeout path that
 real hardware doesn't take that early.
 
-Next session: (1) find the 0xD00-block populator (watchpoint on 0xD00
-after the RAM tests, under -icount), or check whether shortening the
-Egret interrupt delay avoids the delay-trap entirely; (2) then SCSI scan
-(needs 5380 well-behaved-enough to report no devices), floppy check,
-and finally video init (VDAC/framebuffer) for the insert-disk icon.
+RESOLVED: TimeDBRA was a speed artifact — run with **-icount shift=7**
+and the ROM's calibration works (no divide, no patching).  SCSI scan
+then walks all 7 targets (5380 stub reports AIP during arbitration) and
+loops rescanning = normal no-boot-disk behaviour.
+
+### Video pipeline status (2026-07-20, session 3)
+
+- The IIsi onboard video = pseudo NuBus slot $E.  The top 0x1400 bytes
+  of the system ROM are its Declaration ROM (sig 0x5A932BC7 at 0x7fffa,
+  byteLanes 0x0F, length 0x13E6); the hardware also decodes the ROM at
+  the top of slot $E super space — modelled as an alias at 0xfef80000.
+  With it the Slot Manager finds the card and loads the video driver
+  into RAM (sense reads from pcs ~0x4728/0x4998 etc.).
+- RBV +0x02 = RAW slot int lines (slot $E VBL = bit 6, must PULSE
+  1.3ms/frame — the ROM has an explicit wait-for-edge at 0x4084ac90);
+  +0x12 = slot enables (VIA set/clr protocol); IFR bit 1 = latched slot
+  summary → level 2.  All implemented off the 60Hz timer.
+- CURRENT BLOCKER: slot PrimaryInit phase — its temp stack grows down
+  from ~0x57f4 INTO the boot heap zone based at 0x2000 (bkLim 0x57f4).
+  Heap allocations climb to ~0x522c (suspiciously many — the video
+  driver seems to be loaded/inited repeatedly), stack pushes then smash
+  block headers, and the heap-coalesce walk at 0x4080e158 spins forever
+  on a zero-size block.  Catch it with /tmp/maciisi-heap.gdb (watch
+  0x522c; writer pcs: legit MM at 0x4080ddf0/0x4080eb30/0x4080e2ee,
+  then stack pushes from pc 0x4080b170 with sp=0x522c).
+  Next: find why the driver init retries (its failure exit — does it
+  reject something after the sense read? trace the driver instance's
+  flow), or whether the zone SHOULD be bigger/stack elsewhere (zone
+  header at 0x2000: 57f4 2034 210c 0498...).
+- gdb + icount note: interrupting with gdb during icount runs can
+  trigger a QEMU 'bql_lock' assertion abort — reconnect rather than
+  interrupt, or use breakpoints only.
 
 ### v1 skeleton (2026-07-20)
 
