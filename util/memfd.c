@@ -131,6 +131,7 @@ void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals,
         }
     }
 
+    printf("xxx 0x%x\n", (unsigned) size);
     ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
     if (ptr == MAP_FAILED) {
         goto err;
