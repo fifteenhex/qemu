@@ -211,6 +211,17 @@ static void amiga_machine_init(MachineState *machine)
         error_report("Could not load Kickstart ROM '%s'", machine->firmware);
         exit(1);
     }
+    /*
+     * A 256KB Kickstart (the 1.x images) in a 512KB ROM window sits in
+     * a socket whose top address line the chip ignores, so the image
+     * appears twice.  Replicate it so the 0xfc0000-based vectors of
+     * those images land on code in the upper half of the window.
+     */
+    if (rom_loaded > 0 && rom_loaded * 2 == amc->rom_size) {
+        uint8_t *rom = memory_region_get_ram_ptr(&ams->rom);
+
+        memcpy(rom + rom_loaded, rom, rom_loaded);
+    }
 
     memory_region_init_alias(&ams->rom_overlay, OBJECT(machine),
                              "amiga.kickstart-overlay", &ams->rom, 0,
