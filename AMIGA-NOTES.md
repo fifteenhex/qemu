@@ -86,8 +86,8 @@ callbacks run inside the timer's transaction).
   horizontal beam position won't render.
 - Not modelled: audio, keyboard (CIA-A SDR handshake), battery clock
   (RP5C01 at 0xdc0000, currently open bus), Zorro slots.  Floppy: no
-  disk change/eject at runtime yet (fixed media), only DF0, only
-  880KB DD ADFs.
+  disk change/eject at runtime yet (fixed media; two-disk games can
+  put disk 2 in DF1 instead), only 880KB DD ADFs.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 

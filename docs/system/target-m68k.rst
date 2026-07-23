@@ -62,10 +62,12 @@ modelled:
    extra-half-brite, rendered to a QEMU console.  Sprites, HAM and
    dual playfield are not drawn.
 
--  Paula disk DMA and a floppy drive as DF0, backed by a plain 880KB
-   ADF image given with ``-drive if=floppy``.  Reads encode the track
-   into standard AmigaDOS MFM on the fly (both trackdisk.device and
-   custom trackloaders work), writes decode it back into the image.
+-  Paula disk DMA and two floppy drives, DF0 and DF1, backed by plain
+   880KB ADF images given with ``-drive if=floppy`` (once for each
+   drive).  Reads encode the track into standard AmigaDOS MFM on the
+   fly (both trackdisk.device and custom trackloaders work), writes
+   decode it back into the image.  External drive detection through
+   the drive ID shifter works, so DF1 is bootable too.
 
 -  A mouse in gameport 0: counters in JOY0DAT, left button on CIA-A
    PA6, right button on the POTGOR Y line.
