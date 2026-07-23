@@ -50,6 +50,7 @@ config MACIISI
     bool
     default y
     depends on M68K
+    select ADB
     select MOS6522
     select ESCC
     select SWIM

@@ -42,6 +42,7 @@
 #include "hw/block/swim.h"
 #include "hw/scsi/ncr5380.h"
 #include "hw/scsi/scsi.h"
+#include "hw/input/adb.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
@@ -183,6 +184,7 @@ struct MOS6522MacIIsiState {
     MOS6522State parent_obj;
 
     struct MacIIsiMachineState *machine;
+    ADBBusState adb_bus;
     uint8_t pins_a;
     uint8_t pins_b;
     uint8_t last_b;
@@ -402,6 +404,10 @@ static void mos6522_maciisi_init(Object *obj)
 
     v1s->cmd = REG_EMPTY;
     v1s->alt = REG_EMPTY;
+
+    /* the ADB bus hangs off the Egret; the VIA1 device stands in for it */
+    qbus_init(&v1s->adb_bus, sizeof(v1s->adb_bus), TYPE_ADB_BUS,
+              DEVICE(obj), "adb.0");
 }
 
 static void mos6522_maciisi_reset_hold(Object *obj, ResetType type)
@@ -994,8 +1000,21 @@ static void maciisi_egret_timer_cb(void *opaque)
     qemu_set_irq(irq, 1);
 }
 
+static void maciisi_egret_no_response(MacIIsiMachineState *m)
+{
+    /*
+     * No response: run the same interrupt sequence but with /XCVR
+     * high at the turnaround so the driver discards the bytes (count
+     * is zeroed when the response-pending flag is unset).
+     */
+    m->egret_no_resp = true;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+}
+
 static void maciisi_egret_process(MacIIsiMachineState *m)
 {
+    ADBBusState *adb_bus = &m->via1.adb_bus;
     uint8_t *c = m->egret_cmd;
     int n = m->egret_cmd_len;
 
@@ -1012,31 +1031,105 @@ static void maciisi_egret_process(MacIIsiMachineState *m)
     }
 
     m->egret_no_resp = false;
-    switch (c[0]) {
-    case 0x00:                          /* get version */
-        /* Egret 341S0851 (IIsi) reports firmware 1.01 */
-        m->egret_resp[m->egret_resp_len++] = 0x01;
-        m->egret_resp[m->egret_resp_len++] = 0x01;
-        break;
-    default:
+
+    /*
+     * Packet framing as the IIsi ROM/OS drivers actually speak it
+     * (observed on the wire, session 7): a packet is the raw ADB
+     * command byte followed by optional listen data — no type byte.
+     * PRAM/RTC traffic goes over the emulated 343-0042 bit-bang
+     * protocol instead, so ADB is all these packets ever carry.
+     */
+    if (n == 1 && c[0] == 0x00) {
         /*
-         * No response: run the same interrupt sequence but with /XCVR
-         * high at the turnaround so the ROM discards the bytes (count
-         * is zeroed when the response-pending flag is unset).
+         * ADB SendReset, the ROM's startup sync: reset the bus but
+         * answer the two status bytes the ROM driver waits for
+         * (Egret 341S0851 reports firmware 1.01).
          */
-        m->egret_no_resp = true;
-        m->egret_resp[m->egret_resp_len++] = 0x00;
-        m->egret_resp[m->egret_resp_len++] = 0x00;
-        break;
+        uint8_t scratch[ADB_MAX_OUT_LEN];
+
+        adb_autopoll_block(adb_bus);
+        adb_request(adb_bus, scratch, c, 1);
+        adb_autopoll_unblock(adb_bus);
+        m->egret_resp[m->egret_resp_len++] = 0x01;
+        m->egret_resp[m->egret_resp_len++] = 0x01;
+        return;
+    }
+
+    {
+        uint8_t obuf[ADB_MAX_OUT_LEN];
+        int olen;
+
+        adb_autopoll_block(adb_bus);
+        olen = adb_request(adb_bus, obuf, c, n);
+        adb_autopoll_unblock(adb_bus);
+
+        if (olen > 0) {
+            /* reply: the raw register data */
+            memcpy(m->egret_resp, obuf, olen);
+            m->egret_resp_len = olen;
+        } else {
+            /*
+             * Listen/no-data/absent device: ADB bus timeout — the
+             * Egret turns around without a response.
+             */
+            maciisi_egret_no_response(m);
+        }
     }
 }
 
 /*
- * /XCVR_SESSION (PB3) as sampled by the ROM at each shift interrupt:
- * LOW at the turnaround interrupt ("a response follows", the first byte
- * is already in SR), HIGH at the interrupts delivering the middle
- * bytes, and LOW again at the final interrupt after the last byte's
- * ack toggle — that pattern is the receive loop's exit condition.
+ * Egret-initiated transfer: when autopolling finds fresh device data
+ * and the transport is idle, load the first byte into the shift
+ * register, assert /XCVR_SESSION and raise the shift interrupt — the
+ * host's TIP/TACK handshake then clocks the remaining bytes exactly
+ * like a command response.
+ */
+static void maciisi_egret_adb_poll(void *opaque)
+{
+    MacIIsiMachineState *m = opaque;
+    MOS6522MacIIsiState *v1s = &m->via1;
+    MOS6522State *s = MOS6522(v1s);
+    uint8_t obuf[ADB_MAX_OUT_LEN + 2];
+    int olen;
+
+    /* only when no exchange is in progress and the shifter is inbound */
+    if (m->egret_session || m->egret_resp_len > 0 || (s->acr & SR_OUT)) {
+        return;
+    }
+
+    olen = adb_poll(&v1s->adb_bus, obuf, v1s->adb_bus.autopoll_mask);
+    if (olen <= 0) {
+        return;
+    }
+    /* adb_poll tags the data with the Talk R0 command byte at obuf[0] */
+    memcpy(m->egret_resp, obuf, olen);
+    m->egret_resp_len = olen;
+    m->egret_resp_idx = 1;
+    m->egret_no_resp = false;
+    m->egret_session = true;            /* Egret-initiated session */
+    s->sr = m->egret_resp[0];
+    maciisi_egret_set_xcvr(v1s, true);
+    maciisi_egret_schedule_int(m);
+    qemu_log_mask(LOG_UNIMP,
+                  "maciisi egret: unsol len=%d [%02x %02x %02x %02x]\n",
+                  m->egret_resp_len, obuf[0], obuf[1],
+                  m->egret_resp_len > 2 ? obuf[2] : 0,
+                  m->egret_resp_len > 3 ? obuf[3] : 0);
+}
+
+/*
+ * /XCVR_SESSION (PB3) as sampled by the ROM driver at each shift
+ * interrupt (dispatch 0x4080a700: btst #3, then the continuation
+ * branches on it):
+ *  - receive loop: a byte is consumed while PB3 is HIGH; PB3 LOW at an
+ *    interrupt ends the response (cont 0x4080a63c).
+ *  - PB3 LOW already at the first post-turnaround interrupt sets flag
+ *    bit5 (cont 0x4080a624) and the whole byte count is DISCARDED at
+ *    the end (seq/and at 0x4080a646) — that is the driver's "the Egret
+ *    had no response / wants the bus" case.
+ * So: real responses keep PB3 high while bytes flow and drop it as the
+ * end marker; a no-response exchange holds PB3 low throughout (the
+ * driver still clocks two junk bytes through SR).
  */
 static void maciisi_egret_ack_toggle(MOS6522MacIIsiState *v1s)
 {
@@ -1045,19 +1138,17 @@ static void maciisi_egret_ack_toggle(MOS6522MacIIsiState *v1s)
 
     if (m->egret_resp_idx < m->egret_resp_len) {
         s->sr = m->egret_resp[m->egret_resp_idx++];
-        /* PB3 low only for the first byte's (turnaround) interrupt */
-        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx == 1 &&
-                                    !m->egret_no_resp);
+        maciisi_egret_set_xcvr(v1s, m->egret_no_resp);
         maciisi_egret_schedule_int(m);
         qemu_log_mask(LOG_UNIMP, "maciisi egret: feed 0x%02x (#%d/%d) pc=%08x b=%02x\n",
                       s->sr, m->egret_resp_idx, m->egret_resp_len,
                       maciisi_trace_pc(), s->b);
     } else {
-        /* final ack: signal end-of-transfer, the exchange is over */
+        /* final ack: PB3 low = end-of-response, the exchange is over */
         m->egret_resp_len = 0;
         m->egret_resp_idx = 0;
         m->egret_session = false;
-        maciisi_egret_set_xcvr(v1s, true);      /* PB3 low: done */
+        maciisi_egret_set_xcvr(v1s, true);
         maciisi_egret_schedule_int(m);
         qemu_log_mask(LOG_UNIMP, "maciisi egret: response complete pc=%08x b=%02x\n",
                       maciisi_trace_pc(), s->b);
@@ -1089,26 +1180,37 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
     /*
      * TIP/TACK toggles during the receive phase acknowledge the byte
      * in SR and clock the next one; /TIP alternates as part of the ack
-     * so it does not signify session end while a response is flowing.
+     * cadence (ORB ^= 0x30), so mid-receive states always have exactly
+     * one of TIP/TACK asserted.  BOTH released means the host walked
+     * away from the exchange (close/park), never an ack.
      */
     if (m->egret_session && !(s->acr & SR_OUT) && hs_change
-        && m->egret_resp_len > 0) {
+        && m->egret_resp_len > 0
+        && (s->b & (EGRET_SYS_SESSION | EGRET_VIA_FULL)) !=
+           (EGRET_SYS_SESSION | EGRET_VIA_FULL)) {
         maciisi_egret_ack_toggle(v1s);
         return;
     }
 
     if (!sys) {
         /*
-         * Host released the session.  Return /XCVR_SESSION to idle
-         * (PB3 high) even when the exchange already finished on our
-         * side: the final-interrupt path parks PB3 low as the receive
-         * loop's exit condition, and the OS ADB manager (unlike the
-         * ROM driver) waits for the line to go idle before starting
-         * its next exchange.
+         * Host released the session.
+         *
+         * A packet sent without the receive turnaround (Listen
+         * commands: the driver expects no response) is processed now —
+         * it was never seen by maciisi_egret_process, and ADB Listens
+         * must reach the devices (address relocation!).  Any response
+         * it builds is discarded, nobody is listening.
          */
+        if (m->egret_cmd_len > 0 && m->egret_resp_len == 0
+            && m->egret_resp_idx == 0) {
+            maciisi_egret_process(m);
+        }
         m->egret_session = false;
+        m->egret_cmd_len = 0;
         m->egret_resp_len = 0;
         m->egret_resp_idx = 0;
+        /* /XCVR_SESSION returns to idle (PB3 high) */
         maciisi_egret_set_xcvr(v1s, false);
         /*
          * The Egret clocks one final shift-register interrupt when the
@@ -1131,6 +1233,13 @@ static void maciisi_egret_sr_written(MOS6522MacIIsiState *v1s)
     if (!m->egret_session || !(s->acr & SR_OUT)) {
         return;
     }
+    /*
+     * If an Egret-initiated packet is staged (resp pending), /XCVR is
+     * low: the host's send interrupt takes the collision path
+     * (0x4080a614), turns around and receives our packet before
+     * re-sending — the command bytes collected here get dropped at the
+     * turnaround.
+     */
     if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
         m->egret_cmd[m->egret_cmd_len++] = s->sr;
     }
@@ -1146,17 +1255,27 @@ static void maciisi_egret_acr_changed(MOS6522MacIIsiState *v1s)
 
     /*
      * The host turns the shifter around to receive while still holding
-     * the session: treat the bytes collected so far as the command,
-     * build the response and raise /TREQ; the host's following TACK
-     * toggle clocks the first byte out.
+     * the session: treat the bytes collected so far as the command and
+     * build the response; the host's following TACK toggle clocks the
+     * first byte out.  /XCVR_SESSION stays HIGH for a real response
+     * (low at the first data interrupt = "discard" to this driver) and
+     * goes LOW for the no-response turnaround.
      */
     if (m->egret_session && !(s->acr & SR_OUT) && m->egret_resp_len == 0
         && m->egret_cmd_len > 0) {
         maciisi_egret_process(m);
         m->egret_cmd_len = 0;
-        if (m->egret_resp_len > 0) {
-            maciisi_egret_set_xcvr(v1s, true);
-        }
+        maciisi_egret_set_xcvr(v1s, m->egret_no_resp &&
+                                    m->egret_resp_len > 0);
+    } else if (m->egret_session && !(s->acr & SR_OUT)
+               && m->egret_resp_len > 0 && m->egret_cmd_len > 0) {
+        /*
+         * Turnaround with an Egret-initiated packet staged: the host
+         * collided with us mid-send, took the collision path and is
+         * now receiving our packet first.  It re-sends its command
+         * bytes afterwards, so drop the partial command.
+         */
+        m->egret_cmd_len = 0;
     }
 }
 
@@ -1493,6 +1612,20 @@ static void maciisi_machine_init(MachineState *machine)
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
+
+    /* ADB devices behind the Egret */
+    {
+        BusState *adb_bus = qdev_get_child_bus(DEVICE(&m->via1), "adb.0");
+
+        dev = qdev_new(TYPE_ADB_KEYBOARD);
+        qdev_realize_and_unref(dev, adb_bus, &error_fatal);
+        dev = qdev_new(TYPE_ADB_MOUSE);
+        qdev_realize_and_unref(dev, adb_bus, &error_fatal);
+
+        adb_register_autopoll_callback(&m->via1.adb_bus,
+                                       maciisi_egret_adb_poll, m);
+        adb_set_autopoll_enabled(&m->via1.adb_bus, true);
+    }
     m->vbl_off_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_vbl_off, m);
     m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_sixty_hz, m);
     timer_mod(m->sixty_hz_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
