@@ -53,6 +53,7 @@
 #define MVME147_LANCE        0xfffe1800
 #define MVME147_VMECHIP      0xfffe2000
 #define MVME147_SCC          0xfffe3000
+#define MVME147_SCC2         0xfffe3800
 #define MVME147_SCSI         0xfffe4000
 
 void ledma_memory_read(void *opaque, hwaddr addr,
@@ -177,12 +178,19 @@ static void mvme147_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vmechip_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vmechip_dev), 0, MVME147_VMECHIP);
 
-    /* SCC */
+    /* SCC, serial ports 1 and 2 */
     serial_dev = qdev_new(TYPE_ESCC);
     qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, MVME147_SCC);
+
+    /* second SCC, serial ports 3 and 4 */
+    serial_dev = qdev_new(TYPE_ESCC);
+    qdev_prop_set_chr(serial_dev, "chrA", serial_hd(2));
+    qdev_prop_set_chr(serial_dev, "chrB", serial_hd(3));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, MVME147_SCC2);
 
     /* SCSI */
     scsi_dev = qdev_new(TYPE_WD33C93);

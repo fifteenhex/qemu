@@ -35,6 +35,9 @@ static uint64_t mvme147_vmechip_read(void *opaque, hwaddr addr, unsigned size)
     	/* Reading clears any set status bits */
     	s->bus_err_status = 0;
     	return val;
+    case 0x800:
+    	/* GCSR board status: bit 0 = +12V fuse good, bit 1 = syscon */
+    	return 0x01;
     default:
     	break;
     }
@@ -83,7 +86,12 @@ static void mvme147_vmechip_realize(DeviceState *dev, Error **errp)
 {
     MVME147VMEChipState *s = MVME147_VMECHIP(dev);
 
-    memory_region_init_io(&s->mmio, OBJECT(dev), &mvme147_vmechip_ops, s, TYPE_MVME147_VMECHIP, 0x30);
+    /*
+     * The chip decodes fffe2000-fffe2fff: LCSR registers at the base
+     * and the GCSR page at +0x800, which the firmware probes for the
+     * system controller status.
+     */
+    memory_region_init_io(&s->mmio, OBJECT(dev), &mvme147_vmechip_ops, s, TYPE_MVME147_VMECHIP, 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 }
 

@@ -33,6 +33,7 @@ DEF_HELPER_2(frestore_6888x, i32, env, i32)
 DEF_HELPER_1(fp_pretrap, void, env)
 DEF_HELPER_3(fmv, void, env, fp, fp)
 DEF_HELPER_1(fbcc_bsun, void, env)
+DEF_HELPER_3(moves_chk, void, env, i32, i32)
 
 DEF_HELPER_3(fsround, void, env, fp, fp)
 DEF_HELPER_3(fdround, void, env, fp, fp)
