@@ -1001,6 +1001,22 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
             super_only = 1;
         }
         dt = desc & 3;
+
+        /*
+         * Set the descriptor's Used bit (and Modified on the leaf page
+         * for a store) so the guest sees the MMU exercising its tables.
+         */
+        if (!(access_type & ACCESS_DEBUG)) {
+            uint32_t nd = desc | M68K_DESC030_U;
+            if (dt == M68K_DT_PAGE && (access_type & ACCESS_STORE) &&
+                !(desc & M68K_DESC030_WP)) {
+                nd |= M68K_DESC030L_M;
+            }
+            if (nd != desc) {
+                address_space_stl(cs->as, entry, nd,
+                                  MEMTXATTRS_UNSPECIFIED, &txres);
+            }
+        }
     }
 
     if (dt != M68K_DT_PAGE) {
