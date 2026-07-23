@@ -263,12 +263,13 @@ static void amiga_fdc_update_status(AmigaFDCState *s)
 
     /*
      * The status lines are open collector: a deselected drive floats
-     * them all high.
+     * them all high.  With the motor off, /RDY carries the drive ID
+     * shift register instead of the ready state.
      */
     qemu_set_irq(s->chng, !(s->selected && (!disk || s->disk_changed)));
     qemu_set_irq(s->wpro, !(s->selected && wp));
     qemu_set_irq(s->tk0, !(s->selected && s->cyl == 0));
-    qemu_set_irq(s->rdy, !(s->selected && s->motor && disk));
+    qemu_set_irq(s->rdy, !s->selected || (s->motor ? !disk : s->id_bit));
 }
 
 static void amiga_fdc_index_pulse(void *opaque)
@@ -294,8 +295,20 @@ static void amiga_fdc_sel(void *opaque, int n, int level)
 
         if (motor != s->motor) {
             s->motor = motor;
+            /* a motor toggle resets the drive ID shifter */
+            s->id_pos = 0;
             if (motor) {
                 amiga_fdc_index_pulse(s);
+            }
+        } else if (!s->motor) {
+            /* each select pulse with the motor off shifts out one bit */
+            if (s->id_pos < AMIGA_DRIVE_ID_BITS) {
+                s->id_bit = (s->drive_id >>
+                             (AMIGA_DRIVE_ID_BITS - 1 - s->id_pos)) & 1;
+                s->id_pos++;
+            } else {
+                /* the shifter is empty, the pull-up wins */
+                s->id_bit = true;
             }
         }
     }
@@ -363,6 +376,8 @@ static void amiga_fdc_reset(DeviceState *dev)
     s->motor = false;
     s->disk_changed = false;
     s->cyl = 0;
+    s->id_pos = AMIGA_DRIVE_ID_BITS;
+    s->id_bit = true;
     timer_del(&s->index_timer);
     amiga_fdc_update_status(s);
 }
@@ -378,7 +393,8 @@ static void amiga_fdc_realize(DeviceState *dev, Error **errp)
         if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
             return;
         }
-        if (blk_getlength(s->blk) != ADF_IMAGE_SIZE) {
+        if (blk_is_inserted(s->blk) &&
+            blk_getlength(s->blk) != ADF_IMAGE_SIZE) {
             error_setg(errp, "floppy image must be a %d byte ADF",
                        ADF_IMAGE_SIZE);
             return;
@@ -419,6 +435,8 @@ static const VMStateDescription vmstate_amiga_fdc = {
         VMSTATE_BOOL(motor, AmigaFDCState),
         VMSTATE_BOOL(disk_changed, AmigaFDCState),
         VMSTATE_UINT8(cyl, AmigaFDCState),
+        VMSTATE_UINT8(id_pos, AmigaFDCState),
+        VMSTATE_BOOL(id_bit, AmigaFDCState),
         VMSTATE_TIMER(index_timer, AmigaFDCState),
         VMSTATE_END_OF_LIST()
     }
@@ -426,6 +444,8 @@ static const VMStateDescription vmstate_amiga_fdc = {
 
 static const Property amiga_fdc_properties[] = {
     DEFINE_PROP_DRIVE("drive", AmigaFDCState, blk),
+    DEFINE_PROP_UINT32("drive-id", AmigaFDCState, drive_id,
+                       AMIGA_DRIVE_ID_DD),
 };
 
 static void amiga_fdc_class_init(ObjectClass *klass, const void *data)

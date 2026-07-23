@@ -44,6 +44,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmigaFDCState, AMIGA_FDC)
 /* the head can step a little past the last data cylinder */
 #define DRIVE_MAX_CYLINDER      82
 
+/* how many drives the machine wires to the CIA select lines */
+#define AMIGA_FLOPPY_DRIVES     2
+
+/*
+ * Drive identification, shifted out on /RDY one bit per /SEL pulse
+ * after a motor toggle.  A plain double density drive reads as all
+ * zeroes; absent drives read as all ones from the pull-ups.
+ */
+#define AMIGA_DRIVE_ID_DD       0x00000000
+#define AMIGA_DRIVE_ID_HD       0xaaaaaaaa
+#define AMIGA_DRIVE_ID_BITS     32
+
 /*
  * An MFM-encoded sector: 2 gap words, 2 sync words, then the odd/even
  * encoded info longword, 16 label bytes, header and data checksum
@@ -74,6 +86,10 @@ struct AmigaFDCState {
     bool motor;
     bool disk_changed;              /* the /CHNG latch */
     uint8_t cyl;
+
+    uint32_t drive_id;
+    uint8_t id_pos;                 /* bits shifted since the motor toggle */
+    bool id_bit;                    /* the bit currently on /RDY */
 
     QEMUTimer index_timer;
 
