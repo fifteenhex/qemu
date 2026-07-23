@@ -982,3 +982,56 @@ Helpers in ~/e17-re: u-boot.srec (regenerate as above), sloadtest.py
 (drives the whole sload+gm sequence over the serial socket with
 proper XON/XOFF pacing), sloadgdb.py (same but dumps the loaded
 image for debugging).
+
+## Real-board probe (e17-tools/e17probe.py, 2026-07-21)
+
+A read-only RMON probe to compare the real board against the model.
+It issues only display commands ($, db, dl) + a SCSI scan; no writes,
+no boot, no sload/gm; skips the CD2401 console (fec64000) and its
+IACK window (fec66000) so it can't disturb the serial link.  It
+echoes each command it sends (">>> ...") and the reply live, and logs
+everything.  Run on the board's host:
+    python3 e17probe.py /dev/ttyUSB0 [baud]      # default 9600 8N1
+Prereq: console on Serial Port 1 (video absent, or setup Output Port
+= Serial Port 1 - the latter keeps video INITIALISED so the RAMDAC/
+CRTC probes return real values while the console stays on serial).
+The same script drives QEMU for the reference:
+    python3 e17probe.py --socket /path/to/serial.sock
+e17-tools/e17probe-qemu-reference.txt is that reference (video=off,
+fresh NVRAM, 32M).
+
+What each line confirms, and what the MODEL currently returns (so a
+real-board difference is the interesting result):
+- $ banner: real RAM size, "Secondary CPU : Installed/Not installed"
+  (is the real board dual-CPU?), real Ethernet address, CPU type,
+  Extended slave / ICF1 addresses.  Model: 32M, Installed, EPROM
+  default MAC 00:00:5B:00:49:62, 68040.
+- csunit dl fec70000: chip-select + memory controller.  Model returns
+  the ROM init table (base fec00000; timing 0f30 0b84 0b83...; ROM
+  bank fe800000/fff00000/0a03; SRAM fea00000/.../0a04; a4=f0000000,
+  a8=00004000).  Confirms/*corrects* our CS map and reg a4/a8 values.
+- vic068a dl fec01000: model = all zero (plain storage).  Real board
+  = actual VIC068A registers -> identifies the chip / its reset state.
+- asic_dramc fec080f0: model 0f0f0000 / 80808000.  Real = true ASIC /
+  DRAM-refresh regs.
+- cputype fec5e000: model 01.  Real 01 (040) or 04 (060).
+- misc_5c fec5c000: model 05.  Real value of the "slave select" reg.
+- status_ack fec50000: model 00.  Real = abort-switch / IRQ status.
+- i2c_ipin fec54000: model ff (no EEPROM).  Real board HAS the IPIN
+  24Cxx -> different read-back; this is the real MAC/serial source.
+- ramdac fec40000: model ff (open bus, video=off).  With video fitted
+  +2 should read 0x3a and the PLL/palette regs have values -> RAMDAC
+  id.  (needs the Output-Port-serial trick above.)
+- crtc dl fec48000: model ff (video=off).  Real = live CRTC regs.
+- macprom fec69d00: model 0.  Real = station-address PROM nibbles
+  (cross-check against the banner MAC).
+- nvram_* db fec20xxx: model 0 (fresh NVRAM).  Real = the saved
+  config, the board ID block at +0x468 (serial number + MAC source),
+  the config checksum at 5fd-5ff, the OS-9 bootstrap block at +0x700.
+- rtc fec207f8: real M48T02 clock (ctl,sec,min,hr,dow,date,mon,yr BCD)
+  -> confirms the layout and the real date/time.
+- scsi: real targets/LUNs on the bus -> confirms the 53C720 driving
+  real hardware (model shows only emulated devices).
+Highest-value diffs to look for: the VIC068A registers, the IPIN I2C
+behaviour, the real NVRAM board-ID/serial block, and the RAMDAC 0x3a
+id + PLL regs (with video fitted).
