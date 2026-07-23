@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
+#include "hw/m68k/amiga_fdc.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "qom/object.h"
@@ -47,6 +48,11 @@ struct AmigaCustomState {
     uint16_t dmacon, adkcon;
     uint16_t serper, potgo;
     uint8_t serial_rx;
+
+    AmigaFDCState *fdc;         /* DF0, the source of disk DMA data */
+    uint16_t dsklen;
+    bool dsklen_armed;          /* one DMAEN write seen, one to go */
+    QEMUTimer disk_timer;
     /*
      * INT2/INT6 are open-drain lines shared by the CIAs (bit 0) and
      * board hardware (bit 1); INTREQ re-latches while any source holds

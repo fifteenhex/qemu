@@ -25,6 +25,7 @@ struct AmigaMachineState {
     MemoryRegion open_bus;
     DeviceState *ciaa, *ciab;
     DeviceState *custom;
+    DeviceState *fdc;
 };
 
 struct AmigaMachineClass {

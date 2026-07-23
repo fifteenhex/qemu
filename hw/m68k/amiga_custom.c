@@ -44,6 +44,10 @@
 #define REG_DSKBYTR     0x01a
 #define REG_INTENAR     0x01c
 #define REG_INTREQR     0x01e
+#define REG_DSKPTH      0x020
+#define REG_DSKPTL      0x022
+#define REG_DSKLEN      0x024
+#define REG_DSKSYNC     0x07e
 #define REG_SERDAT      0x030
 #define REG_SERPER      0x032
 #define REG_POTGO       0x034
@@ -88,6 +92,17 @@
 #define SERDATR_TSRE    (1 << 12)
 #define SERDATR_TBE     (1 << 13)
 #define SERDATR_RBF     (1 << 14)
+
+#define DSKLEN_DMAEN    (1 << 15)
+#define DSKLEN_WRITE    (1 << 14)
+#define DSKLEN_LENGTH   0x3fff
+
+#define DSKBYTR_DMAON   (1 << 14)
+#define DSKBYTR_WRITE   (1 << 13)
+
+#define ADKCON_WORDSYNC (1 << 10)
+
+#define DMACON_DSKEN    (1 << 4)
 
 /*
  * Paula funnels the fifteen interrupt sources onto six 68k levels.
@@ -681,6 +696,90 @@ static void amiga_custom_serial_receive(void *opaque, const uint8_t *buf,
     amiga_custom_post_int(s, INT_RBF);
 }
 
+/* --- disk DMA --- */
+
+static void amiga_custom_disk_done(void *opaque)
+{
+    AmigaCustomState *s = opaque;
+
+    amiga_custom_post_int(s, INT_DSKBLK);
+}
+
+/*
+ * Run a disk DMA transfer.  The data is moved immediately; the DSKBLK
+ * interrupt follows after the time the words would have taken to pass
+ * under the head, which is what loaders that poll or measure the
+ * transfer expect.  A read that finds no data (no disk, motor off, or
+ * the head past the last cylinder) never completes, as on hardware.
+ */
+static void amiga_custom_disk_dma(AmigaCustomState *s)
+{
+    unsigned words = s->dsklen & DSKLEN_LENGTH;
+    uint32_t ptr = amiga_custom_ptr(s, REG_DSKPTH);
+    const uint8_t *track;
+    int tracklen, offset, i;
+
+    if ((s->dmacon & (DMACON_DMAEN | DMACON_DSKEN)) !=
+        (DMACON_DMAEN | DMACON_DSKEN)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "amiga-custom: disk DMA started while disabled\n");
+        return;
+    }
+    if (!s->fdc) {
+        return;
+    }
+
+    if (s->dsklen & DSKLEN_WRITE) {
+        g_autofree uint8_t *buf = g_malloc(words * 2);
+
+        dma_memory_read(&address_space_memory, ptr & CHIP_MASK, buf,
+                        words * 2, MEMTXATTRS_UNSPECIFIED);
+        amiga_fdc_write_track(s->fdc, buf, words * 2);
+    } else {
+        if (!amiga_fdc_read_track(s->fdc, &track, &tracklen)) {
+            return;
+        }
+        offset = 0;
+        if (s->adkcon & ADKCON_WORDSYNC) {
+            uint16_t sync = amiga_custom_reg(s, REG_DSKSYNC);
+
+            /* the transfer starts with the word after the sync match */
+            for (i = 0; i + 2 <= tracklen; i += 2) {
+                if (lduw_be_p(track + i) == sync) {
+                    offset = i + 2;
+                    break;
+                }
+            }
+            amiga_custom_post_int(s, INT_DSKSYN);
+        }
+        for (i = 0; i < words; i++) {
+            chip_write16(ptr + i * 2,
+                         lduw_be_p(track + (offset + i * 2) % tracklen));
+        }
+    }
+    amiga_custom_set_ptr(s, REG_DSKPTH, ptr + words * 2);
+
+    timer_mod(&s->disk_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)words * 16 * MFM_BITCELL_NS);
+}
+
+static void amiga_custom_dsklen_write(AmigaCustomState *s, uint16_t val)
+{
+    s->dsklen = val;
+    if (!(val & DSKLEN_DMAEN)) {
+        /* disk DMA off: disarm, and stop any transfer in flight */
+        s->dsklen_armed = false;
+        timer_del(&s->disk_timer);
+    } else if (!s->dsklen_armed) {
+        /* first write with DMAEN arms the DMA, the second starts it */
+        s->dsklen_armed = true;
+    } else {
+        s->dsklen_armed = false;
+        amiga_custom_disk_dma(s);
+    }
+}
+
 /* --- register access --- */
 
 static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
@@ -713,7 +812,13 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
                ((s->intreq & INT_RBF) ? SERDATR_RBF | 0x100 | s->serial_rx
                                       : 0);
     case REG_DSKBYTR:
-        return 0;
+        /*
+         * Transfers happen in one go, so no live byte or WORDEQUAL is
+         * ever visible; just reflect the DMA enable state.
+         */
+        return ((s->dsklen & DSKLEN_DMAEN) && (s->dmacon & DMACON_DSKEN)
+                    ? DSKBYTR_DMAON : 0) |
+               ((s->dsklen & DSKLEN_WRITE) ? DSKBYTR_WRITE : 0);
     case REG_INTENAR:
         return s->intena;
     case REG_INTREQR:
@@ -765,6 +870,9 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
         break;
     case REG_ADKCON:
         s->adkcon = setclr(s->adkcon, val, 0x7fff);
+        break;
+    case REG_DSKLEN:
+        amiga_custom_dsklen_write(s, val);
         break;
     case REG_BLTSIZE: {
         int h = (val >> 6) & 0x3ff;
@@ -860,6 +968,9 @@ static void amiga_custom_reset(DeviceState *dev)
     s->ports_levels = 0;
     s->exter_levels = 0;
     s->blit_zero = false;
+    s->dsklen = 0;
+    s->dsklen_armed = false;
+    timer_del(&s->disk_timer);
     memset(s->regs, 0, sizeof(s->regs));
     s->frame_origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
@@ -872,6 +983,8 @@ static void amiga_custom_realize(DeviceState *dev, Error **errp)
 
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL,
                   amiga_custom_vblank, s);
+    timer_init_ns(&s->disk_timer, QEMU_CLOCK_VIRTUAL,
+                  amiga_custom_disk_done, s);
     qemu_chr_fe_set_handlers(&s->chr, amiga_custom_serial_can_receive,
                              amiga_custom_serial_receive, NULL, NULL,
                              s, NULL, true);
@@ -896,9 +1009,12 @@ static void amiga_custom_init(Object *obj)
 
 static const VMStateDescription vmstate_amiga_custom = {
     .name = "amiga-custom",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(dsklen, AmigaCustomState),
+        VMSTATE_BOOL(dsklen_armed, AmigaCustomState),
+        VMSTATE_TIMER(disk_timer, AmigaCustomState),
         VMSTATE_UINT16(intena, AmigaCustomState),
         VMSTATE_UINT16(intreq, AmigaCustomState),
         VMSTATE_UINT16(dmacon, AmigaCustomState),
@@ -921,6 +1037,8 @@ static const Property amiga_custom_properties[] = {
     /* PAL ECS 2MB Agnus / ECS Denise by default */
     DEFINE_PROP_UINT32("agnus-id", AmigaCustomState, agnus_id, 0x22),
     DEFINE_PROP_UINT32("denise-id", AmigaCustomState, denise_id, 0xfc),
+    DEFINE_PROP_LINK("fdc", AmigaCustomState, fdc, TYPE_AMIGA_FDC,
+                     AmigaFDCState *),
 };
 
 static void amiga_custom_class_init(ObjectClass *klass, const void *data)

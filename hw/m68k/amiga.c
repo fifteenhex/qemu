@@ -25,7 +25,9 @@
 #include "hw/core/irq.h"
 #include "hw/m68k/amiga.h"
 #include "hw/m68k/amiga_custom.h"
+#include "hw/m68k/amiga_fdc.h"
 #include "hw/m68k/mos8520.h"
+#include "system/blockdev.h"
 #include "target/m68k/cpu.h"
 
 #define AMIGA_CIAB_BASE     0xbfd000
@@ -99,6 +101,7 @@ static void amiga_machine_init(MachineState *machine)
     AmigaMachineClass *amc = AMIGA_MACHINE_GET_CLASS(machine);
     MemoryRegion *sysmem = get_system_memory();
     ssize_t rom_loaded;
+    DriveInfo *dinfo;
     char *filename;
 
     /*
@@ -152,10 +155,20 @@ static void amiga_machine_init(MachineState *machine)
                              amc->rom_size);
     memory_region_add_subregion_overlap(sysmem, 0, &ams->rom_overlay, 1);
 
+    /* DF0, the internal floppy drive */
+    ams->fdc = qdev_new(TYPE_AMIGA_FDC);
+    dinfo = drive_get(IF_FLOPPY, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(ams->fdc, "drive", blk_by_legacy_dinfo(dinfo));
+    }
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->fdc), &error_fatal);
+
     /* custom chips */
     ams->custom = qdev_new(TYPE_AMIGA_CUSTOM);
     qdev_prop_set_chr(ams->custom, "chardev", serial_hd(0));
     qdev_prop_set_uint32(ams->custom, "agnus-id", amc->agnus_id);
+    object_property_set_link(OBJECT(ams->custom), "fdc", OBJECT(ams->fdc),
+                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->custom), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(ams->custom), 0, AMIGA_CUSTOM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(ams->custom), 0,
@@ -181,6 +194,35 @@ static void amiga_machine_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(ams->ciab), 0,
                        qdev_get_gpio_in_named(ams->custom, "cia-irq", 1));
 
+    /*
+     * DF0: control lines on CIA-B port B, status lines on CIA-A port
+     * A, and the index pulse on CIA-B FLAG.
+     */
+    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_SEL0,
+                                qdev_get_gpio_in_named(ams->fdc, "sel", 0));
+    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_MTR,
+                                qdev_get_gpio_in_named(ams->fdc, "mtr", 0));
+    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_STEP,
+                                qdev_get_gpio_in_named(ams->fdc, "step", 0));
+    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_DIR,
+                                qdev_get_gpio_in_named(ams->fdc, "dir", 0));
+    qdev_connect_gpio_out_named(ams->ciab, "port-b-out", AMIGA_CIAB_PB_SIDE,
+                                qdev_get_gpio_in_named(ams->fdc, "side", 0));
+    qdev_connect_gpio_out_named(ams->fdc, "chng", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_CHNG));
+    qdev_connect_gpio_out_named(ams->fdc, "wpro", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_WPRO));
+    qdev_connect_gpio_out_named(ams->fdc, "tk0", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_TK0));
+    qdev_connect_gpio_out_named(ams->fdc, "rdy", 0,
+                                qdev_get_gpio_in_named(ams->ciaa, "port-in",
+                                                       AMIGA_CIAA_PA_RDY));
+    qdev_connect_gpio_out_named(ams->fdc, "index", 0,
+                                qdev_get_gpio_in_named(ams->ciab, "flag", 0));
+
     if (amc->board_init) {
         amc->board_init(ams);
     }
@@ -194,7 +236,6 @@ static void amiga_machine_class_init(ObjectClass *oc, const void *data)
     mc->init = amiga_machine_init;
     mc->block_default_type = IF_NONE;
     mc->no_parallel = 1;
-    mc->no_floppy = 1;
     mc->no_cdrom = 1;
 
     /* PAL defaults */
