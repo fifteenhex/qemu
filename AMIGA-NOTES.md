@@ -39,13 +39,21 @@ Run it with `-M a4000 -bios kick31_a4000.rom`; disks attach the same way.
     # optional disk: -drive if=scsi,file=hd.img,format=raw
     # serial (Paula):  -serial stdio
 
-## Current state (2026-07-19, evening)
+## Current state (2026-07-20)
+
+Two machines now: `a3000` (68030, ECS) and `a4000` (68040, AGA).  Both
+boot Kickstart 3.1 to the insert-floppy screen and run Workbench 3.1
+from a floppy; the A4000 needs its own Kickstart (see above).  The
+A4000 renders through the ECS display path for now (no real AGA), and
+its onboard IDE is not modelled, so it has no hard disk yet — the two
+open follow-ups for a "real" A4000.  See the A4000 item under "Open
+items" for the details and next steps a new session should pick up.
 
 Kickstart 3.1 boots all the way to the insert-floppy screen with the
-animation running (560x145 hires, 3 planes, purple background; the
-disk animates into the drive).  Chip RAM (2MB) and fast RAM (-m, up
-to 16MB below 0x08000000) are detected correctly; exec multitasks;
-scsi.device initialises and probes the bus.
+animation running (a copper split: hires logo panel over a hires drive
+panel, purple background; the disk animates into the drive).  Chip RAM
+(2MB) and fast RAM (-m, up to 16MB below 0x08000000) are detected
+correctly; exec multitasks; scsi.device initialises and probes the bus.
 
 Floppy boot works: `-drive if=floppy,file=x.adf,format=raw` gives a
 DF0 (hw/m68k/amiga_fdc.c) that encodes ADF tracks to AmigaDOS MFM on
@@ -63,12 +71,16 @@ half.
 Structure: abstract `amiga-common` machine class (hw/m68k/amiga.c)
 holds everything all classic Amigas share — chip RAM, Kickstart +
 reset overlay (CIA-A PA0), the two 8520 CIAs, the custom chip block,
-open-bus filler.  `a3000` (hw/m68k/a3000.c) adds the 68030, fast RAM,
-Ramsey/Gary stubs, Zorro III open bus and the SCSI subsystem.
+open-bus filler; a board fills in class params (ROM, chip RAM, CIA
+clock, Agnus/Denise IDs, open-bus extent) and a board_init hook.
+`a3000` (hw/m68k/a3000.c) adds the 68030, fast RAM, Zorro III open bus
+and the SCSI subsystem; `a4000` (hw/m68k/a4000.c) adds the 68040, fast
+RAM and the AGA chip IDs.  The Ramsey memory controller + Fat Gary glue
+they share is the TYPE_AMIGA_MOBO device (hw/m68k/amiga_mobo.c).
 Devices: hw/m68k/mos8520.c (CIA), hw/m68k/amiga_custom.c (interrupts,
 beam counters, serial, blitter incl. line mode and fills, frame-atomic
-copper, bitplane display renderer), hw/m68k/a3000_sdmac.c (SuperDMAC
-with the wd33c93 behind it, INT2).
+copper, split-window-clipped bitplane display renderer),
+hw/m68k/a3000_sdmac.c (SuperDMAC with the wd33c93 behind it, INT2).
 
 See docs/system/target-m68k.rst for the user-facing feature list and
 the individual commit messages for design details and the bugs found
