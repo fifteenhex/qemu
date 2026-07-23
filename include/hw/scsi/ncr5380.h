@@ -47,20 +47,28 @@ struct NCR5380State {
     uint8_t status;
     uint8_t msg_in;
     uint8_t dma_mode;
-    bool xfer_pending;
     bool status_done;
     bool msg_done;
 
-    /* current data-phase buffer, owned by the SCSI layer */
-    uint8_t *buf;
+    /*
+     * Whole-transfer data buffer, owned by the controller.  Data-in
+     * transfers are pre-read in full at do_command time so the guest's
+     * blind/pseudo-DMA reads never race an in-flight aiocb; data-out
+     * transfers are collected here in full before being fed to the
+     * SCSI layer.
+     */
+    uint8_t *dbuf;
+    uint32_t dbuf_size;
     uint32_t buf_len;
     uint32_t buf_pos;
-    uint8_t *async_buf;
-    uint32_t async_len;
+    uint32_t out_pos;       /* data-out: bytes already fed to the device */
+    bool collecting;        /* inside the synchronous transfer pump */
+    bool cmd_done;          /* completion callback has run */
 };
 
 void ncr5380_ack(NCR5380State *s);
 void ncr5380_ack_release(NCR5380State *s);
+bool ncr5380_pdma_ready(NCR5380State *s, bool out);
 uint8_t ncr5380_pdma_read(NCR5380State *s);
 void ncr5380_pdma_write(NCR5380State *s, uint8_t val);
 

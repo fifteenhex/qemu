@@ -405,10 +405,15 @@ ncr53c720_command_complete(uint32_t status) "status %d"
 ncr53c720_bus_free(void) "disconnect"
 
 # ncr5380.c
-ncr5380_read(int reg, uint8_t val) "reg[%d] -> 0x%02x"
-ncr5380_write(int reg, uint8_t val) "reg[%d] <- 0x%02x"
+ncr5380_read(int reg, uint8_t val, uint64_t pc) "reg[%d] -> 0x%02x pc 0x%08" PRIx64
+ncr5380_write(int reg, uint8_t val, uint64_t pc) "reg[%d] <- 0x%02x pc 0x%08" PRIx64
 ncr5380_select_ok(int target) "selected target %d"
 ncr5380_select_timeout(void) "selection timeout"
 ncr5380_command(uint8_t cdb0, int len) "SCSI command 0x%02x (%d bytes)"
 ncr5380_transfer(uint32_t len) "data phase %u bytes"
 ncr5380_complete(uint8_t status) "command complete status 0x%02x"
+ncr5380_pdma_rd(uint8_t val) "pdma -> 0x%02x"
+ncr5380_pdma_wr(uint8_t val) "pdma <- 0x%02x"
+ncr5380_datain(uint8_t cdb0, uint32_t lba, uint32_t len, uint32_t sum) "cdb 0x%02x lba %u len %u sum 0x%08x"
+ncr5380_stale_read(uint32_t pos, uint32_t len) "stale DI read at %u/%u"
+ncr5380_cmd_pc(uint64_t pc) "command issued from pc 0x%08" PRIx64

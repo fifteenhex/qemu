@@ -19,7 +19,9 @@
 #include "scsi/constants.h"
 #include "scsi/utils.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/cpu.h"
 #include "migration/vmstate.h"
+#include "system/block-backend.h"
 #include "hw/scsi/ncr5380.h"
 #include "trace.h"
 
@@ -93,6 +95,19 @@
 
 static void ncr5380_do_command(NCR5380State *s);
 
+static uint64_t ncr5380_guest_pc(void)
+{
+    if (current_cpu) {
+        CPUClass *cc = CPU_GET_CLASS(current_cpu);
+
+        if (cc->get_pc) {
+            return cc->get_pc(current_cpu);
+        }
+    }
+    return 0;
+}
+
+
 static void ncr5380_update_irq(NCR5380State *s)
 {
     int level = (s->bsr & BSR_IRQ) ? 1 : 0;
@@ -119,34 +134,84 @@ static void ncr5380_reset_bus(NCR5380State *s)
     s->cmd_len = 0;
     s->buf_len = 0;
     s->buf_pos = 0;
+    s->out_pos = 0;
+    s->collecting = false;
+    s->cmd_done = false;
     s->status = 0;
     s->msg_in = 0;
 }
 
-/* pull the next chunk of a data-in transfer from the SCSI layer */
-static void ncr5380_fill_buffer(NCR5380State *s)
+static void ncr5380_grow_dbuf(NCR5380State *s, uint32_t size)
 {
-    if (!s->req || s->buf_pos < s->buf_len) {
-        return;
+    if (s->dbuf_size < size) {
+        s->dbuf = g_realloc(s->dbuf, size);
+        s->dbuf_size = size;
     }
-    if (s->async_len == 0) {
-        return;
-    }
-    s->buf = s->async_buf;
-    s->buf_len = s->async_len;
-    s->buf_pos = 0;
 }
 
-static void ncr5380_command_complete(SCSIRequest *req, size_t resid);
+/*
+ * Run the AIO machinery until the current request's completion callback
+ * has fired.  Called with the whole-transfer buffer in place, so every
+ * transfer_data callback immediately re-continues the request: the
+ * command runs to completion synchronously from the guest's viewpoint.
+ */
+static void ncr5380_pump(NCR5380State *s)
+{
+    while (!s->cmd_done && s->req) {
+        if (s->dev && s->dev->conf.blk) {
+            blk_drain(s->dev->conf.blk);
+        } else {
+            aio_poll(qemu_get_aio_context(), true);
+        }
+    }
+}
+
+/* all data consumed/delivered: move the bus to the STATUS phase */
+static void ncr5380_enter_status(NCR5380State *s)
+{
+    ncr5380_set_phase(s, PHASE_ST);
+    s->last_data = s->status;
+    s->status_done = false;
+    s->msg_done = false;
+    s->bsr &= ~BSR_DRQ;
+    /*
+     * REQ for the new phase may be asserted only when the initiator is
+     * not holding ACK; otherwise ncr5380_ack_release asserts it.
+     */
+    if (!(s->icr & ICR_ASSERT_ACK)) {
+        s->csb |= CSB_REQ;
+    }
+}
+
+/* the guest delivered the last data-out byte: feed it all to the device */
+static void ncr5380_flush_data_out(NCR5380State *s)
+{
+    if (!s->req) {
+        return;
+    }
+    s->out_pos = 0;
+    s->collecting = true;
+    scsi_req_continue(s->req);
+    ncr5380_pump(s);
+    s->collecting = false;
+    ncr5380_enter_status(s);
+}
 
 static void ncr5380_do_command(NCR5380State *s)
 {
-    uint32_t buflen;
+    int32_t buflen;
 
     if (!s->dev) {
         return;
     }
     trace_ncr5380_command(s->cmd[0], s->cmd_len);
+    if (trace_event_get_state_backends(TRACE_NCR5380_CMD_PC) && current_cpu) {
+        CPUClass *cc = CPU_GET_CLASS(current_cpu);
+
+        if (cc->get_pc) {
+            trace_ncr5380_cmd_pc(cc->get_pc(current_cpu));
+        }
+    }
     /*
      * The Mac ROM's boot reader is "blind": it does not issue TEST UNIT
      * READY / REQUEST SENSE to absorb the power-on UNIT ATTENTION that a
@@ -156,32 +221,73 @@ static void ncr5380_do_command(NCR5380State *s)
      */
     s->dev->unit_attention.key = 0;
     s->bus.unit_attention.key = 0;
-    s->req = scsi_req_new(s->dev, 0, s->lun, s->cmd, s->cmd_len, s);
-    buflen = scsi_req_enqueue(s->req);
-    s->async_len = 0;
+    s->cmd_done = false;
     s->buf_len = 0;
     s->buf_pos = 0;
+    s->out_pos = 0;
+    s->req = scsi_req_new(s->dev, 0, s->lun, s->cmd, s->cmd_len, s);
+    buflen = scsi_req_enqueue(s->req);
 
-    if (buflen != 0) {
+    if (buflen > 0 && !s->cmd_done) {
         /*
-         * Data phase.  The first chunk is fetched by ncr5380_ack_release
-         * (which runs right after this, on the final command byte's ACK
-         * release); kicking scsi_req_continue here as well would start a
-         * second async transfer and trip the scsi-disk in-flight assert.
+         * Data-in.  Pre-read the ENTIRE transfer synchronously before
+         * showing the guest the data phase.  The Mac ROM/SCSI Manager
+         * reads blind (pseudo-DMA, or CSD polling with a trailing
+         * "handshake until the phase changes" loop): if the DI->ST
+         * transition waited on an async aiocb, the trailing loop would
+         * clock in phantom stale bytes past the real transfer and
+         * corrupt the guest's buffer (observed: 515 phantom bytes after
+         * a 512-byte READ -> double MMU fault).
          */
-        if (s->req->cmd.mode == SCSI_XFER_FROM_DEV) {
-            ncr5380_set_phase(s, PHASE_DI);
-        } else {
-            ncr5380_set_phase(s, PHASE_DO);
+        ncr5380_grow_dbuf(s, buflen);
+        s->collecting = true;
+        scsi_req_continue(s->req);
+        ncr5380_pump(s);
+        s->collecting = false;
+        if (trace_event_get_state_backends(TRACE_NCR5380_DATAIN)) {
+            uint32_t sum = 0, lba = 0, i;
+
+            for (i = 0; i < s->buf_len; i++) {
+                sum = (sum * 31 + s->dbuf[i]) & 0xffffffff;
+            }
+            if (s->cmd[0] == 0x08) {
+                lba = ((s->cmd[1] & 0x1f) << 16) | (s->cmd[2] << 8)
+                    | s->cmd[3];
+            } else if (s->cmd[0] == 0x28) {
+                lba = (s->cmd[2] << 24) | (s->cmd[3] << 16)
+                    | (s->cmd[4] << 8) | s->cmd[5];
+            }
+            trace_ncr5380_datain(s->cmd[0], lba, s->buf_len, sum);
         }
-    } else {
-        /* no data; wait for completion callback to move to STATUS */
+        if (s->buf_len > 0) {
+            ncr5380_set_phase(s, PHASE_DI);
+            s->buf_pos = 0;
+            s->last_data = s->dbuf[0];
+            s->bsr |= BSR_DRQ;
+            if (!(s->icr & ICR_ASSERT_ACK)) {
+                s->csb |= CSB_REQ;
+            }
+        } else {
+            ncr5380_enter_status(s);
+        }
+    } else if (buflen < 0 && !s->cmd_done) {
+        /*
+         * Data-out: collect the whole transfer from the guest first;
+         * ncr5380_flush_data_out feeds it to the device when the last
+         * byte arrives.
+         */
+        ncr5380_grow_dbuf(s, -buflen);
+        s->buf_len = -buflen;
+        s->buf_pos = 0;
+        ncr5380_set_phase(s, PHASE_DO);
+        s->bsr |= BSR_DRQ;
+        if (!(s->icr & ICR_ASSERT_ACK)) {
+            s->csb |= CSB_REQ;
+        }
     }
     /*
-     * REQ for the new phase is asserted only once the initiator releases
-     * ACK from the final command byte (see ncr5380_ack_release); asserting
-     * it here, while ACK is still high, would make the driver's "wait for
-     * REQ to clear" handshake on the last command byte deadlock.
+     * No-data commands complete during scsi_req_enqueue: the completion
+     * callback has already moved the bus to the STATUS phase.
      */
 }
 
@@ -211,8 +317,8 @@ static void ncr5380_select(NCR5380State *s)
         s->cmd_len = 0;
         trace_ncr5380_select_ok(s->target);
     } else {
-        /* selection timeout: no BSY appears */
-        s->csb &= ~CSB_BSY;
+        /* selection timeout: no BSY appears; the bus stays released */
+        s->csb = 0;
         trace_ncr5380_select_timeout();
     }
 }
@@ -232,17 +338,16 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
          * and step to the next so successive reads drain the buffer.
          */
         if (s->phase == PHASE_DI) {
-            ncr5380_fill_buffer(s);
             if (s->buf_pos < s->buf_len) {
-                val = s->buf[s->buf_pos];
+                val = s->dbuf[s->buf_pos++];
                 s->last_data = val;
-                s->buf_pos++;
-                if (s->buf_pos >= s->buf_len && s->async_len == 0
-                    && s->req && !s->xfer_pending) {
-                    s->xfer_pending = true;
-                    scsi_req_continue(s->req);
-                }
+                /*
+                 * Buffer exhausted?  The DI->ST transition happens on
+                 * the ACK release that follows this read (the ROM's
+                 * per-byte handshake), see ncr5380_ack_release.
+                 */
             } else {
+                trace_ncr5380_stale_read(s->buf_pos, s->buf_len);
                 val = s->last_data;
             }
         } else if (s->phase & CSB_IO) {
@@ -291,7 +396,7 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
         break;
     }
 
-    trace_ncr5380_read(reg, (uint8_t)val);
+    trace_ncr5380_read(reg, (uint8_t)val, ncr5380_guest_pc());
     return val;
 }
 
@@ -301,7 +406,7 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
     NCR5380State *s = opaque;
     int reg = (addr >> s->reg_shift) & 7;
 
-    trace_ncr5380_write(reg, (uint8_t)val);
+    trace_ncr5380_write(reg, (uint8_t)val, ncr5380_guest_pc());
 
     switch (reg) {
     case R_ODR:
@@ -385,7 +490,7 @@ void ncr5380_ack(NCR5380State *s)
         break;
     case PHASE_DO:
         if (s->buf_pos < s->buf_len) {
-            s->buf[s->buf_pos++] = s->odr;
+            s->dbuf[s->buf_pos++] = s->odr;
         }
         break;
     case PHASE_ST:
@@ -415,20 +520,15 @@ void ncr5380_ack_release(NCR5380State *s)
     case PHASE_DI:
         if (s->phase == PHASE_DI) {
             if (s->buf_pos < s->buf_len) {
-                s->last_data = s->buf[s->buf_pos];
+                s->last_data = s->dbuf[s->buf_pos];
                 s->csb |= CSB_REQ;
             } else {
                 /*
-                 * Chunk drained.  Ask the SCSI layer for the next chunk
-                 * (async): transfer_data or command_complete will assert
-                 * REQ for the next data byte or the status phase.
+                 * Whole transfer consumed: move to STATUS right here,
+                 * synchronously, so the initiator's very next phase
+                 * poll sees the change (no phantom-data window).
                  */
-                s->buf_len = 0;
-                s->buf_pos = 0;
-                if (s->req && !s->xfer_pending) {
-                    s->xfer_pending = true;
-                    scsi_req_continue(s->req);
-                }
+                ncr5380_enter_status(s);
             }
             break;
         }
@@ -440,12 +540,8 @@ void ncr5380_ack_release(NCR5380State *s)
         if (s->buf_pos < s->buf_len) {
             s->csb |= CSB_REQ;
         } else {
-            s->buf_len = 0;
-            s->buf_pos = 0;
-            if (s->req && !s->xfer_pending) {
-                s->xfer_pending = true;
-                scsi_req_continue(s->req);
-            }
+            /* last byte received: run the whole transfer synchronously */
+            ncr5380_flush_data_out(s);
         }
         break;
     case PHASE_ST:
@@ -459,8 +555,15 @@ void ncr5380_ack_release(NCR5380State *s)
         break;
     case PHASE_MI:
         if (s->msg_done) {
-            /* bus free: end of transaction */
-            s->csb &= ~(CSB_BSY | CSB_REQ);
+            /*
+             * Bus free: end of transaction.  The target releases ALL
+             * bus lines, phase lines included: CSB must read 0.  Stale
+             * phase bits (0x1c) latched here make the Mac driver's
+             * wait-for-bus-free poll spin into its timeout and fail an
+             * otherwise perfect transfer.
+             */
+            s->csb = 0;
+            s->phase = PHASE_DO;
             s->bsr |= BSR_IRQ;
             ncr5380_update_irq(s);
             if (s->req) {
@@ -477,34 +580,46 @@ void ncr5380_ack_release(NCR5380State *s)
     }
 }
 
+/*
+ * Is a pseudo-DMA byte ready to move?  The Mac's handshake aperture
+ * bus-errors when DRQ does not arrive in time; the machine uses this
+ * to fault accesses outside an active data phase.
+ */
+bool ncr5380_pdma_ready(NCR5380State *s, bool out)
+{
+    uint8_t want = out ? PHASE_DO : PHASE_DI;
+
+    return s->phase == want && s->buf_pos < s->buf_len;
+}
+
 /* pseudo-DMA data movement: one byte per aperture access */
 uint8_t ncr5380_pdma_read(NCR5380State *s)
 {
     uint8_t v = 0;
 
-    ncr5380_fill_buffer(s);
-    if (s->buf_pos < s->buf_len) {
-        v = s->buf[s->buf_pos++];
+    if (s->phase == PHASE_DI && s->buf_pos < s->buf_len) {
+        v = s->dbuf[s->buf_pos++];
         s->last_data = v;
-    }
-    if (s->buf_pos >= s->buf_len && s->req) {
-        /* chunk drained: fetch the next one or finish → STATUS phase */
-        s->buf_len = 0;
-        s->buf_pos = 0;
-        if (s->async_len == 0) {
-            if (!s->xfer_pending) {
-                s->xfer_pending = true;
-                scsi_req_continue(s->req);
-            }
-        } else {
-            ncr5380_fill_buffer(s);
+        if (s->buf_pos >= s->buf_len) {
+            /*
+             * Transfer complete.  Pseudo-DMA has no per-byte ACK, so
+             * flip to STATUS right now: the blind loop's byte counter
+             * runs out on this access and the ROM's trailing phase
+             * poll must already see the change.
+             */
+            ncr5380_enter_status(s);
         }
+    } else {
+        trace_ncr5380_stale_read(s->buf_pos, s->buf_len);
+        v = s->last_data;
     }
+    trace_ncr5380_pdma_rd(v);
     return v;
 }
 
 void ncr5380_pdma_write(NCR5380State *s, uint8_t val)
 {
+    trace_ncr5380_pdma_wr(val);
     if (s->phase == PHASE_CMD) {
         if (s->cmd_len < (int)sizeof(s->cmd)) {
             s->cmd[s->cmd_len++] = val;
@@ -514,12 +629,15 @@ void ncr5380_pdma_write(NCR5380State *s, uint8_t val)
         }
         return;
     }
-    if (s->buf_pos < s->buf_len) {
-        s->buf[s->buf_pos++] = val;
+    if (s->phase != PHASE_DO) {
+        return;
     }
-    if (s->buf_pos >= s->buf_len && s->req && !s->xfer_pending) {
-        s->xfer_pending = true;
-        scsi_req_continue(s->req);
+    if (s->buf_pos < s->buf_len) {
+        s->dbuf[s->buf_pos++] = val;
+    }
+    if (s->buf_pos >= s->buf_len) {
+        /* whole transfer collected: run it synchronously */
+        ncr5380_flush_data_out(s);
     }
 }
 
@@ -533,27 +651,36 @@ static const MemoryRegionOps ncr5380_ops = {
 
 /* SCSI bus callbacks */
 
+/*
+ * SCSI-layer chunk handover.  Only ever called inside the synchronous
+ * pump: for data-in, append the chunk to the whole-transfer buffer; for
+ * data-out, feed the next chunk of the collected buffer to the device.
+ * Then immediately re-continue so the request runs to completion.
+ */
 static void ncr5380_transfer_data(SCSIRequest *req, uint32_t len)
 {
     NCR5380State *s = req->hba_private;
+    uint8_t *chunk = scsi_req_get_buf(req);
 
     trace_ncr5380_transfer(len);
-    s->xfer_pending = false;
-    s->async_len = len;
-    s->async_buf = scsi_req_get_buf(req);
-    ncr5380_fill_buffer(s);
-    if (s->phase == PHASE_DI && s->buf_pos < s->buf_len) {
-        s->last_data = s->buf[s->buf_pos];
-        /*
-         * Assert REQ for the first byte of this chunk, unless we are
-         * still mid-handshake on the final command byte (ACK high), in
-         * which case ncr5380_ack_release will assert it.
-         */
-        if (!(s->icr & ICR_ASSERT_ACK)) {
-            s->csb |= CSB_REQ;
-        }
+    if (!s->collecting) {
+        /* shouldn't happen with the synchronous pump; drop the chunk */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ncr5380: unexpected transfer_data outside pump\n");
+        return;
     }
-    s->bsr |= BSR_DRQ;
+    if (req->cmd.mode == SCSI_XFER_FROM_DEV) {
+        ncr5380_grow_dbuf(s, s->buf_len + len);
+        memcpy(s->dbuf + s->buf_len, chunk, len);
+        s->buf_len += len;
+    } else {
+        if (s->out_pos + len > s->buf_len) {
+            len = s->buf_len > s->out_pos ? s->buf_len - s->out_pos : 0;
+        }
+        memcpy(chunk, s->dbuf + s->out_pos, len);
+        s->out_pos += len;
+    }
+    scsi_req_continue(req);
 }
 
 static void ncr5380_command_complete(SCSIRequest *req, size_t resid)
@@ -561,19 +688,16 @@ static void ncr5380_command_complete(SCSIRequest *req, size_t resid)
     NCR5380State *s = req->hba_private;
 
     trace_ncr5380_complete(req->status);
-    s->xfer_pending = false;
     s->status = req->status;
-    s->async_len = 0;
+    s->cmd_done = true;
+    if (s->collecting) {
+        /* do_command / flush_data_out set up the next bus phase */
+        return;
+    }
+    /* no-data command: completes during scsi_req_enqueue */
     s->buf_len = 0;
     s->buf_pos = 0;
-    ncr5380_set_phase(s, PHASE_ST);
-    s->last_data = s->status;
-    s->status_done = false;
-    s->msg_done = false;
-    /* REQ asserted by ncr5380_ack_release on the next ACK release */
-    if (!(s->icr & ICR_ASSERT_ACK)) {
-        s->csb |= CSB_REQ;      /* no handshake in flight (no-data command) */
-    }
+    ncr5380_enter_status(s);
 }
 
 static void ncr5380_request_cancelled(SCSIRequest *req)
@@ -584,6 +708,7 @@ static void ncr5380_request_cancelled(SCSIRequest *req)
         scsi_req_unref(s->req);
         s->req = NULL;
         s->dev = NULL;
+        s->cmd_done = true;     /* unblock the pump */
     }
 }
 
