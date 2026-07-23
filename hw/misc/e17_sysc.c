@@ -304,10 +304,9 @@ static void e17_sysc_reset(DeviceState *dev)
     }
     /*
      * CIO1 port B reads the configuration DIP switches, port A bit 7
-     * a console select input.  All-ones = switches open; tune these
-     * as their meaning becomes known.
+     * a console select input.
      */
-    s->cio[0].in[E17_CIO_PORTB] = 0xff;
+    s->cio[0].in[E17_CIO_PORTB] = s->dip_switches;
     s->cio[0].in[E17_CIO_PORTA] = 0x00;
     s->cio[0].in[E17_CIO_PORTC] = 0x00;
 
@@ -373,6 +372,10 @@ static const VMStateDescription vmstate_e17_sysc = {
     }
 };
 
+static const Property e17_sysc_properties[] = {
+    DEFINE_PROP_UINT8("dip-switches", E17SysCState, dip_switches, 0x00),
+};
+
 static void e17_sysc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -380,6 +383,7 @@ static void e17_sysc_class_init(ObjectClass *klass, const void *data)
     dc->desc = "ELTEC Eurocom E17 onboard I/O";
     device_class_set_legacy_reset(dc, e17_sysc_reset);
     dc->vmsd = &vmstate_e17_sysc;
+    device_class_set_props(dc, e17_sysc_properties);
 }
 
 static const TypeInfo e17_sysc_info = {

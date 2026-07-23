@@ -80,6 +80,13 @@ struct E17SysCState {
     uint8_t misc_5c;
     uint8_t cputype;
     uint8_t post_code;      /* last value written to the POST display */
+
+    /*
+     * Configuration DIP switches, read through CIO1 port B.  The low
+     * nibble selects the boot configuration profile (only 0-7 are
+     * valid); the high nibble's meaning is not yet understood.
+     */
+    uint8_t dip_switches;
 };
 
 #endif
