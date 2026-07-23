@@ -154,6 +154,28 @@ callbacks run inside the timer's transaction).
   (CIA-A PA7) is wired to the host middle mouse button so joystick games
   (Deluxe Galaga reads port 2) can be driven.  Directions on port 2 are
   not emulated yet.
+- Super Stardust (AGA) [NOT WORKING, investigated]: the PSG-cracked disk 1
+  boots its crack intro (renders fine), fire advances to the game's own
+  trackloader, which sticks at "INSERT DISK 1".  Traced with the gdbstub
+  (`-s`; register/memory reads come back byte-reversed per long, so read
+  guest memory with QMP pmemsave and disassemble with objdump).  The
+  loader's disk routine (chip RAM ~0x1e0950) selects a drive, checks
+  /CHNG then /RDY, sets DSKSYNC=0x4489 + disk DMA, and waits on DSKBLK.
+  It runs this against **drive 1** (register d4=1 -> selects /SEL1), i.e.
+  the empty df1, and hangs.  Two findings for a future attempt:
+  (1) A real CIA bug: mos8520_port_update() drives the eight port-out
+  qemu_irqs low bit first, so the FDC sees the /SEL edge (PB3) before the
+  MTR level (PB7) within one CIA write and latches the motor off a stale
+  MTR.  Real pins change together; emitting high bit first fixes the
+  motor latch (confirmed via an FDC trace: motor stayed correctly on).
+  Left it OUT for now because it needs regression testing against the
+  working floppy games (trackdisk.device uses separate writes, so it may
+  well be safe) and it did not by itself make Super Stardust boot.
+  (2) Even with the motor latch fixed, the loader still targets the empty
+  df1 and hangs; it likely wants disk 1 in df1 (a two-drive setup) or
+  reads df0 first and rejects it.  `-drive if=floppy,index=1,file=...`
+  did not attach media to df1 in a quick test — worth checking how the
+  machine binds floppy unit 1 before retrying.
 - Split-window widths: the surface is now clipped to the widest display
   window the copper opens across the frame (DIWSTRT/DIWSTOP tracked
   through the journal, sampled at DIWSTOP where both halves are fresh),
