@@ -1,4 +1,5 @@
 system_ss.add(when: 'CONFIG_CADENCE', if_true: files('cadence_uart.c'))
+system_ss.add(when: 'CONFIG_CD2401', if_true: files('cd2401.c'))
 system_ss.add(when: 'CONFIG_CMSDK_APB_UART', if_true: files('cmsdk-apb-uart.c'))
 system_ss.add(when: 'CONFIG_ESCC', if_true: files('escc.c'))
 system_ss.add(when: 'CONFIG_GRLIB', if_true: files('grlib_apbuart.c'))
