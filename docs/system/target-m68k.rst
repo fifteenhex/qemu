@@ -73,6 +73,9 @@ modelled:
 -  A mouse in gameport 0: counters in JOY0DAT, left button on CIA-A
    PA6, right button on the POTGOR Y line.
 
+-  A keyboard on CIA-A's serial port, with the acknowledge handshake;
+   QEMU key events are mapped to Amiga raw keycodes.
+
 -  Paula audio: the four DMA sample channels with per-channel period
    and volume, mixed to a stereo backend (0 and 3 left, 1 and 2
    right), with the AUDx interrupts on buffer loop.  Select a backend
@@ -93,8 +96,8 @@ modelled:
 -  Empty Zorro II/III expansion space, reading as open bus so the
    expansion library sees "no board present".
 
-Notably missing: keyboard input, the battery-backed clock, and
-Zorro expansion boards.  Kickstart finds attached SCSI
+Notably missing: the battery-backed clock and Zorro expansion
+boards.  Kickstart finds attached SCSI
 disks but does not yet boot from them: the first TEST UNIT READY
 fails with a power-on unit attention that scsi.device treats as "no
 disk".

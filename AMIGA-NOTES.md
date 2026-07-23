@@ -83,7 +83,10 @@ callbacks run inside the timer's transaction).
   default there, so attach test disks with `-drive if=scsi,unit=6`.
   Recording/replay of a GUI session: `_amiga_assets/replay_input.py`
   + a log from `-trace input_event_rel -trace input_event_btn`.
-  HD *boot* (no floppy) untested.
+  HD BOOT WORKS: with only `-drive if=scsi,unit=6` and no floppy,
+  Kickstart boot-scans the RDB, mounts the bootable FFS partition and
+  (no startup-sequence) drops to the AmigaDOS CLI.  A full
+  Workbench-on-HD still needs the Install program to copy the OS.
 - Workbench text: FIXED — graphics.library uses the ECS BLTCON0L
   register (0x5a, minterm-byte-only write) once it sees our ECS
   chipset IDs; it was landing in the bare backing store.  Beware of
@@ -91,17 +94,28 @@ callbacks run inside the timer's transaction).
   byte-swaps REGISTER values and MEMORY reads both (reverse each
   long); breakpoint addresses are fine; read guest memory via QMP
   pmemsave while stopped for untangled bytes.
-- Keyboard: input path is CIA-A's serial register; the model already
-  has mos8520_sdr_input() for injection.  Needs the handshake
-  protocol and a QEMU keyboard event handler wiring scancodes.
+- Keyboard: DONE (hw/m68k/amiga_kbd.c).  Feeds Amiga raw keycodes
+  into CIA-A's SDR; CIA-A gained an 'sp-out' line pulsed when the
+  guest drives SPMODE to output (keyboard.device's ack handshake),
+  which advances the key queue.  Host key events are Linux keycodes,
+  so map via qemu_input_linux_to_qcode() first.  Verified live: booted
+  to the AmigaDOS CLI and typed at the '1>' prompt.
+- Window close gadget: Daniel reports it doesn't work.  Investigated
+  via synthetic mouse — window DRAG (title bar) works, but the close
+  gadget never highlights/closes even with the pointer's hotspot
+  apparently in the ~16px box (many precise tries; calibrated ~1
+  count/px X, ~2 counts/px Y, corner=logical 0,0).  Real
+  close-gadget/RELVERIFY bug or sub-pixel synthetic-aim miss — needs a
+  human repro or Intuition-MouseXY-based positioning to settle.  Icon
+  double-click, app gadgets and window drag all work.
 - Display gaps: attached sprites, sprite/playfield priority
   (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
-- Not modelled: audio, keyboard (CIA-A SDR handshake), battery clock
-  (RP5C01 at 0xdc0000, currently open bus), Zorro slots.  Floppy: no
-  disk change/eject at runtime yet (fixed media; two-disk games can
-  put disk 2 in DF1 instead), only 880KB DD ADFs.
+- Not modelled: battery clock (RP5C01 at 0xdc0000, currently open
+  bus), Zorro slots.  Floppy: no disk change/eject at runtime yet
+  (fixed media; two-disk games can put disk 2 in DF1 instead), only
+  880KB DD ADFs.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 
