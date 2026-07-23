@@ -238,16 +238,14 @@ Things learned while bringing it up:
   0xfec660fb is LIVR with the interrupt type in bits 1:0.
 
 Known issues / next steps, roughly in order:
-1. "RAM available : 65535 MBytes": the firmware sizes DRAM by writing
-   at 1MB steps expecting a bus error past the end; accesses beyond
-   -m size need to fault (map a bus-error region or check the
-   transaction-failed path) so sizing terminates.
-2. "### Error in hook initialization routine" + one bus error at a
-   garbage address + "Wrong parameter checksum": fresh/empty NVRAM.
-   Understand the NVRAM layout (config block checksummed at 0x800 in
-   DRAM, "system area" 0xdff bytes), consider persisting via
-   -drive if=mtd like mvme147, and model the RTC time registers
-   (chip still not identified — DS1386-like, byte lane 3).
+1. Boot noise + wrong RAM size — one interlinked problem, partially
+   analysed (see "The boot-time hook crash" below for everything
+   known).  Continue from there.
+2. NVRAM: `we` at the prompt fixes the "Wrong parameter checksum"
+   warning for the current run; persist the NVRAM (and battery SRAM)
+   via -drive if=mtd like mvme147 so it survives restarts.  Model the
+   RTC time registers (chip still not identified — DS1386-like, byte
+   lane 3).
 3. Real 53C710 model for SCSI disk boot ("boot" command, LynxOS),
    or port/extend an existing 53c9x-family model — QEMU has none for
    the 710.
@@ -261,3 +259,61 @@ Known issues / next steps, roughly in order:
 
 NOTE: another session is working on this same branch — always
 `git pull --rebase` before pushing.
+
+## The boot-time hook crash (open investigation)
+
+Symptom, in serial output order: "### Reserved (1) Exception",
+"### Error in hook initialization routine", (first boot only:
+"Wrong parameter checksum" + "Reading default configuration values
+from EPROM"), "### Bus Error Exception at address 2f0841ee", and
+"RAM available : 65535 MBytes".  The monitor is fully usable
+afterwards; bus errors at the prompt recover cleanly.
+
+What was established (all in rmon 3.1.3 addresses):
+
+- fe807cc6 is the startup/configuration routine, called once from
+  fe800d88 with the POST flags.  It reads the DIP switches (CIO1
+  port B), copies a configuration profile to DRAM 0x800 (profiles at
+  ROM fe801f5e/fe80275e/fe802f5e/fe800f5e, chosen by the jump table
+  at fe807d78 on the switch low nibble; out-of-range goes through
+  fe804096 = read-from-NVRAM with the checksum warning), forces the
+  console device byte config[0x459] to 0x11 (= serial) when the
+  video-absent POST flag is set, runs the device inits
+  (fe8041f8/fe804380/fe804490/fe80453c/fe8045b4/fe804698), then:
+  - config[0x348] "Additional Init" hook: if != 0xffffffff, call it
+    under a setjmp (fe806f06 = setjmp: saves full context at
+    fp+0x2338, returns 0; the generic exception handler fe806f88
+    longjmps back with the exception number in d0).  On error:
+    fe808288 prints "### <name> Exception" (names at fe807644,
+    16-byte entries) and fe81e03c prints the string at fe807b98
+    ("hook initialization" error).
+  - then a user-module autostart: pointer = config[0x34c], defaulting
+    to 0xfea00000 (battery SRAM!) when 0xffffffff; launched through
+    setjmp + fe80714c, gated by config[0x370] bits and the warm-boot
+    flag (checks around fe808128).
+  - RAM sizing (fe8045ca) runs only AFTER all this and stores the
+    size in config[0x496]; the "65535 MBytes" is its 0xffff error
+    return, a consequence of the earlier crash (vector 2 in DRAM
+    holds garbage 0x2f0841ee at that point — instruction bytes from
+    fe806f8c, i.e. from inside the generic exception handler — so
+    the sizing bus error at end-of-DRAM double-faults).
+- The setup menu ("setup" -> f Hooks) shows all four hook parameters
+  as ffffffff, and a gdb breakpoint confirms config[0x348..0x357] ==
+  ffffffff right before the hook check on the first pass — yet the
+  hook error still prints, and a breakpoint at fe808050 fires with
+  a1=fe806f88 (the generic exception handler!) and a0=0.  So some
+  path reaches the hook-call code with a0 (config base) = 0, reading
+  the "hook pointer" from DRAM 0x348 = the exception vector table
+  (vector 210), which holds fe806f88.  Who calls fe807cc6 (or jumps
+  into its middle) with a0=0 is THE open question.  Next session:
+  breakpoint fe808044 with a proper register dump each hit (it fires
+  more than once), and/or watch DRAM 0x8 for the write of 0x2f0841ee
+  (gdb: set endian big!  the qemu stub + gdb-multiarch otherwise
+  byte-swaps register values).
+
+Debug tips that work: qemu -gdb tcp::PORT -S plus gdb-multiarch
+batch scripts ("set architecture m68k" + "set endian big"); rwatch on
+ROM string addresses to catch prints; -d int shows only real
+exceptions (the hook error prints WITHOUT any logged exception, so
+the "Reserved (1)" report is made up from state, not a taken CPU
+exception).
