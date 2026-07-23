@@ -52,14 +52,23 @@ modelled:
 -  The blitter, including line mode and area fill.  Blits complete
    instantly.
 
--  A frame-atomic copper: the list is executed at each vertical
-   blank with every WAIT considered satisfied, which is enough for
-   displays that reload pointers and palettes per frame but not for
-   beam-synchronous raster effects.
+-  A line-granular copper: the list is executed at each vertical
+   blank with every WAIT considered satisfied, but display register
+   writes are replayed by the renderer at the line of the preceding
+   WAIT, so per-line palettes and mid-frame screen splits render.
+   Effects keyed to the horizontal beam position do not.
 
 -  A bitplane display: lores and hires, up to 6 planes with
-   extra-half-brite, rendered from the current frame's registers to a
-   QEMU console.  Sprites, HAM and dual playfield are not drawn.
+   extra-half-brite, rendered to a QEMU console.  Sprites, HAM and
+   dual playfield are not drawn.
+
+-  Paula disk DMA and a floppy drive as DF0, backed by a plain 880KB
+   ADF image given with ``-drive if=floppy``.  Reads encode the track
+   into standard AmigaDOS MFM on the fly (both trackdisk.device and
+   custom trackloaders work), writes decode it back into the image.
+
+-  A mouse in gameport 0: counters in JOY0DAT, left button on CIA-A
+   PA6, right button on the POTGOR Y line.
 
 -  The Paula serial port, connected to the first QEMU serial device
    (``-serial``).
@@ -74,11 +83,11 @@ modelled:
 -  Empty Zorro II/III expansion space, reading as open bus so the
    expansion library sees "no board present".
 
-Notably missing: keyboard and mouse input, sprites, audio and floppy
-DMA, the battery-backed clock, and Zorro expansion boards.  Kickstart
-finds attached SCSI disks but does not yet boot from them: the first
-TEST UNIT READY fails with a power-on unit attention that scsi.device
-treats as "no disk".
+Notably missing: keyboard input, sprites, audio, the battery-backed
+clock, and Zorro expansion boards.  Kickstart finds attached SCSI
+disks but does not yet boot from them: the first TEST UNIT READY
+fails with a power-on unit attention that scsi.device treats as "no
+disk".
 
 Booting
 ~~~~~~~
@@ -93,7 +102,11 @@ setups, where a bonus ROM loads the real Kickstart from disk, are not
 supported.
 
 Kickstart 3.1 boots to the insert-floppy screen, with the animation
-running on the QEMU console.
+running on the QEMU console, and boots bootable ADF images from the
+floppy::
+
+   qemu-system-m68k -M a3000 -bios kick.rom \
+       -drive if=floppy,file=game.adf,format=raw
 
 Adding other Amiga models
 ~~~~~~~~~~~~~~~~~~~~~~~~~
