@@ -219,6 +219,11 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
     qemu-system-m68k -M e17 -bios rmon.bin
     # rmon.bin: 256KB or the 1MB bitsavers dump, see "Firmware" above
 
+The board was offered with a 68060 as well; -cpu m68060 works and
+RMON identifies it through its movec-PCR probe ("for the Eurocom 27
+- 68060" in the banner).  See "Running as a 68060" below for what
+that needed in target/m68k.
+
 With video fitted (the default) RMON adopts the 800x600 framebuffer
 as its console and the AT keyboard for input, so the machine is a
 fully interactive monitor in the QEMU display window; serial port 1
@@ -676,3 +681,25 @@ sendkey h/e/l/p/ret against the video console, screendump shows the
 echoed command and the full help screen rendered on the 800x600
 framebuffer.  The machine is now fully interactive in a QEMU
 display window (RMON factory console: video out + AT keyboard in).
+
+
+## Running as a 68060 (2026-07-20, late)
+
+The E17/E27 shipped with a 68060 option and RMON carries both CPU
+paths (it probes by executing movec from PCR, which traps on the
+68040).  -cpu m68060 now boots to a clean banner ("for the Eurocom
+27 - 68060", CPU type register at 0xfec5e000 written 4), and the
+SCSI scan runs; the machine restricts -cpu to m68040/m68060.
+
+QEMU's m68060 model needed fixes for RMON's very first instructions
+(all upstreamable):
+- CINV/CPUSH and PFLUSH were registered for the 68040 feature only,
+  but the 68060 keeps all of them (it drops PTEST) — RMON F-lined
+  on the cinva at fe8005e4 before any console output.
+- movec to/from ITT0/ITT1/DTT0/DTT1 was 68040-gated; the 68060 has
+  the same transparent translation registers (RMON sets DTT0/DTT1
+  right after the cache invalidate).
+- movec to/from PCR/BUSCR was cpu_abort().  PCR is now modelled:
+  identification 0x0430, revision 1, writable EDEBUG/dFP/ESS bits
+  (0x83); BUSCR is plain storage.  RMON's CPU probe reads PCR and
+  runs the 68060 setup path with it.
