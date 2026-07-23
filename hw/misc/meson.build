@@ -171,3 +171,4 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 # DragonBall
 system_ss.add(when: 'CONFIG_DRAGONBALL_PLL', if_true: files('dragonball_pll.c'))
+system_ss.add(when: 'CONFIG_DRAGONBALL_SCR', if_true: files('dragonball_scr.c'))
