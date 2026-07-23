@@ -3,8 +3,7 @@
  *
  * 68030 + 68882 at 25MHz, ECS chipset with 2MB chip RAM, motherboard
  * fast RAM below 0x08000000 behind the Ramsey memory controller, Fat
- * Gary bus glue, and a WD33C93A SCSI controller behind the SuperDMAC
- * (not yet modelled).
+ * Gary bus glue, and a WD33C93A SCSI controller behind the SuperDMAC.
  *
  * Memory map (motherboard):
  *   0x00000000  chip RAM (2MB)
@@ -27,8 +26,9 @@
 #include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "hw/core/boards.h"
-#include "hw/misc/unimp.h"
 #include "hw/m68k/amiga.h"
+#include "hw/m68k/a3000_sdmac.h"
+#include "hw/scsi/wd33c93.h"
 #include "target/m68k/cpu.h"
 
 #define A3000_SUPERDMAC_BASE    0xdd0000
@@ -119,6 +119,7 @@ static void a3000_board_init(AmigaMachineState *ams)
     A3000MachineState *s = A3000_MACHINE(ams);
     MachineState *machine = MACHINE(ams);
     MemoryRegion *sysmem = get_system_memory();
+    DeviceState *sbic_dev, *sdmac_dev;
 
     /* motherboard fast RAM sits below 0x08000000, sized by Kickstart */
     if (machine->ram_size > 16 * MiB) {
@@ -135,9 +136,17 @@ static void a3000_board_init(AmigaMachineState *ams)
                           "a3000.mobo", 0x2000);
     memory_region_add_subregion(sysmem, A3000_RAMSEY_BASE, &s->mobo);
 
-    /* SuperDMAC + WD33C93A SCSI: not modelled yet */
-    create_unimplemented_device("a3000.superdmac", A3000_SUPERDMAC_BASE,
-                                0x10000);
+    /* WD33C93A SBIC behind the SuperDMAC, interrupting on INT2 */
+    sbic_dev = qdev_new(TYPE_WD33C93);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(sbic_dev), &error_fatal);
+    sdmac_dev = qdev_new(TYPE_A3000_SDMAC);
+    object_property_set_link(OBJECT(sdmac_dev), "sbic", OBJECT(sbic_dev),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(sdmac_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(sdmac_dev), 0, A3000_SUPERDMAC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(sdmac_dev), 0,
+                       qdev_get_gpio_in_named(ams->custom, "ports-irq", 0));
+    scsi_bus_legacy_handle_cmdline(&WD33C93(sbic_dev)->bus);
 
     /*
      * Zorro III configuration space: with no boards present,
@@ -158,6 +167,7 @@ static void a3000_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68030");
     mc->default_ram_size = 8 * MiB;
     mc->default_ram_id = "amiga.fastram";
+    mc->block_default_type = IF_SCSI;
 
     amc->rom_base = 0xf80000;
     amc->rom_size = 512 * KiB;
