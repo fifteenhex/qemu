@@ -50,6 +50,7 @@
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "system/rtc.h"
+#include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "hw/display/framebuffer.h"
@@ -137,6 +138,40 @@
 
 /* 60.15 Hz vertical blank */
 #define VIA_60HZ_TIMER_PERIOD_NS 16625800
+
+/*
+ * The M0110 keyboard, bit-banged over the VIA shift register with the
+ * keyboard supplying the clock.  The Mac sends a one-byte command
+ * (ACR shift-out under external clock) and the keyboard answers with
+ * one byte; a key transition is (keycode << 1) | 1 with bit 7 set on
+ * release.  The keyboard sits on an Inquiry until it has a key or
+ * ~0.25s passes (Null), so the driver's re-Inquiry loop stays calm.
+ */
+#define KBD_CMD_INQUIRY    0x10
+#define KBD_CMD_INSTANT    0x14
+#define KBD_CMD_MODEL      0x16
+#define KBD_CMD_TEST       0x36
+#define KBD_REPLY_NULL     0x7b
+#define KBD_REPLY_TEST_ACK 0x7d
+/* bit 0 always set, bits 1-3 the keyboard model number */
+#define KBD_REPLY_MODEL    0x0b
+
+/* one byte at the keyboard's ~3 kbit/s takes ~0.5ms to shift */
+#define KBD_SHIFT_NS       500000
+/* an Inquiry with nothing to say answers Null after a quarter second */
+#define KBD_NULL_DELAY_NS  250000000
+
+/* VIA ACR shift-register mode field */
+#define VIA_ACR_SR_MODE    0x1c
+#define VIA_ACR_SR_OUT_EXT 0x1c    /* shift out, external clock */
+
+enum {
+    KBD_IDLE,
+    KBD_CMD_SHIFTED,               /* command byte on its way out */
+    KBD_RESPONSE,                  /* response byte on its way in */
+};
+
+#define KBD_QUEUE_SIZE     16
 
 /*
  * Interrupt glue: VIA at level 1, SCC at level 2, autovectored.
@@ -528,6 +563,17 @@ struct Mac128kMachineState {
     int mouse_dy;
     bool mouse_x1;
     bool mouse_y1;
+
+    /* M0110 keyboard on the VIA shift register */
+    QemuInputHandlerState *kbd_hs;
+    QEMUTimer *kbd_timer;
+    int kbd_phase;
+    uint8_t kbd_cmd;
+    uint8_t kbd_resp;
+    bool kbd_inquiry_open;      /* Inquiry waiting for a key or timeout */
+    uint8_t kbd_queue[KBD_QUEUE_SIZE];
+    int kbd_q_rd;
+    int kbd_q_len;
 };
 
 /*
@@ -549,6 +595,7 @@ struct Mac128kMachineClass {
 OBJECT_DECLARE_TYPE(Mac128kMachineState, Mac128kMachineClass, MAC128K_MACHINE)
 
 static uint32_t mac128k_trace_pc(void);
+static void mac128k_kbd_command(Mac128kMachineState *m, uint8_t val);
 
 static void mac128k_set_overlay(Mac128kMachineState *m, bool overlay)
 {
@@ -648,6 +695,12 @@ static void mac128k_via_write(void *opaque, hwaddr addr, uint64_t val,
     /* DDR changes move the pulled-up input pins too */
     if (reg == VIA_REG_DIRA && v1s->machine) {
         mac128k_via_portA_update(v1s->machine);
+    }
+
+    /* a byte shifted out under the keyboard's clock is a command */
+    if (reg == VIA_REG_SR && v1s->machine &&
+        (s->acr & VIA_ACR_SR_MODE) == VIA_ACR_SR_OUT_EXT) {
+        mac128k_kbd_command(v1s->machine, val);
     }
 }
 
@@ -887,6 +940,166 @@ static const QemuInputHandler mac128k_mouse_handler = {
     .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
     .event = mac128k_mouse_event,
     .sync  = mac128k_mouse_sync,
+};
+
+/*
+ * M0110 keyboard.  The ROM driver (Plus ROM 0x402568..) sends Model
+ * at init and then loops on Inquiry from the shift-register interrupt
+ * handler: cmd byte shifted out -> SR int -> driver flips the ACR to
+ * shift-in -> response byte shifts in -> SR int -> driver reads SR.
+ * Key transitions update KeyMap (0x174) and post keyboard events.
+ */
+
+/* Macintosh virtual keycodes (== the low ADB codes), indexed by the
+ * linux keycode delivered in the input event.  The M0110 has no
+ * control key; control maps to command for convenience. */
+static const uint8_t qemu_to_mac_keycode[] = {
+    [0 ... KEY_MAX] = 0xff,
+
+    [KEY_A] = 0x00, [KEY_S] = 0x01, [KEY_D] = 0x02, [KEY_F] = 0x03,
+    [KEY_H] = 0x04, [KEY_G] = 0x05, [KEY_Z] = 0x06, [KEY_X] = 0x07,
+    [KEY_C] = 0x08, [KEY_V] = 0x09, [KEY_B] = 0x0b, [KEY_Q] = 0x0c,
+    [KEY_W] = 0x0d, [KEY_E] = 0x0e, [KEY_R] = 0x0f, [KEY_Y] = 0x10,
+    [KEY_T] = 0x11, [KEY_1] = 0x12, [KEY_2] = 0x13, [KEY_3] = 0x14,
+    [KEY_4] = 0x15, [KEY_6] = 0x16, [KEY_5] = 0x17,
+    [KEY_EQUAL] = 0x18, [KEY_9] = 0x19, [KEY_7] = 0x1a,
+    [KEY_MINUS] = 0x1b, [KEY_8] = 0x1c, [KEY_0] = 0x1d,
+    [KEY_RIGHTBRACE] = 0x1e, [KEY_O] = 0x1f, [KEY_U] = 0x20,
+    [KEY_LEFTBRACE] = 0x21, [KEY_I] = 0x22, [KEY_P] = 0x23,
+    [KEY_ENTER] = 0x24, [KEY_L] = 0x25, [KEY_J] = 0x26,
+    [KEY_APOSTROPHE] = 0x27, [KEY_K] = 0x28, [KEY_SEMICOLON] = 0x29,
+    [KEY_BACKSLASH] = 0x2a, [KEY_COMMA] = 0x2b, [KEY_SLASH] = 0x2c,
+    [KEY_N] = 0x2d, [KEY_M] = 0x2e, [KEY_DOT] = 0x2f,
+    [KEY_TAB] = 0x30, [KEY_SPACE] = 0x31, [KEY_GRAVE] = 0x32,
+    [KEY_BACKSPACE] = 0x33, [KEY_KPENTER] = 0x34,
+    [KEY_LEFTCTRL] = 0x37, [KEY_RIGHTCTRL] = 0x37,
+    [KEY_LEFTMETA] = 0x37, [KEY_RIGHTMETA] = 0x37,
+    [KEY_LEFTSHIFT] = 0x38, [KEY_RIGHTSHIFT] = 0x38,
+    [KEY_CAPSLOCK] = 0x39,
+    [KEY_LEFTALT] = 0x3a, [KEY_RIGHTALT] = 0x3a,
+};
+
+static void mac128k_kbd_pulse_sr_int(Mac128kMachineState *m)
+{
+    qemu_irq irq = qdev_get_gpio_in(DEVICE(&m->via), SR_INT_BIT);
+
+    qemu_irq_lower(irq);
+    qemu_irq_raise(irq);
+}
+
+static uint8_t mac128k_kbd_pop(Mac128kMachineState *m)
+{
+    uint8_t v;
+
+    if (!m->kbd_q_len) {
+        return KBD_REPLY_NULL;
+    }
+    v = m->kbd_queue[m->kbd_q_rd];
+    m->kbd_q_rd = (m->kbd_q_rd + 1) % KBD_QUEUE_SIZE;
+    m->kbd_q_len--;
+    return v;
+}
+
+static void mac128k_kbd_timer_cb(void *opaque)
+{
+    Mac128kMachineState *m = opaque;
+    MOS6522State *s = MOS6522(&m->via);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    switch (m->kbd_phase) {
+    case KBD_CMD_SHIFTED:
+        /* the command byte has left the SR: interrupt, then answer */
+        mac128k_kbd_pulse_sr_int(m);
+        m->kbd_phase = KBD_RESPONSE;
+        switch (m->kbd_cmd) {
+        case KBD_CMD_INQUIRY:
+            if (m->kbd_q_len) {
+                m->kbd_resp = mac128k_kbd_pop(m);
+                timer_mod(m->kbd_timer, now + KBD_SHIFT_NS);
+            } else {
+                /* sit on the Inquiry until a key or the Null timeout */
+                m->kbd_resp = KBD_REPLY_NULL;
+                m->kbd_inquiry_open = true;
+                timer_mod(m->kbd_timer, now + KBD_NULL_DELAY_NS);
+            }
+            break;
+        case KBD_CMD_INSTANT:
+            m->kbd_resp = mac128k_kbd_pop(m);
+            timer_mod(m->kbd_timer, now + KBD_SHIFT_NS);
+            break;
+        case KBD_CMD_MODEL:
+            /* the model command also resets the keyboard */
+            m->kbd_q_len = 0;
+            m->kbd_resp = KBD_REPLY_MODEL;
+            timer_mod(m->kbd_timer, now + KBD_SHIFT_NS);
+            break;
+        case KBD_CMD_TEST:
+            m->kbd_resp = KBD_REPLY_TEST_ACK;
+            timer_mod(m->kbd_timer, now + KBD_SHIFT_NS);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "mac128k kbd: unknown cmd 0x%02x\n",
+                          m->kbd_cmd);
+            m->kbd_resp = KBD_REPLY_NULL;
+            timer_mod(m->kbd_timer, now + KBD_SHIFT_NS);
+            break;
+        }
+        break;
+    case KBD_RESPONSE:
+        /* the response byte has shifted in */
+        s->sr = m->kbd_resp;
+        m->kbd_phase = KBD_IDLE;
+        m->kbd_inquiry_open = false;
+        mac128k_kbd_pulse_sr_int(m);
+        break;
+    default:
+        break;
+    }
+}
+
+/* the guest wrote a command byte into the shift register */
+static void mac128k_kbd_command(Mac128kMachineState *m, uint8_t val)
+{
+    m->kbd_cmd = val;
+    m->kbd_phase = KBD_CMD_SHIFTED;
+    m->kbd_inquiry_open = false;
+    timer_mod(m->kbd_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + KBD_SHIFT_NS);
+}
+
+static void mac128k_kbd_event(DeviceState *dev, QemuConsole *src,
+                              QemuInputEvent *evt)
+{
+    Mac128kMachineState *m = MAC128K_MACHINE(qdev_get_machine());
+    uint8_t code;
+
+    if (evt->key.key >= ARRAY_SIZE(qemu_to_mac_keycode)) {
+        return;
+    }
+    code = qemu_to_mac_keycode[evt->key.key];
+    if (code == 0xff) {
+        return;
+    }
+    /* wire format: keycode in bits 6-1, bit 0 set, bit 7 = release */
+    code = (code << 1) | 1 | (evt->key.down ? 0 : 0x80);
+
+    if (m->kbd_q_len < KBD_QUEUE_SIZE) {
+        m->kbd_queue[(m->kbd_q_rd + m->kbd_q_len) % KBD_QUEUE_SIZE] = code;
+        m->kbd_q_len++;
+    }
+    /* a pending Inquiry answers as soon as it has a transition */
+    if (m->kbd_inquiry_open) {
+        m->kbd_inquiry_open = false;
+        m->kbd_resp = mac128k_kbd_pop(m);
+        timer_mod(m->kbd_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + KBD_SHIFT_NS);
+    }
+}
+
+static const QemuInputHandler mac128k_kbd_handler = {
+    .name  = "Macintosh Keyboard",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = mac128k_kbd_event,
 };
 
 static void main_cpu_reset(void *opaque)
@@ -1147,6 +1360,11 @@ static void mac128k_machine_init(MachineState *machine)
                                   m);
     m->mouse_hs = qemu_input_handler_register(DEVICE(&m->via),
                                               &mac128k_mouse_handler);
+
+    /* keyboard */
+    m->kbd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mac128k_kbd_timer_cb, m);
+    m->kbd_hs = qemu_input_handler_register(DEVICE(&m->via),
+                                            &mac128k_kbd_handler);
 
     /* ROM contents */
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
