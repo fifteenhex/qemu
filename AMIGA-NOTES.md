@@ -1,4 +1,4 @@
-# Amiga 3000 emulation — working notes
+# Amiga 3000/4000 emulation — working notes
 
 Status and hand-off notes for the `amiga` branch (based on `mvme147`,
 which contributes the 68030 bus-error/trace fixes and the WD33C93
@@ -26,19 +26,34 @@ Sanity check: starts `11 14 4e f9 00 f8 00 d2` (Kickstart magic +
 reset PC 0xf800d2), contains "AMIGA ROM Operating System and
 Libraries".  SuperKickstart (disk-loaded) images are not supported.
 
+The `a4000` machine needs the A4000 Kickstart 3.1 r40.068 instead (also
+512KB, same `commodore-amiga-firmware` item):
+
+    md5  9bdedde6a4f33555b4a270c8ca53297d
+
+Run it with `-M a4000 -bios kick31_a4000.rom`; disks attach the same way.
+
 ## Running
 
     qemu-system-m68k -M a3000 -bios kick31_a3000.rom
     # optional disk: -drive if=scsi,file=hd.img,format=raw
     # serial (Paula):  -serial stdio
 
-## Current state (2026-07-19, evening)
+## Current state (2026-07-20)
+
+Two machines now: `a3000` (68030, ECS) and `a4000` (68040, AGA).  Both
+boot Kickstart 3.1 to the insert-floppy screen and run Workbench 3.1
+from a floppy; the A4000 needs its own Kickstart (see above).  The
+A4000 renders through the ECS display path for now (no real AGA), and
+its onboard IDE is not modelled, so it has no hard disk yet — the two
+open follow-ups for a "real" A4000.  See the A4000 item under "Open
+items" for the details and next steps a new session should pick up.
 
 Kickstart 3.1 boots all the way to the insert-floppy screen with the
-animation running (560x145 hires, 3 planes, purple background; the
-disk animates into the drive).  Chip RAM (2MB) and fast RAM (-m, up
-to 16MB below 0x08000000) are detected correctly; exec multitasks;
-scsi.device initialises and probes the bus.
+animation running (a copper split: hires logo panel over a hires drive
+panel, purple background; the disk animates into the drive).  Chip RAM
+(2MB) and fast RAM (-m, up to 16MB below 0x08000000) are detected
+correctly; exec multitasks; scsi.device initialises and probes the bus.
 
 Floppy boot works: `-drive if=floppy,file=x.adf,format=raw` gives a
 DF0 (hw/m68k/amiga_fdc.c) that encodes ADF tracks to AmigaDOS MFM on
@@ -56,12 +71,16 @@ half.
 Structure: abstract `amiga-common` machine class (hw/m68k/amiga.c)
 holds everything all classic Amigas share — chip RAM, Kickstart +
 reset overlay (CIA-A PA0), the two 8520 CIAs, the custom chip block,
-open-bus filler.  `a3000` (hw/m68k/a3000.c) adds the 68030, fast RAM,
-Ramsey/Gary stubs, Zorro III open bus and the SCSI subsystem.
+open-bus filler; a board fills in class params (ROM, chip RAM, CIA
+clock, Agnus/Denise IDs, open-bus extent) and a board_init hook.
+`a3000` (hw/m68k/a3000.c) adds the 68030, fast RAM, Zorro III open bus
+and the SCSI subsystem; `a4000` (hw/m68k/a4000.c) adds the 68040, fast
+RAM and the AGA chip IDs.  The Ramsey memory controller + Fat Gary glue
+they share is the TYPE_AMIGA_MOBO device (hw/m68k/amiga_mobo.c).
 Devices: hw/m68k/mos8520.c (CIA), hw/m68k/amiga_custom.c (interrupts,
 beam counters, serial, blitter incl. line mode and fills, frame-atomic
-copper, bitplane display renderer), hw/m68k/a3000_sdmac.c (SuperDMAC
-with the wd33c93 behind it, INT2).
+copper, split-window-clipped bitplane display renderer),
+hw/m68k/a3000_sdmac.c (SuperDMAC with the wd33c93 behind it, INT2).
 
 See docs/system/target-m68k.rst for the user-facing feature list and
 the individual commit messages for design details and the bugs found
@@ -83,7 +102,10 @@ callbacks run inside the timer's transaction).
   default there, so attach test disks with `-drive if=scsi,unit=6`.
   Recording/replay of a GUI session: `_amiga_assets/replay_input.py`
   + a log from `-trace input_event_rel -trace input_event_btn`.
-  HD *boot* (no floppy) untested.
+  HD BOOT WORKS: with only `-drive if=scsi,unit=6` and no floppy,
+  Kickstart boot-scans the RDB, mounts the bootable FFS partition and
+  (no startup-sequence) drops to the AmigaDOS CLI.  A full
+  Workbench-on-HD still needs the Install program to copy the OS.
 - Workbench text: FIXED — graphics.library uses the ECS BLTCON0L
   register (0x5a, minterm-byte-only write) once it sees our ECS
   chipset IDs; it was landing in the bare backing store.  Beware of
@@ -91,19 +113,189 @@ callbacks run inside the timer's transaction).
   byte-swaps REGISTER values and MEMORY reads both (reverse each
   long); breakpoint addresses are fine; read guest memory via QMP
   pmemsave while stopped for untangled bytes.
-- Keyboard: input path is CIA-A's serial register; the model already
-  has mos8520_sdr_input() for injection.  Needs the handshake
-  protocol and a QEMU keyboard event handler wiring scancodes.
+- Keyboard: DONE (hw/m68k/amiga_kbd.c).  Feeds Amiga raw keycodes
+  into CIA-A's SDR; CIA-A gained an 'sp-out' line pulsed when the
+  guest drives SPMODE to output (keyboard.device's ack handshake),
+  which advances the key queue.  Host key events are Linux keycodes,
+  so map via qemu_input_linux_to_qcode() first.  Verified live: booted
+  to the AmigaDOS CLI and typed at the '1>' prompt.
+- Window close gadget: Daniel reports it doesn't work.  Investigated
+  via synthetic mouse — window DRAG (title bar) works, but the close
+  gadget never highlights/closes even with the pointer's hotspot
+  apparently in the ~16px box (many precise tries; calibrated ~1
+  count/px X, ~2 counts/px Y, corner=logical 0,0).  Real
+  close-gadget/RELVERIFY bug or sub-pixel synthetic-aim miss — needs a
+  human repro or Intuition-MouseXY-based positioning to settle.  Icon
+  double-click, app gadgets and window drag all work.
+- Games: Lemmings and The Secret of Monkey Island both boot and play
+  (MI reaches full SCUMM gameplay on Melee Island; run-monkey.sh).  A
+  Workbench flicker (a fifth of frames blank) was fixed by running the
+  copper at render time instead of at the vblank, since Intuition
+  swaps its double-buffered copper lists (COP2LC) in the VERTB handler
+  that runs after our old vblank copper pass.
 - Display gaps: attached sprites, sprite/playfield priority
-  (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
+  (BPLCON2), BPLCON1 fine scroll, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
-- Not modelled: audio, keyboard (CIA-A SDR handshake), battery clock
-  (RP5C01 at 0xdc0000, currently open bus), Zorro slots.  Floppy: no
-  disk change/eject at runtime yet (fixed media; two-disk games can
-  put disk 2 in DF1 instead), only 880KB DD ADFs.
+- AGA display works (hw/m68k/amiga_custom.c): 8 bitplanes, the 256-entry
+  24-bit palette (BPLCON3 colour bank + LOCT nibbles, held as device
+  state and snapshot per frame so per-line copper palette splits still
+  replay), HAM6 and HAM8, and the FMODE 32/64-bit fetch widths (only the
+  per-line word count changes since the plane data stays contiguous).
+  Deluxe Galaga (AGA) runs in 256 colours on the a4000; get it with the
+  archive.org item `Deluxe_Galaga_v2.6B_1995-03-15_Vigdal_Edgar_AGA_SW-R`
+  (its startup-sequence LoadWBs, so xdftool-replace s/startup-sequence
+  with `cd Deluxe_Galaga_2.6` + `GALAGA.AGA` to auto-run).  Still ECS
+  through the sprite path: AGA sprites (FMODE width, BPLCON4 offsets) are
+  not widened, so sprite-drawn game objects look streaky.  Watch the
+  display-height clamp: a vertical shmup needs ~315 lines, so the cap is
+  512, not the PAL 313.
+- Control ports: gameport 0 is the mouse; gameport 1's fire button
+  (CIA-A PA7) is wired to the host middle mouse button so joystick games
+  (Deluxe Galaga reads port 2) can be driven.  Directions on port 2 are
+  not emulated yet.
+- Super Stardust (AGA) [NOT WORKING, investigated]: the PSG-cracked disk 1
+  boots its crack intro (renders fine), fire advances to the game's own
+  trackloader, which sticks at "INSERT DISK 1".  Traced with the gdbstub
+  (`-s`; register/memory reads come back byte-reversed per long, so read
+  guest memory with QMP pmemsave and disassemble with objdump).  The
+  loader's disk routine (chip RAM ~0x1e0950) selects a drive, checks
+  /CHNG then /RDY, sets DSKSYNC=0x4489 + disk DMA, and waits on DSKBLK.
+  It runs this against **drive 1** (register d4=1 -> selects /SEL1), i.e.
+  the empty df1, and hangs.  Two findings for a future attempt:
+  (1) A real CIA bug: mos8520_port_update() drives the eight port-out
+  qemu_irqs low bit first, so the FDC sees the /SEL edge (PB3) before the
+  MTR level (PB7) within one CIA write and latches the motor off a stale
+  MTR.  Real pins change together; emitting high bit first fixes the
+  motor latch (confirmed via an FDC trace: motor stayed correctly on).
+  Left it OUT for now because it needs regression testing against the
+  working floppy games (trackdisk.device uses separate writes, so it may
+  well be safe) and it did not by itself make Super Stardust boot.
+  (2) Even with the motor latch fixed, the loader still targets the empty
+  df1 and hangs; it likely wants disk 1 in df1 (a two-drive setup) or
+  reads df0 first and rejects it.  `-drive if=floppy,index=1,file=...`
+  did not attach media to df1 in a quick test — worth checking how the
+  machine binds floppy unit 1 before retrying.
+- Split-window widths: the surface is now clipped to the widest display
+  window the copper opens across the frame (DIWSTRT/DIWSTOP tracked
+  through the journal, sampled at DIWSTOP where both halves are fresh),
+  not the word-granular fetch width.  This fixed the insert-disk screen,
+  a copper split whose lower panel over-fetches its window: the overrun
+  used to spill and draw the whole screen twice side by side.  A few
+  pixels of off-window fetch still show at the far-left edge — the
+  renderer doesn't model the cycle-exact DDF-to-DIW fetch delay, so it
+  can't hide the last word of left overscan.
+- Zorro: II autoconfig works (hw/m68k/amiga_a2065.c) with the A2065
+  Ethernet card (Am7990 LANCE via QEMU's pcnet core, 32KB onboard
+  RAM, MAC 00:80:10:<serial>).  AmigaOS autoconfigures it at 0xe90000
+  (ConfigDev + CSR0=STOP verified); real TX/RX untested (needs a
+  SANA-II driver + TCP stack, not in stock WB).  Base write is a plain
+  byte to config reg 0x48 (NOT nibble-encoded like the read side).
+- Not modelled: battery clock (RP5C01 at 0xdc0000, currently open
+  bus), Zorro III cards.  Floppy: only 880KB DD ADFs.  Disk swap works
+  now (blockdev-change-medium device=floppy0 filename=... format=raw
+  -> /CHNG latch -> Workbench remounts); needed for the HD install.
+- A4000: an `a4000` machine (hw/m68k/a4000.c) boots.  It is a 68040
+  with 2MB chip RAM, the AGA chipset IDs (Alice VPOSR 0x23, Lisa Denise
+  0xf8), motherboard fast RAM at 0x07000000, and the shared Ramsey/Fat
+  Gary glue (now TYPE_AMIGA_MOBO in hw/m68k/amiga_mobo.c, used by both
+  big-box machines).  QEMU's m68040 boots the A4000 Kickstart to the
+  insert-disk prompt and runs Workbench 3.1 from floppy — so the 68040
+  MMU and the AGA chip IDs are fine.  The AGA display is now implemented
+  (see the AGA bullet above), so AGA games render in 256 colours.  The
+  main remaining follow-up for a "real" A4000 is the onboard IDE (an ATA
+  port at 0xdd2020, Gayle-ish; currently open bus, so no hard disk).
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
+- AMIX (Amiga UNIX SVR4) — the 68030 MMU probe.  AMIX 2.1 install disks
+  (boot+root, 880K ADFs) are on archive.org
+  `commodore-amiga-operating-systems-amix`.  Booting the boot disk on
+  the a3000 (`-m 16M`) gets far: the loader decompresses the SVR4 kernel
+  into fast RAM (~0x07000000) and starts it, which probes hardware
+  (Ramsey 0xde0000-0002) — then instantly drowns in **Access Fault
+  (0x8)** exceptions (414k in 50s with `-d int`), looping at
+  pc=0x071234ac with a corrupted supervisor SP (0xfffffff4).
+  Root cause: **QEMU's m68k MMU is 68040-only.**  get_physical_address()
+  (target/m68k/helper.c) walks 68040-format tables via URP/SRP (loaded
+  by MOVEC).  The 68030 PMMU is a stub: translate.c's pmmu030 stores
+  PMOVE of TC/CRP/SRP/TT0/TT1 into mmu.{tc030,crp030,srp030,tt030} but
+  nothing translates through them, PFLUSH/PLOAD are no-ops, and PTEST
+  lies "valid".  Kickstart only *probes* those registers, so AmigaOS
+  boots; AMIX actually enables demand paging, so it fails at the first
+  translated access.
+  IMPLEMENTED (target/m68k, get_physical_address_030): the 030 table walk
+  driven by tc030 (initial shift + up to four TIA-TID index fields),
+  following crp030/srp030, honouring short/long descriptors, WP and the
+  supervisor bit, and setting the Used/Modified bits.  tlb_fill() gates
+  on the 030 TC enable bit.  Result: the Access Fault storm is gone
+  (28M -> a few thousand exceptions), AMIX runs its kernel in virtual
+  memory, brings up its own 640x256 console, and prints a real
+  "DOUBLE PANIC: KERNEL FAULT" register dump instead of looping the CPU.
+  NEXT BLOCKER: that kernel fault — now READ OFF THE CONSOLE.  Captured the
+  on-screen panic with QMP `screendump` at 10s intervals (AMIX writes its
+  console to the graphics display, not serial), upscaled the text band with
+  PIL, and read it:
+
+      PANIC: assertion failed: pp >= pages && pp < epages,
+             file: vm_page.c, line: 1103
+      DOUBLE PANIC: KERNEL FAULT ssw=0x2704 pc=0x00C00AC0 fmt=0x8
+             vector=0xD <Line F>
+
+  So the FIRST fault is a **software assertion in AMIX's VM layer**, not an
+  MMU miss — the page-frame database bounds check `pp >= pages && pp <
+  epages` fails: a physical page pointer fell outside the managed page array.
+  The MMU walk is therefore working; AMIX reaches VM init before tripping.
+  Verified this directly by walking the live SRP tables via QMP pmemsave for
+  the double-panic PC (virtual 0xc00ac0): the SRP root descriptor (entry 0,
+  covering supervisor VA 0-0x3FFFFFFF) is INVALID, so 0xc00ac0 is genuinely
+  unmapped — the double panic is just panic() itself touching an unmapped
+  page and taking a Line-F (open-bus 0xffff decodes as F-line, vector 0xD).
+  The QEMU 030 format-$A bus-fault frame layout was audited against the
+  68030UM and is correct (SR/PC/vector/SSW/pipe/fault-addr all in the right
+  slots), so the frame is not the cause either.
+
+  DISASSEMBLED THE ASSERTION (dump fast RAM 0x07000000-0x08000000 via QMP
+  pmemsave, m68k-linux-gnu-objdump -b binary -m m68k:68030).  The kernel runs
+  **1:1 in fast RAM** (code references the assertion string at its physical
+  address 0x070af518; verified 14 refs, 12 are `pea 0x70af518` call sites).
+  assfail() = 0x0703ec0c.  The assertion macro is:
+
+      jsr   0x070af5f8          ; pp = page-hash lookup(vnode,offset) -> a0
+      moveal %a0,%a2            ; a2 = pp
+      cmpal 0x07124a90,%a2      ; pp vs `pages`  global
+      bcs   fail                ; pp <  pages  -> fail
+      cmpal 0x07116508,%a2      ; pp vs `epages` global
+      bcs   ok                  ; pp <  epages -> ok
+      fail: pea <line> ; pea 0x070af50e"vm_page.c" ; pea 0x070af518 ; jsr assfail
+
+  So `pages`  global lives at 0x07124a90, `epages` at 0x07116508.  Runtime
+  values on our boot: pages=0x40040000, epages=0x400ab364 (span 0x6b364).
+  IMPORTANT: `pp` does NOT come from a pfn formula — 0x070af5f8 is a **page
+  hash lookup** (hashes with >>11, the 2KB page shift from tc030 PS=11).  So
+  the failure is "a vm_page reached through the page hash has an address
+  outside the managed [pages,epages) array" — a page-management inconsistency,
+  not a simple array-sizing bug.
+
+  MMU RULED OUT as the corruptor.  Walked the live SRP tables (base
+  0x0712b800, tc030=0x82b02d60: IS=0, TI=[2,13,6,0], PS=11 -> 2KB pages):
+  the SRP root uses an **early-termination page descriptor** mapping
+  supervisor VA 0x00000000-0x3FFFFFFF 1:1 to physical (hence kernel-in-fast-
+  RAM runs 1:1, and 0xc00ac0 identity-maps to the custom/open-bus region ->
+  reads 0xffff -> the Line-F double panic).  VA 0x40000000+ uses the fine
+  tables and correctly maps the page array (0x40040000 -> fast RAM
+  0x07143800).  get_physical_address_030 handles early termination and the
+  fine walk correctly and self-consistently, so the page array is not being
+  mistranslated.  The out-of-range pp is therefore genuine AMIX behaviour on
+  our chip+fast split memory, reached during early VM init.
+  Remaining work is open-ended AMIX kernel RE: trace how a page enters the
+  hash with an address below `pages` (0x40040000) or >= `epages` — most likely
+  tied to how AMIX enumerates physical segments (2MB chip at pa 0 vs 16MB fast
+  at pa 0x07000000) and which pages it builds structs for.  Cross-check
+  against Kickstart's exec memory list (what the Ramsey/Gary model reports for
+  fast-RAM base+size), since that list feeds AMIX's segment setup.
+  Not-yet-modelled for the 030 walk: descriptor LIMIT fields, the
+  indirect page descriptor, and function-code lookup (TC FCL) — AMIX
+  seems not to need them so far.
 
 ## Debugging recipes that worked
 

@@ -22,6 +22,7 @@ struct MOS8520State {
     qemu_irq irq;
     qemu_irq port_a_out[8];
     qemu_irq port_b_out[8];
+    qemu_irq sp_out;            /* serial port drive level (keyboard ack) */
 
     uint32_t clock_hz;      /* E clock feeding the interval timers */
     uint32_t tod_hz;        /* tick rate of the TOD counter */

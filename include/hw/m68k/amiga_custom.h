@@ -22,8 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(AmigaCustomState, AMIGA_CUSTOM)
 /* plenty for the few hundred entries a busy per-line copper list makes */
 #define AMIGA_COPPER_JOURNAL_MAX    4096
 
-/* gameport 0 fire button / left mouse button input on CIA-A port A */
+/* gameport fire buttons on CIA-A port A: port 0 (mouse) and port 1 (joy) */
 #define AMIGA_CIAA_PA_FIR0          6
+#define AMIGA_CIAA_PA_FIR1          7
 
 /* INTENA/INTREQ bits */
 #define INT_TBE     (1 << 0)
@@ -64,6 +65,7 @@ struct AmigaCustomState {
 
     /* mouse in gameport 0: counters in JOY0DAT, buttons on the CIA/POT */
     qemu_irq mouse_btn;         /* left button, CIA-A PA6, active low */
+    qemu_irq joy2_btn;          /* port 2 joystick fire, CIA-A PA7, low */
     QemuInputHandlerState *mouse_hs;
     uint8_t mouse_x, mouse_y;
     bool mouse_rmb;
@@ -100,6 +102,13 @@ struct AmigaCustomState {
     } journal[AMIGA_COPPER_JOURNAL_MAX];
     unsigned journal_len;
     uint16_t frame_regs[0x100];
+
+    /*
+     * AGA palette: 256 colours of 24-bit RGB, maintained as the guest
+     * writes the 32 COLORxx registers through the bank and LOCT fields
+     * of BPLCON3.  ECS/OCS just uses the low 32 as 12-bit colours.
+     */
+    uint32_t aga_color[256];
 
     bool blit_zero;             /* last blit produced only zeroes */
 

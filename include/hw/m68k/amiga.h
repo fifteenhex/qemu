@@ -10,6 +10,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/m68k/amiga_fdc.h"
+#include "hw/m68k/amiga_kbd.h"
 #include "target/m68k/cpu-qom.h"
 #include "system/memory.h"
 #include "qom/object.h"
@@ -37,6 +38,7 @@ struct AmigaMachineState {
     MemoryRegion open_bus;
     DeviceState *ciaa, *ciab;
     DeviceState *custom;
+    DeviceState *kbd;
     DeviceState *fdc[AMIGA_FLOPPY_DRIVES];
 
     /*
@@ -57,6 +59,7 @@ struct AmigaMachineClass {
     uint32_t chipram_size;
     uint32_t cia_clock_hz;
     uint32_t agnus_id;
+    uint32_t denise_id;
     /*
      * Size of the region (from address 0) where the glue logic always
      * terminates bus cycles, so accesses to unpopulated addresses read
