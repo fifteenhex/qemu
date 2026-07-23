@@ -304,9 +304,19 @@ audiodev, not a bare -audiodev.  The WAV backend only finalises its
 header on clean exit; a killed capture still has valid PCM after the
 44-byte header (resampled to 44.1kHz stereo s16).
 
+### 2026-07-20 — watchdog
+
+RTC watchdog implemented (hw/rtc/dragonball_rtc.c): 2-bit counter on
+the 1Hz tick, serviced by writing the WATCHDOG register, fires at
+count 2 as either a WDT interrupt (INTSEL set; INTSTS is w1c) or a
+watchdog_perform_action() reset.  Powers up enabled like the real
+chip; PalmOS disables it with a single 0x0000 write early in boot
+(observed on both machines, well before the first tick), so boot is
+unaffected.  qtest-verified in both modes.
+
 Still open for both machines: the SPI1 FIFO unit, per-shade grey
-palette (LGPMR stored, not applied), watchdog, SD card (m500),
-HotSync over serial.
+palette (LGPMR stored, not applied), SD card (m500), HotSync over
+serial.
 
 ## Journal
 
