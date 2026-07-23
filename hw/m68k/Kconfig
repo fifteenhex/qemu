@@ -106,6 +106,13 @@ config PALM
     select SSI_SD
     select SD
 
+config SUN3
+    bool
+    default y
+    depends on M68K
+    select ESCC
+    select ICM7170
+
 config MVME147
     bool
     default y
