@@ -63,3 +63,5 @@ config AMIGA
     default y
     depends on M68K
     select PTIMER
+    select SPLIT_IRQ
+    select WD33C93

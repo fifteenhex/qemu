@@ -20,3 +20,6 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Local Amiga test assets (ROMs, ADFs) — do not commit
+_amiga_assets/

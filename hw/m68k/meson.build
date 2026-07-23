@@ -5,6 +5,9 @@ m68k_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-kbd.c', 'next-cube.c')
 m68k_ss.add(when: 'CONFIG_Q800', if_true: files('q800.c', 'q800-glue.c'))
 m68k_ss.add(when: 'CONFIG_M68K_VIRT', if_true: files('virt.c'))
 m68k_ss.add(when: 'CONFIG_MVME147', if_true: files('mvme147.c'))
-m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('mos8520.c'))
+m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga.c', 'a3000.c',
+                                                 'a3000_sdmac.c',
+                                                 'amiga_custom.c',
+                                                 'amiga_fdc.c', 'mos8520.c'))
 
 hw_arch += {'m68k': m68k_ss}
