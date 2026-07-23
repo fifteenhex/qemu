@@ -84,10 +84,33 @@ Run it:
 
 ```sh
 DISPLAY=:1 ./build-megadrive/qemu-system-m68k -M megadrive,mapper=cart \
-    -bios /workspace/src/megadrive-roms/sonic1.md
+    -bios /workspace/src/megadrive-roms/sonic1.md \
+    -qmp unix:/tmp/md-megadrive-play.qmp,server,nowait
 ```
 
 Keys: arrows = d-pad, A/S/D = A/B/C, Enter = Start.
+
+## Scripted playtesting
+
+`scripts/md-playtest.py` (in this repo) drives a running instance over
+the QMP socket: key injection, screendumps, guest-RAM peeks, and the
+Sonic 1 REV00 level-select sequence.  Example:
+
+```sh
+./scripts/md-playtest.py --socket /tmp/md-megadrive-play.qmp \
+    wait-title levelselect 3 sleep 5 shot /tmp/lz.ppm
+```
+
+(3 downs = Labyrinth 1, 19 = Special Stage; see the script header.)
+
+NOTHING under /tmp needs to survive a VM reset: screendumps (.ppm/.png),
+debug logs and QMP sockets there are all disposable and regenerable with
+the commands in this file.  Everything durable lives in this repo, in
+`/workspace/git/qemu.git` (branch `qemu-megadrive`), and in
+`/workspace/src/megadrive-roms/`.  After a reset, rebuild per
+"Reproduce" above (build-megadrive/ survives in the workspace anyway)
+and relaunch with the command above; the desktop QEMU instance does not
+survive a reset and must be restarted by hand.
 
 ## Log
 
