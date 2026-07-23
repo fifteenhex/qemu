@@ -58,9 +58,10 @@ modelled:
    WAIT, so per-line palettes and mid-frame screen splits render.
    Effects keyed to the horizontal beam position do not.
 
--  A bitplane display: lores and hires, up to 6 planes with
-   extra-half-brite, rendered to a QEMU console.  Sprites, HAM and
-   dual playfield are not drawn.
+-  A bitplane display: lores and hires (mixable within a frame), up
+   to 6 planes with extra-half-brite, rendered to a QEMU console.
+   DMA sprites are drawn in front of the playfield (mouse pointers
+   work); attached sprites, HAM and dual playfield are not.
 
 -  Paula disk DMA and two floppy drives, DF0 and DF1, backed by plain
    880KB ADF images given with ``-drive if=floppy`` (once for each
@@ -85,8 +86,8 @@ modelled:
 -  Empty Zorro II/III expansion space, reading as open bus so the
    expansion library sees "no board present".
 
-Notably missing: keyboard input, sprites, audio, the battery-backed
-clock, and Zorro expansion boards.  Kickstart finds attached SCSI
+Notably missing: keyboard input, audio, the battery-backed clock,
+and Zorro expansion boards.  Kickstart finds attached SCSI
 disks but does not yet boot from them: the first TEST UNIT READY
 fails with a power-on unit attention that scsi.device treats as "no
 disk".

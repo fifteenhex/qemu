@@ -81,9 +81,10 @@ callbacks run inside the timer's transaction).
 - Keyboard: input path is CIA-A's serial register; the model already
   has mos8520_sdr_input() for injection.  Needs the handshake
   protocol and a QEMU keyboard event handler wiring scancodes.
-- Display gaps: sprites (mouse pointer is a sprite!), HAM, dual
-  playfield.  The copper is line-granular; effects keyed to the
-  horizontal beam position won't render.
+- Display gaps: attached sprites, sprite/playfield priority
+  (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
+  line-granular; effects keyed to the horizontal beam position won't
+  render.  DMA sprites render (Lemmings is playable, menu and all).
 - Not modelled: audio, keyboard (CIA-A SDR handshake), battery clock
   (RP5C01 at 0xdc0000, currently open bus), Zorro slots.  Floppy: no
   disk change/eject at runtime yet (fixed media; two-disk games can
