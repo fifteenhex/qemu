@@ -1081,13 +1081,23 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
             /*if (!CSR_LAPPEN(s))*/
                 SET_FIELD(&rmd.status, RMDS, STP, 1);
 
+/*
+ * Store the descriptor back only while more buffers follow: the final
+ * descriptor of the packet must be released with a single store that
+ * already carries ENP and MCNT.  Guests that poll OWN in a tight loop
+ * (the E17 firmware's TLANCE driver) otherwise observe the descriptor
+ * between the two stores, with OWN clear but ENP/MCNT not yet written.
+ * Real chips write MCNT before relinquishing OWN, in one final update.
+ */
 #define PCNET_RECV_STORE() do {                                 \
     int count = MIN(4096 - GET_FIELD(rmd.buf_length, RMDL, BCNT),remaining); \
     hwaddr rbadr = PHYSADDR(s, rmd.rbadr);          \
     s->phys_mem_write(s->dma_opaque, rbadr, src, count, CSR_BSWP(s)); \
     src += count; remaining -= count;                           \
     SET_FIELD(&rmd.status, RMDS, OWN, 0);                       \
-    RMDSTORE(&rmd, PHYSADDR(s,crda));                           \
+    if (remaining) {                                            \
+        RMDSTORE(&rmd, PHYSADDR(s,crda));                       \
+    }                                                           \
     pktcount++;                                                 \
 } while (0)
 
@@ -1117,8 +1127,8 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
 
 #undef PCNET_RECV_STORE
 
-            RMDLOAD(&rmd, PHYSADDR(s,crda));
             if (remaining == 0) {
+                /* rmd still holds the final, not yet stored descriptor */
                 SET_FIELD(&rmd.msg_length, RMDM, MCNT, size);
                 SET_FIELD(&rmd.status, RMDS, ENP, 1);
                 SET_FIELD(&rmd.status, RMDS, PAM, !CSR_PROM(s) && is_padr);
@@ -1129,6 +1139,8 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
                     SET_FIELD(&rmd.status, RMDS, ERR, 1);
                 }
             } else {
+                /* rmd may hold a peeked next descriptor: reload */
+                RMDLOAD(&rmd, PHYSADDR(s,crda));
                 SET_FIELD(&rmd.status, RMDS, OFLO, 1);
                 SET_FIELD(&rmd.status, RMDS, BUFF, 1);
                 SET_FIELD(&rmd.status, RMDS, ERR, 1);
