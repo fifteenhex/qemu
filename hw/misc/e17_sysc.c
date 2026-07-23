@@ -310,21 +310,31 @@ static uint64_t e17_sysc_read_impl(void *opaque, hwaddr addr, unsigned size)
     switch (block) {
     case E17_SYSC_VIC:
     case E17_SYSC_VIC_MIRR:
-        /* one byte-wide chip on byte lane 3: register N at N*4+3 */
-        if ((addr & 3) == 3 && off < ARRAY_SIZE(s->vic_regs) * 4) {
+        /*
+         * VIC068A: one byte-wide chip on byte lane 3, register N at
+         * N*4+3.  Lanes 0-2 float and read back 0x08 on the real board,
+         * so a 32-bit read of register N returns 0x080808<reg>.  Serve
+         * the register byte on lane 3 for any access width (byte reads
+         * of lanes 0-2 also read 0x08) so `dl`/`db` dumps match hardware.
+         */
+        if (off < ARRAY_SIZE(s->vic_regs) * 4) {
             uint8_t v = s->vic_regs[off >> 2];
 
             /*
              * LICR6 monitors the (active low) CD2401 interrupt line:
              * the STATE bit reads the raw pin level.
              */
-            if (off == E17_VIC_LICR6) {
+            if ((off | 3) == (E17_VIC_LICR6 | 3)) {
                 v &= ~E17_VIC_LICR_STATE;
                 if (!s->cd2401_irq) {
                     v |= E17_VIC_LICR_STATE;
                 }
             }
-            return v;
+            if (size == 1) {
+                return (addr & 3) == 3 ? v : 0x08;
+            }
+            /* wider access: 0x08 on lanes 0-2, the register on lane 3 */
+            return 0x08080800u | v;
         }
         break;
     case E17_SYSC_DRAMC:
@@ -507,7 +517,18 @@ static void e17_sysc_reset(DeviceState *dev)
     s->misc_5c = 0;
     s->cputype = 0;
     s->post_code = 0;
+    /*
+     * VIC068A power-up state.  Measured on the real board (shiro): the
+     * eight VMEbus interrupt-vector registers (regs 0..7, at byte-lane-3
+     * offsets 0x03,0x07,...,0x1f) read back 0xf8..0xff, i.e. each reg
+     * defaults to 0xf8|n.  RMON reprograms most of the file from the
+     * config profile, but the untouched regs keep these defaults, so a
+     * register dump matches the hardware.
+     */
     memset(s->vic_regs, 0, sizeof(s->vic_regs));
+    for (i = 0; i < 8; i++) {
+        s->vic_regs[i] = 0xf8 + i;
+    }
 }
 
 static void e17_sysc_cd2401_irq(void *opaque, int n, int level)
