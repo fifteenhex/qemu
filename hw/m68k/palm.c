@@ -2,9 +2,12 @@
  * Palm PDA machines on Motorola DragonBall SoCs:
  *
  *   palmv    — Palm V, MC68EZ328 "DragonBall EZ" @ 16.58MHz
+ *   palmiiix — Palm IIIx, MC68EZ328 @ 16.58MHz, 4MB RAM
+ *   palmvx   — Palm Vx, MC68EZ328 @ 20MHz, 8MB RAM
+ *   palmm100 — Palm m100, MC68EZ328 @ 16.58MHz, 2MB RAM
  *   palmm500 — Palm m500, MC68VZ328 "DragonBall VZ" @ 33.16MHz
  *
- * Both are close to the reference designs: the SoC provides
+ * All are close to the reference designs: the SoC provides
  * everything except the flash ROM, the RAM and the touchscreen ADC.
  *
  * Memory map (from the PalmOS ROM boot code, see PALM-NOTES.md):
@@ -82,6 +85,13 @@
 #define PALM_MMIO_LCDC       0xfffffa00
 #define PALM_MMIO_RTC        0xfffffb00
 
+/*
+ * GPIO block pin number of bit <bit> in port <port>, for ports 'A'
+ * to 'G' (the VZ's extra ports J/K/M don't follow the letters: they
+ * are blocks 7/8/9).
+ */
+#define PALM_GPIO(port, bit) (((port) - 'A') * 8 + (bit))
+
 /* /PENIRQ is also readable as a GPIO: port F bit 1 (low = pen down) */
 #define PALM_PENIRQ_GPIO     (5 * 8 + 1)
 /* /POWERFAIL from the supply supervisor: port D bit 7, low = battery dead */
@@ -95,7 +105,9 @@
 
 #define PALM_MMIO_SPI1       0xfffff700
 
-#define EZ_SYSCLK 16580608
+/* EZ SYSCLK = 32768 * ((P + 1) * 14 + Q + 1); PalmOS HAL PLL tables */
+#define EZ_SYSCLK 16580608              /* P=0x23 Q=0x01: the spec'd 16.58MHz */
+#define EZ_SYSCLK_20MHZ (32768 * 612)   /* P=0x2a Q=0x09: Palm Vx "20MHz" */
 #define VZ_SYSCLK (2 * EZ_SYSCLK)
 
 typedef struct PalmMachineClass {
@@ -109,8 +121,8 @@ typedef struct PalmMachineClass {
     uint8_t mask_id;
     uint8_t gpio_ports;
     uint16_t adc_dock_value;
-    /* gpio line of keyboard row 0 (rows are consecutive pins) */
-    uint16_t kbd_row0_gpio;
+    /* gpio lines of the keyboard rows */
+    uint16_t kbd_row_gpio[PALM_KEYPAD_ROWS];
     bool has_timer2;
 } PalmMachineClass;
 
@@ -381,7 +393,7 @@ static void palm_init(MachineState *machine)
     kpd_dev = qdev_new(TYPE_PALM_KEYPAD);
     qdev_realize_and_unref(kpd_dev, NULL, &error_fatal);
     for (i = 0; i < PALM_KEYPAD_ROWS; i++) {
-        qdev_connect_gpio_out(gpio_dev, pmc->kbd_row0_gpio + i,
+        qdev_connect_gpio_out(gpio_dev, pmc->kbd_row_gpio[i],
                               qdev_get_gpio_in_named(kpd_dev, "rows", i));
     }
     for (i = 0; i < PALM_KEYPAD_COLS; i++) {
@@ -419,12 +431,26 @@ static void palm_machine_common_class_init(ObjectClass *oc, const void *data)
     mc->ignore_memory_transaction_failures = true;
 }
 
-static void palmv_machine_class_init(ObjectClass *oc, const void *data)
+static void palm_set_kbd_rows(PalmMachineClass *pmc,
+                              uint16_t row0, uint16_t row1, uint16_t row2)
+{
+    pmc->kbd_row_gpio[0] = row0;
+    pmc->kbd_row_gpio[1] = row1;
+    pmc->kbd_row_gpio[2] = row2;
+}
+
+/*
+ * Shared platform values for the EZ-based Palms (PalmOS "Razor"
+ * reference design): ROM window at CSA0's 0x10c00000 with the big ROM
+ * at +0x8000 (all the ROM card headers carry bigROMOffset
+ * 0x10c08000), serial cradle whose ADC dock-sense channel idles low,
+ * keyboard rows on port F bits 4-6 ("Sumo"/"Brad" wiring).
+ */
+static void palm_ez_machine_class_init(ObjectClass *oc)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
 
-    mc->desc = "Palm V (MC68EZ328)";
     mc->default_ram_size = 2 * MiB;
     pmc->rom_base = 0x10c00000;
     pmc->rom_size = 4 * MiB;
@@ -434,8 +460,62 @@ static void palmv_machine_class_init(ObjectClass *oc, const void *data)
     pmc->mask_id = 0x01;
     pmc->gpio_ports = 7;
     pmc->adc_dock_value = 0;    /* serial dock sense idles low */
-    pmc->kbd_row0_gpio = 5 * 8 + 4; /* rows on port F bits 4-6 */
+    palm_set_kbd_rows(pmc, PALM_GPIO('F', 4), PALM_GPIO('F', 5),
+                      PALM_GPIO('F', 6));
     pmc->has_timer2 = false;
+}
+
+static void palmv_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    palm_ez_machine_class_init(oc);
+    mc->desc = "Palm V (MC68EZ328)";
+}
+
+static void palmiiix_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    palm_ez_machine_class_init(oc);
+    mc->desc = "Palm IIIx (MC68EZ328)";
+    mc->default_ram_size = 4 * MiB;
+}
+
+static void palmvx_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    palm_ez_machine_class_init(oc);
+    mc->desc = "Palm Vx (MC68EZ328 at 20MHz)";
+    mc->default_ram_size = 8 * MiB;
+    pmc->sysclk = EZ_SYSCLK_20MHZ;
+    /*
+     * The HAL only skips the throttle-to-13.5MHz path for EZs of
+     * mask revision 4 up ("0J83C" parts).
+     */
+    pmc->mask_id = 0x04;
+    /* "Cobra 2" moves the keyboard rows up to port F bits 5-7 */
+    palm_set_kbd_rows(pmc, PALM_GPIO('F', 5), PALM_GPIO('F', 6),
+                      PALM_GPIO('F', 7));
+}
+
+static void palmm100_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    palm_ez_machine_class_init(oc);
+    mc->desc = "Palm m100 (MC68EZ328)";
+    /*
+     * The m100 ("Calvin") scans its keyboard rows on port B bits
+     * 0/3/6 (found by tracing the ROM's GPIO writes; the columns are
+     * the usual port D bits 0-3, taken as INT0-3 edges rather than
+     * the KB source).
+     */
+    palm_set_kbd_rows(pmc, PALM_GPIO('B', 0), PALM_GPIO('B', 3),
+                      PALM_GPIO('B', 6));
 }
 
 static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
@@ -453,7 +533,8 @@ static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
     pmc->mask_id = 0x01;
     pmc->gpio_ports = 10;
     pmc->adc_dock_value = 0xfff; /* "twister" dock sense idles high */
-    pmc->kbd_row0_gpio = 8 * 8 + 5; /* rows on port K bits 5-7 */
+    /* rows on port K (block 8) bits 5-7 */
+    palm_set_kbd_rows(pmc, 8 * 8 + 5, 8 * 8 + 6, 8 * 8 + 7);
     pmc->has_timer2 = true;
 }
 
@@ -470,6 +551,21 @@ static const TypeInfo palm_machine_types[] = {
         .name          = MACHINE_TYPE_NAME("palmv"),
         .parent        = TYPE_PALM_MACHINE,
         .class_init    = palmv_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmiiix"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmiiix_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmvx"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmvx_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmm100"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmm100_machine_class_init,
     },
     {
         .name          = MACHINE_TYPE_NAME("palmm500"),
