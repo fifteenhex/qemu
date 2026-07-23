@@ -449,3 +449,90 @@ response" turnaround.  Wire QEMU's adb-kbd/adb-mouse behind
 egret_process (cuda.c-style adb_request) and answer Talk R3 probes
 with real device registers — that changes the whole post-probe flow
 and is needed for Finder input anyway.
+
+### VM OFF — THE SPLASH STALL SOLVED (2026-07-23, session 7)
+
+MILESTONE: the deterministic "Welcome to Macintosh" park is ROOT-CAUSED
+and FIXED — three real bugs plus one self-inflicted config bit.  The
+boot now clears the splash (screen goes white, desktop draw begins) and
+dies later in startup with SysError 1 — the new frontier.
+
+1. **ADB devices wired behind the Egret** (adb-kbd + adb-mouse on an
+   ADB bus owned by the VIA1/Egret, cuda-style adb_request).  Wire
+   format, observed: a packet is the RAW ADB COMMAND BYTE plus listen
+   data — NO type byte on this machine (PRAM/RTC goes over the
+   bit-bang, so packets only ever carry ADB).  [00] at startup is ADB
+   SendReset; keep answering it 01 01.
+2. **/XCVR_SESSION polarity was INVERTED** in the model.  Ground truth
+   from the ROM transport disassembly (0x4080a5f6-0x4080a70e, a3 =
+   [$0CF8]; flags +350, byte count +355, receive buffer +356):
+   - receive loop consumes a byte while PB3 is HIGH at the interrupt;
+     PB3 LOW ends the response (cont 0x4080a63c);
+   - PB3 LOW already at the first post-turnaround interrupt sets flag
+     bit5 and the count is DISCARDED at the end (seq/and 0x4080a646).
+     (The session-6 notes had this backwards.)
+   So: real response = PB3 high during bytes, low as end marker;
+   no-response = PB3 low throughout (driver still clocks 2 junk
+   bytes).  The old model delivered real Talk replies with the
+   discard signature and empty probes as phantom [00 00] responses —
+   the OS ADBReInit "found" devices at addresses 0/1 and wedged its
+   next request forever (spin at 0xf034 on a completion flag).
+3. **Listen packets were dropped**: the driver never does the ACR
+   turnaround for commands without responses, and egret_process only
+   ran at turnaround.  Process leftover command bytes at session
+   release — the ADBReInit relocation dance (Listen R3 move-to-15,
+   verify, move-back: [2b 0f fe] / [fb 02 fe] etc.) needs it.
+   Also: both TIP+TACK released = host close/park, never an ack (ack
+   cadence alternates 0x10/0x20 states).  And the extra "session
+   closed" interrupt is GONE — with correct polarity it makes the OS
+   ADB manager run its transaction-end path twice (second entry with
+   busy count [0xB78]+0x48 == 0 → infinite completion wait).
+   With all this the sweep finds kbd at 2 (R3=[02 01]) / mouse at 3
+   ([03 02]), runs the full collision dance 3x and parks cleanly
+   after Talk R0 addr 2.  ADB was NOT the splash stall.
+4. **target/m68k: 030 long-descriptor LIMIT fields now checked** (real
+   emulation bug).  The IIsi ROM's compact 32-bit map bounds its
+   level-B RAM table to ONE entry via limit=0 in the root descriptor
+   ([0x7ffce0] = 0000fc0a 007ffcd0; level-B entry 0 = 0x00000019 →
+   maps 0-8MB; the rest of that table area is 0x6db6db6d RAM-test
+   residue that decodes as "valid" descriptors).  Without limit
+   checking, virtual 8-128MB translates into garbage instead of
+   taking a limit-violation bus error.
+5. **THE STALL: we were enabling VIRTUAL MEMORY ourselves.**  The
+   session-4 hack forces XPRAM 0x8A reads |= 0x05.  Bit 0 = 32-bit
+   addressing (needed).  Bit 2 = VM ENABLED: the 7.5.3 memory-manager
+   patch then installs a 90MB logical space — 0x5A00000 == the size
+   of the previous owner's "VM Storage" swap file still sitting on
+   the macos753 disk (logical+physical EOF 0x05A00000 in the HFS
+   catalog).  MemTop/[0x1EF4] became 0x5A00000 regardless of -m
+   (8MB/64MB both), the boot world (BufPtr, stacks) moved above
+   backed RAM, and everything parked at the splash with the 1Hz
+   XPRAM clock loop running.  Evidence chain: MemTop writer = 
+   transient patch code 0x1a6ac (gdb watch on 0x108 over the
+   deterministic boot, ~400s in), size = installer argument via
+   memory-manager globals [0xB78]+4, [0x1EF8] physical stayed a
+   correct 0x800000 while [0x1EF4] logical read 0x5A00000, VM
+   backing-file open path in the transient module (GetString -16508,
+   fnfErr → create).  Fix: force only bit 0.  MemTop now 0x800000.
+   (gdb-forcing MemTop back at 0x1a6ac was NOT enough — the 90MB
+   lived on in the installer globals; renaming "VM Storage" on a
+   disk copy also NOT enough — the size is config, not file-derived.)
+
+Boot state after the fixes: splash clears (~4min at icount shift=7),
+screen goes white, then **SysError 1 (bus error)** → ROM debug nub
+(0x408496ce prompt loop, serial silent).  First-error capture (gdb
+break 0x40849668): crash PC [0xC70]=0x4080b8de = the find-DRVR-by-name
+loop walking the unit table ([0x11C], count [0x1D2], 'DRVR' pushed at
+0x4080b90e) — a DCE handle deref bus-errors.  The 0xC30/0xC50 reg
+block is contaminated by the SysError handler itself (a0=0xFFFFFAF0
+is a jump-table offset at 0x40802820, not a fault address).  NEXT:
+run with -d mmu fault logging to get the faulting physical address;
+suspect a tagged master pointer or a stale pre-VM-era pointer.
+
+Session tools: /tmp/adbwork-qmp.py (QMP + HMP one-liners),
+/tmp/adbwork-input.py (screendump/mouse/keys), gdb-multiarch batch
+scripts against -gdb tcp:127.0.0.1:412xx (watchpoints work; the
+conditional-eval throttle makes busy-address watches crawl — watch
+0x108 is cheap, 0xf110 is not).  Boots are deterministic enough that
+two-stage capture (find PC in run N, dump live state in run N+1)
+works reliably.
