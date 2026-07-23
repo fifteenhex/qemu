@@ -27,6 +27,14 @@ because it is the iconic EZ device, ROMs are plentiful, and OS 3.x is
 the least demanding of the hardware.  Extending to Vx/IIIx later is
 mostly a RAM-size and ROM-file matter.
 
+## Building and testing
+
+See `palm-tools/README.md` for the crib.  In short: build in `build/`,
+run with `-M palmv`/`-M palmm500 -bios <rom>`; drive the UI over QMP
+with `palm-tools/palmctl.py`; run the deterministic device tests with
+`palm-tools/qtest-devices.py`; make an SD image with
+`palm-tools/make-sd.sh`.
+
 ## ROMs
 
 From archive.org item `20250707_20250707_0134` ("Palm Pilot Roms", a
