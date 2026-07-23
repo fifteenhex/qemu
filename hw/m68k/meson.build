@@ -10,7 +10,8 @@ m68k_ss.add(when: 'CONFIG_PALM', if_true: files('palm.c'))
 m68k_ss.add(when: 'CONFIG_MVME147', if_true: files('mvme147.c'))
 m68k_ss.add(when: 'CONFIG_MEGADRIVE', if_true: files('megadrive.c'))
 m68k_ss.add(when: 'CONFIG_ELTEC_E17', if_true: files('e17.c'))
-m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga.c', 'a3000.c',
+m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga.c', 'a2000.c',
+                                                 'a3000.c',
                                                  'a4000.c',
                                                  'a500.c',
                                                  'a3000_sdmac.c',
