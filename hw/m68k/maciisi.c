@@ -85,6 +85,7 @@
 
 /* Size of whole RAM area (unbacked reads return 0 for RAM sizing) */
 #define RAM_SIZE              0x40000000
+#define RAM_BANK_SPAN         0x04000000  /* 64MB bank A decode window */
 
 /*
  * Interrupt glue: one input per 680x0 interrupt level (input n asserts
@@ -264,6 +265,9 @@ static void via1_rtc_update(MOS6522MacIIsiState *v1s)
     }
 
     v1s->data_out_cnt = 0;
+
+    qemu_log_mask(LOG_UNIMP, "maciisi rtc: byte 0x%02x (cmd=%02x alt=%02x)\n",
+                  v1s->data_out, v1s->cmd, v1s->alt);
 
     /* first byte: it's a command */
     if (v1s->cmd == REG_EMPTY) {
@@ -610,7 +614,7 @@ static uint64_t ramio_read(void *opaque, hwaddr addr, unsigned size)
 {
     static int count;
 
-    if (count < 200) {
+    if (count < 20000) {
         count++;
         qemu_log_mask(LOG_UNIMP,
                       "maciisi ram-hole: read  0x%08x (%d) pc=0x%08x\n",
@@ -624,7 +628,7 @@ static void ramio_write(void *opaque, hwaddr addr, uint64_t val,
 {
     static int count;
 
-    if (count < 200) {
+    if (count < 20000) {
         count++;
         qemu_log_mask(LOG_UNIMP,
                       "maciisi ram-hole: write 0x%08x (%d) <- 0x%08" PRIx64
@@ -1045,8 +1049,9 @@ static void maciisi_egret_ack_toggle(MOS6522MacIIsiState *v1s)
         maciisi_egret_set_xcvr(v1s, m->egret_resp_idx == 1 &&
                                     !m->egret_no_resp);
         maciisi_egret_schedule_int(m);
-        qemu_log_mask(LOG_UNIMP, "maciisi egret: feed 0x%02x (#%d/%d)\n",
-                      s->sr, m->egret_resp_idx, m->egret_resp_len);
+        qemu_log_mask(LOG_UNIMP, "maciisi egret: feed 0x%02x (#%d/%d) pc=%08x b=%02x\n",
+                      s->sr, m->egret_resp_idx, m->egret_resp_len,
+                      maciisi_trace_pc(), s->b);
     } else {
         /* final ack: signal end-of-transfer, the exchange is over */
         m->egret_resp_len = 0;
@@ -1054,7 +1059,8 @@ static void maciisi_egret_ack_toggle(MOS6522MacIIsiState *v1s)
         m->egret_session = false;
         maciisi_egret_set_xcvr(v1s, true);      /* PB3 low: done */
         maciisi_egret_schedule_int(m);
-        qemu_log_mask(LOG_UNIMP, "maciisi egret: response complete\n");
+        qemu_log_mask(LOG_UNIMP, "maciisi egret: response complete pc=%08x b=%02x\n",
+                      maciisi_trace_pc(), s->b);
     }
 }
 
@@ -1091,11 +1097,29 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
         return;
     }
 
-    if (!sys && m->egret_session) {
+    if (!sys) {
+        /*
+         * Host released the session.  Return /XCVR_SESSION to idle
+         * (PB3 high) even when the exchange already finished on our
+         * side: the final-interrupt path parks PB3 low as the receive
+         * loop's exit condition, and the OS ADB manager (unlike the
+         * ROM driver) waits for the line to go idle before starting
+         * its next exchange.
+         */
         m->egret_session = false;
         m->egret_resp_len = 0;
         m->egret_resp_idx = 0;
         maciisi_egret_set_xcvr(v1s, false);
+        /*
+         * The Egret clocks one final shift-register interrupt when the
+         * host releases /TIP: the "session closed" acknowledgement.
+         * The OS Egret driver parks its state machine (state byte 0x01)
+         * on this interrupt after every exchange; without it the next
+         * queued ADB request is never started (observed: boot hangs at
+         * the splash screen with an armed continuation and an idle
+         * bus).  The ROM driver simply eats the extra interrupt.
+         */
+        maciisi_egret_schedule_int(m);
     }
 }
 
@@ -1110,8 +1134,8 @@ static void maciisi_egret_sr_written(MOS6522MacIIsiState *v1s)
     if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
         m->egret_cmd[m->egret_cmd_len++] = s->sr;
     }
-    qemu_log_mask(LOG_UNIMP, "maciisi egret: <- 0x%02x (#%d)\n", s->sr,
-                  m->egret_cmd_len);
+    qemu_log_mask(LOG_UNIMP, "maciisi egret: <- 0x%02x (#%d) pc=%08x b=%02x\n", s->sr,
+                  m->egret_cmd_len, maciisi_trace_pc(), s->b);
     maciisi_egret_schedule_int(m);
 }
 
@@ -1144,8 +1168,8 @@ static void maciisi_egret_sr_read(MOS6522MacIIsiState *v1s)
     if ((s->acr & SR_OUT) || m->egret_resp_len == 0) {
         return;
     }
-    qemu_log_mask(LOG_UNIMP, "maciisi egret: -> 0x%02x (#%d/%d)\n", s->sr,
-                  m->egret_resp_idx, m->egret_resp_len);
+    qemu_log_mask(LOG_UNIMP, "maciisi egret: -> 0x%02x (#%d/%d) pc=%08x b=%02x\n", s->sr,
+                  m->egret_resp_idx, m->egret_resp_len, maciisi_trace_pc(), s->b);
 }
 
 /*
@@ -1391,9 +1415,9 @@ static void maciisi_machine_init(MachineState *machine)
     DeviceState *dev;
     SysBusDevice *sysbus;
 
-    if (ram_size > ADDR24_RAM_LIMIT) {
+    if (ram_size > RAM_BANK_SPAN * 2) {
         error_report("Too much memory for this machine: %" PRId64 " MiB, "
-                     "maximum 8 MiB (24-bit map aliasing)", ram_size / MiB);
+                     "maximum 128 MiB (two 64 MiB banks)", ram_size / MiB);
         exit(1);
     }
 
