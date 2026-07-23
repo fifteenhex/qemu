@@ -6112,7 +6112,9 @@ void register_m68k_insns (CPUM68KState *env)
     BASE(clr,       4200, ff00);
     BASE(undef,     42c0, ffc0);
     INSN(move_from_ccr, 42c0, fff8, CF_ISA_A);
-    INSN(move_from_ccr, 42c0, ffc0, M68K);
+    /* introduced with the 68010: a 68000 takes an illegal-instruction
+     * trap, which is how TOS 2.06 tells the CPU generations apart */
+    INSN(move_from_ccr, 42c0, ffc0, MOVEFROMCCR);
     INSN(neg,       4480, fff8, CF_ISA_A);
     INSN(neg,       4400, ff00, M68K);
     INSN(undef,     44c0, ffc0, M68K);
@@ -6132,7 +6134,9 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(movem,     4880, fb80, M68K);
     BASE(ext,       4880, fff8);
     BASE(ext,       48c0, fff8);
-    BASE(ext,       49c0, fff8);
+    /* EXTB.L is 68020+ / ColdFire; 68000/010 must trap */
+    INSN(ext,       49c0, fff8, EXTB);
+    INSN(ext,       49c0, fff8, CF_ISA_A);
     BASE(tst,       4a00, ff00);
     INSN(tas,       4ac0, ffc0, CF_ISA_B);
     INSN(tas,       4ac0, ffc0, M68K);

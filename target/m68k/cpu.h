@@ -670,6 +670,11 @@ enum m68k_features {
     M68K_FEATURE_TRAPCC,
     /* MOVE from SR privileged (from 68010) */
     M68K_FEATURE_MOVEFROMSR_PRIV,
+    /* MOVE from CCR (from 68010; the 68000 traps, which TOS 2.06's
+     * CPU detection relies on) */
+    M68K_FEATURE_MOVEFROMCCR,
+    /* EXTB.L (680[2346]0, CPU32 and ColdFire) */
+    M68K_FEATURE_EXTB,
     /* Exception frame with format+vector (from 68010) */
     M68K_FEATURE_EXCEPTION_FORMAT_VEC,
     /* LINK.L (680[2346]0, and CPU32) */
