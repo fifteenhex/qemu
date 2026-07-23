@@ -146,6 +146,12 @@ config AMIGA
     select PCI
     imply PCI_DEVICES
 
+config ATARIST
+    bool
+    default y
+    depends on M68K
+    select FRAMEBUFFER
+
 config MEGADRIVE
     bool
     default y

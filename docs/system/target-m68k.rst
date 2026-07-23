@@ -20,6 +20,7 @@ Board-specific documentation
 
    m68k/mac128k
    m68k/maciisi
+   m68k/atarist
    m68k/amiga
    m68k/e17
    m68k/mc68ez328
