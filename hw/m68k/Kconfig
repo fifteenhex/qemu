@@ -78,6 +78,7 @@ config PALM
     select DRAGONBALL_RTC
     select ADS7843
     select PALM_KEYPAD
+    select DRAGONBALL_PWM
     select SPLIT_IRQ
 
 config MVME147

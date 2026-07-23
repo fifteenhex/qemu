@@ -62,11 +62,13 @@
 #include "hw/rtc/dragonball_rtc.h"
 #include "hw/input/ads7843.h"
 #include "hw/input/palm_keypad.h"
+#include "hw/audio/dragonball_pwm.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
 #define PALM_MMIO_INTC       0xfffff300
 #define PALM_MMIO_GPIO       0xfffff400
+#define PALM_MMIO_PWM        0xfffff500
 #define PALM_MMIO_TIMER1     0xfffff600
 #define PALM_MMIO_TIMER2     0xfffff610
 #define PALM_MMIO_SPI        0xfffff800
@@ -141,7 +143,7 @@ static void palm_init(MachineState *machine)
     PalmResetInfo *ri;
     DeviceState *scr_dev, *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
                 *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev, *adc_dev,
-                *pen_split, *kpd_dev;
+                *pen_split, *kpd_dev, *pwm_dev;
     MemoryRegion *sysmem = get_system_memory();
     ssize_t size;
     int i;
@@ -211,6 +213,15 @@ static void palm_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio_dev), 0, PALM_MMIO_GPIO);
     /* the battery is always healthy here */
     qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_POWERFAIL_GPIO));
+
+    /* PWM 1: the speaker */
+    pwm_dev = qdev_new(TYPE_DRAGONBALL_PWM);
+    qdev_prop_set_uint32(pwm_dev, "sysclk", pmc->sysclk);
+    if (machine->audiodev) {
+        qdev_prop_set_string(pwm_dev, "audiodev", machine->audiodev);
+    }
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(pwm_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pwm_dev), 0, PALM_MMIO_PWM);
 
     /* Timer(s) */
     timer_dev = qdev_new(TYPE_DRAGONBALL_TIMER);
@@ -340,6 +351,11 @@ static void palm_init(MachineState *machine)
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
                                                        DRAGONBALL_INTC_KB));
+    for (i = 0; i < PALM_KEYPAD_SILK; i++) {
+        qdev_connect_gpio_out_named(kpd_dev, "silk", i,
+                                    qdev_get_gpio_in_named(adc_dev,
+                                                           "silk-tap", i));
+    }
 }
 
 static void palm_machine_common_class_init(ObjectClass *oc, const void *data)
@@ -349,6 +365,7 @@ static void palm_machine_common_class_init(ObjectClass *oc, const void *data)
     mc->init = palm_init;
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68000");
     mc->default_ram_id = "palm.ram";
+    machine_add_audiodev_property(mc);
     /*
      * The whole 0xfffffxxx page is on-chip; nothing bus-errors on the
      * real device even where we have no model yet (chip selects, DRAM
