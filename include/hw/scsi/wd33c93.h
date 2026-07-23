@@ -58,6 +58,7 @@ struct WD33C93State {
     /* post a service-required interrupt once the last one is consumed */
     bool srv_req_pending;
     bool disconnect_pending;
+    bool data_out_pending;
     Fifo8 fifo;
 
     /* raised while a dma-mode transfer wants servicing */

@@ -162,7 +162,6 @@ static void wd33c93_ti_complete(WD33C93State *s)
 		break;
 	}
 	case WD33C93_PHASE_DATA_IN:
-	case WD33C93_PHASE_DATA_OUT:
 		if (s->sat_active) {
 			if (s->req_done) {
 				wd33c93_sat_finish(s);
@@ -173,6 +172,26 @@ static void wd33c93_ti_complete(WD33C93State *s)
 			s->bus_phase = WD33C93_PHASE_STATUS;
 			s->cmdphase = 0x46;
 		}
+		break;
+	case WD33C93_PHASE_DATA_OUT:
+		if (s->sat_active) {
+			if (s->req_done) {
+				wd33c93_sat_finish(s);
+			}
+			return;
+		}
+		if (!s->req_done) {
+			/*
+			 * The host has fed all the data but the block write is
+			 * still in flight.  Hold the transfer-complete interrupt
+			 * until the write lands, so the bus advances to the
+			 * status phase only once there is a status to report.
+			 */
+			s->data_out_pending = true;
+			return;
+		}
+		s->bus_phase = WD33C93_PHASE_STATUS;
+		s->cmdphase = 0x46;
 		break;
 	case WD33C93_PHASE_STATUS:
 		s->bus_phase = WD33C93_PHASE_MSG_IN;
@@ -363,6 +382,8 @@ static void wd33c93_cmd_reset(WD33C93State *s)
 	s->state = WD33C93_IDLE;
 	s->bus_phase = WD33C93_PHASE_BUS_FREE;
 	s->srv_req_pending = false;
+	s->disconnect_pending = false;
+	s->data_out_pending = false;
 	s->ti_remaining = 0;
 	s->cmdphase = 0;
 	fifo8_reset(&s->fifo);
@@ -825,6 +846,8 @@ static void wd33c93_reset(DeviceState *dev)
 	s->state = WD33C93_IDLE;
 	s->bus_phase = WD33C93_PHASE_BUS_FREE;
 	s->srv_req_pending = false;
+	s->disconnect_pending = false;
+	s->data_out_pending = false;
 	s->ti_remaining = 0;
 	s->auxstat = 0;
 	s->scsistatus = 0;
@@ -862,6 +885,16 @@ static void wd33c93_command_complete(SCSIRequest *req, size_t resid)
 	s->req_done = true;
 	s->scsi_len = 0;
 	s->scsi_pos = 0;
+
+	if (s->data_out_pending) {
+		/* the deferred write completion (see wd33c93_ti_complete) */
+		s->data_out_pending = false;
+		s->bus_phase = WD33C93_PHASE_STATUS;
+		s->cmdphase = 0x46;
+		wd33c93_do_int(s, WD33C93_SCSISTATUS_XFER_DONE |
+		                  WD33C93_PHASE_STATUS);
+		return;
+	}
 
 	/*
 	 * If the host is still waiting inside a data-phase transfer
