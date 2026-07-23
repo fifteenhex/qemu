@@ -231,19 +231,44 @@ callbacks run inside the timer's transaction).
   (28M -> a few thousand exceptions), AMIX runs its kernel in virtual
   memory, brings up its own 640x256 console, and prints a real
   "DOUBLE PANIC: KERNEL FAULT" register dump instead of looping the CPU.
-  NEXT BLOCKER: that kernel fault.  There are no access faults left, so
-  it is not a paging miss; the dominant symptom afterwards is a
-  privilege-violation loop at ROM pc=0x00f80c00 (`ori #$2000,SR`) in USER
-  mode, interleaved with Kickstart's own interrupt handlers — i.e. the
-  kernel has crashed and control fell back to the ROM.  Leads to chase:
-  (1) the 030 exception/RTE frame path (op_helper.c builds a format-$A
-  bus-fault frame with a 68040-style SSW; the 030 wants its own SSW and
-  possibly a format-$B frame, and a wrong frame would land an RTE at a
-  bogus PC), and (2) an unimplemented line-F/FPU instruction (one F-Line
-  at virtual pc=0x00c00ac0 appears late).  AMIX writes its console to the
-  graphics display, not serial (serial stays empty), so reading the panic
-  needs either a serial-console AMIX config or gdb (-s; registers/memory
-  come back byte-reversed per long, read via QMP pmemsave + objdump).
+  NEXT BLOCKER: that kernel fault — now READ OFF THE CONSOLE.  Captured the
+  on-screen panic with QMP `screendump` at 10s intervals (AMIX writes its
+  console to the graphics display, not serial), upscaled the text band with
+  PIL, and read it:
+
+      PANIC: assertion failed: pp >= pages && pp < epages,
+             file: vm_page.c, line: 1103
+      DOUBLE PANIC: KERNEL FAULT ssw=0x2704 pc=0x00C00AC0 fmt=0x8
+             vector=0xD <Line F>
+
+  So the FIRST fault is a **software assertion in AMIX's VM layer**, not an
+  MMU miss — the page-frame database bounds check `pp >= pages && pp <
+  epages` fails: a physical page pointer fell outside the managed page array.
+  The MMU walk is therefore working; AMIX reaches VM init before tripping.
+  Verified this directly by walking the live SRP tables via QMP pmemsave for
+  the double-panic PC (virtual 0xc00ac0): the SRP root descriptor (entry 0,
+  covering supervisor VA 0-0x3FFFFFFF) is INVALID, so 0xc00ac0 is genuinely
+  unmapped — the double panic is just panic() itself touching an unmapped
+  page and taking a Line-F (open-bus 0xffff decodes as F-line, vector 0xD).
+  The QEMU 030 format-$A bus-fault frame layout was audited against the
+  68030UM and is correct (SR/PC/vector/SSW/pipe/fault-addr all in the right
+  slots), so the frame is not the cause either.
+
+  ROOT-CAUSE HYPOTHESIS: our (hardware-accurate) A3000 memory map is
+  **non-contiguous** — chip RAM 0x00000000-0x00200000 (pfn 0-0x200), a large
+  gap, then motherboard fast RAM 0x07000000-0x08000000 (pfn 0x7000-0x8000,
+  growing down from A3000_FASTRAM_TOP; hw/m68k/a3000.c).  If AMIX sizes its
+  `pages[]` array to the total page COUNT ((2M chip + 16M fast)/4K = 4608)
+  but indexes it by absolute pfn (phys>>12, up to 0x8000 for fast RAM), a
+  fast-RAM page's pp lands past `epages` and the assertion fires.  Real A3000
+  AMIX has the same split map and copes, so it must build per-segment
+  page ranges we're mis-feeding — the exact check at vm_page.c:1103 needs the
+  AMIX kernel disassembled (or a memory-layout experiment) to pin down.
+  Next concrete steps: (a) disassemble the AMIX boot kernel around the
+  vm_page.c:1103 assertion to see how `pages`/`epages`/`pp` are derived and
+  what memory-descriptor input it expects; (b) check whether Kickstart's
+  exec memory list (which AMIX reads for its physical segments) matches what
+  the Ramsey/Gary model reports for fast RAM base+size.
   Not-yet-modelled for the 030 walk: descriptor LIMIT fields, the
   indirect page descriptor, and function-code lookup (TC FCL) — AMIX
   seems not to need them so far.
