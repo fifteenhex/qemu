@@ -254,21 +254,45 @@ callbacks run inside the timer's transaction).
   68030UM and is correct (SR/PC/vector/SSW/pipe/fault-addr all in the right
   slots), so the frame is not the cause either.
 
-  ROOT-CAUSE HYPOTHESIS: our (hardware-accurate) A3000 memory map is
-  **non-contiguous** — chip RAM 0x00000000-0x00200000 (pfn 0-0x200), a large
-  gap, then motherboard fast RAM 0x07000000-0x08000000 (pfn 0x7000-0x8000,
-  growing down from A3000_FASTRAM_TOP; hw/m68k/a3000.c).  If AMIX sizes its
-  `pages[]` array to the total page COUNT ((2M chip + 16M fast)/4K = 4608)
-  but indexes it by absolute pfn (phys>>12, up to 0x8000 for fast RAM), a
-  fast-RAM page's pp lands past `epages` and the assertion fires.  Real A3000
-  AMIX has the same split map and copes, so it must build per-segment
-  page ranges we're mis-feeding — the exact check at vm_page.c:1103 needs the
-  AMIX kernel disassembled (or a memory-layout experiment) to pin down.
-  Next concrete steps: (a) disassemble the AMIX boot kernel around the
-  vm_page.c:1103 assertion to see how `pages`/`epages`/`pp` are derived and
-  what memory-descriptor input it expects; (b) check whether Kickstart's
-  exec memory list (which AMIX reads for its physical segments) matches what
-  the Ramsey/Gary model reports for fast RAM base+size.
+  DISASSEMBLED THE ASSERTION (dump fast RAM 0x07000000-0x08000000 via QMP
+  pmemsave, m68k-linux-gnu-objdump -b binary -m m68k:68030).  The kernel runs
+  **1:1 in fast RAM** (code references the assertion string at its physical
+  address 0x070af518; verified 14 refs, 12 are `pea 0x70af518` call sites).
+  assfail() = 0x0703ec0c.  The assertion macro is:
+
+      jsr   0x070af5f8          ; pp = page-hash lookup(vnode,offset) -> a0
+      moveal %a0,%a2            ; a2 = pp
+      cmpal 0x07124a90,%a2      ; pp vs `pages`  global
+      bcs   fail                ; pp <  pages  -> fail
+      cmpal 0x07116508,%a2      ; pp vs `epages` global
+      bcs   ok                  ; pp <  epages -> ok
+      fail: pea <line> ; pea 0x070af50e"vm_page.c" ; pea 0x070af518 ; jsr assfail
+
+  So `pages`  global lives at 0x07124a90, `epages` at 0x07116508.  Runtime
+  values on our boot: pages=0x40040000, epages=0x400ab364 (span 0x6b364).
+  IMPORTANT: `pp` does NOT come from a pfn formula — 0x070af5f8 is a **page
+  hash lookup** (hashes with >>11, the 2KB page shift from tc030 PS=11).  So
+  the failure is "a vm_page reached through the page hash has an address
+  outside the managed [pages,epages) array" — a page-management inconsistency,
+  not a simple array-sizing bug.
+
+  MMU RULED OUT as the corruptor.  Walked the live SRP tables (base
+  0x0712b800, tc030=0x82b02d60: IS=0, TI=[2,13,6,0], PS=11 -> 2KB pages):
+  the SRP root uses an **early-termination page descriptor** mapping
+  supervisor VA 0x00000000-0x3FFFFFFF 1:1 to physical (hence kernel-in-fast-
+  RAM runs 1:1, and 0xc00ac0 identity-maps to the custom/open-bus region ->
+  reads 0xffff -> the Line-F double panic).  VA 0x40000000+ uses the fine
+  tables and correctly maps the page array (0x40040000 -> fast RAM
+  0x07143800).  get_physical_address_030 handles early termination and the
+  fine walk correctly and self-consistently, so the page array is not being
+  mistranslated.  The out-of-range pp is therefore genuine AMIX behaviour on
+  our chip+fast split memory, reached during early VM init.
+  Remaining work is open-ended AMIX kernel RE: trace how a page enters the
+  hash with an address below `pages` (0x40040000) or >= `epages` — most likely
+  tied to how AMIX enumerates physical segments (2MB chip at pa 0 vs 16MB fast
+  at pa 0x07000000) and which pages it builds structs for.  Cross-check
+  against Kickstart's exec memory list (what the Ramsey/Gary model reports for
+  fast-RAM base+size), since that list feeds AMIX's segment setup.
   Not-yet-modelled for the 030 walk: descriptor LIMIT fields, the
   indirect page descriptor, and function-code lookup (TC FCL) — AMIX
   seems not to need them so far.
