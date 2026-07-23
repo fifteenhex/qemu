@@ -73,6 +73,13 @@ config MVME147
     select LANCE
     select WD33C93
 
+config ELTEC_E17
+    bool
+    default y
+    depends on M68K
+    select E17_SYSC
+    select CD2401
+
 config AMIGA
     bool
     default y

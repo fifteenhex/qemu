@@ -7,6 +7,7 @@ m68k_ss.add(when: 'CONFIG_M68K_VIRT', if_true: files('virt.c'))
 m68k_ss.add(when: 'CONFIG_MC68EZ328', if_true: files('mc68ez328.c'))
 m68k_ss.add(when: 'CONFIG_MVME147', if_true: files('mvme147.c'))
 m68k_ss.add(when: 'CONFIG_MEGADRIVE', if_true: files('megadrive.c'))
+m68k_ss.add(when: 'CONFIG_ELTEC_E17', if_true: files('e17.c'))
 m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga.c', 'a3000.c',
                                                  'a4000.c',
                                                  'a3000_sdmac.c',
