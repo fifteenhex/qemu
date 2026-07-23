@@ -25,6 +25,7 @@ Board-specific documentation
    m68k/e17
    m68k/mc68ez328
    m68k/mvme147
+   m68k/sun3
    m68k/palm
    m68k/megadrive
 
