@@ -36,6 +36,16 @@ config Q800
     select IOSB
     select ASC
 
+config MAC128K
+    bool
+    default y
+    depends on M68K
+    select MOS6522
+    select ESCC
+    select IWM
+    select OR_IRQ
+    select FRAMEBUFFER
+
 config MACIISI
     bool
     default y
