@@ -404,6 +404,12 @@ static void e17_machine_instance_init(Object *obj)
     E17_MACHINE(obj)->video = true;
 }
 
+static const char *const e17_valid_cpu_types[] = {
+    M68K_CPU_TYPE_NAME("m68040"),
+    M68K_CPU_TYPE_NAME("m68060"),   /* a factory CPU option on this board */
+    NULL
+};
+
 static void e17_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -411,6 +417,7 @@ static void e17_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "ELTEC Eurocom E17";
     mc->init = e17_init;
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
+    mc->valid_cpu_types = e17_valid_cpu_types;
     mc->default_ram_size = E17_DEFAULT_RAM_SIZE;
     mc->default_ram_id = "dram";
     /* the board carries a second 68040; -smp 1 removes it */
