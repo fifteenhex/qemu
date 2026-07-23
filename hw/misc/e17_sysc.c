@@ -24,6 +24,7 @@
 
 /* Z8536 register numbers used by RMON */
 #define Z8536_MICR          0x00
+#define Z8536_MICR_RESET    0x01
 #define Z8536_MCCR          0x01
 #define Z8536_PCDDR         0x06
 #define Z8536_PADDR         0x23
@@ -53,6 +54,15 @@
  * and resets the pointer state.  Ports A/B/C are data latches; reads
  * mix the output latch with the input pins according to the data
  * direction registers (DDR bit set = input).
+ *
+ * Reset protocol: the chip powers up with the MICR RESET bit set,
+ * and while it is set every control port WRITE addresses the MICR
+ * directly (only the reset bit is writable), bypassing the pointer
+ * state machine.  RMON's init depends on this: it writes 0x00, 0x01
+ * (pointer MICR, data RESET), then a bare 0x00 that must clear the
+ * reset — getting this wrong desyncs every subsequent pointer/data
+ * pair, the DDRs never load, and the DIP switch read returns the
+ * port B output latch (0xff) instead of the switches.
  */
 static uint8_t e17_cio_ddr_reg(int port)
 {
@@ -87,7 +97,11 @@ static void e17_cio_write(E17CIOState *c, hwaddr addr, uint8_t val)
 {
     switch (addr) {
     case E17_CIO_CTRL:
-        if (c->ctrl_expect_data) {
+        if (c->regs[Z8536_MICR] & Z8536_MICR_RESET) {
+            /* in reset state every control write hits the MICR */
+            c->regs[Z8536_MICR] = val & Z8536_MICR_RESET;
+            c->ctrl_expect_data = false;
+        } else if (c->ctrl_expect_data) {
             c->regs[c->ctrl_ptr] = val;
             c->ctrl_expect_data = false;
         } else {
@@ -293,16 +307,18 @@ static void e17_sysc_reset(DeviceState *dev)
 
     for (i = 0; i < 2; i++) {
         memset(s->cio[i].regs, 0, sizeof(s->cio[i].regs));
+        /* the Z8536 powers up in reset state */
+        s->cio[i].regs[Z8536_MICR] = Z8536_MICR_RESET;
         s->cio[i].ctrl_ptr = 0;
         s->cio[i].ctrl_expect_data = false;
         memset(s->cio[i].out, 0, sizeof(s->cio[i].out));
     }
     /*
      * CIO1 port B reads the configuration DIP switches, port A bit 7
-     * a console select input.
+     * a console select input (reads high on the bench).
      */
     s->cio[0].in[E17_CIO_PORTB] = s->dip_switches;
-    s->cio[0].in[E17_CIO_PORTA] = 0x00;
+    s->cio[0].in[E17_CIO_PORTA] = 0x80;
     s->cio[0].in[E17_CIO_PORTC] = 0x00;
 
     s->kbd_data = 0;
