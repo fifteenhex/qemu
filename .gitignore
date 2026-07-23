@@ -23,3 +23,6 @@ GTAGS
 
 # Local Amiga test assets (ROMs, ADFs) — do not commit
 _amiga_assets/
+_mac_assets/
+_sun3_assets/
+_atarist_assets/
