@@ -43,6 +43,17 @@ struct IWMState {
     bool ejected;
     bool switched;              /* disk-switched latch */
 
+    int64_t lstrb_time;
+    QEMUTimer *reinsert_timer;
+
+    /*
+     * The Macintosh 128K sets the drive speed with a PWM signal taken
+     * from the low bytes of the words in the sound page; the machine
+     * points this at that buffer so the tachometer can answer with the
+     * speed the ROM asked for.
+     */
+    const uint8_t *pwm_buf;
+
     /* GCR-encoded track under the head */
     int cached_track;
     int track_len;
