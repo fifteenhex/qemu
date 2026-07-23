@@ -19,9 +19,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
 #include "softfloat.h"
 
 /*
@@ -186,35 +188,47 @@ static int cpu_m68k_exceptbits_from_host(int host_bits)
     return target_bits;
 }
 
-/* Convert cpu_m68k exception flags to target form.  */
-static int cpu_m68k_exceptbits_to_host(int target_bits)
+/*
+ * Fold host float flags into the FPSR EXC byte (bits 15-8) and the
+ * accrued AEXC bits, then clear them, so that each sync point sees
+ * only the flags raised by the operations since the previous one.
+ * The EXC byte reflects the most recent exception-raising operation.
+ */
+static void fp_materialize_exc(CPUM68KState *env)
 {
-    int host_bits = 0;
+    int now = get_float_exception_flags(&env->fp_status);
+    int exc = 0;
 
-    if (target_bits & 0x80) {
-        host_bits |= float_flag_invalid;
+    if (!now) {
+        return;
     }
-    if (target_bits & 0x40) {
-        host_bits |= float_flag_overflow;
+    if (now & float_flag_invalid_snan) {
+        exc |= 1 << 14;                       /* SNAN */
+    } else if (now & float_flag_invalid) {
+        exc |= 1 << 13;                       /* OPERR */
     }
-    if (target_bits & 0x20) {
-        host_bits |= float_flag_underflow;
+    if (now & float_flag_overflow) {
+        exc |= 1 << 12;                       /* OVFL */
     }
-    if (target_bits & 0x10) {
-        host_bits |= float_flag_divbyzero;
+    if (now & (float_flag_underflow | float_flag_output_denormal_flushed)) {
+        exc |= 1 << 11;                       /* UNFL */
     }
-    if (target_bits & 0x08) {
-        host_bits |= float_flag_inexact;
+    if (now & float_flag_divbyzero) {
+        exc |= 1 << 10;                       /* DZ */
     }
-    return host_bits;
+    if (now & float_flag_inexact) {
+        exc |= 1 << 9;                        /* INEX2 */
+    }
+    env->fpsr = (env->fpsr & ~0xff00) | exc;
+    env->fp_aexc |= cpu_m68k_exceptbits_from_host(now);
+    set_float_exception_flags(0, &env->fp_status);
+    env->fp_trap_armed = 1;
 }
 
 uint32_t cpu_m68k_get_fpsr(CPUM68KState *env)
 {
-    int host_flags = get_float_exception_flags(&env->fp_status);
-    int target_flags = cpu_m68k_exceptbits_from_host(host_flags);
-    int except = (env->fpsr & ~(0xf8)) | target_flags;
-    return except;
+    fp_materialize_exc(env);
+    return (env->fpsr & ~(0xf8)) | env->fp_aexc;
 }
 
 uint32_t HELPER(get_fpsr)(CPUM68KState *env)
@@ -225,9 +239,10 @@ uint32_t HELPER(get_fpsr)(CPUM68KState *env)
 void cpu_m68k_set_fpsr(CPUM68KState *env, uint32_t val)
 {
     env->fpsr = val;
-
-    int host_flags = cpu_m68k_exceptbits_to_host((int) env->fpsr);
-    set_float_exception_flags(host_flags, &env->fp_status);
+    env->fp_aexc = val & 0xf8;
+    set_float_exception_flags(0, &env->fp_status);
+    /* writing the FPSR does not create an exception trap request */
+    env->fp_trap_armed = 0;
 }
 
 void HELPER(set_fpsr)(CPUM68KState *env, uint32_t val)
@@ -746,4 +761,361 @@ void HELPER(fsinh)(CPUM68KState *env, FPReg *res, FPReg *val)
 void HELPER(fcosh)(CPUM68KState *env, FPReg *res, FPReg *val)
 {
     res->d = floatx80_cosh(val->d, &env->fp_status);
+}
+
+/*
+ * 68881/68882 packed decimal real format:
+ *   bit 95: mantissa sign, bit 94: exponent sign,
+ *   bits 91-80: 3 BCD exponent digits,
+ *   bits 67-64: BCD integer digit,
+ *   bits 63-0: 16 BCD fraction digits.
+ * Value = (-1)^SM * D16.D15...D0 * 10^((-1)^SE * EEE)
+ */
+
+static const uint64_t pow10_tab[19] = {
+    1ULL,
+    10ULL,
+    100ULL,
+    1000ULL,
+    10000ULL,
+    100000ULL,
+    1000000ULL,
+    10000000ULL,
+    100000000ULL,
+    1000000000ULL,
+    10000000000ULL,
+    100000000000ULL,
+    1000000000000ULL,
+    10000000000000ULL,
+    100000000000000ULL,
+    1000000000000000ULL,
+    10000000000000000ULL,
+    100000000000000000ULL,
+    1000000000000000000ULL,
+};
+
+/*
+ * Scale x by 10^e.  Powers up to 10^18 are exactly representable, so
+ * each step is a single correctly rounded operation.
+ */
+static floatx80 scale10(floatx80 x, int e, float_status *st)
+{
+    while (e > 0) {
+        int c = e > 18 ? 18 : e;
+        x = floatx80_mul(x, int64_to_floatx80(pow10_tab[c], st), st);
+        e -= c;
+    }
+    while (e < 0) {
+        int c = e < -18 ? 18 : -e;
+        x = floatx80_div(x, int64_to_floatx80(pow10_tab[c], st), st);
+        e += c;
+    }
+    return x;
+}
+
+void HELPER(extpk)(CPUM68KState *env, FPReg *res, uint32_t hi, uint32_t mid,
+                   uint32_t lo)
+{
+    float_status st = env->fp_status;
+    int sm = (hi >> 31) & 1;
+    int se = (hi >> 30) & 1;
+    floatx80 x;
+    int64_t mant;
+    int exp10, i;
+
+    if (((hi >> 16) & 0xfff) == 0xfff) {
+        /* exponent field all ones: infinity or NaN */
+        x.high = (sm << 15) | 0x7fff;
+        if (mid == 0 && lo == 0) {
+            x.low = 0;
+        } else {
+            x.low = (1ULL << 63) | ((uint64_t)mid << 32) | lo;
+        }
+        res->d = x;
+        return;
+    }
+
+    exp10 = ((hi >> 24) & 0xf) * 100 + ((hi >> 20) & 0xf) * 10
+          + ((hi >> 16) & 0xf);
+    mant = hi & 0xf;
+    for (i = 7; i >= 0; i--) {
+        mant = mant * 10 + ((mid >> (i * 4)) & 0xf);
+    }
+    for (i = 7; i >= 0; i--) {
+        mant = mant * 10 + ((lo >> (i * 4)) & 0xf);
+    }
+
+    x = int64_to_floatx80(mant, &st);
+    x = scale10(x, (se ? -exp10 : exp10) - 16, &st);
+    if (sm) {
+        x = floatx80_chs(x);
+    }
+    res->d = x;
+}
+
+void HELPER(redpk)(CPUM68KState *env, FPReg *val, uint32_t addr, int32_t k)
+{
+    uintptr_t ra = GETPC();
+    float_status st = env->fp_status;
+    floatx80 x = val->d;
+    int sm = (x.high >> 15) & 1;
+    int exp = x.high & 0x7fff;
+    uint32_t hi, mid = 0, lo = 0;
+
+    if (exp == 0x7fff) {
+        /* infinity or NaN */
+        hi = ((uint32_t)sm << 31) | 0x7fff0000;
+        if ((x.low << 1) != 0) {
+            mid = x.low >> 32;
+            lo = x.low;
+        }
+    } else if (exp == 0 && x.low == 0) {
+        hi = (uint32_t)sm << 31;
+    } else {
+        floatx80 abs = x;
+        floatx80 one = int64_to_floatx80(1, &st);
+        int d, len, dexp, i;
+        int64_t n;
+        uint64_t m17, bcdm;
+
+        abs.high &= 0x7fff;
+        /* decimal exponent: refine estimate to 10^d <= abs < 10^(d+1) */
+        d = (int)(((int64_t)(exp - 0x3fff) * 19728) >> 16);
+        while (floatx80_lt(abs, scale10(one, d, &st), &st)) {
+            d--;
+        }
+        while (!floatx80_lt(abs, scale10(one, d + 1, &st), &st)) {
+            d++;
+        }
+        /* k > 0: k significant digits; k <= 0: -k digits after the point */
+        len = k > 0 ? k : d + 1 - k;
+        if (len < 1) {
+            len = 1;
+        }
+        if (len > 17) {
+            len = 17;
+        }
+        n = floatx80_to_int64(scale10(abs, len - 1 - d, &st), &st);
+        if (n >= (int64_t)pow10_tab[len]) {
+            /* rounding carried into an extra digit */
+            n /= 10;
+            d++;
+        }
+        /* left-align into the 17 digit mantissa d16.d15...d0 */
+        m17 = (uint64_t)n * pow10_tab[17 - len];
+        bcdm = 0;
+        for (i = 0; i < 16; i++) {
+            bcdm |= (uint64_t)(m17 % 10) << (i * 4);
+            m17 /= 10;
+        }
+        mid = bcdm >> 32;
+        lo = bcdm;
+        dexp = d < 0 ? -d : d;
+        hi = ((uint32_t)sm << 31) | (d < 0 ? 1u << 30 : 0)
+           | (((dexp / 100) % 10) << 24) | (((dexp / 10) % 10) << 20)
+           | ((dexp % 10) << 16) | (uint32_t)m17;
+    }
+
+    cpu_stl_be_data_ra(env, addr, hi, ra);
+    cpu_stl_be_data_ra(env, addr + 4, mid, ra);
+    cpu_stl_be_data_ra(env, addr + 8, lo, ra);
+}
+
+/*
+ * 68881/68882 FSAVE/FRESTORE state frames.
+ *
+ * A real coprocessor dumps internal microcode state; QEMU completes
+ * every instruction synchronously, so the architecturally visible
+ * registers are the whole state.  We write a NULL frame when the FPU
+ * is in its reset state (matching the hardware, which firmware checks)
+ * and otherwise a QEMU-specific idle frame carrying the data and
+ * control registers, so that a save/restore pair round-trips state --
+ * 147Bug saves after FREM, restores a null frame and then the saved
+ * frame, and expects the FREM result to survive.
+ */
+/* 8 fp regs * 12 bytes + 3 control longs + trailer */
+#define FSAVE_6888X_VERSION 0x1f
+#define FSAVE_6888X_PAYLOAD 112
+
+static void fpu_do_reset(CPUM68KState *env)
+{
+    floatx80 nan = floatx80_default_nan(&env->fp_status);
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        env->fregs[i].d = nan;
+    }
+    cpu_m68k_set_fpcr(env, 0);
+    cpu_m68k_set_fpsr(env, 0);
+    env->fpiar = 0;
+}
+
+static bool fpu_in_reset_state(CPUM68KState *env)
+{
+    floatx80 nan = floatx80_default_nan(&env->fp_status);
+    int i;
+
+    if (env->fpcr != 0 || cpu_m68k_get_fpsr(env) != 0 || env->fpiar != 0) {
+        return false;
+    }
+    for (i = 0; i < 8; i++) {
+        if (env->fregs[i].l.upper != (nan.high & 0xffff) ||
+            env->fregs[i].l.lower != nan.low) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t do_fsave(CPUM68KState *env, uint32_t addr, uintptr_t ra)
+{
+    int i;
+
+    if (fpu_in_reset_state(env)) {
+        cpu_stl_be_data_ra(env, addr, 0, ra);
+        return 4;
+    }
+    cpu_stl_be_data_ra(env, addr,
+                       (FSAVE_6888X_VERSION << 24) | (FSAVE_6888X_PAYLOAD << 16) |
+                       ((env->fp_trap_armed & 1) << 8),
+                       ra);
+    addr += 4;
+    for (i = 0; i < 8; i++) {
+        cpu_stl_be_data_ra(env, addr, (uint32_t)env->fregs[i].l.upper << 16, ra);
+        cpu_stl_be_data_ra(env, addr + 4, env->fregs[i].l.lower >> 32, ra);
+        cpu_stl_be_data_ra(env, addr + 8, env->fregs[i].l.lower, ra);
+        addr += 12;
+    }
+    cpu_stl_be_data_ra(env, addr, env->fpcr, ra);
+    cpu_stl_be_data_ra(env, addr + 4, cpu_m68k_get_fpsr(env), ra);
+    cpu_stl_be_data_ra(env, addr + 8, env->fpiar, ra);
+    /*
+     * Trailer, mimicking a real 68882 frame whose final internal-state
+     * bytes are nonzero: 147Bug's FPC test reads the last byte of a
+     * frame it saved over a flag variable and relies on it being
+     * nonzero.  Exception handlers may also set bits in this long.
+     */
+    cpu_stl_be_data_ra(env, addr + 12, 0x000000ff, ra);
+    return 4 + FSAVE_6888X_PAYLOAD;
+}
+
+uint32_t HELPER(fsave_6888x)(CPUM68KState *env, uint32_t addr)
+{
+    return do_fsave(env, addr, GETPC());
+}
+
+uint32_t HELPER(fsave_6888x_predec)(CPUM68KState *env, uint32_t an)
+{
+    uintptr_t ra = GETPC();
+    uint32_t size = fpu_in_reset_state(env) ? 4 : 4 + FSAVE_6888X_PAYLOAD;
+
+    do_fsave(env, an - size, ra);
+    return size;
+}
+
+uint32_t HELPER(frestore_6888x)(CPUM68KState *env, uint32_t addr)
+{
+    uintptr_t ra = GETPC();
+    uint32_t hdr = cpu_ldl_be_data_ra(env, addr, ra);
+    int i;
+
+    if ((hdr >> 24) == 0) {
+        /* NULL frame: reset the FPU */
+        fpu_do_reset(env);
+        return 4;
+    }
+    if ((hdr >> 24) == FSAVE_6888X_VERSION) {
+        addr += 4;
+        for (i = 0; i < 8; i++) {
+            env->fregs[i].l.upper = cpu_ldl_be_data_ra(env, addr, ra) >> 16;
+            env->fregs[i].l.lower =
+                ((uint64_t)cpu_ldl_be_data_ra(env, addr + 4, ra) << 32) |
+                cpu_ldl_be_data_ra(env, addr + 8, ra);
+            addr += 12;
+        }
+        cpu_m68k_set_fpcr(env, cpu_ldl_be_data_ra(env, addr, ra));
+        cpu_m68k_set_fpsr(env, cpu_ldl_be_data_ra(env, addr + 4, ra));
+        env->fpiar = cpu_ldl_be_data_ra(env, addr + 8, ra);
+        env->fp_trap_armed = (hdr >> 8) & 1;
+        return 4 + FSAVE_6888X_PAYLOAD;
+    }
+    /* Unrecognized frame: skip it by its size byte */
+    qemu_log_mask(LOG_UNIMP, "frestore: unknown frame version %02x\n",
+                  hdr >> 24);
+    return 4 + ((hdr >> 16) & 0xff);
+}
+
+/*
+ * 6888x exception traps.  A pending exception (EXC byte & FPCR enable
+ * byte) is reported when the next general FP instruction or FBcc
+ * starts, like the coprocessor pre-instruction protocol.
+ */
+static G_NORETURN void fp_raise(CPUM68KState *env, int tt, uintptr_t ra)
+{
+    CPUState *cs = env_cpu(env);
+
+    cs->exception_index = tt;
+    cpu_loop_exit_restore(cs, ra);
+}
+
+void HELPER(fp_pretrap)(CPUM68KState *env)
+{
+    uint32_t pend;
+
+    fp_materialize_exc(env);
+    pend = env->fpsr & env->fpcr & 0xff00;
+    if (!env->fp_trap_armed) {
+        pend = 0;
+    }
+    if (unlikely(pend)) {
+        int vector;
+
+        if (pend & 0x8000) {
+            vector = EXCP_FP_BSUN;
+        } else if (pend & 0x4000) {
+            vector = EXCP_FP_SNAN;
+        } else if (pend & 0x2000) {
+            vector = EXCP_FP_OPERR;
+        } else if (pend & 0x1000) {
+            vector = EXCP_FP_OVFL;
+        } else if (pend & 0x0800) {
+            vector = EXCP_FP_UNFL;
+        } else if (pend & 0x0400) {
+            vector = EXCP_FP_DZ;
+        } else {
+            vector = EXCP_FP_INEX;
+        }
+        /* the request is discharged by taking the trap */
+        env->fp_trap_armed = 0;
+        fp_raise(env, vector, GETPC());
+    }
+}
+
+void HELPER(fmv)(CPUM68KState *env, FPReg *res, FPReg *val)
+{
+    floatx80 v = val->d;
+
+    if ((v.high & 0x7fff) == 0 && v.low != 0) {
+        /* moving a denormal signals underflow */
+        float_raise(float_flag_underflow, &env->fp_status);
+    } else if ((v.high & 0x7fff) == 0x7fff && (v.low << 1) != 0 &&
+               !(v.low & (1ULL << 62))) {
+        /* moving a signaling NaN signals SNAN and quiets it */
+        float_raise(float_flag_invalid | float_flag_invalid_snan,
+                    &env->fp_status);
+        v.low |= 1ULL << 62;
+    }
+    res->d = v;
+}
+
+void HELPER(fbcc_bsun)(CPUM68KState *env)
+{
+    /* IEEE nonaware conditional on an unordered result */
+    if (env->fpsr & FPSR_CC_A) {
+        fp_materialize_exc(env);
+        env->fpsr |= 1 << 15;                 /* BSUN */
+        if (env->fpcr & (1 << 15)) {
+            fp_raise(env, EXCP_FP_BSUN, GETPC());
+        }
+    }
 }
