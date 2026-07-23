@@ -323,6 +323,29 @@ everything — beware, the idle loop makes that huge — or the targeted
   CSR0 = INIT and endless CSR0 polling for IDON.  With 0.0.0.0
   addresses it will BOOTP first ("Received BOOTP response" string).
 
+## Netboot status (2026-07-20, late night)
+
+The LANCE is wired up (see the "wire up the LANCE" commit for the
+model details — it is an Am79C900 ILACC, 32-bit init block and
+descriptors, full byte lane reversal on descriptor DMA, pass-through
+data).  With e17-tools/netserv.py as the network peer, RMON's
+netboot now: initialises the chip (IDON), transmits a CORRECT RARP
+request, gets the reply DMA'd into the right RX buffer (verified in
+guest memory at the ring from the init block) — and then the TLANCE
+driver rejects it with "TLANCE: chain err 2".
+
+State at the error (rings from init block: RX 0x8020 x8, TX 0x80a0
+x1, RMDs re-armed by the driver as 0x8040fa12/0x8000fa12): RMD2
+(message count) reads 0 where the driver expects MCNT — either
+pcnet's rmd store didn't land (check e17_lance_swap on the store
+path) or the driver checks a different RMD2 bit layout (ILACC RMD2
+has RCC/RPC fields above MCNT).  Next: instrument pcnet_rmd_store
+(or enable PCNET_DEBUG_RMD) and compare the written RMD1/RMD2
+against what the TLANCE driver's chain checks want (driver error
+strings are around the "TLANCE:" cluster in the ROM).  After that:
+BOOTP/TFTP against netserv.py and then RE the loaded-image header
+("boot file cpu type mismatch") for u-boot payloads.
+
 ## Netboot plan (for loading u-boot or other payloads)
 
 1. Wire QEMU's existing LANCE model (hw/net/lance.c, as mvme147
