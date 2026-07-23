@@ -157,3 +157,21 @@ survive a reset and must be restarted by hand.
   - no audio at all (YM2612/PSG are stubs) - stretch goal
   - everdrive/Linux regression: default machine boots, but the Linux
     image itself has not been re-run (image location unknown to me)
+
+## 2026-07-22 — the "Sonic on top of the grass" report: demo desync, not VDP priority
+
+Daniel spotted Sonic rendered over the Marble Zone foreground grass
+during the attract demo.  Instrumented the VDP mixing at pixel level
+(probe data in the session log): sprite/plane priority extraction and
+the mix order (sprite-hi > A-hi > B-hi > sprite-lo > A-lo > B-lo) are
+all correct; at the reported pixels plane A is genuinely transparent
+and the "grass" behind Sonic is the low-priority plane-B backdrop —
+correct layering for a sprite at that position.  The real anomaly is
+Sonic's POSITION: the attract demos are recorded joypad streams, and
+input application depends on the exact lag-frame pattern the game
+experiences.  Our VDP/DMA timing is not cycle-accurate, so the demo
+diverges from the recorded path (Sonic goes airborne over the grass,
+later roams the ruins interior) — the same class of desync the real
+demos exhibit across console revisions.  Gameplay is unaffected.
+A cycle-accurate 68k/VDP/DMA timing pass would be needed for
+frame-exact demo playback; parked as a known limitation.
