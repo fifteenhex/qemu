@@ -924,3 +924,26 @@ Caveat: a real SMP OS (LynxOS) might use a per-socket strap or the
 VME geographical address that RMON never touches — unconfirmed;
 candidates would be a byte the trampoline reads before STOP or the
 2-bit fields at 0xfec660fb.
+
+### What actually runs on the second CPU (2026-07-21, measured)
+
+- RMON (-smp 2): CPU#0 runs the monitor; CPU#1, verified over the gdb
+  stub, sits HALTED at fe800bf8 — the instruction right after the
+  trampoline's `stop #0x2700`.  So the secondary executes only the
+  boot probe (write 0xfeed, STOP) and is then frozen.  It is NOT woken
+  again: RMON's post-probe write of 0 to 0xfec58000 doesn't restart
+  it, and the onboard interrupts (levels 1/5) are below the STOP mask
+  (7), so nothing short of a fresh 0xfec58000 release pulse revives it.
+- VxWorks 5.3.1 bootrom: traced every sysc write — it NEVER touches
+  0xfec58000 (the slave run/reset register); its only CPU-region
+  write is 0xfec5e000 = 0x01 (the CPU-type latch).  So it leaves the
+  secondary in whatever state it inherited and starts nothing on it,
+  as expected for that uniprocessor VxWorks.
+- LynxOS: no image available here to test.  Whether it uses the
+  second CPU depends entirely on whether the BSP is an SMP build and
+  re-releases the secondary via 0xfec58000 (planting an AP entry at
+  DRAM 0/4 first).  The QEMU model supports that: e17_slave_run
+  resets the secondary, reloads SP/PC from 0/4 and kicks it on each
+  0->1 pulse while it is halted, and a STOPped secondary is halted,
+  so a fresh 0x20 pulse would restart it into OS-supplied AP code.
+  Nothing to observe until such an image exists.
