@@ -827,3 +827,75 @@ cascade.  Next session: watch the workQ/TCB (0xf836c breakpoint) or
 watch writes of 0x000e19f0 anywhere in RAM to catch who computes the
 bad pointer; suspect a wdStart with a garbage routine from a device
 driver init (console tty is a candidate — no banner ever printed).
+
+## Video modes: RE'd by driving the setup menu (2026-07-21)
+
+The setup "Video Interface" menu's (a) Video Mode field is a
+SPACE-cycled list of 10 modes (RETURN accepts).  Selecting a mode
+writes it to the NVRAM config; it is NOT applied live, only on the
+next boot, and even then ONLY if the boot loads its config from
+NVRAM rather than a ROM profile.
+
+Which config source is used is picked by the CIO1 port-B DIP switch
+low nibble (the profile jump table at fe807d78, 8 entries):
+    nibble 0     -> ROM profile 0  (fe807da0, the default 800x600 35kHz)
+    nibble 1, 2  -> READ FROM NVRAM (fe807f22 -> fe804096)
+    nibble 3..7  -> other ROM profiles
+So to make RMON honour an NVRAM-selected video mode across a reboot:
+    -global e17-sysc.dip-switches=1
+(This is the general "boot from the saved configuration" switch, not
+just video — the same path restores boot device, addresses, etc.)
+
+Driving it: video fitted (default) so RMON uses the framebuffer +
+AT keyboard; drive keys over the QEMU monitor (sendkey) and
+screendump.  Two-phase capture in ~/e17-re/: modecap.py <nspaces>
+<label> sets one mode into a fresh 2KB NVRAM (-drive if=mtd) and
+reboots to trace the init; allmodes.py loops all ten.  Reboot init
+traces via -trace e17_vid_dac_write / e17_vid_crtc_reg.
+
+### CRTC timing register table (indexed regs 0..18, hex)
+
+reg#:                        0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18
+640x480_31kHz_60Hz       060e 0009 0039 0051 0190 000b 000d 002e 020d 0021 0161 0006 000c 0000 0000 0050 018f 0001 0002
+800x600_35kHz_56Hz       060e 000d 0031 006f 01fe 0002 0004 001a 0271 002c 01c1 0001 0008 0000 0000 006e 01fd 0001 0002
+800x600_38kHz_60Hz       060e 0015 0055 0081 0210 0002 0006 001d 0274 0035 01d1 0001 0008 0000 0000 0080 020f 0001 0002
+800x600_48kHz_72Hz       060e 001d 0059 0079 0208 0026 002c 0043 029a 003b 01cd 0024 002e 0000 0000 0078 0207 0001 0002
+1024x768_48kHz_60Hz      060e 0007 0029 0051 0150 0004 000a 0027 0326 0018 012f 0002 000c 0000 0000 0050 014f 0001 0002
+1024x768_56kHz_70Hz      060e 0007 0029 004d 014c 0004 000a 0027 0326 0018 012b 0002 000c 0000 0000 004c 014b 0001 0002
+1152x870_69kHz_75Hz      040c 000b 002b 004d 016c 0004 0007 002e 0393 001b 00a1 0002 0009 0000 0000 004c 016c 0001 0002
+1152x900_62kHz_66Hz      040c 000b 002b 0059 0178 0003 0007 0026 03a9 001b 00a7 0001 0009 0000 0000 0058 0177 0001 0002
+CCIR_625_15kHz_50Hz      0404 000e 0030 005a 01c9 000c 0011 0031 0271 001f 00d0 0005 0014 0000 0000 0059 01c8 0001 0003
+EIA_525_15kHz_60Hz       0404 000d 002a 004e 018d 000b 0011 002d 020d 001b 00b6 0006 0018 0000 0000 004d 018c 0001 0003
+
+Loaded via CRTC index port +6 / data port +7 (16-bit, high byte
+first), after direct regs +0..+5.  Deductions from the table:
+- reg 8  = horizontal total (dot-clocks/char): scales with width
+  (640->0x20d, 800->0x271, 1024->0x326, 1152->0x3a9).
+- reg 4 ~= reg 16 + 1: a vertical total pair (lines).
+- regs 1/2/3 and 15 = horizontal sync/blank positions; regs
+  9/10/11/12 = vertical sync/blank; regs 13/14 always 0.
+- reg 0 top byte and reg 18 select timing class: reg18=3 exactly on
+  the two INTERLACED TV modes (CCIR/EIA), =2 otherwise; reg0 = 060e
+  (progressive VGA/SVGA), 040c (1152 high-res), 0404 (TV).
+The CRTC chip is still unidentified but this is a full mode table
+to match against a datasheet.
+
+### RAMDAC / clock synthesizer (GENDAC-class)
+
+The DAC at 0xfec40000 is a GENDAC-family part (palette + dual PLL):
+index at +0, palette data at +1, and TWO clock-parameter data ports
+that autoincrement the index:
+- +5: reference / memory-clock PLL — indices 0x10..0x13 loaded
+  07 08 ff 00 for EVERY mode (fixed MCLK).
+- +6: the pixel-clock VCO — indices 0x10..0x17 loaded
+  00 02 08 NN 0c 14 03 45, where NN at index 0x13 is the per-mode
+  dot-clock select (640x480 & 800x600 = 01, 1024x768 = 03, i.e. a
+  VCO post-divider).  Probe id at +2 reads 0x3a.
+So the pixel clock is synthesized per mode from the fixed 25.175MHz
+reference by this one VCO byte plus the shared M/N — consistent with
+the earlier "PLL search against 75/37.5/18.75MHz /1/2/4/8" note.
+
+Artifacts (~/e17-re): modecap.py, allmodes.py, viddrive.py; raw
+per-mode traces were in /tmp/vidcap-*.txt (regenerate with the
+scripts — they are cheap).  Menu screenshots proved the field is
+SPACE-cycled ("Use <SPACE> to toggle and <RETURN> to accept").
