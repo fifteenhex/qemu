@@ -14,6 +14,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/input/ps2.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_E17_SYSC "e17-sysc"
@@ -70,6 +71,7 @@ typedef struct {
     bool ctrl_expect_data;  /* next control write is data, not pointer */
     uint8_t out[3];         /* port C/B/A output latches */
     uint8_t in[3];          /* port C/B/A input pin state */
+    QEMUTimer *ct3;         /* counter/timer 3 (the VxWorks system clock) */
 } E17CIOState;
 
 struct E17SysCState {
@@ -84,6 +86,9 @@ struct E17SysCState {
 
     PS2KbdState ps2kbd;     /* the AT keyboard (raw scan code set 2) */
     bool kbd_obf;           /* a byte is waiting in the data register */
+
+    qemu_irq cpu_irq;       /* (level << 8) | vector, 0 = deassert */
+    int32_t cd2401_vec;     /* pending CD2401 vector, 0 = none */
 
     uint32_t csctl[0x2c];   /* chip select controller, 0xb0 bytes */
     uint32_t dramc[2];      /* 0x080f0/0x080f4 */

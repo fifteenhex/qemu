@@ -95,11 +95,29 @@ static int cd2401_tx_pending_chan(CD2401State *s)
     return -1;
 }
 
-/* The interrupt request pin: asserted while anything is pending */
+/*
+ * The interrupt request pin.  The board routes it through a VIC068A
+ * local interrupt input, and the chip answers the IACK cycle with
+ * the pending channel's LIVR; carry that vector on the line (0 =
+ * deasserted) so the machine can hand it to the CPU.
+ */
 static void cd2401_update_irq(CD2401State *s)
 {
-    qemu_set_irq(s->irq, cd2401_rx_pending_chan(s) >= 0 ||
-                         cd2401_tx_pending_chan(s) >= 0);
+    int chan;
+
+    chan = cd2401_rx_pending_chan(s);
+    if (chan >= 0) {
+        qemu_set_irq(s->irq,
+                     (s->chan[chan].regs[CD2401_LIVR] & ~3) | CD2401_INT_RX);
+        return;
+    }
+    chan = cd2401_tx_pending_chan(s);
+    if (chan >= 0) {
+        qemu_set_irq(s->irq,
+                     (s->chan[chan].regs[CD2401_LIVR] & ~3) | CD2401_INT_TX);
+        return;
+    }
+    qemu_set_irq(s->irq, 0);
 }
 
 static uint8_t cd2401_ack(CD2401State *s, int chan, int type)

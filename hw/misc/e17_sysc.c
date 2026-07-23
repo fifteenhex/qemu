@@ -23,13 +23,47 @@
 #include "hw/input/ps2.h"
 #include "trace.h"
 
-/* Z8536 register numbers used by RMON */
+/* Z8536 register numbers used by RMON and the VxWorks BSP */
 #define Z8536_MICR          0x00
 #define Z8536_MICR_RESET    0x01
+#define Z8536_MICR_MIE      0x80
 #define Z8536_MCCR          0x01
+#define Z8536_MCCR_CT3E     0x10    /* port C and CT3 enable */
+#define Z8536_CTVEC         0x04    /* counter/timer interrupt vector */
 #define Z8536_PCDDR         0x06
+#define Z8536_CT3CS         0x0c    /* CT3 command and status */
+#define Z8536_CT3TC_MSB     0x1a
+#define Z8536_CT3TC_LSB     0x1b
+#define Z8536_CT3MODE       0x1e
 #define Z8536_PADDR         0x23
 #define Z8536_PBDDR         0x2b
+
+/* command/status: D7:5 = command code on write, flags on read */
+#define Z8536_CS_IUS        0x80
+#define Z8536_CS_IE         0x40
+#define Z8536_CS_IP         0x20
+#define Z8536_CS_GCB        0x04    /* gate command bit */
+#define Z8536_CS_TCB        0x02    /* trigger command bit */
+#define Z8536_CMD_MASK      0xe0
+#define Z8536_CMD_CLR_IPUS  0x20
+#define Z8536_CMD_SET_IUS   0x40
+#define Z8536_CMD_CLR_IUS   0x60
+#define Z8536_CMD_SET_IP    0x80
+#define Z8536_CMD_CLR_IP    0xa0
+#define Z8536_CMD_SET_IE    0xc0
+#define Z8536_CMD_CLR_IE    0xe0
+
+/*
+ * The CIO PCLK.  The VxWorks BSP programs CT3 with time constant
+ * 41666 for the 60Hz system clock, so the counters tick at 2.5MHz.
+ */
+#define Z8536_PCLK_HZ       2500000
+
+/* VIC068A local interrupt control (byte offsets on lane 3) */
+#define E17_VIC_LICR1       0x27    /* CIO2 counter/timers */
+#define E17_VIC_LICR_LEVEL  0x07
+#define E17_VIC_LICR_MASK   0x80
+/* E17_VIC_LICR6 (the CD2401) is in the public header */
 
 /*
  * AT keyboard interface status bits, from the RMON driver
@@ -82,6 +116,97 @@ static uint8_t e17_cio_ddr_reg(int port)
     }
 }
 
+/*
+ * Interrupt hub: the onboard interrupters feed the VIC068A local
+ * interrupt inputs; an unmasked input interrupts the CPU at the
+ * level programmed in its LICR, and the device supplies the vector
+ * during the IACK cycle.  Known wiring (from the VxWorks BSP and
+ * the RMON CD2401 code): LIRQ1 = CIO2 counter/timers, LIRQ6 =
+ * CD2401.  Only the CIO tick is delivered so far.
+ */
+static void e17_sysc_update_irq(E17SysCState *s)
+{
+    E17CIOState *c = &s->cio[1];
+    uint8_t licr1 = s->vic_regs[(E17_VIC_LICR1 - 3) / 4];
+    uint8_t licr6 = s->vic_regs[(E17_VIC_LICR6 - 3) / 4];
+    int level = 0, vector = 0;
+
+    if ((c->regs[Z8536_CT3CS] & Z8536_CS_IP) &&
+        (c->regs[Z8536_CT3CS] & Z8536_CS_IE) &&
+        (c->regs[Z8536_MICR] & Z8536_MICR_MIE) &&
+        !(licr1 & E17_VIC_LICR_MASK)) {
+        level = licr1 & E17_VIC_LICR_LEVEL;
+        vector = c->regs[Z8536_CTVEC];
+    }
+    if (s->cd2401_vec && !(licr6 & E17_VIC_LICR_MASK) &&
+        (licr6 & E17_VIC_LICR_LEVEL) >= level) {
+        level = licr6 & E17_VIC_LICR_LEVEL;
+        vector = s->cd2401_vec;
+    }
+    qemu_set_irq(s->cpu_irq, level ? (level << 8) | vector : 0);
+}
+
+static void e17_cio_ct3_arm(E17CIOState *c)
+{
+    unsigned tc = (c->regs[Z8536_CT3TC_MSB] << 8) | c->regs[Z8536_CT3TC_LSB];
+
+    if (!tc) {
+        tc = 0x10000;   /* a time constant of 0 counts 65536 PCLKs */
+    }
+    trace_e17_cio_ct3_arm(tc);
+    timer_mod(c->ct3, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (uint64_t)tc * NANOSECONDS_PER_SECOND / Z8536_PCLK_HZ);
+}
+
+static void e17_cio_ct3_expire(void *opaque)
+{
+    E17SysCState *s = opaque;
+    E17CIOState *c = &s->cio[1];
+
+    c->regs[Z8536_CT3CS] |= Z8536_CS_IP;
+    trace_e17_cio_ct3_tick();
+    /* continuous mode reloads; single cycle stops until retriggered */
+    if (c->regs[Z8536_CT3MODE] & 0x80) {
+        e17_cio_ct3_arm(c);
+    }
+    e17_sysc_update_irq(s);
+}
+
+/* a write to a counter/timer command/status register */
+static void e17_cio_ct_command(E17CIOState *c, unsigned reg, uint8_t val)
+{
+    uint8_t *cs = &c->regs[reg];
+
+    switch (val & Z8536_CMD_MASK) {
+    case Z8536_CMD_CLR_IPUS:
+        *cs &= ~(Z8536_CS_IP | Z8536_CS_IUS);
+        break;
+    case Z8536_CMD_SET_IUS:
+        *cs |= Z8536_CS_IUS;
+        break;
+    case Z8536_CMD_CLR_IUS:
+        *cs &= ~Z8536_CS_IUS;
+        break;
+    case Z8536_CMD_SET_IP:
+        *cs |= Z8536_CS_IP;
+        break;
+    case Z8536_CMD_CLR_IP:
+        *cs &= ~Z8536_CS_IP;
+        break;
+    case Z8536_CMD_SET_IE:
+        *cs |= Z8536_CS_IE;
+        break;
+    case Z8536_CMD_CLR_IE:
+        *cs &= ~Z8536_CS_IE;
+        break;
+    }
+    if (reg == Z8536_CT3CS && (val & Z8536_CS_TCB)) {
+        /* trigger: load the time constant and start counting */
+        *cs |= Z8536_CS_GCB | Z8536_CS_TCB;
+        e17_cio_ct3_arm(c);
+    }
+}
+
 static uint64_t e17_cio_read(E17CIOState *c, hwaddr addr)
 {
     uint8_t ddr;
@@ -108,7 +233,11 @@ static void e17_cio_write(E17CIOState *c, hwaddr addr, uint8_t val)
             c->regs[Z8536_MICR] = val & Z8536_MICR_RESET;
             c->ctrl_expect_data = false;
         } else if (c->ctrl_expect_data) {
-            c->regs[c->ctrl_ptr] = val;
+            if (c->ctrl_ptr == Z8536_CT3CS) {
+                e17_cio_ct_command(c, c->ctrl_ptr, val);
+            } else {
+                c->regs[c->ctrl_ptr] = val;
+            }
             c->ctrl_expect_data = false;
         } else {
             c->ctrl_ptr = val & 0x3f;
@@ -210,6 +339,7 @@ static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
     case E17_SYSC_VIC_MIRR:
         if ((addr & 3) == 3 && off < ARRAY_SIZE(s->vic_regs) * 4) {
             s->vic_regs[off >> 2] = val;
+            e17_sysc_update_irq(s);
             return;
         }
         break;
@@ -221,6 +351,7 @@ static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
         break;
     case E17_SYSC_CIO2:
         e17_cio_write(&s->cio[1], addr & 3, val);
+        e17_sysc_update_irq(s);
         return;
     case E17_SYSC_CIO1:
         if ((addr & 3) == E17_CIO_PORTC && val != s->post_code) {
@@ -334,7 +465,9 @@ static void e17_sysc_cd2401_irq(void *opaque, int n, int level)
 {
     E17SysCState *s = E17_SYSC(opaque);
 
-    s->cd2401_irq = level;
+    s->cd2401_irq = level != 0;
+    s->cd2401_vec = level;
+    e17_sysc_update_irq(s);
 }
 
 /* the PS2 keyboard core raises its "irq" while a byte is waiting */
@@ -354,6 +487,8 @@ static void e17_sysc_realize(DeviceState *dev, Error **errp)
     }
     qdev_connect_gpio_out(DEVICE(&s->ps2kbd), PS2_DEVICE_IRQ,
                           qdev_get_gpio_in_named(dev, "ps2-kbd-irq", 0));
+
+    s->cio[1].ct3 = timer_new_ns(QEMU_CLOCK_VIRTUAL, e17_cio_ct3_expire, s);
 }
 
 static void e17_sysc_init(Object *obj)
@@ -364,6 +499,7 @@ static void e17_sysc_init(Object *obj)
                           E17_SYSC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->slave_run, "slave-run", 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->cpu_irq, "cpu-irq", 1);
     qdev_init_gpio_in_named(DEVICE(obj), e17_sysc_cd2401_irq, "cd2401-irq", 1);
     object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_PS2_KBD_DEVICE);
     qdev_init_gpio_in_named(DEVICE(obj), e17_sysc_kbd_irq, "ps2-kbd-irq", 1);
@@ -393,6 +529,8 @@ static const VMStateDescription vmstate_e17_sysc = {
         VMSTATE_UINT8_ARRAY(vic_regs, E17SysCState, 256),
         VMSTATE_BOOL(cd2401_irq, E17SysCState),
         VMSTATE_BOOL(kbd_obf, E17SysCState),
+        VMSTATE_INT32(cd2401_vec, E17SysCState),
+        VMSTATE_TIMER_PTR(cio[1].ct3, E17SysCState),
         VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),
         VMSTATE_UINT32_ARRAY(dramc, E17SysCState, 2),
         VMSTATE_UINT8(slave_ctl, E17SysCState),

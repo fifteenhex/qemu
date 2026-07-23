@@ -444,6 +444,8 @@ iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
 
 # e17_sysc.c
+e17_cio_ct3_tick(void) "CT3 tick"
+e17_cio_ct3_arm(unsigned tc) "CT3 armed tc=%u"
 e17_post_code(uint8_t code) "POST checkpoint 0x%02x"
 e17_sysc_read(uint64_t addr, unsigned size, uint64_t val) "+0x%05" PRIx64 " size %u -> 0x%" PRIx64
 e17_sysc_write(uint64_t addr, unsigned size, uint64_t val) "+0x%05" PRIx64 " size %u = 0x%" PRIx64

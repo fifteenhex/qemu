@@ -133,6 +133,14 @@ static void e17_lance_dma_write(void *opaque, hwaddr addr,
                      MEMTXATTRS_UNSPECIFIED);
 }
 
+/* onboard interrupters -> VIC068A -> the CPU's IPL, vector included */
+static void e17_cpu_irq(void *opaque, int n, int value)
+{
+    M68kCPU *cpu = opaque;
+
+    m68k_set_irq_level(cpu, value >> 8, value & 0xff);
+}
+
 /* The secondary CPU is held in halt until released via the sysc */
 static void e17_slave_cpu_reset(void *opaque)
 {
@@ -300,6 +308,8 @@ static void e17_init(MachineState *machine)
                                     qemu_allocate_irq(e17_slave_run,
                                                       slave_cpu, 0));
     }
+    qdev_connect_gpio_out_named(sysc_dev, "cpu-irq", 0,
+                                qemu_allocate_irq(e17_cpu_irq, cpu, 0));
 
     /*
      * Onboard video: VRAM plus the DAC/CRTC blocks inside the sysc
@@ -359,6 +369,18 @@ static void e17_init(MachineState *machine)
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(nvram_dev), &error_fatal);
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(nvram_dev), 0, E17_NVRAM_BASE, 1);
+    /*
+     * The 2KB chip mirrors across its chip select window (the
+     * VxWorks BSP reads the clock through the +0x7ff8 mirror).
+     */
+    for (hwaddr base = 0x800; base < 0x10000; base += 0x800) {
+        MemoryRegion *mirror = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(mirror, NULL, "e17.nvram-mirror",
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(nvram_dev), 0), 0, 0x800);
+        memory_region_add_subregion_overlap(sysmem, E17_NVRAM_BASE + base,
+                                            mirror, 1);
+    }
 
     /*
      * NCR 53C720 SCSI (the register map RMON drives is the 720/8xx
