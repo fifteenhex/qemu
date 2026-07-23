@@ -242,8 +242,22 @@ static void mos6522_timer2_update(MOS6522State *s, MOS6522Timer *ti,
     if (!ti->timer) {
         return;
     }
+    /*
+     * T2 is a one-shot: the IFR set happens at the first zero crossing
+     * after a T2CH load.  If that crossing is already in the past when
+     * we are asked to (re)arm - e.g. IER.T2 is enabled long after an
+     * old load expired - the event must not be delivered again.
+     */
+    if (ti->frequency && !ti->oneshot_fired) {
+        int64_t d = muldiv64(current_time - ti->load_time, ti->frequency,
+                             NANOSECONDS_PER_SECOND);
+
+        if (d > ti->counter_value + 1) {
+            ti->oneshot_fired = true;
+        }
+    }
     ti->next_irq_time = get_next_irq_time(s, ti, current_time);
-    if ((s->ier & T2_INT) == 0) {
+    if ((s->ier & T2_INT) == 0 || ti->oneshot_fired) {
         timer_del(ti->timer);
     } else {
         timer_mod(ti->timer, ti->next_irq_time);
@@ -266,8 +280,15 @@ static void mos6522_timer2(void *opaque)
     MOS6522Timer *ti = &s->timers[1];
 
     mos6522_timer2_update(s, ti, ti->next_irq_time);
-    s->ifr |= T2_INT;
-    mos6522_update_irq(s);
+    /*
+     * T2 is a one-shot: it keeps counting after the zero crossing but
+     * only sets IFR once per load of T2CH.
+     */
+    if (!ti->oneshot_fired) {
+        ti->oneshot_fired = true;
+        s->ifr |= T2_INT;
+        mos6522_update_irq(s);
+    }
 }
 
 static uint64_t mos6522_get_counter_value(MOS6522State *s, MOS6522Timer *ti)
@@ -305,8 +326,13 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         s->ifr |= T1_INT;
     }
     if (now >= s->timers[1].next_irq_time) {
+        bool fire = !s->timers[1].oneshot_fired;
+
         mos6522_timer2_update(s, &s->timers[1], now);
-        s->ifr |= T2_INT;
+        s->timers[1].oneshot_fired = true;
+        if (fire) {
+            s->ifr |= T2_INT;
+        }
     }
     switch (addr) {
     case VIA_REG_B:
@@ -459,6 +485,7 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
            the counter */
         s->timers[1].latch = (s->timers[1].latch & 0xff) | (val << 8);
         s->ifr &= ~T2_INT;
+        s->timers[1].oneshot_fired = false;
         set_counter(s, &s->timers[1], s->timers[1].latch);
         break;
     case VIA_REG_SR:

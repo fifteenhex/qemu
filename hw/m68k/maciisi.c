@@ -545,6 +545,7 @@ struct MacIIsiMachineState {
     MemoryRegion rom;
     MemoryRegion rom_alias;
     MemoryRegion rom_slot_alias;
+    MemoryRegion vram_alias;
     MemoryRegion rom_alias24;
     MemoryRegion ramio;
     MemoryRegion macio;
@@ -570,8 +571,8 @@ struct MacIIsiMachineState {
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
-    QEMUTimer *one_second_timer;
     QEMUTimer *vbl_off_timer;
+    QEMUTimer *one_second_timer;
 
     /* Egret ADB/system MCU on the VIA1 shift register */
     QEMUTimer *egret_timer;
@@ -896,6 +897,20 @@ static const MemoryRegionOps maciisi_rbv_ops = {
 
 static void maciisi_rbv_update_irq(MacIIsiMachineState *m)
 {
+    /*
+     * The onboard-video VBL (slot $E, SIFR bit 6) is a pollable status
+     * line only — the ROM's frame wait reads it directly and does not
+     * install a slot interrupt handler for it, so it must not raise a
+     * CPU interrupt (that yields dsBadSlotInt).  Other slot bits do
+     * summarise into IFR bit 1 → level 2.
+     */
+    uint8_t slot_cpu = m->rbv_sifr & m->rbv_sier & 0x3f;
+
+    if (slot_cpu) {
+        m->rbv_ifr |= RBV_IFR_SLOT;
+    } else {
+        m->rbv_ifr &= ~RBV_IFR_SLOT;
+    }
     qemu_set_irq(qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_RBV),
                  (m->rbv_ifr & m->rbv_ier & 0x7f) != 0);
 }
@@ -904,8 +919,13 @@ static void maciisi_vbl_off(void *opaque)
 {
     MacIIsiMachineState *m = opaque;
 
-    /* SIFR bit 6 is the raw VBL line; the latched event stays in IFR */
+    /*
+     * End of vertical blank: the slot line and the level-triggered IFR
+     * summary drop together, so an interrupt masked past the blank is
+     * simply missed rather than serviced stale (dsBadSlotInt).
+     */
     m->rbv_sifr &= ~RBV_SLOT_E_INT;
+    maciisi_rbv_update_irq(m);
 }
 
 static void maciisi_sixty_hz(void *opaque)
@@ -916,11 +936,8 @@ static void maciisi_sixty_hz(void *opaque)
     qemu_irq_lower(irq);
     qemu_irq_raise(irq);
 
-    /* onboard video vertical blank = slot $E interrupt via the RBV */
+    /* onboard video vertical blank = slot $E line pulses via the RBV */
     m->rbv_sifr |= RBV_SLOT_E_INT;
-    if (m->rbv_sier & RBV_SLOT_E_INT) {
-        m->rbv_ifr |= RBV_IFR_SLOT;
-    }
     maciisi_rbv_update_irq(m);
     timer_mod(m->vbl_off_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1300000);
@@ -1526,12 +1543,22 @@ static void maciisi_machine_init(MachineState *machine)
                                 0xff000000 - MACIISI_ROM_SIZE,
                                 &m->rom_slot_alias);
 
-    /* onboard video framebuffer aperture in slot $E space (ScrnBase) */
+    /*
+     * Onboard video framebuffer.  The machine table in the ROM hardwires
+     * the physical base 0xFBB08000; the same memory also appears at the
+     * slot $E view 0xFEE00000 that the Declaration ROM's video driver
+     * publishes as ScrnBase.
+     */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACIISI_FB);
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
-    memory_region_add_subregion(get_system_memory(), 0xfee00000,
+    memory_region_add_subregion(get_system_memory(), 0xfbb08000,
                                 sysbus_mmio_get_region(sysbus, 0));
+
+    memory_region_init_alias(&m->vram_alias, NULL, "maciisi.vram-slote",
+                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
+    memory_region_add_subregion(get_system_memory(), 0xfee00000,
+                                &m->vram_alias);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
