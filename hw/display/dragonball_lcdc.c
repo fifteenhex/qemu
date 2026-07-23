@@ -37,10 +37,11 @@ static void draw_line1_32(void *opaque, uint8_t *d, const uint8_t *s,
             bool pixel = (pixels & (1 << (7 - j))) ? true : false;
             uint32_t *rgbpixel = ((uint32_t *) d) + (i + j);
 
+            /* Set bits are ink on a pale green-grey LCD */
             if (pixel)
-                *rgbpixel = rgb_to_pixel32(0x9c, 0x9c, 0x9c);
+                *rgbpixel = rgb_to_pixel32(0x20, 0x28, 0x20);
             else
-                *rgbpixel = rgb_to_pixel32(0, 0x22, 0x66);
+                *rgbpixel = rgb_to_pixel32(0xb8, 0xc0, 0xa8);
         }
     }
 }
@@ -105,7 +106,6 @@ static uint64_t dragonball_lcdc_read(void *opaque, hwaddr addr, unsigned size)
 {
     DragonBallLCDCState *s = opaque;
 
-    printf("%s:%d\n", __func__, __LINE__);
     switch(addr){
         case DRAGONBALL_LCDC_LSSA:
             return s->lssa;
@@ -135,7 +135,6 @@ static void dragonball_lcdc_write(void *opaque, hwaddr addr, uint64_t value,
 {
     DragonBallLCDCState *s = opaque;
 
-    printf("%s:%d 0x%08lx 0x%08lx\n", __func__, __LINE__, addr, value);
     switch(addr){
         case DRAGONBALL_LCDC_LSSA:
             s->lssa = value;
@@ -269,9 +268,8 @@ static void dragonball_lcdc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->legacy_reset = dragonball_lcdc_reset;
-    device_class_set_props(dc, dragonball_lcdc_properties);
     device_class_set_legacy_reset(dc, dragonball_lcdc_reset);
+    device_class_set_props(dc, dragonball_lcdc_properties);
     dc->realize = dragonball_lcdc_realize;
     dc->vmsd = &vmstate_dragonball_lcdc;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
