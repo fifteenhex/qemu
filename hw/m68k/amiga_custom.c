@@ -712,7 +712,9 @@ static bool amiga_custom_gfx_update(void *opaque)
      */
     {
         uint16_t c_strt = ddfstrt, c_stop = ddfstop, c_con0 = bplcon0;
-        int wl = 0, wh = 0;
+        uint16_t c_diwstrt = diwstrt, c_diwstop = diwstop;
+        int wl = 0, wh = 0, dw = 0;
+        bool diw_from_copper = false;
         unsigned i;
 
         for (i = 0; i <= s->journal_len; i++) {
@@ -735,6 +737,19 @@ static bool amiga_custom_gfx_update(void *opaque)
             case REG_BPLCON0:
                 c_con0 = s->journal[i].val;
                 break;
+            case REG_DIWSTRT:
+                c_diwstrt = s->journal[i].val;
+                break;
+            case REG_DIWSTOP:
+                /*
+                 * DIWSTOP is written after DIWSTRT, so sample the window
+                 * here where both halves are current; a copper split
+                 * updates the pair for each section.
+                 */
+                c_diwstop = s->journal[i].val;
+                dw = MAX(dw, ((c_diwstop & 0xff) | 0x100) - (c_diwstrt & 0xff));
+                diw_from_copper = true;
+                break;
             }
         }
         if (surf_hires) {
@@ -742,15 +757,19 @@ static bool amiga_custom_gfx_update(void *opaque)
         } else {
             width = wl * 16;
         }
-    }
-    /* clip the fetch overrun to the display window width */
-    {
-        int hstart = diwstrt & 0xff;
-        int hstop = (diwstop & 0xff) | 0x100;
-        int diw_width = (hstop - hstart) << (surf_hires ? 1 : 0);
-
-        if (diw_width > 0 && diw_width < width) {
-            width = diw_width;
+        /*
+         * The word-granular data fetch overruns the visible display
+         * window; clip the surface to the widest window the frame opens
+         * so the overrun does not spill and wrap.  Prefer the copper's
+         * per-section windows over the frame-start register, which is
+         * stale once a copper list drives the display.
+         */
+        if (!diw_from_copper) {
+            dw = ((diwstop & 0xff) | 0x100) - (diwstrt & 0xff);
+        }
+        dw <<= surf_hires ? 1 : 0;
+        if (dw > 0 && dw < width) {
+            width = dw;
         }
     }
 
