@@ -72,6 +72,9 @@ typedef struct {
     uint8_t out[3];         /* port C/B/A output latches */
     uint8_t in[3];          /* port C/B/A input pin state */
     QEMUTimer *ct3;         /* counter/timer 3 (the VxWorks system clock) */
+    int64_t ct12_start;     /* CT1/CT2 32-bit cascade trigger time, ns */
+    bool ct12_running;
+    uint32_t ct_latch;      /* counter readout latched by the RCC command */
 } E17CIOState;
 
 struct E17SysCState {

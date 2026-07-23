@@ -31,7 +31,11 @@
 #define Z8536_MCCR_CT3E     0x10    /* port C and CT3 enable */
 #define Z8536_CTVEC         0x04    /* counter/timer interrupt vector */
 #define Z8536_PCDDR         0x06
+#define Z8536_CT1CS         0x0a    /* CT1..3 command and status */
+#define Z8536_CT2CS         0x0b
 #define Z8536_CT3CS         0x0c    /* CT3 command and status */
+#define Z8536_CT1VAL_MSB    0x10    /* current count registers */
+#define Z8536_CT2VAL_LSB    0x13
 #define Z8536_CT3TC_MSB     0x1a
 #define Z8536_CT3TC_LSB     0x1b
 #define Z8536_CT3MODE       0x1e
@@ -44,6 +48,8 @@
 #define Z8536_CS_IP         0x20
 #define Z8536_CS_GCB        0x04    /* gate command bit */
 #define Z8536_CS_TCB        0x02    /* trigger command bit */
+#define Z8536_CS_CIP        0x01    /* count in progress (status) */
+#define Z8536_CS_RCC        0x08    /* read counter control (latch) */
 #define Z8536_CMD_MASK      0xe0
 #define Z8536_CMD_CLR_IPUS  0x20
 #define Z8536_CMD_SET_IUS   0x40
@@ -200,11 +206,50 @@ static void e17_cio_ct_command(E17CIOState *c, unsigned reg, uint8_t val)
         *cs &= ~Z8536_CS_IE;
         break;
     }
+    if (val & Z8536_CS_TCB) {
+        /* any trigger marks the counter as running */
+        *cs |= Z8536_CS_GCB | Z8536_CS_CIP;
+    }
     if (reg == Z8536_CT3CS && (val & Z8536_CS_TCB)) {
         /* trigger: load the time constant and start counting */
-        *cs |= Z8536_CS_GCB | Z8536_CS_TCB;
         e17_cio_ct3_arm(c);
     }
+    if (reg == Z8536_CT1CS && (val & Z8536_CS_TCB)) {
+        /*
+         * CT1 triggered.  The u-boot timer runs CT1/CT2 as a linked
+         * 32-bit down counter (both time constants 0xffff, MCCR link
+         * control set): model it as free running from the trigger.
+         */
+        c->ct12_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        c->ct12_running = true;
+    }
+    if (reg == Z8536_CT1CS && (val & Z8536_CS_RCC) && c->ct12_running) {
+        /* latch the cascade for the current count registers */
+        uint64_t elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                           c->ct12_start;
+
+        c->ct_latch = ~(uint32_t)(elapsed * Z8536_PCLK_HZ /
+                                  NANOSECONDS_PER_SECOND);
+    }
+}
+
+/*
+ * CT1/CT2 current count: CT1 is the low half of the latched cascade,
+ * CT2 the high half (the counters count down).
+ */
+static uint8_t e17_cio_ct_count_read(E17CIOState *c, unsigned reg)
+{
+    switch (reg) {
+    case Z8536_CT1VAL_MSB:
+        return c->ct_latch >> 8;
+    case Z8536_CT1VAL_MSB + 1:
+        return c->ct_latch;
+    case Z8536_CT1VAL_MSB + 2:
+        return c->ct_latch >> 24;
+    case Z8536_CT2VAL_LSB:
+        return c->ct_latch >> 16;
+    }
+    return 0;
 }
 
 static uint64_t e17_cio_read(E17CIOState *c, hwaddr addr)
@@ -214,6 +259,10 @@ static uint64_t e17_cio_read(E17CIOState *c, hwaddr addr)
     switch (addr) {
     case E17_CIO_CTRL:
         c->ctrl_expect_data = false;
+        if (c->ctrl_ptr >= Z8536_CT1VAL_MSB &&
+            c->ctrl_ptr <= Z8536_CT2VAL_LSB && c->ct12_running) {
+            return e17_cio_ct_count_read(c, c->ctrl_ptr);
+        }
         return c->regs[c->ctrl_ptr];
     case E17_CIO_PORTA:
     case E17_CIO_PORTB:
@@ -233,7 +282,7 @@ static void e17_cio_write(E17CIOState *c, hwaddr addr, uint8_t val)
             c->regs[Z8536_MICR] = val & Z8536_MICR_RESET;
             c->ctrl_expect_data = false;
         } else if (c->ctrl_expect_data) {
-            if (c->ctrl_ptr == Z8536_CT3CS) {
+            if (c->ctrl_ptr >= Z8536_CT1CS && c->ctrl_ptr <= Z8536_CT3CS) {
                 e17_cio_ct_command(c, c->ctrl_ptr, val);
             } else {
                 c->regs[c->ctrl_ptr] = val;
@@ -531,6 +580,12 @@ static const VMStateDescription vmstate_e17_sysc = {
         VMSTATE_BOOL(kbd_obf, E17SysCState),
         VMSTATE_INT32(cd2401_vec, E17SysCState),
         VMSTATE_TIMER_PTR(cio[1].ct3, E17SysCState),
+        VMSTATE_INT64(cio[0].ct12_start, E17SysCState),
+        VMSTATE_BOOL(cio[0].ct12_running, E17SysCState),
+        VMSTATE_UINT32(cio[0].ct_latch, E17SysCState),
+        VMSTATE_INT64(cio[1].ct12_start, E17SysCState),
+        VMSTATE_BOOL(cio[1].ct12_running, E17SysCState),
+        VMSTATE_UINT32(cio[1].ct_latch, E17SysCState),
         VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),
         VMSTATE_UINT32_ARRAY(dramc, E17SysCState, 2),
         VMSTATE_UINT8(slave_ctl, E17SysCState),
