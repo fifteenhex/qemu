@@ -1,8 +1,10 @@
-Atari 1040STF (``atarist``)
-===========================
+Atari 1040STF (``atarist``) and 1040STE (``atariste``)
+======================================================
 
 The ``atarist`` machine models the Atari 1040STF: a 68000 at 8 MHz
-with up to 4MB of RAM behind the GLUE/MMU pair and TOS in ROM.
+with up to 4MB of RAM behind the GLUE/MMU pair and TOS in ROM.  The
+``atariste`` machine models the 1040STE on top of the same chip set;
+its additions are listed in their own section below.
 
 Emulated hardware
 -----------------
@@ -38,14 +40,51 @@ Emulated hardware
   (``-drive if=floppy``), raw .ST images; geometry is taken from the
   boot sector BPB when sane, else derived from the image size.
 
+The STE additions (``atariste``)
+--------------------------------
+
+* 256KB TOS 2.0x ROM at 0xE00000; 0xFC0000 is left open and
+  bus-errors like on the real machine.
+* STE MCU RAM aliasing: an undersized bank mirrors every chip-size
+  bytes instead of the ST MMU's column fold.  TOS 2.06's STE-specific
+  cold-boot sizing (taken once a write to the video base low byte
+  0xFF820D sticks) probes for mirrors at +0x40000/+0x80000.
+* Shifter STE extensions: the 4096-colour palette (bit 3 of each
+  nibble is the added *least* significant intensity bit), video base
+  low byte 0xFF820D (cleared again whenever the pre-STE hi/mid bytes
+  are written), the line-width register 0xFF820F and the horizontal
+  fine-scroll register 0xFF8264/65 including the extra per-line
+  prefetch words while scrolling.
+* The BLiTTER at 0xFF8A00: complete register file and operation
+  (halftone/HOP/OP, endmasks, skew, FXSR/NFSR, smudge, the
+  ascending/descending source FIFO).  Blits complete within the
+  register write that sets the busy bit, so hog and shared mode
+  behave identically and restart loops terminate immediately.  The
+  GEM desktop's Options->Blitter toggle works and routes the VDI
+  through it.
+* DMA sound as a register model at 0xFF8900: the frame counter
+  advances at the programmed sample rate between the frame base and
+  end (single-shot end clears the enable bit; repeat wraps), but no
+  audio is produced.  The Microwire mixer interface completes its
+  transfer instantly: the data register reads back zero (TOS 2.06's
+  boot polls for exactly that) and the mask register keeps its value.
+* Enhanced joystick ports at 0xFF9200 reading as "no buttons".
+
+TOS 2.06 idles on the cold-boot memory-test screen until the 200Hz
+counter reaches 16000 (80 seconds); pressing any key skips the wait,
+and warm boots skip the test entirely.
+
 Firmware
 --------
 
-The machine wants a 192KB TOS 1.0x image, passed with ``-bios``
-(default name ``tos104uk.rom``).  TOS 1.04 UK, md5
+The ``atarist`` machine wants a 192KB TOS 1.0x image, passed with
+``-bios`` (default name ``tos104uk.rom``).  TOS 1.04 UK, md5
 ``036c5ae4f885cbf62c9bed651c6c58a8``, is the tested target; TOS 1.00
-and 1.02 load at the same address.  256KB TOS 2.0x images map at
-0xE00000 and are not supported yet.
+and 1.02 load at the same address.
+
+The ``atariste`` machine wants a 256KB TOS 2.0x image mapping at
+0xE00000 (default name ``tos206.rom``).  TOS 2.06, md5
+``e690bec90d902024beed549d22150755``, is the tested target.
 
 Booting
 -------
@@ -59,7 +98,10 @@ Booting
 With no floppy TOS boots to the GEM desktop.  A bootable .ST image
 (boot sector word-checksum 0x1234) is executed, so game compilation
 disks start their menus directly.  ``atarist-tools/msa2st.py``
-converts MSA images to raw .ST.
+converts MSA images to raw .ST.  The same applies to ``atariste``
+with a TOS 2.06 image, though period disks that stop MFP timer C and
+then call TOS floppy routines hang on TOS 2.06 (its FDC micro-delay
+polls the timer C data register), exactly as on real STE hardware.
 
 ``-icount shift=7`` is recommended: TOS times some floppy waits by
 comparing against the 200Hz tick counter with an equality test, which
