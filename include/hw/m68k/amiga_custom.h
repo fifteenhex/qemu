@@ -81,6 +81,8 @@ struct AmigaCustomState {
         uint8_t bytepos;        /* which byte of it is playing */
         int8_t sample;
     } aud[4];
+    /* pending "next word please" interrupts of hand-fed (non-DMA) audio */
+    QEMUTimer aud_dat_timer[4];
     /*
      * INT2/INT6 are open-drain lines shared by the CIAs (bit 0) and
      * board hardware (bit 1); INTREQ re-latches while any source holds
