@@ -263,4 +263,10 @@ config DRAGONBALL_PLL
 config DRAGONBALL_SCR
     bool
 
+config MVME147_PCC
+    bool
+
+config MVME147_VMECHIP
+    bool
+
 source macio/Kconfig
