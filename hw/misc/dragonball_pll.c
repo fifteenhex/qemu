@@ -116,7 +116,7 @@ static void dragonball_pll_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->legacy_reset = dragonball_pll_reset;
+    device_class_set_legacy_reset(dc, dragonball_pll_reset);
 //    device_class_set_props(dc, dragonball_pll_properties);
     dc->realize = dragonball_pll_realize;
     dc->vmsd = &vmstate_dragonball_pll;
