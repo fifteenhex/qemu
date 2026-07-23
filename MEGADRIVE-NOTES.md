@@ -113,11 +113,24 @@ Keys: arrows = d-pad, A/S/D = A/B/C, Enter = Start.
 - RESULT: attract demo plays in Green Hill Zone, graphics look right
   (screendumps verified: SEGA logo, title, GHZ demo with HUD, water,
   scroll, sprite priorities).
-- Still to do / verify:
-  - pad input end-to-end (title -> gameplay with QMP input events)
-  - H-int water effect in Labyrinth Zone (renderer is frame-based, so
-    mid-frame CRAM writes tint the whole frame - acceptable for now?)
-  - special stages (use per-line HSCROLL heavily - check)
+- Verified end-to-end via QMP input events + screendumps + monitor
+  peeks of Sonic's RAM (Game_Mode at 0xFFF600, pad vars at 0xFFF604):
+  - Start at title begins the game; Sonic runs/jumps under control in
+    GHZ (playtested by walking right and jumping over a crab).
+    Gotcha for scripted tests: a Start press during the attract demo
+    exits the demo and eats the press edge - press Start again AT the
+    title (hold-to-catch-it does not work, the game wants an edge).
+  - Level select cheat works (title: U D L R, then hold A + Start).
+    REV00 menu order is GH, LZ, MZ, SLZ, SYZ, SBZ (LZ1 = 3 downs,
+    SPECIAL STAGE = 19 downs).
+  - Labyrinth Zone: plays; H-int fires (info irq shows level 4 = 556
+    after a swim) and the game keeps running.
+  - Star Light Zone and the Special Stage render and play.
+- Still open:
+  - underwater palette is applied per-frame, not per-line (whole
+    screen tints when the beam is "below water"); needs a per-line
+    CRAM snapshot in the renderer for the real split
   - sprite masking (x=0) and shadow/highlight not implemented
   - no audio at all (YM2612/PSG are stubs) - stretch goal
-  - everdrive/Linux regression test (defaults must stay identical)
+  - everdrive/Linux regression: default machine boots, but the Linux
+    image itself has not been re-run (image location unknown to me)
