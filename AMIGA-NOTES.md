@@ -222,10 +222,31 @@ callbacks run inside the timer's transaction).
   nothing translates through them, PFLUSH/PLOAD are no-ops, and PTEST
   lies "valid".  Kickstart only *probes* those registers, so AmigaOS
   boots; AMIX actually enables demand paging, so it fails at the first
-  translated access.  Fixing it means implementing the 030 table walk
-  (configurable TC IS/TIA-TID levels, short/long + indirect descriptors,
-  the ATC, real PTEST/PFLUSH) and a resumable bus-fault frame — the one
-  thing standing between us and Amiga Unix.
+  translated access.
+  IMPLEMENTED (target/m68k, get_physical_address_030): the 030 table walk
+  driven by tc030 (initial shift + up to four TIA-TID index fields),
+  following crp030/srp030, honouring short/long descriptors, WP and the
+  supervisor bit, and setting the Used/Modified bits.  tlb_fill() gates
+  on the 030 TC enable bit.  Result: the Access Fault storm is gone
+  (28M -> a few thousand exceptions), AMIX runs its kernel in virtual
+  memory, brings up its own 640x256 console, and prints a real
+  "DOUBLE PANIC: KERNEL FAULT" register dump instead of looping the CPU.
+  NEXT BLOCKER: that kernel fault.  There are no access faults left, so
+  it is not a paging miss; the dominant symptom afterwards is a
+  privilege-violation loop at ROM pc=0x00f80c00 (`ori #$2000,SR`) in USER
+  mode, interleaved with Kickstart's own interrupt handlers — i.e. the
+  kernel has crashed and control fell back to the ROM.  Leads to chase:
+  (1) the 030 exception/RTE frame path (op_helper.c builds a format-$A
+  bus-fault frame with a 68040-style SSW; the 030 wants its own SSW and
+  possibly a format-$B frame, and a wrong frame would land an RTE at a
+  bogus PC), and (2) an unimplemented line-F/FPU instruction (one F-Line
+  at virtual pc=0x00c00ac0 appears late).  AMIX writes its console to the
+  graphics display, not serial (serial stays empty), so reading the panic
+  needs either a serial-console AMIX config or gdb (-s; registers/memory
+  come back byte-reversed per long, read via QMP pmemsave + objdump).
+  Not-yet-modelled for the 030 walk: descriptor LIMIT fields, the
+  indirect page descriptor, and function-code lookup (TC FCL) — AMIX
+  seems not to need them so far.
 
 ## Debugging recipes that worked
 
