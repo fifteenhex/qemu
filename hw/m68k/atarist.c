@@ -53,6 +53,7 @@
 #include "hw/core/loader.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
@@ -1240,6 +1241,1253 @@ static void atarist_psg_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = atarist_psg_reset_hold;
 }
 
+
+/*
+ * ---------------------------------------------------------------------
+ * The two MC6850 ACIAs and the IKBD (HD6301) keyboard controller,
+ * modelled at protocol level.  Both ACIA interrupt outputs wire-OR
+ * into MFP GPIP4 (active low).  The keyboard ACIA's serial line runs
+ * at 7812.5 baud, so consecutive IKBD bytes are paced rather than
+ * delivered back-to-back - TOS's interrupt handler takes one byte per
+ * GPIP edge.
+ * ---------------------------------------------------------------------
+ */
+
+#define TYPE_ATARIST_IKBD "atarist-ikbd"
+OBJECT_DECLARE_SIMPLE_TYPE(AtaristIkbdState, ATARIST_IKBD)
+
+/* byte offsets in the 0xFFFC00 region */
+#define ACIA_KBD_CTRL         0x00
+#define ACIA_KBD_DATA         0x02
+#define ACIA_MIDI_CTRL        0x04
+#define ACIA_MIDI_DATA        0x06
+
+/* MC6850 status bits */
+#define ACIA_SR_RDRF          0x01
+#define ACIA_SR_TDRE          0x02
+#define ACIA_SR_IRQ           0x80
+
+/* MC6850 control bits */
+#define ACIA_CR_RESET_MASK    0x03        /* 11 = master reset */
+#define ACIA_CR_RX_IRQ_EN     0x80
+
+/* IKBD commands */
+#define IKBD_CMD_RESET        0x80        /* param 0x01 */
+#define IKBD_CMD_MOUSE_ACTION 0x07
+#define IKBD_CMD_MOUSE_REL    0x08
+#define IKBD_CMD_MOUSE_ABS    0x09
+#define IKBD_CMD_MOUSE_KEYCD  0x0a
+#define IKBD_CMD_MOUSE_THRESH 0x0b
+#define IKBD_CMD_MOUSE_SCALE  0x0c
+#define IKBD_CMD_MOUSE_POLL   0x0d
+#define IKBD_CMD_MOUSE_LOAD   0x0e
+#define IKBD_CMD_MOUSE_YBOT   0x0f
+#define IKBD_CMD_MOUSE_YTOP   0x10
+#define IKBD_CMD_RESUME       0x11
+#define IKBD_CMD_MOUSE_OFF    0x12
+#define IKBD_CMD_PAUSE        0x13
+#define IKBD_CMD_JOY_EVENT    0x14
+#define IKBD_CMD_JOY_POLLMODE 0x15
+#define IKBD_CMD_JOY_POLL     0x16
+#define IKBD_CMD_JOY_MONITOR  0x17
+#define IKBD_CMD_JOY_FIRE     0x18
+#define IKBD_CMD_JOY_KEYCD    0x19
+#define IKBD_CMD_JOY_OFF      0x1a
+#define IKBD_CMD_SET_TIME     0x1b
+#define IKBD_CMD_GET_TIME     0x1c
+
+/* IKBD report headers */
+#define IKBD_REPLY_VERSION    0xf1        /* self-test done, version */
+#define IKBD_HDR_STATUS       0xf6
+#define IKBD_HDR_MOUSE_ABS    0xf7
+#define IKBD_HDR_MOUSE_REL    0xf8        /* + button bits */
+#define IKBD_HDR_TIME         0xfc
+#define IKBD_HDR_JOY0         0xfd
+
+#define IKBD_MOUSE_BTN_LEFT   0x02
+#define IKBD_MOUSE_BTN_RIGHT  0x01
+
+#define IKBD_KEY_RELEASE      0x80
+
+#define IKBD_BUF_SIZE         256
+
+/* 7812.5 baud, 10 bits on the wire */
+#define IKBD_BYTE_NS          1280000
+/* the HD6301 self-test after a reset command */
+#define IKBD_RESET_DELAY_NS   (40 * SCALE_MS)
+/* relative mouse packet pacing */
+#define IKBD_MOUSE_PACKET_NS  (5 * SCALE_MS)
+
+/* QEMU qcode -> Atari ST scancode (largely the XT layout + ST extras) */
+static const uint8_t atarist_keymap[Q_KEY_CODE__MAX] = {
+    [Q_KEY_CODE_ESC] = 0x01,
+    [Q_KEY_CODE_1] = 0x02, [Q_KEY_CODE_2] = 0x03, [Q_KEY_CODE_3] = 0x04,
+    [Q_KEY_CODE_4] = 0x05, [Q_KEY_CODE_5] = 0x06, [Q_KEY_CODE_6] = 0x07,
+    [Q_KEY_CODE_7] = 0x08, [Q_KEY_CODE_8] = 0x09, [Q_KEY_CODE_9] = 0x0a,
+    [Q_KEY_CODE_0] = 0x0b,
+    [Q_KEY_CODE_MINUS] = 0x0c, [Q_KEY_CODE_EQUAL] = 0x0d,
+    [Q_KEY_CODE_BACKSPACE] = 0x0e,
+    [Q_KEY_CODE_TAB] = 0x0f,
+    [Q_KEY_CODE_Q] = 0x10, [Q_KEY_CODE_W] = 0x11, [Q_KEY_CODE_E] = 0x12,
+    [Q_KEY_CODE_R] = 0x13, [Q_KEY_CODE_T] = 0x14, [Q_KEY_CODE_Y] = 0x15,
+    [Q_KEY_CODE_U] = 0x16, [Q_KEY_CODE_I] = 0x17, [Q_KEY_CODE_O] = 0x18,
+    [Q_KEY_CODE_P] = 0x19,
+    [Q_KEY_CODE_BRACKET_LEFT] = 0x1a, [Q_KEY_CODE_BRACKET_RIGHT] = 0x1b,
+    [Q_KEY_CODE_RET] = 0x1c,
+    [Q_KEY_CODE_CTRL] = 0x1d, [Q_KEY_CODE_CTRL_R] = 0x1d,
+    [Q_KEY_CODE_A] = 0x1e, [Q_KEY_CODE_S] = 0x1f, [Q_KEY_CODE_D] = 0x20,
+    [Q_KEY_CODE_F] = 0x21, [Q_KEY_CODE_G] = 0x22, [Q_KEY_CODE_H] = 0x23,
+    [Q_KEY_CODE_J] = 0x24, [Q_KEY_CODE_K] = 0x25, [Q_KEY_CODE_L] = 0x26,
+    [Q_KEY_CODE_SEMICOLON] = 0x27, [Q_KEY_CODE_APOSTROPHE] = 0x28,
+    [Q_KEY_CODE_GRAVE_ACCENT] = 0x2b,   /* ST "#~", nearest match */
+    [Q_KEY_CODE_SHIFT] = 0x2a,
+    [Q_KEY_CODE_BACKSLASH] = 0x60,      /* ST ISO key next to lshift */
+    [Q_KEY_CODE_Z] = 0x2c, [Q_KEY_CODE_X] = 0x2d, [Q_KEY_CODE_C] = 0x2e,
+    [Q_KEY_CODE_V] = 0x2f, [Q_KEY_CODE_B] = 0x30, [Q_KEY_CODE_N] = 0x31,
+    [Q_KEY_CODE_M] = 0x32,
+    [Q_KEY_CODE_COMMA] = 0x33, [Q_KEY_CODE_DOT] = 0x34,
+    [Q_KEY_CODE_SLASH] = 0x35,
+    [Q_KEY_CODE_SHIFT_R] = 0x36,
+    [Q_KEY_CODE_ALT] = 0x38, [Q_KEY_CODE_ALT_R] = 0x38,
+    [Q_KEY_CODE_SPC] = 0x39,
+    [Q_KEY_CODE_CAPS_LOCK] = 0x3a,
+    [Q_KEY_CODE_F1] = 0x3b, [Q_KEY_CODE_F2] = 0x3c, [Q_KEY_CODE_F3] = 0x3d,
+    [Q_KEY_CODE_F4] = 0x3e, [Q_KEY_CODE_F5] = 0x3f, [Q_KEY_CODE_F6] = 0x40,
+    [Q_KEY_CODE_F7] = 0x41, [Q_KEY_CODE_F8] = 0x42, [Q_KEY_CODE_F9] = 0x43,
+    [Q_KEY_CODE_F10] = 0x44,
+    [Q_KEY_CODE_HOME] = 0x47,           /* ClrHome */
+    [Q_KEY_CODE_UP] = 0x48,
+    [Q_KEY_CODE_KP_SUBTRACT] = 0x4a,
+    [Q_KEY_CODE_LEFT] = 0x4b, [Q_KEY_CODE_RIGHT] = 0x4d,
+    [Q_KEY_CODE_KP_ADD] = 0x4e,
+    [Q_KEY_CODE_DOWN] = 0x50,
+    [Q_KEY_CODE_INSERT] = 0x52,
+    [Q_KEY_CODE_DELETE] = 0x53,
+    [Q_KEY_CODE_END] = 0x61,            /* Undo */
+    [Q_KEY_CODE_PGUP] = 0x62,           /* Help */
+    [Q_KEY_CODE_KP_DIVIDE] = 0x65,
+    [Q_KEY_CODE_KP_MULTIPLY] = 0x66,
+    [Q_KEY_CODE_KP_7] = 0x67, [Q_KEY_CODE_KP_8] = 0x68,
+    [Q_KEY_CODE_KP_9] = 0x69, [Q_KEY_CODE_KP_4] = 0x6a,
+    [Q_KEY_CODE_KP_5] = 0x6b, [Q_KEY_CODE_KP_6] = 0x6c,
+    [Q_KEY_CODE_KP_1] = 0x6d, [Q_KEY_CODE_KP_2] = 0x6e,
+    [Q_KEY_CODE_KP_3] = 0x6f, [Q_KEY_CODE_KP_0] = 0x70,
+    [Q_KEY_CODE_KP_DECIMAL] = 0x71,
+    [Q_KEY_CODE_KP_ENTER] = 0x72,
+};
+
+struct AtaristIkbdState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;               /* to MFP GPIP4, active low */
+
+    /* keyboard ACIA */
+    uint8_t kbd_ctrl;
+    uint8_t kbd_rx;
+    bool kbd_rdrf;
+    /* MIDI ACIA: transmit is discarded, nothing ever received */
+    uint8_t midi_ctrl;
+
+    /* IKBD output queue towards the ACIA */
+    uint8_t obuf[IKBD_BUF_SIZE];
+    unsigned ohead, ocount;
+    bool paused;
+    QEMUTimer *xmit_timer;
+    QEMUTimer *reset_timer;
+
+    /* IKBD command parser */
+    uint8_t cmd;
+    uint8_t params[8];
+    unsigned nparams, want_params;
+
+    /* mouse */
+    bool mouse_rel;             /* relative reporting enabled */
+    bool mouse_y_bottom;
+    int mouse_dx, mouse_dy;
+    uint8_t mouse_buttons;
+    uint8_t mouse_sent_buttons;
+    QEMUTimer *mouse_timer;
+
+    QemuInputHandlerState *mouse_hs;
+    QemuInputHandlerState *kbd_hs;
+};
+
+static void ikbd_acia_update_irq(AtaristIkbdState *s)
+{
+    bool kbd_irq = s->kbd_rdrf && (s->kbd_ctrl & ACIA_CR_RX_IRQ_EN);
+
+    /* wire-OR into GPIP4, active low */
+    qemu_set_irq(s->irq, !kbd_irq);
+}
+
+/* move the next queued byte into the ACIA receive register */
+static void ikbd_deliver(AtaristIkbdState *s)
+{
+    if (s->kbd_rdrf || !s->ocount || s->paused) {
+        return;
+    }
+    s->kbd_rx = s->obuf[s->ohead];
+    s->ohead = (s->ohead + 1) % IKBD_BUF_SIZE;
+    s->ocount--;
+    s->kbd_rdrf = true;
+    ikbd_acia_update_irq(s);
+}
+
+static void ikbd_xmit_cb(void *opaque)
+{
+    ikbd_deliver(opaque);
+}
+
+static void ikbd_queue(AtaristIkbdState *s, const uint8_t *data, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len && s->ocount < IKBD_BUF_SIZE; i++) {
+        s->obuf[(s->ohead + s->ocount) % IKBD_BUF_SIZE] = data[i];
+        s->ocount++;
+    }
+    if (!s->kbd_rdrf && !timer_pending(s->xmit_timer)) {
+        ikbd_deliver(s);
+    }
+}
+
+static void ikbd_queue_byte(AtaristIkbdState *s, uint8_t b)
+{
+    ikbd_queue(s, &b, 1);
+}
+
+/* emit one relative mouse packet, rescheduling while movement remains */
+static void ikbd_mouse_flush(AtaristIkbdState *s)
+{
+    uint8_t pkt[3];
+    int dx, dy;
+
+    if (!s->mouse_rel || s->paused) {
+        return;
+    }
+    if (!s->mouse_dx && !s->mouse_dy &&
+        s->mouse_buttons == s->mouse_sent_buttons) {
+        return;
+    }
+    if (timer_pending(s->mouse_timer)) {
+        return;
+    }
+
+    dx = MIN(MAX(s->mouse_dx, -127), 127);
+    dy = MIN(MAX(s->mouse_dy, -127), 127);
+    s->mouse_dx -= dx;
+    s->mouse_dy -= dy;
+    s->mouse_sent_buttons = s->mouse_buttons;
+
+    pkt[0] = IKBD_HDR_MOUSE_REL | s->mouse_buttons;
+    pkt[1] = dx;
+    pkt[2] = s->mouse_y_bottom ? -dy : dy;
+    ikbd_queue(s, pkt, sizeof(pkt));
+
+    if (s->mouse_dx || s->mouse_dy) {
+        timer_mod(s->mouse_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  IKBD_MOUSE_PACKET_NS);
+    }
+}
+
+static void ikbd_mouse_timer_cb(void *opaque)
+{
+    ikbd_mouse_flush(opaque);
+}
+
+static void ikbd_reset_state(AtaristIkbdState *s)
+{
+    s->ohead = s->ocount = 0;
+    s->paused = false;
+    s->cmd = 0;
+    s->nparams = s->want_params = 0;
+    s->mouse_rel = true;        /* power-up default: relative mode */
+    s->mouse_y_bottom = false;
+    s->mouse_dx = s->mouse_dy = 0;
+    s->mouse_buttons = 0;
+    s->mouse_sent_buttons = 0;
+}
+
+static void ikbd_reset_done_cb(void *opaque)
+{
+    AtaristIkbdState *s = opaque;
+
+    ikbd_queue_byte(s, IKBD_REPLY_VERSION);
+}
+
+/* number of parameter bytes each IKBD command takes */
+static unsigned ikbd_cmd_params(uint8_t cmd)
+{
+    switch (cmd) {
+    case IKBD_CMD_RESET:
+    case IKBD_CMD_MOUSE_ACTION:
+        return 1;
+    case IKBD_CMD_MOUSE_KEYCD:
+    case IKBD_CMD_MOUSE_THRESH:
+    case IKBD_CMD_MOUSE_SCALE:
+    case IKBD_CMD_JOY_MONITOR:
+        return 2;
+    case IKBD_CMD_MOUSE_ABS:
+        return 4;
+    case IKBD_CMD_MOUSE_LOAD:
+        return 5;
+    case IKBD_CMD_JOY_KEYCD:
+    case IKBD_CMD_SET_TIME:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+static void ikbd_run_cmd(AtaristIkbdState *s)
+{
+    switch (s->cmd) {
+    case IKBD_CMD_RESET:
+        if (s->params[0] == 0x01) {
+            ikbd_reset_state(s);
+            timer_mod(s->reset_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      IKBD_RESET_DELAY_NS);
+        }
+        break;
+    case IKBD_CMD_MOUSE_REL:
+        s->mouse_rel = true;
+        break;
+    case IKBD_CMD_MOUSE_ABS:
+    case IKBD_CMD_MOUSE_KEYCD:
+    case IKBD_CMD_MOUSE_OFF:
+        s->mouse_rel = false;
+        break;
+    case IKBD_CMD_MOUSE_YBOT:
+        s->mouse_y_bottom = true;
+        break;
+    case IKBD_CMD_MOUSE_YTOP:
+        s->mouse_y_bottom = false;
+        break;
+    case IKBD_CMD_MOUSE_POLL: {
+        uint8_t pkt[6] = { IKBD_HDR_MOUSE_ABS, s->mouse_buttons ^ 0,
+                           0, 0, 0, 0 };
+        ikbd_queue(s, pkt, sizeof(pkt));
+        break;
+    }
+    case IKBD_CMD_RESUME:
+        s->paused = false;
+        ikbd_deliver(s);
+        break;
+    case IKBD_CMD_PAUSE:
+        s->paused = true;
+        break;
+    case IKBD_CMD_JOY_POLL: {
+        uint8_t pkt[3] = { IKBD_HDR_JOY0, 0, 0 };
+        ikbd_queue(s, pkt, sizeof(pkt));
+        break;
+    }
+    case IKBD_CMD_GET_TIME: {
+        /* BCD YY MM DD hh mm ss; a real HD6301 wakes up with a sane
+         * (if arbitrary) clock, and TOS feeds the reply through its
+         * date conversion unchecked */
+        uint8_t pkt[7] = { IKBD_HDR_TIME, 0x86, 0x07, 0x22, 0x12, 0x00,
+                           0x00 };
+        ikbd_queue(s, pkt, sizeof(pkt));
+        break;
+    }
+    case IKBD_CMD_MOUSE_ACTION:
+    case IKBD_CMD_MOUSE_THRESH:
+    case IKBD_CMD_MOUSE_SCALE:
+    case IKBD_CMD_MOUSE_LOAD:
+    case IKBD_CMD_JOY_EVENT:
+    case IKBD_CMD_JOY_POLLMODE:
+    case IKBD_CMD_JOY_MONITOR:
+    case IKBD_CMD_JOY_FIRE:
+    case IKBD_CMD_JOY_KEYCD:
+    case IKBD_CMD_JOY_OFF:
+    case IKBD_CMD_SET_TIME:
+        break;                  /* accepted, nothing to model */
+    default:
+        qemu_log_mask(LOG_UNIMP, "atarist ikbd: command 0x%02x\n", s->cmd);
+        break;
+    }
+}
+
+/* a command byte arrived from the keyboard ACIA transmit register */
+static void ikbd_rx_byte(AtaristIkbdState *s, uint8_t b)
+{
+    if (s->want_params) {
+        s->params[s->nparams++] = b;
+        if (s->nparams >= s->want_params) {
+            s->want_params = 0;
+            ikbd_run_cmd(s);
+        }
+        return;
+    }
+    s->cmd = b;
+    s->nparams = 0;
+    s->want_params = ikbd_cmd_params(b);
+    if (s->want_params > sizeof(s->params)) {
+        s->want_params = sizeof(s->params);
+    }
+    if (!s->want_params) {
+        ikbd_run_cmd(s);
+    }
+}
+
+static uint64_t atarist_ikbd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    AtaristIkbdState *s = opaque;
+
+    switch (addr) {
+    case ACIA_KBD_CTRL: {
+        uint8_t sr = ACIA_SR_TDRE;
+
+        if (s->kbd_rdrf) {
+            sr |= ACIA_SR_RDRF;
+        }
+        if (s->kbd_rdrf && (s->kbd_ctrl & ACIA_CR_RX_IRQ_EN)) {
+            sr |= ACIA_SR_IRQ;
+        }
+        return sr;
+    }
+    case ACIA_KBD_DATA:
+        s->kbd_rdrf = false;
+        ikbd_acia_update_irq(s);
+        if (s->ocount) {
+            timer_mod(s->xmit_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + IKBD_BYTE_NS);
+        }
+        return s->kbd_rx;
+    case ACIA_MIDI_CTRL:
+        return ACIA_SR_TDRE;
+    case ACIA_MIDI_DATA:
+        return 0;
+    default:
+        return 0xff;
+    }
+}
+
+static void atarist_ikbd_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    AtaristIkbdState *s = opaque;
+
+    switch (addr) {
+    case ACIA_KBD_CTRL:
+        s->kbd_ctrl = val;
+        if ((val & ACIA_CR_RESET_MASK) == ACIA_CR_RESET_MASK) {
+            s->kbd_rdrf = false;
+        }
+        ikbd_acia_update_irq(s);
+        break;
+    case ACIA_KBD_DATA:
+        ikbd_rx_byte(s, val);
+        break;
+    case ACIA_MIDI_CTRL:
+        s->midi_ctrl = val;
+        break;
+    case ACIA_MIDI_DATA:
+        break;                  /* MIDI out: discarded */
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps atarist_ikbd_ops = {
+    .read = atarist_ikbd_read,
+    .write = atarist_ikbd_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static void atarist_ikbd_mouse_event(DeviceState *dev, QemuConsole *src,
+                                     QemuInputEvent *evt)
+{
+    AtaristIkbdState *s = ATARIST_IKBD(dev);
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+        if (evt->rel.axis == INPUT_AXIS_X) {
+            s->mouse_dx += evt->rel.value;
+        } else if (evt->rel.axis == INPUT_AXIS_Y) {
+            s->mouse_dy += evt->rel.value;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        if (evt->btn.button == INPUT_BUTTON_LEFT) {
+            if (evt->btn.down) {
+                s->mouse_buttons |= IKBD_MOUSE_BTN_LEFT;
+            } else {
+                s->mouse_buttons &= ~IKBD_MOUSE_BTN_LEFT;
+            }
+        } else if (evt->btn.button == INPUT_BUTTON_RIGHT) {
+            if (evt->btn.down) {
+                s->mouse_buttons |= IKBD_MOUSE_BTN_RIGHT;
+            } else {
+                s->mouse_buttons &= ~IKBD_MOUSE_BTN_RIGHT;
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void atarist_ikbd_mouse_sync(DeviceState *dev)
+{
+    ikbd_mouse_flush(ATARIST_IKBD(dev));
+}
+
+static const QemuInputHandler atarist_ikbd_mouse_handler = {
+    .name  = "Atari ST Mouse",
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
+    .event = atarist_ikbd_mouse_event,
+    .sync  = atarist_ikbd_mouse_sync,
+};
+
+static void atarist_ikbd_key_event(DeviceState *dev, QemuConsole *src,
+                                   QemuInputEvent *evt)
+{
+    AtaristIkbdState *s = ATARIST_IKBD(dev);
+    int qcode;
+    uint8_t code;
+
+    if (evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+    /* handlers receive the host (Linux) keycode; map it to a QKeyCode */
+    qcode = qemu_input_linux_to_qcode(evt->key.key);
+    if (qcode <= 0 || qcode >= Q_KEY_CODE__MAX) {
+        return;
+    }
+    code = atarist_keymap[qcode];
+    if (!code) {
+        return;
+    }
+    ikbd_queue_byte(s, code | (evt->key.down ? 0 : IKBD_KEY_RELEASE));
+}
+
+static const QemuInputHandler atarist_ikbd_key_handler = {
+    .name  = "Atari ST Keyboard",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = atarist_ikbd_key_event,
+};
+
+static void atarist_ikbd_reset_hold(Object *obj, ResetType type)
+{
+    AtaristIkbdState *s = ATARIST_IKBD(obj);
+
+    s->kbd_ctrl = 0;
+    s->kbd_rdrf = false;
+    s->midi_ctrl = 0;
+    ikbd_reset_state(s);
+    timer_del(s->xmit_timer);
+    timer_del(s->reset_timer);
+    timer_del(s->mouse_timer);
+    ikbd_acia_update_irq(s);
+}
+
+static void atarist_ikbd_init(Object *obj)
+{
+    AtaristIkbdState *s = ATARIST_IKBD(obj);
+
+    memory_region_init_io(&s->iomem, obj, &atarist_ikbd_ops, s,
+                          "atarist.acia", 8);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+}
+
+static void atarist_ikbd_realize(DeviceState *dev, Error **errp)
+{
+    AtaristIkbdState *s = ATARIST_IKBD(dev);
+
+    s->xmit_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ikbd_xmit_cb, s);
+    s->reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ikbd_reset_done_cb, s);
+    s->mouse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ikbd_mouse_timer_cb, s);
+    s->mouse_hs = qemu_input_handler_register(dev,
+                                              &atarist_ikbd_mouse_handler);
+    s->kbd_hs = qemu_input_handler_register(dev, &atarist_ikbd_key_handler);
+}
+
+static void atarist_ikbd_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->realize = atarist_ikbd_realize;
+    rc->phases.hold = atarist_ikbd_reset_hold;
+}
+
+
+/*
+ * ---------------------------------------------------------------------
+ * WD1772 FDC behind the ST DMA controller
+ *
+ * The FDC/HDC registers are reached through 0xFF8604 (word), with the
+ * DMA mode register at 0xFF8606 selecting which register the access
+ * hits; 0xFF8606 reads back as DMA status.  The DMA base address is
+ * three byte registers at 0xFF8609/0B/0D and counts up as sectors move.
+ * Drive/side selection comes from the PSG's port A.  Command
+ * completion raises INTRQ into MFP GPIP5 (active low); reading the
+ * status register or writing a command clears it.
+ * ---------------------------------------------------------------------
+ */
+
+#define TYPE_ATARIST_FDC "atarist-fdc"
+OBJECT_DECLARE_SIMPLE_TYPE(AtaristFdcState, ATARIST_FDC)
+
+/* byte offsets in the 0xFF8604 region */
+#define DMA_REG_DATA          0x00        /* FDC/HDC/sector count access */
+#define DMA_REG_MODE          0x02        /* write: mode, read: status */
+#define DMA_REG_ADDR_HI       0x05
+#define DMA_REG_ADDR_MID      0x07
+#define DMA_REG_ADDR_LO       0x09
+
+/* DMA mode register bits */
+#define DMA_MODE_A0           0x0002
+#define DMA_MODE_A1           0x0004
+#define DMA_MODE_HDC          0x0008      /* 1 = HDC, 0 = FDC */
+#define DMA_MODE_SECCOUNT     0x0010      /* access the sector counter */
+#define DMA_MODE_DISABLED     0x0080
+#define DMA_MODE_WRITE        0x0100      /* 1 = RAM -> disk */
+
+/* DMA status register bits */
+#define DMA_STATUS_OK         0x01        /* 1 = no error */
+#define DMA_STATUS_SECCOUNT   0x02        /* 1 = sector count nonzero */
+#define DMA_STATUS_DRQ        0x04
+
+/* WD1772 registers, selected by mode bits A1/A0 */
+#define FDC_REG_STATUS_CMD    0
+#define FDC_REG_TRACK         1
+#define FDC_REG_SECTOR        2
+#define FDC_REG_DATA          3
+
+/* WD1772 status bits */
+#define FDC_SR_BUSY           0x01
+#define FDC_SR_DRQ_INDEX      0x02
+#define FDC_SR_TRACK0_LOST    0x04
+#define FDC_SR_CRC_ERROR      0x08
+#define FDC_SR_RNF            0x10
+#define FDC_SR_SPINUP_RECTYPE 0x20
+#define FDC_SR_WPROT          0x40
+#define FDC_SR_MOTOR_ON       0x80
+
+/* command classes */
+#define FDC_CMD_RESTORE       0x00
+#define FDC_CMD_SEEK          0x10
+#define FDC_CMD_STEP          0x20
+#define FDC_CMD_STEP_IN       0x40
+#define FDC_CMD_STEP_OUT      0x60
+#define FDC_CMD_READ_SECTOR   0x80
+#define FDC_CMD_WRITE_SECTOR  0xa0
+#define FDC_CMD_READ_ADDRESS  0xc0
+#define FDC_CMD_FORCE_INT     0xd0
+#define FDC_CMD_READ_TRACK    0xe0
+#define FDC_CMD_WRITE_TRACK   0xf0
+
+#define FDC_CMD_FLAG_UPDATE   0x10        /* type I step: update track reg */
+#define FDC_CMD_FLAG_MULTIPLE 0x10        /* type II: multiple sectors */
+#define FDC_FORCE_INT_NOW     0x08
+
+#define FDC_NUM_DRIVES        2
+#define FDC_MAX_TRACK         85
+#define FDC_SECTOR_SIZE       512
+
+#define FDC_STEP_NS           (3 * SCALE_MS)
+#define FDC_SETTLE_NS         (15 * SCALE_MS)
+#define FDC_SECTOR_NS         (2 * SCALE_MS)
+#define FDC_MOTOR_SPINDOWN_NS ((int64_t)1800 * SCALE_MS)
+
+typedef struct AtaristFloppy {
+    BlockBackend *blk;
+    unsigned spt, sides, tracks;
+    unsigned phys_track;
+} AtaristFloppy;
+
+struct AtaristFdcState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;               /* to MFP GPIP5, active low */
+
+    AtaristFloppy drive[FDC_NUM_DRIVES];
+
+    /* PSG port A levels (raw, selects are active low) */
+    bool sel_drive[FDC_NUM_DRIVES];
+    bool side1;
+
+    uint8_t track, sector, data, status, cmd;
+    bool busy;
+    bool intrq;
+    int64_t motor_off_ns;
+
+    uint16_t dma_mode;
+    uint32_t dma_addr;
+    uint16_t dma_seccount;
+    bool dma_ok;
+
+    QEMUTimer *cmd_timer;
+};
+
+static void fdc_update_irq(AtaristFdcState *s)
+{
+    qemu_set_irq(s->irq, !s->intrq);
+}
+
+static void fdc_set_intrq(AtaristFdcState *s)
+{
+    s->intrq = true;
+    fdc_update_irq(s);
+}
+
+static void fdc_clear_intrq(AtaristFdcState *s)
+{
+    s->intrq = false;
+    fdc_update_irq(s);
+}
+
+static AtaristFloppy *fdc_selected(AtaristFdcState *s)
+{
+    int i;
+
+    for (i = 0; i < FDC_NUM_DRIVES; i++) {
+        if (!s->sel_drive[i]) {         /* active low */
+            return &s->drive[i];
+        }
+    }
+    return NULL;
+}
+
+static void fdc_motor_on(AtaristFdcState *s)
+{
+    s->motor_off_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      FDC_MOTOR_SPINDOWN_NS;
+}
+
+static bool fdc_motor_running(AtaristFdcState *s)
+{
+    return s->busy ||
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->motor_off_ns;
+}
+
+/* DMA one buffer into/out of RAM, advancing the address register */
+static void fdc_dma_transfer(AtaristFdcState *s, uint8_t *buf, size_t len,
+                             bool to_ram)
+{
+    if (!s->dma_seccount) {
+        return;                 /* the DMA FIFO is not listening */
+    }
+    if (to_ram) {
+        address_space_write(&address_space_memory,
+                            s->dma_addr & (ATARIST_ADDR_SPACE - 1),
+                            MEMTXATTRS_UNSPECIFIED, buf, len);
+    } else {
+        address_space_read(&address_space_memory,
+                           s->dma_addr & (ATARIST_ADDR_SPACE - 1),
+                           MEMTXATTRS_UNSPECIFIED, buf, len);
+    }
+    s->dma_addr += len;
+}
+
+static void fdc_sector_done(AtaristFdcState *s)
+{
+    if (s->dma_seccount) {
+        s->dma_seccount--;
+    }
+}
+
+/* type II/III payload work, run from the command completion timer */
+static void fdc_do_read_sectors(AtaristFdcState *s, AtaristFloppy *fl)
+{
+    bool multiple = s->cmd & FDC_CMD_FLAG_MULTIPLE;
+    unsigned side = fl->sides > 1 && s->side1 ? 1 : 0;
+    unsigned transferred = 0;
+    uint8_t buf[FDC_SECTOR_SIZE];
+
+    if (!fl->blk || s->track != fl->phys_track ||
+        fl->phys_track >= fl->tracks) {
+        s->status |= FDC_SR_RNF;
+        return;
+    }
+
+    while (s->sector >= 1 && s->sector <= fl->spt) {
+        int64_t lba = ((int64_t)fl->phys_track * fl->sides + side) *
+                      fl->spt + (s->sector - 1);
+
+        if (blk_pread(fl->blk, lba * FDC_SECTOR_SIZE, FDC_SECTOR_SIZE,
+                      buf, 0) < 0) {
+            s->status |= FDC_SR_RNF;
+            return;
+        }
+        fdc_dma_transfer(s, buf, FDC_SECTOR_SIZE, true);
+        fdc_sector_done(s);
+        transferred++;
+        if (!multiple) {
+            return;
+        }
+        s->sector++;
+        if (!s->dma_seccount) {
+            return;             /* the ST always force-stops here anyway */
+        }
+    }
+    if (!transferred) {
+        s->status |= FDC_SR_RNF;
+    }
+}
+
+static void fdc_do_write_sectors(AtaristFdcState *s, AtaristFloppy *fl)
+{
+    bool multiple = s->cmd & FDC_CMD_FLAG_MULTIPLE;
+    unsigned side = fl->sides > 1 && s->side1 ? 1 : 0;
+    unsigned transferred = 0;
+    uint8_t buf[FDC_SECTOR_SIZE];
+
+    if (!fl->blk || s->track != fl->phys_track ||
+        fl->phys_track >= fl->tracks) {
+        s->status |= FDC_SR_RNF;
+        return;
+    }
+    if (!blk_supports_write_perm(fl->blk)) {
+        s->status |= FDC_SR_WPROT;
+        return;
+    }
+
+    while (s->sector >= 1 && s->sector <= fl->spt && s->dma_seccount) {
+        int64_t lba = ((int64_t)fl->phys_track * fl->sides + side) *
+                      fl->spt + (s->sector - 1);
+
+        fdc_dma_transfer(s, buf, FDC_SECTOR_SIZE, false);
+        if (blk_pwrite(fl->blk, lba * FDC_SECTOR_SIZE, FDC_SECTOR_SIZE,
+                       buf, 0) < 0) {
+            s->status |= FDC_SR_RNF;
+            return;
+        }
+        fdc_sector_done(s);
+        transferred++;
+        if (!multiple) {
+            return;
+        }
+        s->sector++;
+    }
+    if (!transferred) {
+        s->status |= FDC_SR_RNF;
+    }
+}
+
+static void fdc_do_read_address(AtaristFdcState *s, AtaristFloppy *fl)
+{
+    uint8_t id[6];
+
+    if (!fl->blk || fl->phys_track >= fl->tracks) {
+        s->status |= FDC_SR_RNF;
+        return;
+    }
+    id[0] = fl->phys_track;
+    id[1] = fl->sides > 1 && s->side1 ? 1 : 0;
+    id[2] = 1;
+    id[3] = 2;                  /* 512 bytes/sector */
+    id[4] = 0;                  /* CRC, not modelled */
+    id[5] = 0;
+    fdc_dma_transfer(s, id, sizeof(id), true);
+    /* the 1772 copies the track number into the sector register */
+    s->sector = fl->phys_track;
+}
+
+static void fdc_cmd_done(void *opaque)
+{
+    AtaristFdcState *s = opaque;
+    AtaristFloppy *fl = fdc_selected(s);
+    uint8_t type = s->cmd & 0xf0;
+
+    s->status = 0;
+
+    switch (type) {
+    case FDC_CMD_RESTORE:
+    case FDC_CMD_SEEK:
+    case FDC_CMD_STEP:
+    case FDC_CMD_STEP | FDC_CMD_FLAG_UPDATE:
+    case FDC_CMD_STEP_IN:
+    case FDC_CMD_STEP_IN | FDC_CMD_FLAG_UPDATE:
+    case FDC_CMD_STEP_OUT:
+    case FDC_CMD_STEP_OUT | FDC_CMD_FLAG_UPDATE: {
+        unsigned phys = fl ? fl->phys_track : 0;
+
+        s->status |= FDC_SR_SPINUP_RECTYPE;
+        if (phys == 0) {
+            s->status |= FDC_SR_TRACK0_LOST;
+        }
+        break;
+    }
+    case FDC_CMD_READ_SECTOR:
+    case FDC_CMD_READ_SECTOR | FDC_CMD_FLAG_MULTIPLE:
+        if (fl) {
+            fdc_do_read_sectors(s, fl);
+        } else {
+            s->status |= FDC_SR_RNF;
+        }
+        break;
+    case FDC_CMD_WRITE_SECTOR:
+    case FDC_CMD_WRITE_SECTOR | FDC_CMD_FLAG_MULTIPLE:
+        if (fl) {
+            fdc_do_write_sectors(s, fl);
+        } else {
+            s->status |= FDC_SR_RNF;
+        }
+        break;
+    case FDC_CMD_READ_ADDRESS:
+        if (fl) {
+            fdc_do_read_address(s, fl);
+        } else {
+            s->status |= FDC_SR_RNF;
+        }
+        break;
+    case FDC_CMD_READ_TRACK:
+    case FDC_CMD_WRITE_TRACK:
+        qemu_log_mask(LOG_UNIMP, "atarist fdc: command 0x%02x\n", s->cmd);
+        break;
+    }
+
+    if (fdc_motor_running(s)) {
+        s->status |= FDC_SR_MOTOR_ON;
+    }
+    s->busy = false;
+    fdc_motor_on(s);
+    fdc_set_intrq(s);
+}
+
+static void fdc_command(AtaristFdcState *s, uint8_t cmd)
+{
+    AtaristFloppy *fl = fdc_selected(s);
+    uint8_t type = cmd & 0xf0;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t delay;
+    int steps;
+
+    if (type == FDC_CMD_FORCE_INT) {
+        timer_del(s->cmd_timer);
+        s->busy = false;
+        s->status &= ~FDC_SR_BUSY;
+        if (cmd & FDC_FORCE_INT_NOW) {
+            fdc_set_intrq(s);
+        }
+        return;
+    }
+    if (s->busy) {
+        return;                 /* only force interrupt gets through */
+    }
+
+    s->cmd = cmd;
+    s->busy = true;
+    fdc_clear_intrq(s);
+    fdc_motor_on(s);
+
+    switch (type) {
+    case FDC_CMD_RESTORE:
+        steps = fl ? fl->phys_track : 0;
+        if (fl) {
+            fl->phys_track = 0;
+        }
+        s->track = 0;
+        delay = FDC_SETTLE_NS + steps * FDC_STEP_NS;
+        break;
+    case FDC_CMD_SEEK: {
+        unsigned target = MIN(s->data, FDC_MAX_TRACK);
+
+        steps = fl ? abs((int)fl->phys_track - (int)target) : 0;
+        if (fl) {
+            fl->phys_track = target;
+        }
+        s->track = s->data;
+        delay = FDC_SETTLE_NS + steps * FDC_STEP_NS;
+        break;
+    }
+    case FDC_CMD_STEP:
+    case FDC_CMD_STEP | FDC_CMD_FLAG_UPDATE:
+    case FDC_CMD_STEP_IN:
+    case FDC_CMD_STEP_IN | FDC_CMD_FLAG_UPDATE:
+    case FDC_CMD_STEP_OUT:
+    case FDC_CMD_STEP_OUT | FDC_CMD_FLAG_UPDATE: {
+        int dir = (type & 0xe0) == FDC_CMD_STEP_OUT ? -1 : 1;
+
+        if (fl) {
+            int t = (int)fl->phys_track + dir;
+
+            fl->phys_track = MIN(MAX(t, 0), FDC_MAX_TRACK);
+            if (cmd & FDC_CMD_FLAG_UPDATE) {
+                s->track = fl->phys_track;
+            }
+        }
+        delay = FDC_STEP_NS;
+        break;
+    }
+    case FDC_CMD_READ_SECTOR:
+    case FDC_CMD_READ_SECTOR | FDC_CMD_FLAG_MULTIPLE:
+    case FDC_CMD_WRITE_SECTOR:
+    case FDC_CMD_WRITE_SECTOR | FDC_CMD_FLAG_MULTIPLE:
+        delay = FDC_SECTOR_NS *
+                ((cmd & FDC_CMD_FLAG_MULTIPLE) ? MAX(s->dma_seccount, 1)
+                                               : 1);
+        break;
+    default:
+        delay = FDC_SETTLE_NS;
+        break;
+    }
+
+    timer_mod(s->cmd_timer, now + delay);
+}
+
+static uint8_t fdc_status(AtaristFdcState *s)
+{
+    uint8_t sr = s->status;
+
+    if (s->busy) {
+        sr |= FDC_SR_BUSY;
+    }
+    if (fdc_motor_running(s)) {
+        sr |= FDC_SR_MOTOR_ON;
+    } else {
+        sr &= ~FDC_SR_MOTOR_ON;
+    }
+    return sr;
+}
+
+static uint64_t atarist_fdc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    AtaristFdcState *s = opaque;
+
+    switch (addr & ~1) {
+    case DMA_REG_DATA:
+        if (s->dma_mode & DMA_MODE_SECCOUNT) {
+            return s->dma_seccount;
+        }
+        if (s->dma_mode & DMA_MODE_HDC) {
+            return 0xff;        /* no ACSI device: floating bus */
+        }
+        switch ((s->dma_mode & (DMA_MODE_A1 | DMA_MODE_A0)) >> 1) {
+        case FDC_REG_STATUS_CMD:
+            fdc_clear_intrq(s);
+            return fdc_status(s);
+        case FDC_REG_TRACK:
+            return s->track;
+        case FDC_REG_SECTOR:
+            return s->sector;
+        default:
+            return s->data;
+        }
+    case DMA_REG_MODE:
+        return (s->dma_ok ? DMA_STATUS_OK : 0) |
+               (s->dma_seccount ? DMA_STATUS_SECCOUNT : 0);
+    case DMA_REG_ADDR_HI & ~1:
+        return (s->dma_addr >> 16) & 0x3f;
+    case DMA_REG_ADDR_MID & ~1:
+        return (s->dma_addr >> 8) & 0xff;
+    case DMA_REG_ADDR_LO & ~1:
+        return s->dma_addr & 0xff;
+    default:
+        return 0xff;
+    }
+}
+
+static void atarist_fdc_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    AtaristFdcState *s = opaque;
+
+    switch (addr & ~1) {
+    case DMA_REG_DATA:
+        if (s->dma_mode & DMA_MODE_SECCOUNT) {
+            s->dma_seccount = val & 0xff;
+            return;
+        }
+        if (s->dma_mode & DMA_MODE_HDC) {
+            return;             /* no ACSI device */
+        }
+        switch ((s->dma_mode & (DMA_MODE_A1 | DMA_MODE_A0)) >> 1) {
+        case FDC_REG_STATUS_CMD:
+            fdc_clear_intrq(s);
+            fdc_command(s, val);
+            return;
+        case FDC_REG_TRACK:
+            s->track = val;
+            return;
+        case FDC_REG_SECTOR:
+            s->sector = val;
+            return;
+        default:
+            s->data = val;
+            return;
+        }
+    case DMA_REG_MODE:
+        /* flipping the direction bit resets the DMA state machine */
+        if ((s->dma_mode ^ val) & DMA_MODE_WRITE) {
+            s->dma_ok = true;
+        }
+        s->dma_mode = val;
+        return;
+    case DMA_REG_ADDR_HI & ~1:
+        s->dma_addr = deposit32(s->dma_addr, 16, 8, val & 0x3f);
+        return;
+    case DMA_REG_ADDR_MID & ~1:
+        s->dma_addr = deposit32(s->dma_addr, 8, 8, val);
+        return;
+    case DMA_REG_ADDR_LO & ~1:
+        s->dma_addr = deposit32(s->dma_addr, 0, 8, val);
+        return;
+    default:
+        return;
+    }
+}
+
+static const MemoryRegionOps atarist_fdc_ops = {
+    .read = atarist_fdc_read,
+    .write = atarist_fdc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+};
+
+/* PSG port A lines: 0 = side select, 1/2 = drive selects (active low) */
+static void atarist_fdc_porta(void *opaque, int line, int level)
+{
+    AtaristFdcState *s = opaque;
+
+    if (line == 0) {
+        s->side1 = !level;
+    } else {
+        s->sel_drive[line - 1] = level;
+    }
+}
+
+/*
+ * Geometry from the image: trust the boot sector BPB when sane
+ * (sectors/track at 0x18, sides at 0x1A, both little-endian), fall
+ * back to deriving it from the image size.
+ */
+static void fdc_probe_geometry(AtaristFloppy *fl, Error **errp)
+{
+    int64_t len = blk_getlength(fl->blk);
+    int64_t total;
+    uint8_t boot[FDC_SECTOR_SIZE];
+    static const unsigned try_sides[] = { 2, 1 };
+    static const unsigned try_spt[] = { 9, 10, 11, 12 };
+    unsigned i, j;
+
+    if (len <= 0) {
+        fl->blk = NULL;         /* no medium */
+        return;
+    }
+    if (len % FDC_SECTOR_SIZE) {
+        error_setg(errp, "floppy image size %" PRId64
+                   " is not a multiple of 512", len);
+        return;
+    }
+    total = len / FDC_SECTOR_SIZE;
+
+    if (blk_pread(fl->blk, 0, FDC_SECTOR_SIZE, boot, 0) == 0) {
+        unsigned spt = lduw_le_p(boot + 0x18);
+        unsigned sides = lduw_le_p(boot + 0x1a);
+
+        if (spt >= 8 && spt <= 12 && sides >= 1 && sides <= 2 &&
+            total % (spt * sides) == 0) {
+            unsigned tracks = total / (spt * sides);
+
+            if (tracks >= 75 && tracks <= FDC_MAX_TRACK + 1) {
+                fl->spt = spt;
+                fl->sides = sides;
+                fl->tracks = tracks;
+                return;
+            }
+        }
+    }
+
+    for (i = 0; i < ARRAY_SIZE(try_sides); i++) {
+        for (j = 0; j < ARRAY_SIZE(try_spt); j++) {
+            unsigned per = try_sides[i] * try_spt[j];
+            unsigned tracks = total / per;
+
+            if (total % per == 0 && tracks >= 75 &&
+                tracks <= FDC_MAX_TRACK + 1) {
+                fl->spt = try_spt[j];
+                fl->sides = try_sides[i];
+                fl->tracks = tracks;
+                return;
+            }
+        }
+    }
+    error_setg(errp, "cannot derive a floppy geometry from %" PRId64
+               " sectors (raw .ST images only)", total);
+}
+
+static void atarist_fdc_reset_hold(Object *obj, ResetType type)
+{
+    AtaristFdcState *s = ATARIST_FDC(obj);
+
+    s->track = s->sector = s->data = s->status = s->cmd = 0;
+    s->busy = false;
+    s->intrq = false;
+    s->motor_off_ns = 0;
+    s->dma_mode = 0;
+    s->dma_addr = 0;
+    s->dma_seccount = 0;
+    s->dma_ok = true;
+    timer_del(s->cmd_timer);
+    fdc_update_irq(s);
+}
+
+static void atarist_fdc_init(Object *obj)
+{
+    AtaristFdcState *s = ATARIST_FDC(obj);
+    int i;
+
+    memory_region_init_io(&s->iomem, obj, &atarist_fdc_ops, s,
+                          "atarist.fdc-dma", 0x0c);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_in_named(DEVICE(obj), atarist_fdc_porta, "porta", 3);
+    for (i = 0; i < FDC_NUM_DRIVES; i++) {
+        s->sel_drive[i] = true;         /* deselected */
+    }
+}
+
+static void atarist_fdc_realize(DeviceState *dev, Error **errp)
+{
+    AtaristFdcState *s = ATARIST_FDC(dev);
+    int i;
+
+    s->cmd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, fdc_cmd_done, s);
+    for (i = 0; i < FDC_NUM_DRIVES; i++) {
+        if (!s->drive[i].blk) {
+            continue;
+        }
+        fdc_probe_geometry(&s->drive[i], errp);
+        if (*errp) {
+            return;
+        }
+    }
+}
+
+static const Property atarist_fdc_properties[] = {
+    DEFINE_PROP_DRIVE("driveA", AtaristFdcState, drive[0].blk),
+    DEFINE_PROP_DRIVE("driveB", AtaristFdcState, drive[1].blk),
+};
+
+static void atarist_fdc_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->realize = atarist_fdc_realize;
+    device_class_set_props(dc, atarist_fdc_properties);
+    rc->phases.hold = atarist_fdc_reset_hold;
+}
+
 /*
  * ---------------------------------------------------------------------
  * Machine
@@ -1266,6 +2514,8 @@ struct AtaristMachineState {
     AtaristMfpState mfp;
     AtaristVideoState video;
     AtaristPsgState psg;
+    AtaristIkbdState ikbd;
+    AtaristFdcState fdc;
 
     MemoryRegion rom;
     MemoryRegion rom_low;       /* reset vectors readable at 0 */
@@ -1273,8 +2523,6 @@ struct AtaristMachineState {
     MemoryRegion berr;          /* everything unassigned bus-errors */
     MemoryRegion ram_window;    /* container for the decoded banks */
     MemoryRegion memcfg_mr;
-    MemoryRegion acia_stub;
-    MemoryRegion dma_stub;
 
     uint8_t memcfg;
     AtaristBank bank[2];
@@ -1550,59 +2798,6 @@ static const MemoryRegionOps atarist_berr_ops = {
     },
 };
 
-/*
- * Temporary stubs for the ACIAs and the FDC/DMA port so TOS's probes
- * find silent but present hardware.
- */
-static uint64_t atarist_acia_stub_read(void *opaque, hwaddr addr,
-                                       unsigned size)
-{
-    /* status: transmit data register empty, nothing received */
-    return (addr & 2) ? 0x00 : 0x02;
-}
-
-static void atarist_acia_stub_write(void *opaque, hwaddr addr, uint64_t val,
-                                    unsigned size)
-{
-}
-
-static const MemoryRegionOps atarist_acia_stub_ops = {
-    .read = atarist_acia_stub_read,
-    .write = atarist_acia_stub_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 2,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 1,
-    },
-};
-
-static uint64_t atarist_dma_stub_read(void *opaque, hwaddr addr,
-                                      unsigned size)
-{
-    if (addr == 2) {
-        return 0x01;            /* DMA status: no error */
-    }
-    return 0xff;
-}
-
-static void atarist_dma_stub_write(void *opaque, hwaddr addr, uint64_t val,
-                                   unsigned size)
-{
-}
-
-static const MemoryRegionOps atarist_dma_stub_ops = {
-    .read = atarist_dma_stub_read,
-    .write = atarist_dma_stub_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 2,
-    },
-};
 
 static void atarist_machine_reset(void *opaque)
 {
@@ -1632,6 +2827,8 @@ static void atarist_reset_out(void *opaque, int n, int level)
     device_cold_reset(DEVICE(&m->mfp));
     device_cold_reset(DEVICE(&m->video));
     device_cold_reset(DEVICE(&m->psg));
+    device_cold_reset(DEVICE(&m->ikbd));
+    device_cold_reset(DEVICE(&m->fdc));
 }
 
 static void atarist_machine_init(MachineState *machine)
@@ -1793,13 +2990,40 @@ static void atarist_machine_init(MachineState *machine)
                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->psg),
                                                        0));
 
-    /* ACIA + FDC/DMA stubs */
-    memory_region_init_io(&m->acia_stub, OBJECT(machine),
-                          &atarist_acia_stub_ops, m, "atarist.acia", 8);
-    memory_region_add_subregion(sysmem, ATARIST_ACIA_BASE, &m->acia_stub);
-    memory_region_init_io(&m->dma_stub, OBJECT(machine),
-                          &atarist_dma_stub_ops, m, "atarist.dma", 0x0c);
-    memory_region_add_subregion(sysmem, ATARIST_DMA_BASE, &m->dma_stub);
+    /* the ACIAs and the IKBD behind them */
+    object_initialize_child(OBJECT(machine), "ikbd", &m->ikbd,
+                            TYPE_ATARIST_IKBD);
+    sysbus_realize(SYS_BUS_DEVICE(&m->ikbd), &error_fatal);
+    memory_region_add_subregion(sysmem, ATARIST_ACIA_BASE,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->ikbd),
+                                                       0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&m->ikbd), 0,
+                       qdev_get_gpio_in_named(DEVICE(&m->mfp), "gpip",
+                                              MFP_GPIP_ACIA));
+
+    /* WD1772 + DMA */
+    object_initialize_child(OBJECT(machine), "fdc", &m->fdc,
+                            TYPE_ATARIST_FDC);
+    for (i = 0; i < FDC_NUM_DRIVES; i++) {
+        DriveInfo *dinfo = drive_get(IF_FLOPPY, 0, i);
+
+        if (dinfo) {
+            qdev_prop_set_drive(DEVICE(&m->fdc), i ? "driveB" : "driveA",
+                                blk_by_legacy_dinfo(dinfo));
+        }
+    }
+    sysbus_realize(SYS_BUS_DEVICE(&m->fdc), &error_fatal);
+    memory_region_add_subregion(sysmem, ATARIST_DMA_BASE,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->fdc),
+                                                       0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&m->fdc), 0,
+                       qdev_get_gpio_in_named(DEVICE(&m->mfp), "gpip",
+                                              MFP_GPIP_FDC));
+    for (i = 0; i < 3; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&m->psg), "porta", i,
+                                    qdev_get_gpio_in_named(DEVICE(&m->fdc),
+                                                           "porta", i));
+    }
 
     qemu_register_reset(atarist_machine_reset, m);
 }
@@ -1843,6 +3067,20 @@ static const TypeInfo atarist_machine_typeinfo[] = {
         .instance_size = sizeof(AtaristGlueState),
         .instance_init = atarist_glue_init,
         .class_init = atarist_glue_class_init,
+    },
+    {
+        .name       = TYPE_ATARIST_IKBD,
+        .parent     = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AtaristIkbdState),
+        .instance_init = atarist_ikbd_init,
+        .class_init = atarist_ikbd_class_init,
+    },
+    {
+        .name       = TYPE_ATARIST_FDC,
+        .parent     = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AtaristFdcState),
+        .instance_init = atarist_fdc_init,
+        .class_init = atarist_fdc_class_init,
     },
     {
         .name       = TYPE_ATARIST_PSG,
