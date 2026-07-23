@@ -204,8 +204,16 @@ DTT0=0xfe01a040 DTT1=0xfe018040: both transparent-translate
 
 ## Running it
 
-    qemu-system-m68k -M e17 -bios rmon.bin -nographic
+    qemu-system-m68k -M e17 -bios rmon.bin
     # rmon.bin: 256KB or the 1MB bitsavers dump, see "Firmware" above
+
+With video fitted (the default) RMON adopts the 800x600 framebuffer
+as its console, so the monitor prompt appears in the QEMU display
+window; serial port 1 is still there (-serial ...).  Keyboard input
+for the video console is NOT modelled yet — for an interactive
+monitor use -nographic (video still probes OK; RMON only switches
+the console to video, output-wise; input handling is the open item).
+-smp 1 removes the second 68040 ("Secondary CPU : Not installed").
 
 ## Current state (2026-07-20, evening)
 
