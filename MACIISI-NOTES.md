@@ -424,3 +424,28 @@ feeding the ROM garbage PRAM occasionally.  NEXT:
    adb_request, cuda.c-style) for Finder input once the desktop shows.
 4. The 5380 model is solid now — don't suspect it first anymore
    (commands:completes 1:1, byte-exact, ncr5380_datain proves it).
+
+Addendum (same session, later): the splash stall is DETERMINISTIC —
+every successful boot parks at exactly 198 SCSI commands (all
+complete), after the ADB Talk-R3 probe sweep ends with 0xfc, with the
+1Hz XPRAM clock-backup loop (write 0xB8-0xBB, +1s, verify) running
+forever.  Ruled out since the last entry:
+- No classic seconds-register access AT ALL (cmd bytes are only WP
+  0x35, XPRAM writes 0x38-0x3f, XPRAM reads 0xb8-0xbf) — so the
+  ignored-seconds-write theory is dead; the OS keeps time via XPRAM.
+- The OS rewrites ALL XPRAM sectors early (invalid-PRAM rebuild);
+  seeding 'NuMc'@0x0C + 0x8A=0x05 at init removes the churn but the
+  stall is unchanged.
+- Egret session-close interrupt + /XCVR idle fixes: correct per the
+  Linux via-maciisi model, but A/B against the pre-fix binary shows
+  identical behaviour (both reach Welcome, both park at 198).
+- Waited 30+ min: no crawl, hard wait.  Ticks advance, 60Hz+1s ints
+  fire, SCSI idle, ADB request queue empty (head=0 at [0xB78]+220).
+Best next theory: after the probe sweep the ADB manager expects
+Egret-INITIATED traffic (autopoll data or the Egret time packets) that
+our reactive-only model never sends; or command 0xfc (addr 15 Talk R0
+— or an Egret function 0xC?) demands a real answer, not the "no
+response" turnaround.  Wire QEMU's adb-kbd/adb-mouse behind
+egret_process (cuda.c-style adb_request) and answer Talk R3 probes
+with real device registers — that changes the whole post-probe flow
+and is needed for Finder input anyway.
