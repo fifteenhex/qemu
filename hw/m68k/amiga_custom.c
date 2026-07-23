@@ -60,6 +60,7 @@
 #define REG_COPCON      0x02e
 #define REG_BLTCON0     0x040
 #define REG_BLTCON1     0x042
+#define REG_BLTCON0L    0x05a
 #define REG_BLTAFWM     0x044
 #define REG_BLTALWM     0x046
 #define REG_BLTCPT      0x048
@@ -1269,6 +1270,11 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
         break;
     case REG_DSKLEN:
         amiga_custom_dsklen_write(s, val);
+        break;
+    case REG_BLTCON0L:
+        /* ECS: replaces only the minterm byte of BLTCON0 */
+        s->regs[REG_BLTCON0 >> 1] =
+            (s->regs[REG_BLTCON0 >> 1] & 0xff00) | (val & 0xff);
         break;
     case REG_BLTSIZE: {
         int h = (val >> 6) & 0x3ff;
