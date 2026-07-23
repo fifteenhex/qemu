@@ -1,12 +1,21 @@
-Palm PDAs (``palmv``, ``palmm500``)
-===================================
+Palm PDAs (``palmv``, ``palmiiix``, ``palmvx``, ``palmm100``, ``palmm500``, ``palmm515``)
+=========================================================================================
 
-Two Palm handhelds built on Motorola DragonBall system-on-chips:
+Palm handhelds built on Motorola DragonBall system-on-chips:
 
 * ``palmv`` — Palm V: MC68EZ328 "DragonBall EZ" at 16.58MHz, 2MB RAM,
   runs PalmOS 3.x.
+* ``palmiiix`` — Palm IIIx: MC68EZ328 at 16.58MHz, 4MB RAM, runs
+  PalmOS 3.x.
+* ``palmvx`` — Palm Vx: MC68EZ328 at 20MHz, 8MB RAM, runs PalmOS
+  3.x/4.x.
+* ``palmm100`` — Palm m100: MC68EZ328 at 16.58MHz, 2MB RAM, runs
+  PalmOS 3.5 (same 160x160 panel as the others behind the smaller
+  bezel).
 * ``palmm500`` — Palm m500: MC68VZ328 "DragonBall VZ" at 33.16MHz,
   8MB RAM, an SD card slot, runs PalmOS 4.x.
+* ``palmm515`` — Palm m515: like the m500 but 16MB RAM and a *color*
+  160x160 panel on an Epson SED1376 companion LCD controller.
 
 Emulated hardware
 -----------------
@@ -28,8 +37,11 @@ Emulated hardware
   sounds alarms and explicit tones by default, not UI taps).
 * Serial cradle on the UART (``-serial``); on the m500 the cradle is
   UART2 and UART1 is the IR port.
-* m500 only: the SD slot on the VZ's SPI1 unit
+* m500/m515: the SD slot on the VZ's SPI1 unit
   (``-drive if=sd,format=raw,file=sd.img``).
+* m515: the SED1376 color LCD controller with its embedded display
+  SRAM and 256-entry color look-up table (the launcher and apps run
+  in 8-bit color).
 
 Firmware
 --------
@@ -50,9 +62,29 @@ as archive.org item ``20250707_20250707_0134``:
    * - Palm-V-3.3-en.rom
      - ``palmv``
      - 6b347dada1c8b6bbc7546cc0f7281990
+   * - Palm-IIIx-3.1.rom
+     - ``palmiiix``
+     - 1022a3ecca4e18e212956a4f5cb79fb4
+   * - Palm-Vx-4.1-en.rom
+     - ``palmvx``
+     - e56adbdffb6420725b0dc5b6fa95b36c
+   * - Palm-m100-3.51-en.rom
+     - ``palmm100``
+     - d5eaa0eb27e1ae35b33f04dd7b762ad6
    * - Palm-m500-4.1-en.rom
      - ``palmm500``
      - dc8f0f8a6ffed58764065a7abe468ce4
+   * - Palm-m515-4.1-en.rom
+     - ``palmm515``
+     - 412557a221933a8be12622de7a21320a
+
+(The item's ``Palm-IIIx-4.0.rom`` is not a ROM at all but a truncated
+HTML error page — don't use it.)
+
+The m515 image is a whole-flash dump including the small (boot) ROM;
+the machine still enters through the big ROM's reset vectors because
+the small ROM's boot path waits on the m515's USB cradle controller,
+which is not modelled.
 
 Running
 -------
@@ -68,7 +100,7 @@ Running
 What works
 ----------
 
-Both machines boot PalmOS to the launcher with a working pen: the
+All machines boot PalmOS to the launcher with a working pen: the
 whole Setup wizard completes, including the digitizer calibration
 screen, and the built-in applications run (Memo Pad shows its
 welcome memos on the V, Note Pad its handwritten note on the m500).
@@ -83,7 +115,10 @@ an SD image builder.
 Known limitations
 -----------------
 
-* HotSync over the serial cradle has not been brought up.
+* HotSync over the serial cradle has not been brought up; the m515's
+  USB cradle controller is not modelled at all.
+* The SED1376's 16bpp mode and SwivelView start-address arithmetic
+  are best-effort (PalmOS 4.1 runs the m515 at 8bpp).
 * Sound is the PWM tone generator only; the sample-FIFO PCM path is
   not modelled.
 * The m500's digitizer calibration is sensitive to exact tap

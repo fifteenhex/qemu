@@ -28,6 +28,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/input/ads7843.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -38,11 +39,16 @@
 #define ADS7843_CMD_CHANNEL(_c) (((_c) >> 4) & 7)
 #define ADS7843_CMD_8BIT    0x08
 
-/* differential-mode channel assignments */
-#define ADS7843_CHANNEL_XPOS  1
+/*
+ * Channel assignments as wired on the Palm V (POSE's kChannelSet2):
+ * note Y on channel 1 and X on channel 5.
+ */
+#define ADS7843_CHANNEL_YPOS  1
+#define ADS7843_CHANNEL_BATT  2
 #define ADS7843_CHANNEL_Z1    3
 #define ADS7843_CHANNEL_Z2    4
-#define ADS7843_CHANNEL_YPOS  5
+#define ADS7843_CHANNEL_XPOS  5
+#define ADS7843_CHANNEL_DOCK  6
 
 #define ADS7843_MAX 0xfff
 
@@ -58,16 +64,15 @@ static uint16_t ads7843_sample(ADS7843State *s, int channel)
         return s->pen_down ? 0x600 : 0;
     case ADS7843_CHANNEL_Z2:
         return s->pen_down ? 0x600 : ADS7843_MAX;
-    case 2:
-        return 0xbd0; /* ch2 */
-    case 6:
-        return 0xbd0; /* ch6 */
+    case ADS7843_CHANNEL_BATT:
+        /* a healthy battery, or PalmOS goes straight to sleep */
+        return s->battery;
+    case ADS7843_CHANNEL_DOCK:
+        /* dock sense; the idle level is board specific */
+        return s->dock;
     default:
-        /*
-         * IN3/IN4: the Palm V measures its battery here.  Report a
-         * healthy Li-ion voltage or PalmOS goes straight to sleep.
-         */
-        return 0xbd0;
+        /* temperature sensors on some boards */
+        return ADS7843_MAX;
     }
 }
 
@@ -122,19 +127,21 @@ static void ads7843_input_event(DeviceState *dev, QemuConsole *src,
     switch (evt->type) {
     case INPUT_EVENT_KIND_ABS: {
         /*
-         * Produce what a real Palm V panel produces, so that the
-         * PalmOS *default* pen calibration (screenX = 0.72*raw8 - 2,
-         * screenY = raw8 - 3, measured against the OS 3.1 ROM) maps
-         * the pen exactly onto the pixel being pointed at.
+         * Produce what a real Palm V panel produces.  The raw values
+         * *decrease* as the screen coordinate grows — the PalmOS HAL
+         * inverts the ADC byte (255 - raw) before anything else sees
+         * it, verified by catching PenCalibrate's arguments in the
+         * OS 3.1 ROM.  The scale factors make PalmOS's default pen
+         * calibration land the pen on the pixel being pointed at.
          */
         int val = qemu_input_scale_axis(evt->abs.value,
                                         INPUT_EVENT_ABS_MIN,
                                         INPUT_EVENT_ABS_MAX,
                                         0, 159);
         if (evt->abs.axis == INPUT_AXIS_X) {
-            s->x = ((val * 1387) / 1000 + 3) << 4;
+            s->x = (252 - (val * 1387) / 1000) << 4;
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            s->y = (val + 3) << 4;
+            s->y = (252 - val) << 4;
         }
         break;
     }
@@ -155,6 +162,37 @@ static void ads7843_input_sync(DeviceState *dev)
     qemu_set_irq(s->penirq, s->pen_down);
 }
 
+/*
+ * The silkscreen buttons sit below the LCD on the digitizer (screen
+ * y 160..219).  A raised line simulates the pen held on a hotspot.
+ */
+static const struct {
+    uint16_t x, y;
+} ads7843_silk_hotspots[] = {
+    { 15, 175 },    /* Applications */
+    { 15, 205 },    /* Menu         */
+    { 145, 175 },   /* Calculator   */
+    { 145, 205 },   /* Find         */
+};
+
+static void ads7843_silk_set(void *opaque, int line, int value)
+{
+    ADS7843State *s = ADS7843(opaque);
+
+    if (value) {
+        s->silk_down |= 1 << line;
+        s->x = (252 - ads7843_silk_hotspots[line].x * 1387 / 1000) << 4;
+        s->y = (252 - ads7843_silk_hotspots[line].y) << 4;
+        s->pen_down = true;
+    } else {
+        s->silk_down &= ~(1 << line);
+        if (!s->silk_down)
+            s->pen_down = false;
+    }
+
+    qemu_set_irq(s->penirq, s->pen_down);
+}
+
 static const QemuInputHandler ads7843_handler = {
     .name = TYPE_ADS7843,
     .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
@@ -168,6 +206,8 @@ static void ads7843_realize(SSIPeripheral *d, Error **errp)
     ADS7843State *s = ADS7843(d);
 
     qdev_init_gpio_out_named(dev, &s->penirq, "penirq", 1);
+    qdev_init_gpio_in_named(dev, ads7843_silk_set, "silk-tap",
+                            ARRAY_SIZE(ads7843_silk_hotspots));
 
     s->hs = qemu_input_handler_register(dev, &ads7843_handler);
     qemu_input_handler_activate(s->hs);
@@ -190,10 +230,17 @@ static const VMStateDescription vmstate_ads7843 = {
     }
 };
 
+static const Property ads7843_properties[] = {
+    DEFINE_PROP_UINT16("battery-value", ADS7843State, battery, 0xbd0),
+    DEFINE_PROP_UINT16("dock-value", ADS7843State, dock, 0),
+};
+
 static void ads7843_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+
+    device_class_set_props(dc, ads7843_properties);
 
     k->realize = ads7843_realize;
     k->transfer = ads7843_transfer;

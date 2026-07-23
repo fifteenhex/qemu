@@ -17,6 +17,9 @@ config ADS7843
     bool
     depends on SSI
 
+config PALM_KEYPAD
+    bool
+
 config STELLARIS_GAMEPAD
     bool
 

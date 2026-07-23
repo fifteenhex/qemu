@@ -244,7 +244,7 @@ static void dragonball_uart_init(Object *obj)
     fifo8_create(&s->tx_fifo, TXFIFOSZ);
 
     memory_region_init_io(&s->iomem, obj, &dragonball_uart_ops, s,
-                          TYPE_DRAGONBALL_UART, 0x100);
+                          TYPE_DRAGONBALL_UART, 0x10);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 }
