@@ -71,13 +71,19 @@ callbacks run inside the timer's transaction).
 
 ## Open items / next steps
 
-- SCSI works: the "unit attention" was a red herring — the wd33c93
-  model was mis-running scsi.device's select-and-transfer-at-phase-
-  0x46 trick as a fresh command (a phantom all-zero-CDB TEST UNIT
-  READY), and never raised the ending disconnect interrupt the
-  driver completes commands from.  Both fixed; the full probe runs
-  and an RDB + FFS disk (see _amiga_assets/make_rdb_disk.py) mounts
-  on the Workbench desktop.  HD *boot* (no floppy) untested.
+- SCSI works, incl. writes: three wd33c93 bugs fixed in sequence —
+  (1) select-and-transfer-at-0x46 was mis-run as a fresh all-zero-CDB
+  command; (2) the ending disconnect interrupt was never raised; (3)
+  writes deferred: the data-out transfer completed (interrupt) before
+  the async block write landed, so command_complete moved the bus to
+  status with no interrupt and the guest hung.  HDToolBox/HDSetup now
+  partitions AND formats a blank drive end to end (real RDB+PART+FSHD
+  +FFS written by the guest), volume mounts on the desktop.
+  NOTE: the A3000 factory drive is SCSI unit **6** — HDSetup/HDToolBox
+  default there, so attach test disks with `-drive if=scsi,unit=6`.
+  Recording/replay of a GUI session: `_amiga_assets/replay_input.py`
+  + a log from `-trace input_event_rel -trace input_event_btn`.
+  HD *boot* (no floppy) untested.
 - Workbench text: FIXED — graphics.library uses the ECS BLTCON0L
   register (0x5a, minterm-byte-only write) once it sees our ECS
   chipset IDs; it was landing in the bare backing store.  Beware of
