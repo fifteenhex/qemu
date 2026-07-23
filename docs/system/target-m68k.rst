@@ -59,10 +59,13 @@ modelled:
    splits render.  Effects keyed to the horizontal beam position do
    not.
 
--  A bitplane display: lores and hires (mixable within a frame), up
-   to 6 planes with extra-half-brite, rendered to a QEMU console.
-   DMA sprites are drawn in front of the playfield (mouse pointers
-   work); attached sprites, HAM and dual playfield are not.
+-  A bitplane display: lores and hires (mixable within a frame),
+   extra-half-brite and hold-and-modify, rendered to a QEMU console.
+   On the AGA machine it extends to eight bitplanes, the 256-entry
+   24-bit palette (BPLCON3 bank and LOCT), HAM8 and the FMODE 32/64-bit
+   fetch widths, so AGA software displays in 256 colours.  DMA sprites
+   are drawn in front of the playfield (mouse pointers work); attached
+   sprites, the AGA sprite widths and dual playfield are not.
 
 -  Paula disk DMA and two floppy drives, DF0 and DF1, backed by plain
    880KB ADF images given with ``-drive if=floppy`` (once for each
@@ -136,9 +139,10 @@ same way::
    qemu-system-m68k -M a4000 -bios kick_a4000.rom \
        -drive if=floppy,file=disk.adf,format=raw
 
-The AGA display features (eight bitplanes, the 256-entry 24-bit
-palette, HAM8) and the onboard IDE interface are not modelled yet, so
-the OS falls back to the ECS display path and finds no hard disk.
+The AGA display is modelled (eight bitplanes, the 256-entry 24-bit
+palette, HAM8, FMODE fetch widths), so AGA software runs in 256
+colours.  The onboard IDE interface is not modelled yet, so there is no
+hard disk, and the AGA sprite fetch widths are not implemented.
 
 Adding other Amiga models
 ~~~~~~~~~~~~~~~~~~~~~~~~~

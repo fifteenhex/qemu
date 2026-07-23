@@ -134,9 +134,26 @@ callbacks run inside the timer's transaction).
   swaps its double-buffered copper lists (COP2LC) in the VERTB handler
   that runs after our old vblank copper pass.
 - Display gaps: attached sprites, sprite/playfield priority
-  (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
+  (BPLCON2), BPLCON1 fine scroll, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
   render.  DMA sprites render (Lemmings is playable, menu and all).
+- AGA display works (hw/m68k/amiga_custom.c): 8 bitplanes, the 256-entry
+  24-bit palette (BPLCON3 colour bank + LOCT nibbles, held as device
+  state and snapshot per frame so per-line copper palette splits still
+  replay), HAM6 and HAM8, and the FMODE 32/64-bit fetch widths (only the
+  per-line word count changes since the plane data stays contiguous).
+  Deluxe Galaga (AGA) runs in 256 colours on the a4000; get it with the
+  archive.org item `Deluxe_Galaga_v2.6B_1995-03-15_Vigdal_Edgar_AGA_SW-R`
+  (its startup-sequence LoadWBs, so xdftool-replace s/startup-sequence
+  with `cd Deluxe_Galaga_2.6` + `GALAGA.AGA` to auto-run).  Still ECS
+  through the sprite path: AGA sprites (FMODE width, BPLCON4 offsets) are
+  not widened, so sprite-drawn game objects look streaky.  Watch the
+  display-height clamp: a vertical shmup needs ~315 lines, so the cap is
+  512, not the PAL 313.
+- Control ports: gameport 0 is the mouse; gameport 1's fire button
+  (CIA-A PA7) is wired to the host middle mouse button so joystick games
+  (Deluxe Galaga reads port 2) can be driven.  Directions on port 2 are
+  not emulated yet.
 - Split-window widths: the surface is now clipped to the widest display
   window the copper opens across the frame (DIWSTRT/DIWSTOP tracked
   through the journal, sampled at DIWSTOP where both halves are fresh),
@@ -162,11 +179,10 @@ callbacks run inside the timer's transaction).
   Gary glue (now TYPE_AMIGA_MOBO in hw/m68k/amiga_mobo.c, used by both
   big-box machines).  QEMU's m68040 boots the A4000 Kickstart to the
   insert-disk prompt and runs Workbench 3.1 from floppy — so the 68040
-  MMU and the AGA chip IDs are fine.  Two follow-ups for a "real" A4000:
-  (1) the onboard IDE (an ATA port at 0xdd2020, Gayle-ish; currently
-  open bus so no HD), and (2) AGA display (8 bitplanes, 256-colour
-  24-bit palette, HAM8, FMODE/sprite-res) in amiga_custom.c — for now
-  the OS renders through the ECS path.
+  MMU and the AGA chip IDs are fine.  The AGA display is now implemented
+  (see the AGA bullet above), so AGA games render in 256 colours.  The
+  main remaining follow-up for a "real" A4000 is the onboard IDE (an ATA
+  port at 0xdd2020, Gayle-ish; currently open bus, so no hard disk).
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 
