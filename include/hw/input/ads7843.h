@@ -30,6 +30,9 @@ struct ADS7843State {
     uint16_t battery;
     uint16_t dock;
 
+    /* virtual taps on the silkscreen hotspots below the LCD */
+    uint8_t silk_down;
+
     /* command byte being shifted in */
     uint8_t cmd;
     int cmdbits;

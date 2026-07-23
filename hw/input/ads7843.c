@@ -162,6 +162,37 @@ static void ads7843_input_sync(DeviceState *dev)
     qemu_set_irq(s->penirq, s->pen_down);
 }
 
+/*
+ * The silkscreen buttons sit below the LCD on the digitizer (screen
+ * y 160..219).  A raised line simulates the pen held on a hotspot.
+ */
+static const struct {
+    uint16_t x, y;
+} ads7843_silk_hotspots[] = {
+    { 15, 175 },    /* Applications */
+    { 15, 205 },    /* Menu         */
+    { 145, 175 },   /* Calculator   */
+    { 145, 205 },   /* Find         */
+};
+
+static void ads7843_silk_set(void *opaque, int line, int value)
+{
+    ADS7843State *s = ADS7843(opaque);
+
+    if (value) {
+        s->silk_down |= 1 << line;
+        s->x = (252 - ads7843_silk_hotspots[line].x * 1387 / 1000) << 4;
+        s->y = (252 - ads7843_silk_hotspots[line].y) << 4;
+        s->pen_down = true;
+    } else {
+        s->silk_down &= ~(1 << line);
+        if (!s->silk_down)
+            s->pen_down = false;
+    }
+
+    qemu_set_irq(s->penirq, s->pen_down);
+}
+
 static const QemuInputHandler ads7843_handler = {
     .name = TYPE_ADS7843,
     .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
@@ -175,6 +206,8 @@ static void ads7843_realize(SSIPeripheral *d, Error **errp)
     ADS7843State *s = ADS7843(d);
 
     qdev_init_gpio_out_named(dev, &s->penirq, "penirq", 1);
+    qdev_init_gpio_in_named(dev, ads7843_silk_set, "silk-tap",
+                            ARRAY_SIZE(ads7843_silk_hotspots));
 
     s->hs = qemu_input_handler_register(dev, &ads7843_handler);
     qemu_input_handler_activate(s->hs);

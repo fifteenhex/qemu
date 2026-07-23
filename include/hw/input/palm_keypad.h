@@ -31,6 +31,9 @@ struct PalmKeypadState {
 
     qemu_irq col_out[PALM_KEYPAD_COLS];
     qemu_irq any_out;
+
+#define PALM_KEYPAD_SILK 4
+    qemu_irq silk_out[PALM_KEYPAD_SILK];
 };
 
 #endif

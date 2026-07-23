@@ -58,6 +58,11 @@ static const PalmKeypadKey palm_keypad_keys[] = {
     { Q_KEY_CODE_F6, 2, 1 },        /* Contrast   */
 };
 
+/* F7-F10 tap the silkscreen: Applications, Menu, Calc, Find */
+static const QKeyCode palm_keypad_silk_keys[PALM_KEYPAD_SILK] = {
+    Q_KEY_CODE_F7, Q_KEY_CODE_F8, Q_KEY_CODE_F9, Q_KEY_CODE_F10,
+};
+
 static void palm_keypad_update(PalmKeypadState *s)
 {
     uint8_t cols = 0;
@@ -108,6 +113,11 @@ static void palm_keypad_event(DeviceState *dev, QemuConsole *src,
                 s->pressed[palm_keypad_keys[i].row] &= ~mask;
         }
     }
+
+    for (i = 0; i < PALM_KEYPAD_SILK; i++) {
+        if (palm_keypad_silk_keys[i] == qcode)
+            qemu_set_irq(s->silk_out[i], evt->key.down);
+    }
 }
 
 static void palm_keypad_sync(DeviceState *dev)
@@ -130,6 +140,7 @@ static void palm_keypad_realize(DeviceState *dev, Error **errp)
                             PALM_KEYPAD_ROWS);
     qdev_init_gpio_out_named(dev, s->col_out, "cols", PALM_KEYPAD_COLS);
     qdev_init_gpio_out_named(dev, &s->any_out, "any", 1);
+    qdev_init_gpio_out_named(dev, s->silk_out, "silk", PALM_KEYPAD_SILK);
 
     s->hs = qemu_input_handler_register(dev, &palm_keypad_handler);
     qemu_input_handler_activate(s->hs);
