@@ -299,13 +299,25 @@ everything — beware, the idle loop makes that huge — or the targeted
   Adapter) are the console selection — with video absent RMON forces
   both to Serial Port 1.  SCSI/Keyboard: typematic rate, language,
   SCSI own ID 7, "SCSI Reset on startup".
-- `boot` with device=Ethernet: hangs producing no output and never
-  touching the LANCE.  Prime suspect: the boot paths need a working
-  Z8536 CIO counter/timer for their delays/timeouts (the u-boot DTS
-  also uses cio0 as tick-timer) — the CIO model has no counters yet.
-  Model the three 16-bit counters next, then retry netboot (which
-  should then fail over to the LANCE register trace) and `boot` from
-  Harddisk (SCSI).
+- `boot` with device=Harddisk (the default, OS "OS-9"): runs an
+  embedded "OS-9/68K System Bootstrap" which endlessly retries
+  "boot: Can't initialize the boot device / Boot failed, error
+  status $00F6" against the SCSI stub.  So the road to booting an
+  OS is: make the 53C710 model real.  RMON/the bootstrap drive it
+  with manual register-level selection (see the scsi trace above),
+  not SCRIPTS, so a phase-engine model in the style of the other
+  QEMU SCSI HBAs should be enough to boot OS-9 from a disk image.
+  THIS IS THE HIGHEST-PAYOFF NEXT TASK.
+- `boot` with device=Ethernet: no output, sits in the console getc
+  loop (PC fe81dc7e/fe81dca0) polling only VIC LICR6 + the CD2401 —
+  it never touches the LANCE.  NOT a timer problem (a 0.3s runtime
+  trace of the hang shows zero CIO accesses; enable tracing at
+  runtime with an HMP monitor socket and "trace-event NAME on").
+  Perhaps it waits for the ethernet address from the IPIN EEPROM
+  (our I2C stub reads 0xff) — investigate when doing the LANCE.
+- Session hygiene: other Claude sessions also run QEMU here — always
+  use unique names (socket paths under ~/e17-re, odd gdb ports, kill
+  only via stored pids, never pkill by generic pattern).
 
 ## The u-boot port (branch e17 in /workspace/src/uboot-e17)
 
