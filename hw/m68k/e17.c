@@ -50,6 +50,14 @@
 
 #define E17_DEFAULT_RAM_SIZE (16 * MiB)
 
+struct E17MachineState {
+    MachineState parent_obj;
+    bool video;
+};
+
+#define TYPE_E17_MACHINE MACHINE_TYPE_NAME("e17")
+OBJECT_DECLARE_SIMPLE_TYPE(E17MachineState, E17_MACHINE)
+
 typedef struct {
     M68kCPU *cpu;
     uint32_t initial_sp;
@@ -105,6 +113,7 @@ static void e17_slave_run(void *opaque, int n, int level)
 
 static void e17_init(MachineState *machine)
 {
+    E17MachineState *e17 = E17_MACHINE(machine);
     M68kCPU *cpu;
     M68kCPU *slave_cpu = NULL;
     MemoryRegion *sysmem = get_system_memory();
@@ -139,7 +148,8 @@ static void e17_init(MachineState *machine)
     if (machine->firmware) {
         bios_size = get_image_size(machine->firmware, NULL);
     }
-    if (bios_size != E17_ROM_IMAGE_SIZE && bios_size != E17_ROM_SIZE) {
+    if (!machine->kernel_filename &&
+        bios_size != E17_ROM_IMAGE_SIZE && bios_size != E17_ROM_SIZE) {
         bios_size_err = bios_size < 0 ?
             g_strdup("not found") :
             g_strdup_printf("has %" PRId64 " bytes", bios_size);
@@ -149,7 +159,8 @@ static void e17_init(MachineState *machine)
                      bios_size_err);
         exit(1);
     }
-    for (i = 0; i < E17_ROM_SIZE / E17_ROM_IMAGE_SIZE; i++) {
+    for (i = 0; machine->firmware &&
+                i < E17_ROM_SIZE / E17_ROM_IMAGE_SIZE; i++) {
         load_image_targphys(machine->firmware,
                             E17_ROM_BASE + i * E17_ROM_IMAGE_SIZE,
                             E17_ROM_SIZE - i * E17_ROM_IMAGE_SIZE, NULL);
@@ -161,21 +172,36 @@ static void e17_init(MachineState *machine)
     /*
      * ROM blob contents only appear in the region at machine reset,
      * after init-registered reset handlers have run: take the reset
-     * vectors from the file.
+     * vectors from the file.  -kernel loads an ELF (a u-boot build,
+     * say) into RAM instead and starts at its entry point, standing
+     * in for "load it over the ROM monitor and jump to it".
      */
     {
         E17ResetInfo *ri = g_new0(E17ResetInfo, 1);
         uint8_t vecs[8];
+        uint64_t elf_entry;
 
-        if (load_image_size(machine->firmware, vecs,
-                            sizeof(vecs)) != sizeof(vecs)) {
-            error_report("e17: cannot read reset vectors from %s",
-                         machine->firmware);
-            exit(1);
+        if (machine->kernel_filename) {
+            if (load_elf(machine->kernel_filename, NULL, NULL, NULL,
+                         &elf_entry, NULL, NULL, NULL,
+                         ELFDATA2MSB, EM_68K, 0, 0) <= 0) {
+                error_report("e17: cannot load %s",
+                             machine->kernel_filename);
+                exit(1);
+            }
+            ri->initial_sp = 0x8000;
+            ri->initial_pc = elf_entry;
+        } else {
+            if (load_image_size(machine->firmware, vecs,
+                                sizeof(vecs)) != sizeof(vecs)) {
+                error_report("e17: cannot read reset vectors from %s",
+                             machine->firmware);
+                exit(1);
+            }
+            ri->initial_sp = ldl_be_p(&vecs[0]);
+            ri->initial_pc = ldl_be_p(&vecs[4]);
         }
         ri->cpu = cpu;
-        ri->initial_sp = ldl_be_p(&vecs[0]);
-        ri->initial_pc = ldl_be_p(&vecs[4]);
         qemu_register_reset(e17_cpu_reset, ri);
     }
 
@@ -189,14 +215,21 @@ static void e17_init(MachineState *machine)
                                                       slave_cpu, 0));
     }
 
-    /* onboard video: VRAM plus the DAC/CRTC blocks inside the sysc */
-    vid_dev = qdev_new(TYPE_E17_VID);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(vid_dev), &error_fatal);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 0,
-                            E17_VID_DAC_BASE, 1);
-    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 1,
-                            E17_VID_CRTC_BASE, 1);
-    sysbus_mmio_map(SYS_BUS_DEVICE(vid_dev), 2, E17_VRAM_BASE);
+    /*
+     * Onboard video: VRAM plus the DAC/CRTC blocks inside the sysc
+     * window.  video=off depopulates it, which makes RMON fall back
+     * to the serial console (keyboard input is not modelled yet, so
+     * with video fitted the monitor is display-only).
+     */
+    if (e17->video) {
+        vid_dev = qdev_new(TYPE_E17_VID);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vid_dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 0,
+                                E17_VID_DAC_BASE, 1);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 1,
+                                E17_VID_CRTC_BASE, 1);
+        sysbus_mmio_map(SYS_BUS_DEVICE(vid_dev), 2, E17_VRAM_BASE);
+    }
 
     /* CD2401, serial ports 1-4; sits inside the e17-sysc window */
     serial_dev = qdev_new(TYPE_CD2401);
@@ -214,8 +247,25 @@ static void e17_init(MachineState *machine)
                        qdev_get_gpio_in_named(sysc_dev, "cd2401-irq", 0));
 }
 
-static void e17_machine_init(MachineClass *mc)
+static bool e17_get_video(Object *obj, Error **errp)
 {
+    return E17_MACHINE(obj)->video;
+}
+
+static void e17_set_video(Object *obj, bool value, Error **errp)
+{
+    E17_MACHINE(obj)->video = value;
+}
+
+static void e17_machine_instance_init(Object *obj)
+{
+    E17_MACHINE(obj)->video = true;
+}
+
+static void e17_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
     mc->desc = "ELTEC Eurocom E17";
     mc->init = e17_init;
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
@@ -224,6 +274,24 @@ static void e17_machine_init(MachineClass *mc)
     /* the board carries a second 68040; -smp 1 removes it */
     mc->max_cpus = 2;
     mc->default_cpus = 2;
+
+    object_class_property_add_bool(oc, "video", e17_get_video,
+                                   e17_set_video);
+    object_class_property_set_description(oc, "video",
+        "Fit the onboard video (default on; off = serial console)");
 }
 
-DEFINE_MACHINE("e17", e17_machine_init)
+static const TypeInfo e17_machine_typeinfo = {
+    .name = TYPE_E17_MACHINE,
+    .parent = TYPE_MACHINE,
+    .instance_size = sizeof(E17MachineState),
+    .instance_init = e17_machine_instance_init,
+    .class_init = e17_machine_class_init,
+};
+
+static void e17_machine_register_types(void)
+{
+    type_register_static(&e17_machine_typeinfo);
+}
+
+type_init(e17_machine_register_types)
