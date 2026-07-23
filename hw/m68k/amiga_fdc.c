@@ -363,6 +363,45 @@ static void amiga_fdc_side(void *opaque, int n, int level)
     s->side_level = level;
 }
 
+/* claim the medium read-only or read-write, matching its backing file */
+static bool amiga_fdc_claim(AmigaFDCState *s, Error **errp)
+{
+    uint64_t perm = BLK_PERM_CONSISTENT_READ |
+                    (blk_supports_write_perm(s->blk) ? BLK_PERM_WRITE : 0);
+
+    return blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) == 0;
+}
+
+/*
+ * A disk was inserted or removed from the monitor.  Re-claim the new
+ * medium (or release the old one) and latch /CHNG: it stays asserted
+ * until the drive next steps, which is how trackdisk.device learns the
+ * disk has been swapped and drops its cached track.
+ */
+static void amiga_fdc_change_media(void *opaque, bool load, Error **errp)
+{
+    AmigaFDCState *s = opaque;
+
+    if (!load) {
+        blk_set_perm(s->blk, 0, BLK_PERM_ALL, &error_abort);
+    } else {
+        if (blk_getlength(s->blk) != ADF_IMAGE_SIZE) {
+            error_setg(errp, "floppy image must be a %d byte ADF",
+                       ADF_IMAGE_SIZE);
+            return;
+        }
+        if (!amiga_fdc_claim(s, errp)) {
+            return;
+        }
+    }
+    s->disk_changed = true;
+    amiga_fdc_update_status(s);
+}
+
+static const BlockDevOps amiga_fdc_block_ops = {
+    .change_media_cb = amiga_fdc_change_media,
+};
+
 static void amiga_fdc_reset(DeviceState *dev)
 {
     AmigaFDCState *s = AMIGA_FDC(dev);
@@ -387,10 +426,7 @@ static void amiga_fdc_realize(DeviceState *dev, Error **errp)
     AmigaFDCState *s = AMIGA_FDC(dev);
 
     if (s->blk) {
-        uint64_t perm = BLK_PERM_CONSISTENT_READ |
-                        (blk_supports_write_perm(s->blk) ? BLK_PERM_WRITE : 0);
-
-        if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
+        if (!amiga_fdc_claim(s, errp)) {
             return;
         }
         if (blk_is_inserted(s->blk) &&
@@ -399,6 +435,7 @@ static void amiga_fdc_realize(DeviceState *dev, Error **errp)
                        ADF_IMAGE_SIZE);
             return;
         }
+        blk_set_dev_ops(s->blk, &amiga_fdc_block_ops, s);
     }
     timer_init_ns(&s->index_timer, QEMU_CLOCK_VIRTUAL,
                   amiga_fdc_index_pulse, s);
