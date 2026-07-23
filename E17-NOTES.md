@@ -582,13 +582,42 @@ Daniel's port lives on origin/mc68000_megadrive (checked out as
 DTS arch/m68k/dts/eltec-e17.dts, chip headers include/cd2401.h and
 include/vic068a.h (from the hardware manual — these named the sysc
 blocks, see the VIC068A commit).  TEXT_BASE 0x600000, SPL 0x400000;
-the machine's new -kernel option loads an ELF and jumps to it.
-Building is BLOCKED on missing bison/flex (+m4) in the sandbox —
-waiting for Daniel on how to provide them.  The CD2401 model now
-covers everything the u-boot serial driver does (polled TISR,
-PILR-matched IACK, VIC LICR6 line readback), so once it builds the
-UART should work — test with:
-    qemu-system-m68k -M e17,video=off -kernel u-boot -serial stdio
+the machine's -kernel option loads an ELF and jumps to it.
+(Reminder: the port is Daniel's own WIP and is NOT a hardware
+reference — trust the RMON/VxWorks RE over it.)
+
+### It builds and boots to a prompt (2026-07-21)
+
+bison/flex/m4 are now installed.  Build:
+    cd /workspace/src/uboot-e17    # branch e17, pushed to origin/e17
+    make CROSS_COMPILE=m68k-linux-gnu- eltec-e17_defconfig
+    make CROSS_COMPILE=m68k-linux-gnu- -j8
+Run (needs >=32M; the port's DTS declares 32MB of DRAM):
+    qemu-system-m68k -M e17,video=off -m 32M -bios rmon.bin \
+        -kernel u-boot -serial ...
+(-bios rmon.bin is still needed: -kernel loads the ELF and enters
+at its entry, but the reset SP/PC come from the ROM file.)
+
+It reaches an interactive "e17 =>" prompt: DRAM sized (32 MiB),
+relocation, driver model up, CD2401 console in/out, lance eth0
+registered, timer running, and 'md fec207f8' reads the live M48T02
+clock.  Getting there needed:
+- build fixes in the port (see its "make the port build and boot"
+  commit): -fno-plt -fvisibility=hidden to stop early PLT calls
+  through an unfixed GOT, 68040 flush_cache/cache ops, z8536 and
+  lance driver compile fixes;
+- a machine model addition (committed here): the Z8536 CT1/CT2
+  linked 32-bit counter with RCC count readback, which the port's
+  z8536_timer driver polls for CIP and reads for its timebase.
+
+Netboot of u-boot (wrap u-boot.bin with mke17boot.py at 0x600000,
+serve via netserv.py): RARP + ARP succeed but the multi-block TFTP
+stalls — netserv.py's minimal TFTP plus RX-ring timing drops blocks
+the RMON driver then re-requests.  Single-block payloads netboot
+fine; -kernel is the reliable way to run u-boot for now.  (RMON's
+in-order RX consumption still needs pcnet's owned-descriptor scan
+heuristic — do NOT remove it; that regressed even single-block
+netboot in testing.)
 
 ## The boot-time hook crash: SOLVED (2026-07-20, night)
 
