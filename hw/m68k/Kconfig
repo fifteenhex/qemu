@@ -73,6 +73,12 @@ config MVME147
     select LANCE
     select WD33C93
 
+config AMIGA
+    bool
+    default y
+    depends on M68K
+    select PTIMER
+
 config MEGADRIVE
     bool
     default y
