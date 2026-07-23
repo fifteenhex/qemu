@@ -78,7 +78,7 @@ static const MemoryRegionOps lance_mem_ops = {
     .write = lance_mem_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = {
-        .min_access_size = 2,
+        .min_access_size = 1,
         .max_access_size = 2,
     },
 };
