@@ -52,6 +52,8 @@
 #define MVME147_ROM_BANK2_SZ (2 * MiB)
 #define MVME147_BBRAM        0xfffe0000
 #define MVME147_BBRAM_SZ     2024
+/* second NVRAM, "free for the OS": u-boot keeps its environment here */
+#define MVME147_BBRAM2       0xfffe0800
 #define MVME147_PCC          0xfffe1000
 #define MVME147_LANCE        0xfffe1800
 #define MVME147_VMECHIP      0xfffe2000
@@ -162,6 +164,19 @@ static void mvme147_init(MachineState *machine)
     }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bbram_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bbram_dev), 0, MVME147_BBRAM);
+
+    /*
+     * Second NVRAM at 0xfffe0800: the board has a further 2KB of
+     * battery-backed RAM that the OS is free to use; u-boot stores its
+     * environment here.  Persist it via a second -drive if=mtd,index=1.
+     */
+    bbram_dev = qdev_new("sysbus-m48t02");
+    dinfo = drive_get(IF_MTD, 0, 1);
+    if (dinfo) {
+        qdev_prop_set_drive(bbram_dev, "drive", blk_by_legacy_dinfo(dinfo));
+    }
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(bbram_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(bbram_dev), 0, MVME147_BBRAM2);
 
     /* SCSI */
     scsi_dev = qdev_new(TYPE_WD33C93);
