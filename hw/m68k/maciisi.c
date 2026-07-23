@@ -40,6 +40,8 @@
 #include "hw/misc/mos6522.h"
 #include "hw/audio/asc.h"
 #include "hw/block/swim.h"
+#include "hw/scsi/ncr5380.h"
+#include "hw/scsi/scsi.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
@@ -540,6 +542,7 @@ struct MacIIsiMachineState {
     OrIRQState escc_orgate;
     ASCState asc;
     Swim swim;
+    NCR5380State scsi;
 
     MacIIsiFbState fb;
     MemoryRegion rom;
@@ -557,7 +560,7 @@ struct MacIIsiMachineState {
     MemoryRegion swim_mirror;
     MemoryRegion rbvmem;
     MemoryRegion vdacmem;
-    MemoryRegion scsimem;
+    MemoryRegion scsi_pdma;
     MemoryRegion iotrace;
 
     uint8_t rbv_regs[0x100];
@@ -567,7 +570,6 @@ struct MacIIsiMachineState {
     uint8_t rbv_sier;
     uint8_t rbv_via2_regs[16];
     uint8_t vdac_regs[0x40];
-    uint8_t scsi_regs[8];
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
@@ -1245,49 +1247,29 @@ static const MemoryRegionOps maciisi_vdac_ops = {
 };
 
 /*
- * SCSI (NCR5380) stub: enough behaviour for the boot-device scan on an
- * empty bus — arbitration always wins (AIP set while MODE.arbitrate,
- * LA never), selection sees no BSY so every target times out.
+ * Pseudo-DMA aperture for the NCR5380 at slice +0x12000: each access
+ * moves one byte to/from the current SCSI data phase.
  */
 
-static uint64_t maciisi_scsi_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t maciisi_scsi_pdma_read(void *opaque, hwaddr addr,
+                                       unsigned size)
 {
-    MacIIsiMachineState *m = opaque;
-    int reg = (addr >> 4) & 7;
-    uint64_t val;
+    NCR5380State *s = opaque;
 
-    switch (reg) {
-    case 1:                             /* ICR: reflect asserts + AIP */
-        val = m->scsi_regs[1] & 0x9f;
-        if (m->scsi_regs[2] & 1) {
-            val |= 0x40;                /* arbitration in progress */
-        }
-        break;
-    case 2:                             /* MODE reads back */
-        val = m->scsi_regs[2];
-        break;
-    default:
-        val = 0;                        /* bus free, no target */
-        break;
-    }
-    /* reads are polled hard during arbitration/selection; don't log */
-    return val;
+    return ncr5380_pdma_read(s);
 }
 
-static void maciisi_scsi_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
+static void maciisi_scsi_pdma_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
 {
-    MacIIsiMachineState *m = opaque;
-    int reg = (addr >> 4) & 7;
+    NCR5380State *s = opaque;
 
-    m->scsi_regs[reg] = val;
-    qemu_log_mask(LOG_UNIMP, "maciisi scsi: write +0x%03x <- 0x%02" PRIx64 "\n",
-                  (unsigned)addr, val);
+    ncr5380_pdma_write(s, val);
 }
 
-static const MemoryRegionOps maciisi_scsi_ops = {
-    .read = maciisi_scsi_read,
-    .write = maciisi_scsi_write,
+static const MemoryRegionOps maciisi_scsi_pdma_ops = {
+    .read = maciisi_scsi_pdma_read,
+    .write = maciisi_scsi_pdma_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -1517,9 +1499,20 @@ static void maciisi_machine_init(MachineState *machine)
                           "vdac", 0x40);
     memory_region_add_subregion(&m->macio, VDAC_OFS, &m->vdacmem);
 
-    memory_region_init_io(&m->scsimem, OBJECT(machine), &maciisi_scsi_ops, m,
-                          "scsi", 0x200);
-    memory_region_add_subregion(&m->macio, SCSI_OFS, &m->scsimem);
+    /* NCR5380 SCSI controller and its pseudo-DMA aperture (+0x2000) */
+    object_initialize_child(OBJECT(machine), "scsi", &m->scsi, TYPE_NCR5380);
+    qdev_prop_set_uint8(DEVICE(&m->scsi), "reg-shift", 4);
+    sysbus = SYS_BUS_DEVICE(&m->scsi);
+    sysbus_realize(sysbus, &error_fatal);
+    sysbus_connect_irq(sysbus, 0,
+                       qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_RBV));
+    memory_region_add_subregion(&m->macio, SCSI_OFS,
+                                sysbus_mmio_get_region(sysbus, 0));
+    memory_region_init_io(&m->scsi_pdma, OBJECT(machine),
+                          &maciisi_scsi_pdma_ops, &m->scsi, "scsi-pdma", 0x2000);
+    memory_region_add_subregion(&m->macio, SCSI_OFS + 0x2000, &m->scsi_pdma);
+
+    scsi_bus_legacy_handle_cmdline(&m->scsi.bus);
 
     /* ROM */
     memory_region_init_rom(&m->rom, NULL, "maciisi.rom", MACIISI_ROM_SIZE,
@@ -1597,6 +1590,7 @@ static void maciisi_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68030");
     mc->valid_cpu_types = valid_cpu_types;
     mc->max_cpus = 1;
+    mc->block_default_type = IF_SCSI;
     mc->default_ram_size = 8 * MiB;
     mc->default_ram_id = "maciisi.ram";
     machine_add_audiodev_property(mc);

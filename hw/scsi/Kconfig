@@ -16,6 +16,10 @@ config NCR53C720
     bool
     select SCSI
 
+config NCR5380
+    bool
+    select SCSI
+
 config MPTSAS_SCSI_PCI
     bool
     default y if PCI_DEVICES

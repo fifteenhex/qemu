@@ -46,6 +46,7 @@ config MACIISI
     select ASC
     select OR_IRQ
     select FRAMEBUFFER
+    select NCR5380
 
 config M68K_VIRT
     bool

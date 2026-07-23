@@ -403,3 +403,12 @@ ncr53c720_request(uint8_t phase) "phase %d REQ"
 ncr53c720_command(uint8_t target, int lun, uint8_t opcode, int32_t len) "target %d lun %d opcode 0x%02x cdb_len %d"
 ncr53c720_command_complete(uint32_t status) "status %d"
 ncr53c720_bus_free(void) "disconnect"
+
+# ncr5380.c
+ncr5380_read(int reg, uint8_t val) "reg[%d] -> 0x%02x"
+ncr5380_write(int reg, uint8_t val) "reg[%d] <- 0x%02x"
+ncr5380_select_ok(int target) "selected target %d"
+ncr5380_select_timeout(void) "selection timeout"
+ncr5380_command(uint8_t cdb0, int len) "SCSI command 0x%02x (%d bytes)"
+ncr5380_transfer(uint32_t len) "data phase %u bytes"
+ncr5380_complete(uint8_t status) "command complete status 0x%02x"
