@@ -749,3 +749,52 @@ kernel work queue, or breakpoint f836c (TCB context save) and walk
 taskIdCurrent; compare what sysHwInit reads from our devices vs a
 real board (VIC/CIO/CD2401 probe results).  The RMON regression
 suite still passes (netboot, scsi, video console).
+
+### VxWorks bootrom: analysis artifacts and address map
+
+Artifacts (qemu-e17-re/, rescued from /tmp before a machine reset):
+
+    vx-ram.bin — the bootrom DECOMPRESSED into DRAM, dumped from the
+      guest (0xd0000-0x140000).  Regenerate: run ~/e17-re/vxrun.py,
+      then gdb: dump binary memory vx-ram.bin 0xd0000 0x140000
+    vx-ram.asm — its disassembly:
+      m68k-linux-gnu-objdump -b binary -m m68k:68040 -D vx-ram.bin \
+        --adjust-vma=0xd0000 > vx-ram.asm
+
+Driver scripts in ~/e17-re: vxrun.py (boot + report), vxinspect.py
+(boot + arbitrary gdb commands), vxstep.py (runs a gdb script file:
+vxload.gdb inject-only, vxwatch.gdb vector-table watch, vxstep.gdb/
+vxstep2.gdb break at the tick handler and single-step).
+
+Addresses in the DECOMPRESSED image (all confirmed by stepping):
+
+    0xdc664   vector table init loop (fills vectors with the stub)
+    0xfa81a   uninitialized-interrupt stub handler
+    0x7fd8c4  intConnect trampoline installed at vector 0x50 (tick)
+    0x7fd898  ditto at vector 0x52
+    0xf82fa   intEnt (entered from the trampolines)
+    0xf8276   windExit kernel idle spin: tstl 0x138e88; bne .
+    0x138e88  workQIsEmpty flag (1 = empty; ISR work clears it)
+    0xf83d8/f8402/f843c/f847e  workQAdd0/1/2 (clear workQIsEmpty)
+    0xf84a0   workQDoWork (sets it back at 0xf84d8)
+    0xf830c   intExit; 0xf8322 btst #4,sp@(4) = frame SR.M test;
+              0xf834c the plain rte (unwinds the throwaway frame)
+    0xf834e   intExit reschedule path: saves the interrupt frame
+              into the TCB (0xf836c: sp@ -> TCB+0x16e SR,
+              sp@(2) -> +0x170 PC — a straddled layout), stack from
+              0x138a60, then windExit dispatch
+    0x138950  taskIdCurrent (TCB list head at 0x138a70)
+    0x126796/0x126798  saved SR values used for int lock/unlock
+              (0x126798 holds 0x3000: S|M, IPL0 — master mode!)
+    0xe19f0   THE CRASH SITE: mid-instruction inside a longword fill
+              loop (dbf at 0xe19ee); a callout fired at tick 60 jumps
+              here (poison pattern 0x0f0f0f0f); vector table then gets
+              shredded and the machine double faults
+
+Crash timeline (deterministic): 60 clean tick interrupts (all at the
+idle pc, constant sp — entry/exit verified good), then F-Line at
+0xe19f0 in a fresh context (sp=0x7ffd5c), then the Address Error
+cascade.  Next session: watch the workQ/TCB (0xf836c breakpoint) or
+watch writes of 0x000e19f0 anywhere in RAM to catch who computes the
+bad pointer; suspect a wdStart with a garbage routine from a device
+driver init (console tty is a candidate — no banner ever printed).
