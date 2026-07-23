@@ -212,6 +212,49 @@ the RAM store / databases work as well.  OS 3.3's Setup page 1 also
 advances now (it evidently validates the raw point where 3.1
 didn't).
 
+## Palm m500 / MC68VZ328 (added 2026-07-20, late night)
+
+Second machine: `palmm500` — Palm m500, DragonBall VZ @ 33.16MHz,
+8MB RAM, PalmOS 4.1 (`Palm-m500-4.1-en.rom`, md5
+dc8f0f8a6ffed58764065a7abe468ce4, same archive.org item).  Boots to
+the launcher; Setup wizard incl. digitizer calibration works, Note
+Pad shows the handwritten welcome note.
+
+    qemu-system-m68k -M palmm500 -bios Palm-m500-4.1-en.rom
+
+VZ facts used (sources: POSE EmRegsVZ*/M68VZ328Hwr.h in
+/workspace/src/pose-ref/, fetched with permission):
+
+  - ROM base 0x10000000, big ROM at +0x10000 (card header
+    bigROMOffset 0x10010000; reset SP/PC from there as on the V).
+  - Register map is EZ-compatible where we care, with additions:
+    chip ID at 0xfffff004 = 0x56 (mask 0x01) — PalmOS checks it, so
+    there is now a dragonball_scr device; second timer at 0xf610;
+    UART2 at 0xf910 (unimplemented — it is the m500's HotSync
+    serial, UART1 is IR); SPI1 (FIFO unit) at 0xf700 unimplemented;
+    GPIO gains ports J/K/M at 0xf438/440/448; ILCR at 0xfffff314
+    sets levels for TMR2/SPI1/UART2/PWM2 (TMR2 field 0 acts as
+    level 6 — PalmOS's "Skywalker" clears it before writing 6 and
+    must not lose ticks in between; POSE has the same hack).
+  - PalmOS 4.1 runs the system tick on TMR2 at level 6 (via ILCR).
+  - SYSCLK is 33.16MHz (timer "sysclk" property; EZ default stays
+    16.58MHz).
+  - m500 wiring: ADC on SPI2 (= the EZ SPIM) with CS on port G bit 2,
+    channel set 1: Y=ch1, X=ch5, battery=ch2 (7846-style), dock
+    sense=ch6 idling HIGH (0xfff, "twister" dock — the V's serial
+    dock idles low), temp sensors ch0/ch7 read 0xfff.  Pen is port F
+    bit 1 as on the EZ.  /POWERFAIL port D bit 7 high, SD card
+    detect port D bit 5 high = no card, AC sense port K bit 2 high =
+    not charging.  Buttons (unimplemented): rows port K bits 5-7,
+    columns port D bits 0-3.
+  - LCDC: same block; the model now honours LPICF (writable) and
+    draws 1/2/4bpp greyscale.
+
+Still open for both machines: on-chip RTC timekeeping (stub — the
+clock reads 12:00 am forever), hard buttons, UART2, the SPI1 FIFO
+unit, 8/16-gray screen modes' palette registers (LGPMR is stored but
+not applied per-shade), sound (PWM).
+
 ## Journal
 
 ### 2026-07-20 (evening) — pen works; Setup advances on OS 3.1
