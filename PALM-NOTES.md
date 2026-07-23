@@ -314,9 +314,18 @@ chip; PalmOS disables it with a single 0x0000 write early in boot
 (observed on both machines, well before the first tick), so boot is
 unaffected.  qtest-verified in both modes.
 
-Still open for both machines: the SPI1 FIFO unit, per-shade grey
-palette (LGPMR stored, not applied), SD card (m500), HotSync over
-serial.
+### 2026-07-20 — gray palette (LGPMR)
+
+The 2bpp draw path applies the gray palette register now (was a
+linear ramp): codes 0/3 -> intensities 0/15, codes 1/2 -> the
+register's low/high nibble, per POSE GetLCD2bitMapping; 4bpp uses the
+pixel value directly.  The m500 (OS 4.1) runs the panel at 2bpp and
+reprograms LGPMR, so it's live there — though most built-in screens
+(launcher, setup) are drawn with only codes 0 and 3, so the greys
+only show on genuinely shaded content.  qtest-verified against known
+patterns and two LGPMR values.
+
+Still open: the SPI1 FIFO unit, SD card (m500), HotSync over serial.
 
 ## Journal
 
