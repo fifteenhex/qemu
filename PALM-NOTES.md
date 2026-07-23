@@ -124,6 +124,59 @@ user's manual:
 
 ## Journal
 
+### 2026-07-20 (later) — PalmOS 3.3 boots to the Setup wizard
+
+`palmv` machine added (hw/m68k/palm.c): 2MB RAM at 0, 4MB ROM window
+at 0x10c00000 pre-filled with 0xff (erased flash), ROM image loaded
+at +0x8000, reset SP/PC pulled from the big-ROM card header.  Run:
+
+    qemu-system-m68k -M palmv -bios Palm-V-3.3-en.rom
+
+ROM image layout — resolved.  The archive .rom files are *big ROM
+only*: the card header at file offset 0 is the big ROM's own header
+(bigROMOffset field = 0x10c08000 = where file offset 0 must land).
+There is no small ROM in the files; the entry point at +0x23c is a
+`jmp` followed by the ASCII tag "boot".  Verified the same for 3.1
+(entry +0x22a).  First wrong theory (file = small ROM at 0 + big ROM
+at 0x3000) put the reset PC mid-instruction — beware.
+
+Boot-path findings, in order hit:
+
+  1. Reset hook must not use load_image_targphys: the ROM-loader
+     copies the image in from its own reset hook, *after* ours reads
+     the vectors -> read 0xff, jumped to -1.  Load directly into the
+     MemoryRegion instead.
+  2. Unmapped on-chip regs (SCR 0xfffff000, chip selects 0xfffff100,
+     DRAMC 0xfffffc00) caused bus-error -> double fault.  On silicon
+     the fffff page never bus-errors, so the machine sets
+     ignore_memory_transaction_failures.  The boot code writes SCR=0xf8,
+     CSGBA=0x8600 (0x8600<<13 = 0x10c00000 — ROM base confirmed),
+     CSD/DRAMC for RAM, reads the chip-ID at 0xfffff004 (we return 0,
+     it takes the default EZ path — fine).
+  3. dragonball_spi asserted on transfer widths other than 8/16 —
+     PalmOS uses odd widths for the touchscreen ADC.  The EZ SPIM does
+     1..16 bits; fixed the model to match (MSB-first byte chunks,
+     result masked).
+  4. PLL gets programmed to 16589716 Hz — the Palm V's real 16.58MHz.
+     LCDC gets LSSA=0x25b0 (fb in RAM), LVPW=0xa, LXMAX=0xa0,
+     LYMAX=0x9f -> 160x160x1bpp.  PCTLR (0xfffff207) written 0xc0,
+     then the OS idles in PrvShutDownCPU via `stop #2000` — normal
+     PalmOS doze, woken by interrupts.
+  5. Screendump after ~8s: the OS 3.3 *Setup wizard page 1 of 4*
+     renders fully.  Boot works end to end.
+
+Known gaps after first boot:
+
+  - LCD polarity inverted: model paints 1-bits light on dark; a Palm
+    paints ink (1) dark on a pale LCD.  Swap the two hardcoded colours
+    (proper palette/contrast handling later).
+  - No input: pen needs the PENIRQ (IPR bit 20, level 5; INTC level
+    table lacks it) + an ADS7843-style ADC on the SPI bus (QEMU has
+    hw/display/ads7846.c, POSE models ADS784x for the Palm V — likely
+    reusable).  Buttons need GPIO port D input + interrupt regs.
+  - RTC still a stub; OS will lose time.  Timer tick evidently works
+    (UI drew and updates).
+
 ### 2026-07-20 — project start
 
   - Cloned `amiga` -> `/workspace/src/qemu-palm`, created `palm`
