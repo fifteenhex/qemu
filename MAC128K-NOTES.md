@@ -79,3 +79,102 @@ QMP socket `/tmp/qmp-mac128k.qmp`, screenshots `/tmp/mac128k-*.png`.
   pushing into the top-of-address-space bit bucket; first insn at 0
   before the fix decoded as `movel %pc@(0x61d0),%a4@` = the checksum
   dword — nice fingerprint that the vectors weren't loaded.
+
+### Floppy boot: the drive probe fights back (2026-07-22)
+
+Traced the ROM's boot-time drive probe through the new IWM latch/sense
+logging (`-d unimp`).  Findings, each verified against the running ROM:
+
+- The probe is: poll CSTIN (disk in), motor on, **strobe the eject
+  register with LSTRB held across a timed delay**, motor off, then
+  read sense reg 0xE once per connector and believe it forever.  The
+  power-on sequence really does eject the disk and then waits for an
+  insertion event.  Consequences for the model: eject requires a
+  >=400us LSTRB pulse with stable address lines, and an eject with the
+  image still attached re-inserts it one second later (a stand-in for
+  the user pushing the disk back in).
+- Sense 0xE (my {CA2,CA1,CA0,SEL} numbering) = DRIVE PRESENT, active
+  low.  Cracked via the select-value table in linux swim.c
+  (SWIM_DRIVE_PRESENT 0x077 -> SEL=0, CA=111); my first guess (DRVIN
+  at 0xF) made the probe write off the internal drive.
+- Sad mac **0F0004** (divide by zero) at ROM 0x401ec0: the ROM
+  calibrates a PWM->speed table by measuring the tach at two PWM
+  settings (0x401e82) and divides by the speed *difference* - a tach
+  that always reports the nominal zone speed calibrates to a zero
+  slope.  The 128K spins the drive itself: PWM bytes = low bytes of
+  the sound-page words; SetSpeed (0x401c12, CurSpeed lowmem 0x138)
+  encodes its 0..399 index as a **6-bit LFSR state**
+  (`next = (s>>1) | (((s^(s>>1))&1) << 5)` from state 11, one step
+  per 10 index units, two adjacent states dithered across the buffer).
+  The model decodes buffer bytes back to step counts and answers with
+  a linear RPM curve (695 - 10*steps); the ROM happily calibrates it.
+- `-icount shift=7` is required for the tach/speed dance, exactly like
+  the maciisi TimeDBRA story: the ROM samples the tach in dbra-timed
+  windows, so the CPU must run at a realistic 68000 pace relative to
+  the virtual clock.
+- GCR worked on the first try: address field D5 AA 96 + 6&2 GCR
+  track/sector/side/format/csum + DE AA; data field D5 AA AD + sector
+  + 12 zero tags + 512 data through the three-rolling-checksum
+  nibblizer (ROL/ADDX chain, MAME ap_dsk35-style) + csum group
+  (c4,c3,c2,c1) + DE AA FF.  Sectors served in logical order,
+  always-valid bytes; the polling reader doesn't care about pacing.
+
+### Mouse: two interrupt-model bugs, then a driveable Finder
+
+- **Level-3 livelock**: VIA on IPL0 + SCC on IPL1 OR-ed gives level 3
+  when both assert - and the 64K ROM's level-3 autovector (0x6C) is a
+  bare RTE (0x400bec, the tail of its SCC ISR).  With level-triggered
+  re-sampling the CPU takes level 3 forever; the machine soft-locked
+  the moment a VBL landed during mouse traffic.  The glue is now a
+  priority encoder: SCC pending = 2, else VIA = 1.
+- **Stale RR2**: the Mac SCC ISR (0x400bc0) reads RR0, selects reg 2,
+  dispatches on the RR2B modified vector through Lvl2DT (0x1b2), and
+  resets only the channel it dispatched to.  escc now recomputes the
+  modified vector from the still-pending ext ints on set *and* clear
+  (A first), else the second channel's edge dispatched to the null
+  handler and its interrupt stayed asserted forever.  Related trap:
+  escc's txint is latched by every data write even with tx ints
+  disabled, so the vector-precedence guard must check enables.
+- Mouse ISR protocol (from the ROM): saved RR0 copies at 0x2ce/0x2cf,
+  per-channel handler tables at 0x2be/0x2c6, second entry taken when
+  RR0 changed in *only* the DCD bit; direction = DCD level vs VIA
+  PB4/PB5 phase (X positive when X2 != X1 after the edge, Y positive
+  when Y2 == Y1 - found empirically).  Steps are paced at 1.5ms:
+  400us outran the 7.8MHz guest's per-edge interrupt service.
+- Guest-side debugging tricks that paid off: HMP `xp` of the mouse
+  globals (MTemp/RawMouse/Mouse at 0x828/0x82C/0x830) to tell "cursor
+  offscreen" from "counts lost", and gdb -p on the qemu process
+  reading `current_machine` (never *call* functions from gdb - a
+  qdev_get_machine() call aborted the VM on a BQL assertion).
+
+### Milestones - all reached (evidence in /tmp)
+
+- (a) blinking ?-icon: mac128k-fd1.png (also shot2 without disk)
+- (b) happy mac: mac128k-fast-01.png
+- (c) Welcome to Macintosh: mac128k-fast-02.png
+- (d) Finder desktop: mac128k-fd8.png; System Disk window opened via
+  mouse-driven File > Open: mac128k-open2.png (5 items, 288K in disk);
+  menu tracking: mac128k-menu1.png (Edit), mac128k-menu3.png (File
+  with Open/Get Info/Eject enabled)
+- (e) mouse: cursor moves via QMP input-send-event, click selects
+  (mac128k-click2.png), menus drag, File > Open executes.
+- System 2.0/Finder 4.1 (system20.img) boots to its MiniFinder
+  (mac128k-sys20.png) and clicking its Finder button brings up the
+  Finder 4.1 desktop (mac128k-sys20-finder2.png).
+
+Run recipe:
+  build/qemu-system-m68k -M mac128k \
+    -bios _mac_assets/Mac128K.ROM \
+    -drive if=floppy,file=_mac_assets/system11.img,format=raw \
+    -icount shift=7 -display none \
+    -qmp unix:/tmp/qmp-mac128k.qmp,server,nowait
+
+Known gaps / shortcuts (documented in the code):
+- Disk always reads write-protected; no GCR write/decode path, so the
+  Finder cannot save to floppy (fine for locked-floppy boots).
+- Eject auto-reinserts after 1s whenever the image stays attached - a
+  Finder-menu Eject puts the disk back in shortly after.
+- Keyboard not modelled (the ROM's model query times out harmlessly).
+- Sound not modelled (the PWM bytes only feed the drive speed).
+- The IWM data path ignores bit-level timing (always-valid bytes,
+  position advances per read); writes are logged and dropped.
