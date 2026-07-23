@@ -225,8 +225,27 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (reg) {
     case R_CSD:
-        /* current data byte during data-in / status / message-in */
-        if (s->phase & CSB_IO) {
+        /*
+         * Current data byte.  During a data-in phase the Mac driver can
+         * "blind" read: it reads CSD repeatedly without a per-byte ACK,
+         * relying on the hardware to advance.  Deliver the current byte
+         * and step to the next so successive reads drain the buffer.
+         */
+        if (s->phase == PHASE_DI) {
+            ncr5380_fill_buffer(s);
+            if (s->buf_pos < s->buf_len) {
+                val = s->buf[s->buf_pos];
+                s->last_data = val;
+                s->buf_pos++;
+                if (s->buf_pos >= s->buf_len && s->async_len == 0
+                    && s->req && !s->xfer_pending) {
+                    s->xfer_pending = true;
+                    scsi_req_continue(s->req);
+                }
+            } else {
+                val = s->last_data;
+            }
+        } else if (s->phase & CSB_IO) {
             val = s->last_data;
         } else {
             val = s->odr;
@@ -362,9 +381,7 @@ void ncr5380_ack(NCR5380State *s)
         }
         break;
     case PHASE_DI:
-        if (s->buf_pos < s->buf_len) {
-            s->buf_pos++;
-        }
+        /* the byte was already consumed and advanced by the CSD read */
         break;
     case PHASE_DO:
         if (s->buf_pos < s->buf_len) {
