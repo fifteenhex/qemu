@@ -292,6 +292,16 @@ static void iwmctrl_write(void *opaque, hwaddr addr, uint64_t value,
         swimctrl->iwm_latches &= ~(1 << latch);
     }
 
+    /*
+     * The value on the data bus only reaches an IWM register when the
+     * access targets the L6/L7 select addresses; accesses to the phase/
+     * motor/drive-select addresses merely toggle their latch (the Mac
+     * IIsi ROM does dummy writes to the phase 3 address while polling).
+     */
+    if (latch < IWMLB_L6) {
+        return;
+    }
+
     reg = (swimctrl->iwm_latches & 0xc0) >> 5 |
           (swimctrl->iwm_latches & 0x10) >> 4;
 
@@ -362,6 +372,11 @@ static uint64_t iwmctrl_read(void *opaque, hwaddr addr, unsigned size)
     switch (reg) {
     case IWM_READALLONES:
         value = 0xff;
+        break;
+    case IWM_READSTATUS0:
+    case IWM_READSTATUS1:
+        /* status reads back mode register bits 0-4; enable (bit 5) off */
+        value = swimctrl->iwmregs[IWM_WRITESETMODE] & 0x1f;
         break;
     default:
         value = 0;

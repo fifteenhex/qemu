@@ -36,6 +36,19 @@ config Q800
     select IOSB
     select ASC
 
+config MACIISI
+    bool
+    default y
+    depends on M68K
+    select ADB
+    select MOS6522
+    select ESCC
+    select SWIM
+    select ASC
+    select OR_IRQ
+    select FRAMEBUFFER
+    select NCR5380
+
 config M68K_VIRT
     bool
     default y
