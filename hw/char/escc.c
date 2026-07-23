@@ -326,6 +326,10 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     if (s->disabled) {
         s->rregs[R_STATUS] |= STATUS_DCD | STATUS_SYNC | STATUS_CTS;
     }
+    /* a board-driven DCD line (the "dcd" gpio) survives reset */
+    if (s->dcd) {
+        s->rregs[R_STATUS] |= STATUS_DCD;
+    }
     s->rregs[R_SPEC] &= SPEC_ALLSENT;
     s->rregs[R_SPEC] |= SPEC_BITS8;
     s->rregs[R_INTR] = 0;
