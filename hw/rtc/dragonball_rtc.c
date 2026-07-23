@@ -5,8 +5,8 @@
  * plus a guest-set offset, so setting it never disturbs the host.
  * The EZ counts hours/minutes/seconds and wraps daily; the VZ adds
  * the day counter and day alarm.  A 1Hz tick derives the second/
- * minute/hour/day/alarm interrupts; the sample-rate interrupts
- * (2..512Hz) and the watchdog are not modelled.
+ * minute/hour/day/alarm interrupts and clocks the watchdog; the
+ * sample-rate interrupts (2..512Hz) are not modelled.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -40,8 +40,10 @@
 #include "migration/vmstate.h"
 #include "system/rtc.h"
 #include "system/system.h"
+#include "system/watchdog.h"
 
 #define SECSPERDAY 86400
+#define WDT_TIMEOUT_COUNT 2
 
 static int64_t dragonball_rtc_seconds(DragonBallRTCState *s)
 {
@@ -59,6 +61,30 @@ static uint32_t dragonball_rtc_hms(int64_t daysecs)
 static void dragonball_rtc_update_irq(DragonBallRTCState *s)
 {
     qemu_set_irq(s->rtc_irq, (s->isr & s->ienr) != 0);
+    qemu_set_irq(s->wdt_irq, (s->watchdog & DRAGONBALL_RTC_WDT_INTSTS) != 0);
+}
+
+/*
+ * The watchdog is a 2-bit counter clocked by the RTC 1Hz signal.
+ * Software services it by writing the register (which zeroes the
+ * count); if the count reaches its terminal value the watchdog fires
+ * — an interrupt when WDT_INTSEL is set, otherwise a system reset.
+ */
+static void dragonball_rtc_wdt_tick(DragonBallRTCState *s)
+{
+    if (!(s->watchdog & DRAGONBALL_RTC_WDT_EN))
+        return;
+
+    if (++s->wdt_count < WDT_TIMEOUT_COUNT)
+        return;
+
+    s->wdt_count = WDT_TIMEOUT_COUNT;
+    if (s->watchdog & DRAGONBALL_RTC_WDT_INTSEL) {
+        s->watchdog |= DRAGONBALL_RTC_WDT_INTSTS;
+        dragonball_rtc_update_irq(s);
+    } else {
+        watchdog_perform_action();
+    }
 }
 
 static void dragonball_rtc_tick(void *opaque)
@@ -82,6 +108,8 @@ static void dragonball_rtc_tick(void *opaque)
     s->last_seconds = now;
     s->isr |= set;
     dragonball_rtc_update_irq(s);
+
+    dragonball_rtc_wdt_tick(s);
 }
 
 static uint64_t dragonball_rtc_read(void *opaque, hwaddr addr, unsigned size)
@@ -95,7 +123,8 @@ static uint64_t dragonball_rtc_read(void *opaque, hwaddr addr, unsigned size)
     case DRAGONBALL_RTC_RTCALRM:
         return s->alarm;
     case DRAGONBALL_RTC_WATCHDOG:
-        return s->watchdog;
+        return s->watchdog |
+               ((uint16_t)s->wdt_count << DRAGONBALL_RTC_WDT_CNT_SHIFT);
     case DRAGONBALL_RTC_RTCCTL:
         return s->ctl;
     case DRAGONBALL_RTC_RTCISR:
@@ -131,9 +160,22 @@ static void dragonball_rtc_write(void *opaque, hwaddr addr, uint64_t value,
     case DRAGONBALL_RTC_RTCALRM:
         s->alarm = value;
         break;
-    case DRAGONBALL_RTC_WATCHDOG:
-        s->watchdog = value;
+    case DRAGONBALL_RTC_WATCHDOG: {
+        /*
+         * A write both configures the watchdog and services it: the
+         * count field (read-only) resets to zero.  The status bit is
+         * write-one-to-clear; everything else comes from the value.
+         */
+        uint16_t intsts = s->watchdog & DRAGONBALL_RTC_WDT_INTSTS;
+
+        if (value & DRAGONBALL_RTC_WDT_INTSTS)
+            intsts = 0;
+        s->watchdog = (value & (DRAGONBALL_RTC_WDT_EN |
+                                DRAGONBALL_RTC_WDT_INTSEL)) | intsts;
+        s->wdt_count = 0;
+        dragonball_rtc_update_irq(s);
         break;
+    }
     case DRAGONBALL_RTC_RTCCTL:
         s->ctl = value;
         break;
@@ -187,7 +229,9 @@ static void dragonball_rtc_reset(DeviceState *dev)
     s->isr = 0;
     s->ienr = 0;
     s->stpwch = 0x3f;
-    s->watchdog = 0;
+    /* the watchdog powers up enabled; PalmOS disables it early in boot */
+    s->watchdog = DRAGONBALL_RTC_WDT_EN;
+    s->wdt_count = 0;
     s->last_seconds = dragonball_rtc_seconds(s);
 
     ptimer_transaction_begin(s->timer);
@@ -224,6 +268,7 @@ static const VMStateDescription vmstate_dragonball_rtc = {
         VMSTATE_UINT16(ienr, DragonBallRTCState),
         VMSTATE_UINT16(stpwch, DragonBallRTCState),
         VMSTATE_UINT16(watchdog, DragonBallRTCState),
+        VMSTATE_UINT8(wdt_count, DragonBallRTCState),
         VMSTATE_INT64(last_seconds, DragonBallRTCState),
         VMSTATE_PTIMER(timer, DragonBallRTCState),
         VMSTATE_END_OF_LIST()

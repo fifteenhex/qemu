@@ -34,6 +34,8 @@ struct DragonBallRTCState {
     uint16_t ienr;
     uint16_t stpwch;
     uint16_t watchdog;
+    /* watchdog seconds-counter (0..3), fires at 2 if not serviced */
+    uint8_t wdt_count;
 
     /* last observed counter value, for edge detection in the tick */
     int64_t last_seconds;
@@ -62,5 +64,10 @@ struct DragonBallRTCState {
 #define DRAGONBALL_RTC_INT_DAY  (1 << 3)
 #define DRAGONBALL_RTC_INT_1HZ  (1 << 4)
 #define DRAGONBALL_RTC_INT_HR   (1 << 5)
+
+#define DRAGONBALL_RTC_WDT_EN     (1 << 0)  /* enable */
+#define DRAGONBALL_RTC_WDT_INTSEL (1 << 1)  /* 1: interrupt, 0: reset */
+#define DRAGONBALL_RTC_WDT_INTSTS (1 << 7)  /* interrupt occurred, w1c */
+#define DRAGONBALL_RTC_WDT_CNT_SHIFT 8      /* count in bits 9:8 */
 
 #endif
