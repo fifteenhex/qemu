@@ -569,6 +569,7 @@ struct MacIIsiMachineState {
     MemoryRegion vram_alias;
     MemoryRegion rom_alias24;
     MemoryRegion ramio;
+    MemoryRegion ramio_a31;
     MemoryRegion macio;
     MemoryRegion macio_alias;
     MemoryRegion macio_alias24;
@@ -718,6 +719,71 @@ static const MemoryRegionOps macio_alias_ops = {
     .write_with_attrs = macio_alias_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/*
+ * A31-half accesses: only the low 24 bits reach the decoder (24-bit
+ * tagged master pointers must alias onto RAM).
+ */
+
+static MemTxResult maciisi_a31_read(void *opaque, hwaddr addr, uint64_t *data,
+                                    unsigned size, MemTxAttrs attrs)
+{
+    MemTxResult r;
+    uint32_t val;
+
+    addr &= 0x00FFFFFF;
+    switch (size) {
+    case 4:
+        val = address_space_ldl_be(&address_space_memory, addr, attrs, &r);
+        break;
+    case 2:
+        val = address_space_lduw_be(&address_space_memory, addr, attrs, &r);
+        break;
+    case 1:
+        val = address_space_ldub(&address_space_memory, addr, attrs, &r);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    *data = val;
+    return r;
+}
+
+static MemTxResult maciisi_a31_write(void *opaque, hwaddr addr, uint64_t value,
+                                     unsigned size, MemTxAttrs attrs)
+{
+    MemTxResult r;
+
+    addr &= 0x00FFFFFF;
+    switch (size) {
+    case 4:
+        address_space_stl_be(&address_space_memory, addr, value, attrs, &r);
+        break;
+    case 2:
+        address_space_stw_be(&address_space_memory, addr, value, attrs, &r);
+        break;
+    case 1:
+        address_space_stb(&address_space_memory, addr, value, attrs, &r);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    return r;
+}
+
+static const MemoryRegionOps maciisi_a31_ops = {
+    .read_with_attrs = maciisi_a31_read,
+    .write_with_attrs = maciisi_a31_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
         .min_access_size = 1,
         .max_access_size = 4,
     },
@@ -1558,6 +1624,24 @@ static void maciisi_machine_init(MachineState *machine)
                           "ram", RAM_SIZE);
     memory_region_add_subregion(get_system_memory(), 0x0, &m->ramio);
     memory_region_add_subregion(&m->ramio, 0, machine->ram);
+
+    /*
+     * The top half of the physical address space (A31 set) reaches the
+     * RAM decoder with only the low 24 address bits significant.  The
+     * ROM's 32-bit page tables map it as early-terminated identity
+     * because of this, and MacOS still dereferences 24-bit-tagged
+     * master pointers through it (handle-state flags live in address
+     * bits 31-29: e.g. 0x80004cb5 in the driver-name lookup at ROM
+     * 0x4080b8de, 0xE0xxxxxx for locked resource handles).  Forward
+     * such accesses to the low 16MB.  Low priority: the slot-space
+     * windows (super slot $E ROM/VRAM at 0xFBxxxxxx/0xFExxxxxx) keep
+     * their own decode.
+     */
+    memory_region_init_io(&m->ramio_a31, OBJECT(machine),
+                          &maciisi_a31_ops, m, "maciisi.ram-a31",
+                          0x80000000);
+    memory_region_add_subregion_overlap(get_system_memory(), 0x80000000,
+                                        &m->ramio_a31, -2);
 
     /* IRQ glue */
     object_initialize_child(OBJECT(machine), "glue", &m->glue,
