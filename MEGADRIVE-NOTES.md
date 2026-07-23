@@ -72,7 +72,52 @@ Not present at all (Sonic 1 needs these to boot/play):
 5. Iterate with Sonic 1 until fully playable; sound emulation (YM2612 +
    PSG audio output) is a stretch goal, tracked here.
 
+## ROM
+
+Sonic the Hedgehog (USA, Europe) REV00, No-Intro verified dump:
+- `/workspace/src/megadrive-roms/sonic1.md`, 524288 bytes,
+  md5 `1bc674be034e43c96b86487ac69d9293`
+- source: archive.org item `sega-genesis-romset-ultra-usa`, file
+  "Sonic The Hedgehog (USA, Europe).zip" (download OK'd by Daniel)
+
+Run it:
+
+```sh
+DISPLAY=:1 ./build-megadrive/qemu-system-m68k -M megadrive,mapper=cart \
+    -bios /workspace/src/megadrive-roms/sonic1.md
+```
+
+Keys: arrows = d-pad, A/S/D = A/B/C, Enter = Start.
+
 ## Log
 
 ### 2026-07-20 session 1
 - Created branch + clone, surveyed code, wrote this journal.
+- Bare boot of Sonic 1: double MMU fault - work RAM had no 0xE00000+
+  mirrors (Sonic uses 0xFExxxx addresses) and nothing else was mapped.
+- Commit 504bc110c4 "megadrive: enough hardware to run Sonic 1" - see
+  the commit message for the full list (mapper=cart option, WRAM
+  mirrors, open-bus region, md-sys Z80/arbiter/YM stub, VDP DMA +
+  HV/VBLANK/H-int timing + priority renderer, keyboard pad,
+  target/m68k ADDR24 masking).  Findings along the way:
+  - QEMU's m68k core does NOT mask addresses to 24 bits; Sonic keeps
+    tag bits in the top byte of pointers (e.g. reads via 0x0503bcf2
+    = ROM 0x03bcf2).  Fixed properly in the CPU with a new
+    M68K_FEATURE_ADDR24 (68000/68010 set it, 68020+ unsets) rather
+    than hacking aliases into the machine.
+  - Writes to a memory_region_init_rom region fault on m68k instead
+    of being ignored; the open-bus background region absorbs those
+    too (real MD has no bus-error generator at all).
+  - Sonic's own "BUS ERROR" screen = its unhandled-exception handler;
+    useful smoke signal that a QEMU-level access fault leaked in.
+- RESULT: attract demo plays in Green Hill Zone, graphics look right
+  (screendumps verified: SEGA logo, title, GHZ demo with HUD, water,
+  scroll, sprite priorities).
+- Still to do / verify:
+  - pad input end-to-end (title -> gameplay with QMP input events)
+  - H-int water effect in Labyrinth Zone (renderer is frame-based, so
+    mid-frame CRAM writes tint the whole frame - acceptable for now?)
+  - special stages (use per-line HSCROLL heavily - check)
+  - sprite masking (x=0) and shadow/highlight not implemented
+  - no audio at all (YM2612/PSG are stubs) - stretch goal
+  - everdrive/Linux regression test (defaults must stay identical)
