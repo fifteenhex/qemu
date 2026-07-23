@@ -369,18 +369,11 @@ static void maciisi_egret_acr_changed(MOS6522MacIIsiState *v1s);
 
 static void maciisi_via1_portA_write(MOS6522State *s)
 {
-    qemu_log_mask(LOG_UNIMP, "maciisi %s: portA <- 0x%02x (dir 0x%02x)\n",
-                  object_get_canonical_path_component(OBJECT(s)),
-                  s->a, s->dira);
 }
 
 static void maciisi_via1_portB_write(MOS6522State *s)
 {
     MOS6522MacIIsiState *v1s = MOS6522_MACIISI(s);
-
-    qemu_log_mask(LOG_UNIMP, "maciisi %s: portB <- 0x%02x (dir 0x%02x)\n",
-                  object_get_canonical_path_component(OBJECT(s)),
-                  s->b, s->dirb);
 
     if (v1s->machine) {
         maciisi_egret_session_update(v1s);
@@ -448,6 +441,7 @@ struct MacIIsiMachineState {
 
     MemoryRegion rom;
     MemoryRegion rom_alias;
+    MemoryRegion rom_slot_alias;
     MemoryRegion rom_alias24;
     MemoryRegion ramio;
     MemoryRegion macio;
@@ -469,10 +463,12 @@ struct MacIIsiMachineState {
     uint8_t rbv_sier;
     uint8_t rbv_via2_regs[16];
     uint8_t vdac_regs[0x40];
+    uint8_t scsi_regs[8];
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
     QEMUTimer *one_second_timer;
+    QEMUTimer *vbl_off_timer;
 
     /* Egret ADB/system MCU on the VIA1 shift register */
     QEMUTimer *egret_timer;
@@ -696,13 +692,17 @@ static const MemoryRegionOps maciisi_via1_ops = {
  * monitor sense in the low bits; 6 = Apple 13" 640x480 RGB.
  */
 
-#define RBV_RIFR   0x03
+#define RBV_RSIFR  0x02    /* slot interrupt flags (bit 6 = slot $E VBL) */
+#define RBV_RIFR   0x03    /* interrupt flags (bit 1 = any slot) */
 #define RBV_RMONP  0x10
-#define RBV_RSIFR  0x12
+#define RBV_RSIER  0x12    /* slot interrupt enables, VIA set/clr protocol */
 #define RBV_RIER   0x13
-#define RBV_RSIER  0x14
 
 #define RBV_MONITOR_SENSE  0x06
+#define RBV_SLOT_E_INT     0x40
+#define RBV_IFR_SLOT       0x02
+
+static void maciisi_rbv_update_irq(MacIIsiMachineState *m);
 
 static uint64_t maciisi_rbv_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -714,6 +714,9 @@ static uint64_t maciisi_rbv_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case RBV_RIFR:
         val = m->rbv_ifr;
+        if (m->rbv_ifr & m->rbv_ier & 0x7f) {
+            val |= 0x80;
+        }
         break;
     case RBV_RSIFR:
         val = m->rbv_sifr;
@@ -748,10 +751,10 @@ static void maciisi_rbv_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case RBV_RIFR:
-        m->rbv_ifr &= ~val;
+        m->rbv_ifr &= ~(val & 0x7f);
         break;
     case RBV_RSIFR:
-        m->rbv_sifr &= ~val;
+        m->rbv_sifr &= ~(val & 0x7f);
         break;
     case RBV_RIER:
         if (val & 0x80) {
@@ -771,6 +774,7 @@ static void maciisi_rbv_write(void *opaque, hwaddr addr, uint64_t val,
         m->rbv_regs[addr] = val;
         break;
     }
+    maciisi_rbv_update_irq(m);
 }
 
 static const MemoryRegionOps maciisi_rbv_ops = {
@@ -787,6 +791,20 @@ static const MemoryRegionOps maciisi_rbv_ops = {
 
 #define VIA_60HZ_TIMER_PERIOD_NS   16625800
 
+static void maciisi_rbv_update_irq(MacIIsiMachineState *m)
+{
+    qemu_set_irq(qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_RBV),
+                 (m->rbv_ifr & m->rbv_ier & 0x7f) != 0);
+}
+
+static void maciisi_vbl_off(void *opaque)
+{
+    MacIIsiMachineState *m = opaque;
+
+    /* SIFR bit 6 is the raw VBL line; the latched event stays in IFR */
+    m->rbv_sifr &= ~RBV_SLOT_E_INT;
+}
+
 static void maciisi_sixty_hz(void *opaque)
 {
     MacIIsiMachineState *m = opaque;
@@ -794,6 +812,15 @@ static void maciisi_sixty_hz(void *opaque)
 
     qemu_irq_lower(irq);
     qemu_irq_raise(irq);
+
+    /* onboard video vertical blank = slot $E interrupt via the RBV */
+    m->rbv_sifr |= RBV_SLOT_E_INT;
+    if (m->rbv_sier & RBV_SLOT_E_INT) {
+        m->rbv_ifr |= RBV_IFR_SLOT;
+    }
+    maciisi_rbv_update_irq(m);
+    timer_mod(m->vbl_off_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1300000);
 
     timer_mod(m->sixty_hz_timer,
               (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1039,7 +1066,7 @@ static void maciisi_rbv_via2_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (reg) {
     case VIA_REG_IFR:
-        m->rbv_ifr &= ~val;
+        m->rbv_ifr &= ~(val & 0x7f);
         break;
     case VIA_REG_IER:
         if (val & 0x80) {
@@ -1052,6 +1079,7 @@ static void maciisi_rbv_via2_write(void *opaque, hwaddr addr, uint64_t val,
         m->rbv_via2_regs[reg] = val;
         break;
     }
+    maciisi_rbv_update_irq(m);
 }
 
 static const MemoryRegionOps maciisi_rbv_via2_ops = {
@@ -1096,17 +1124,43 @@ static const MemoryRegionOps maciisi_vdac_ops = {
     },
 };
 
-/* SCSI (NCR5380) stub: all-zero reads mean "bus free", probes fail cleanly */
+/*
+ * SCSI (NCR5380) stub: enough behaviour for the boot-device scan on an
+ * empty bus — arbitration always wins (AIP set while MODE.arbitrate,
+ * LA never), selection sees no BSY so every target times out.
+ */
 
 static uint64_t maciisi_scsi_read(void *opaque, hwaddr addr, unsigned size)
 {
-    qemu_log_mask(LOG_UNIMP, "maciisi scsi: read  +0x%03x\n", (unsigned)addr);
-    return 0;
+    MacIIsiMachineState *m = opaque;
+    int reg = (addr >> 4) & 7;
+    uint64_t val;
+
+    switch (reg) {
+    case 1:                             /* ICR: reflect asserts + AIP */
+        val = m->scsi_regs[1] & 0x9f;
+        if (m->scsi_regs[2] & 1) {
+            val |= 0x40;                /* arbitration in progress */
+        }
+        break;
+    case 2:                             /* MODE reads back */
+        val = m->scsi_regs[2];
+        break;
+    default:
+        val = 0;                        /* bus free, no target */
+        break;
+    }
+    /* reads are polled hard during arbitration/selection; don't log */
+    return val;
 }
 
 static void maciisi_scsi_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size)
 {
+    MacIIsiMachineState *m = opaque;
+    int reg = (addr >> 4) & 7;
+
+    m->scsi_regs[reg] = val;
     qemu_log_mask(LOG_UNIMP, "maciisi scsi: write +0x%03x <- 0x%02" PRIx64 "\n",
                   (unsigned)addr, val);
 }
@@ -1240,6 +1294,7 @@ static void maciisi_machine_init(MachineState *machine)
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
+    m->vbl_off_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_vbl_off, m);
     m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_sixty_hz, m);
     timer_mod(m->sixty_hz_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               VIA_60HZ_TIMER_PERIOD_NS);
@@ -1356,6 +1411,17 @@ static void maciisi_machine_init(MachineState *machine)
                              &m->rom, 0, MACIISI_ROM_SIZE);
     memory_region_add_subregion(get_system_memory(), 0x40000000,
                                 &m->rom_alias);
+
+    /*
+     * The onboard video is a pseudo NuBus slot: the ROM (whose top holds
+     * the video Declaration ROM) also decodes at the top of slot $E
+     * super space, where the Slot Manager's byte-lane probe finds it.
+     */
+    memory_region_init_alias(&m->rom_slot_alias, NULL, "maciisi.rom-slote",
+                             &m->rom, 0, MACIISI_ROM_SIZE);
+    memory_region_add_subregion(get_system_memory(),
+                                0xff000000 - MACIISI_ROM_SIZE,
+                                &m->rom_slot_alias);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
