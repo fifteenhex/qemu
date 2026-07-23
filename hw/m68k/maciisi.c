@@ -345,7 +345,15 @@ static void via1_rtc_update(MOS6522MacIIsiState *v1s)
                  * doesn't wrap; 32-bit-clean boot avoids it entirely.
                  */
                 if (sector * 32 + addr == 0x8a) {
-                    v1s->data_in |= 0x05;
+                    /*
+                     * Bit 0 only (32-bit addressing).  Bit 2 — the old
+                     * |= 0x05 — additionally means VIRTUAL MEMORY ON:
+                     * the 7.5.3 memory manager then installs a 90MB
+                     * logical address space (matching the disk's saved
+                     * VM Storage size) that our 030 emulation cannot
+                     * back, and the boot parks at the splash screen.
+                     */
+                    v1s->data_in |= 0x01;
                 }
                 v1s->data_in_cnt = 8;
                 v1s->cmd = REG_EMPTY;
@@ -1608,7 +1616,7 @@ static void maciisi_machine_init(MachineState *machine)
     m->via1.PRAM[0x0d] = 0x75;      /* 'u' */
     m->via1.PRAM[0x0e] = 0x4d;      /* 'M' */
     m->via1.PRAM[0x0f] = 0x63;      /* 'c' */
-    m->via1.PRAM[0x8a] = 0x05;      /* boot 32-bit clean */
+    m->via1.PRAM[0x8a] = 0x01;      /* boot 32-bit clean, VM off */
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
