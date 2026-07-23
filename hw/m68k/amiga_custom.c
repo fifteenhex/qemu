@@ -674,7 +674,7 @@ static void amiga_custom_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = amiga_custom_realize;
-    dc->legacy_reset = amiga_custom_reset;
+    device_class_set_legacy_reset(dc, amiga_custom_reset);
     dc->vmsd = &vmstate_amiga_custom;
     device_class_set_props(dc, amiga_custom_properties);
 }

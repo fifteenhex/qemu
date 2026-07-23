@@ -557,7 +557,7 @@ static void mos8520_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = mos8520_realize;
-    dc->legacy_reset = mos8520_reset;
+    device_class_set_legacy_reset(dc, mos8520_reset);
     dc->vmsd = &vmstate_mos8520;
     device_class_set_props(dc, mos8520_properties);
 }

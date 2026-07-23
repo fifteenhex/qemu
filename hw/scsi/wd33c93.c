@@ -921,7 +921,7 @@ static void wd33c93_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->legacy_reset = wd33c93_reset;
+    device_class_set_legacy_reset(dc, wd33c93_reset);
     dc->realize = wd33c93_realize;
     dc->vmsd = &vmstate_wd33c93;
 

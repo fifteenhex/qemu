@@ -346,7 +346,7 @@ static void a3000_sdmac_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = a3000_sdmac_realize;
-    dc->legacy_reset = a3000_sdmac_reset;
+    device_class_set_legacy_reset(dc, a3000_sdmac_reset);
     dc->vmsd = &vmstate_a3000_sdmac;
     device_class_set_props(dc, a3000_sdmac_properties);
 }
