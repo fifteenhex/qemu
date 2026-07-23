@@ -216,6 +216,9 @@ static const uint8_t mfp_timer_channel[4] = {
 };
 
 static int64_t atarist_video_de_events(AtaristVideoState *v, int64_t t);
+static int64_t atarist_video_de_event_time(AtaristVideoState *v,
+                                           int64_t target);
+static uint8_t mfp_timer_count(AtaristMfpState *s, int i);
 
 static int mfp_highest(uint16_t bits)
 {
@@ -310,11 +313,45 @@ static void mfp_timer_arm(AtaristMfpState *s, int i)
     timer_mod(s->qtimer[i], t->expiry);
 }
 
+/*
+ * Timer B event-count interrupts: with the channel enabled, schedule
+ * the terminal count from the video frame phase (its event input is
+ * the Shifter DE line, one event per visible scanline - games use it
+ * as a raster interrupt).
+ */
+static void mfp_timer_b_event_arm(AtaristMfpState *s)
+{
+    MfpTimer *t = &s->t[MFP_TIMER_B];
+    int64_t now, target;
+
+    if (!t->event_mode || !s->video) {
+        return;
+    }
+    if (!(s->ier & BIT(MFP_CH_TIMER_B))) {
+        timer_del(s->qtimer[MFP_TIMER_B]);
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    target = atarist_video_de_events(s->video, now) + mfp_timer_count(s, MFP_TIMER_B);
+    timer_mod(s->qtimer[MFP_TIMER_B],
+              atarist_video_de_event_time(s->video, target));
+}
+
 static void mfp_timer_fire(void *opaque, int i)
 {
     AtaristMfpState *s = opaque;
     MfpTimer *t = &s->t[i];
 
+    if (t->event_mode) {
+        mfp_set_pending(s, mfp_timer_channel[i]);
+        /* reload and rearm on the frame phase */
+        t->event_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        t->event_count0 = mfp_reload_ticks(t->reload);
+        if (i == MFP_TIMER_B) {
+            mfp_timer_b_event_arm(s);
+        }
+        return;
+    }
     if (!t->running) {
         return;
     }
@@ -398,6 +435,7 @@ static void mfp_timer_set_ctrl(AtaristMfpState *s, int i, uint8_t ctrl)
         t->event_mode = true;
         t->event_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         t->event_count0 = t->counter;
+        mfp_timer_b_event_arm(s);
     } else {
         qemu_log_mask(LOG_UNIMP,
                       "atarist mfp: timer %c event/pulse mode 0x%x\n",
@@ -489,6 +527,7 @@ static void atarist_mfp_write(void *opaque, hwaddr addr, uint64_t val,
     case MFP_REG_IERA:
         s->ier = deposit32(s->ier, 8, 8, val);
         s->ipr &= s->ier;       /* disabling a channel drops its pending */
+        mfp_timer_b_event_arm(s);
         mfp_update_irq(s);
         break;
     case MFP_REG_IERB:
@@ -731,6 +770,21 @@ static int64_t atarist_video_de_events(AtaristVideoState *s, int64_t t)
     int64_t vis = MIN(MAX(line - first, 0), FRAME_VISIBLE_LINES);
 
     return frames * FRAME_VISIBLE_LINES + vis;
+}
+
+/* the time at which the cumulative DE event count reaches @target */
+static int64_t atarist_video_de_event_time(AtaristVideoState *s,
+                                           int64_t target)
+{
+    int64_t period = video_frame_ns(s);
+    int lines = video_frame_lines(s);
+    int64_t line_ns = period / lines;
+    int64_t first = (lines - FRAME_VISIBLE_LINES) / 2;
+    int64_t frames = target / FRAME_VISIBLE_LINES;
+    int64_t rem = target % FRAME_VISIBLE_LINES;
+
+    /* the event completes at the end of its scanline */
+    return frames * period + (first + rem + 1) * line_ns;
 }
 
 static void atarist_video_vbl(void *opaque)

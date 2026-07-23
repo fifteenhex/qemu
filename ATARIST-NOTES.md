@@ -139,15 +139,16 @@ boot-sector reads in the FDC trace and 0xE5 at `_dskbufp` (0x181C).
   menu (/tmp/atarist-game1c.png), all via GEMDOS sector reads over
   the WD1772/DMA model.  Hostages (menu option 2) loads its ~1100
   sectors and runs its main loop but sits on a black palette —
-  unresolved, possibly wants timer B raster interrupts (only the
-  event *counter* is modelled, event-mode interrupts are not) or
-  joystick reports.
+  unresolved.  (Its MFP state shows timer A delay-mode at ~13.7kHz
+  - digi music - and timer B *off*, so the later timer-B
+  event-interrupt work was not the missing piece; next suspects are
+  the video address counter granularity and IKBD joystick reports.)
 
 ## Gaps / next steps
 
-- Timer A/B event-count interrupts (per-scanline raster) are not
-  delivered; the counter is computed on read.  Suspected blocker for
-  the Hostages intro.
+- Timer B event-count *interrupts* are now delivered (terminal count
+  scheduled from the video frame phase); timer A event mode is still
+  count-on-read only, and pulse modes are stubs.
 - FDC write track (format) and read track are stubs; write sector
   works.
 - Sound: PSG is a register file only.
