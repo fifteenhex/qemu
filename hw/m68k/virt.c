@@ -240,9 +240,14 @@ static void virt_init(MachineState *machine)
         param_ptr = param_blob;
 
         BOOTINFO1(param_ptr, BI_MACHTYPE, MACH_VIRT);
-        if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
+        BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68000);
+        if (m68k_feature(&cpu->env, M68K_FEATURE_M68010)) {
+            BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68010);
+	}
+        else if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
             BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68020);
-        } else if (m68k_feature(&cpu->env, M68K_FEATURE_M68030)) {
+	}
+        else if (m68k_feature(&cpu->env, M68K_FEATURE_M68030)) {
             BOOTINFO1(param_ptr, BI_MMUTYPE, MMU_68030);
             BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68030);
         } else if (m68k_feature(&cpu->env, M68K_FEATURE_M68040)) {
