@@ -108,6 +108,12 @@ callbacks run inside the timer's transaction).
   close-gadget/RELVERIFY bug or sub-pixel synthetic-aim miss — needs a
   human repro or Intuition-MouseXY-based positioning to settle.  Icon
   double-click, app gadgets and window drag all work.
+- Games: Lemmings and The Secret of Monkey Island both boot and play
+  (MI reaches full SCUMM gameplay on Melee Island; run-monkey.sh).  A
+  Workbench flicker (a fifth of frames blank) was fixed by running the
+  copper at render time instead of at the vblank, since Intuition
+  swaps its double-buffered copper lists (COP2LC) in the VERTB handler
+  that runs after our old vblank copper pass.
 - Display gaps: attached sprites, sprite/playfield priority
   (BPLCON2), BPLCON1 fine scroll, HAM, dual playfield.  The copper is
   line-granular; effects keyed to the horizontal beam position won't
