@@ -78,6 +78,7 @@ config ELTEC_E17
     default y
     depends on M68K
     select E17_SYSC
+    select E17_VID
     select CD2401
 
 config AMIGA

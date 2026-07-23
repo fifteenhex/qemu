@@ -140,9 +140,9 @@ static uint64_t e17_sysc_read(void *opaque, hwaddr addr, unsigned size)
     case E17_SYSC_VID_DAC:
     case E17_SYSC_VID_CRTC:
         /*
-         * No video model yet: read as open bus so the RMON probe
-         * fails cleanly and the monitor falls back to the serial
-         * console (POST flag bit 16, "video absent").
+         * Open bus: the e17-vid device overlays these blocks when the
+         * board has video fitted; without it the RMON probe fails
+         * cleanly and the monitor uses the serial console.
          */
         return (1ULL << (size * 8)) - 1;
     case E17_SYSC_ACK:
@@ -227,8 +227,10 @@ static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case E17_SYSC_VID_DAC:
     case E17_SYSC_VID_CRTC:
+        /* open bus unless the e17-vid device overlays these blocks */
+        return;
     case E17_SYSC_I2C:
-        /* no video / no EEPROM fitted */
+        /* no EEPROM fitted */
         return;
     case E17_SYSC_SLAVE:
         /* 0x20 releases the (absent) secondary CPU */

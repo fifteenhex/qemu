@@ -7,10 +7,10 @@
  *
  * Memory map (from the RMON boot path):
  *   0x00000000  DRAM (-m, sized by the firmware by wrap detection)
- *   0x0fc00000  video RAM, 2MB (no video model yet)
+ *   0x0fc00000  video RAM, 4MB window (e17-vid)
  *   0xfe800000  1MB EPROM window: a 256KB image mirrored 4 times
  *   0xfea00000  battery backed SRAM, 1MB
- *   0xfec00000  onboard I/O (e17-sysc + CD2401 serial)
+ *   0xfec00000  onboard I/O (e17-sysc + CD2401 serial + e17-vid regs)
  *
  * Fit the RMON image with -bios; both the raw 256KB EPROM content
  * and a full 1MB dump of the window work.
@@ -30,11 +30,13 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/cd2401.h"
+#include "hw/display/e17_vid.h"
 #include "hw/misc/e17_sysc.h"
 #include "target/m68k/cpu.h"
 
 #define E17_VRAM_BASE       0x0fc00000
-#define E17_VRAM_SIZE       (2 * MiB)
+#define E17_VID_DAC_BASE    0xfec40000
+#define E17_VID_CRTC_BASE   0xfec48000
 #define E17_ROM_BASE        0xfe800000
 #define E17_ROM_SIZE        (1 * MiB)
 #define E17_ROM_IMAGE_SIZE  (256 * KiB)
@@ -67,15 +69,16 @@ static void e17_cpu_reset(void *opaque)
     ri->cpu->env.pc = ri->initial_pc;
 }
 
+
 static void e17_init(MachineState *machine)
 {
     M68kCPU *cpu;
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *rom = g_new(MemoryRegion, 1);
     MemoryRegion *sram = g_new(MemoryRegion, 1);
-    MemoryRegion *vram = g_new(MemoryRegion, 1);
     DeviceState *sysc_dev;
     DeviceState *serial_dev;
+    DeviceState *vid_dev;
     gchar *bios_size_err;
     int64_t bios_size = -1;
     int i;
@@ -84,11 +87,6 @@ static void e17_init(MachineState *machine)
 
     /* DRAM */
     memory_region_add_subregion(sysmem, 0, machine->ram);
-
-    /* video RAM, no controller model yet */
-    memory_region_init_ram(vram, NULL, "e17.vram", E17_VRAM_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(sysmem, E17_VRAM_BASE, vram);
 
     /* battery backed SRAM */
     memory_region_init_ram(sram, NULL, "e17.sram", E17_SRAM_SIZE,
@@ -145,6 +143,15 @@ static void e17_init(MachineState *machine)
     sysc_dev = qdev_new(TYPE_E17_SYSC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sysc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sysc_dev), 0, E17_IO_BASE);
+
+    /* onboard video: VRAM plus the DAC/CRTC blocks inside the sysc */
+    vid_dev = qdev_new(TYPE_E17_VID);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(vid_dev), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 0,
+                            E17_VID_DAC_BASE, 1);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(vid_dev), 1,
+                            E17_VID_CRTC_BASE, 1);
+    sysbus_mmio_map(SYS_BUS_DEVICE(vid_dev), 2, E17_VRAM_BASE);
 
     /* CD2401, serial ports 1-4; sits inside the e17-sysc window */
     serial_dev = qdev_new(TYPE_CD2401);
