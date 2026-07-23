@@ -188,10 +188,38 @@ SR reads — hook portB eor-0x30/0x10 transitions during a session as the
 discards the response (only 2 of 3 bytes consumed, then it reopens a
 receive session and polls forever at 0x4080a8e6).
 
-Consider fetching MAME's egret.cpp for the Egret-side firmware protocol
-(NEEDS DANIEL'S PERMISSION for the download) — it would confirm the
-attention/idle semantics (e.g. whether Egret sends an unsolicited
-power-on packet, which the ROM's second, empty receive session suggests).
+MAME egret.cpp/h fetched (in _maciisi_assets/) — turned out to be full
+68HC05 firmware emulation, not HLE; its pin table confirmed the PB
+wiring.  The protocol was instead cracked by reversing the ROM driver —
+see the commit "Egret startup sequence completes" for the full timing
+rules now implemented and working (version cmd 0x00 → 01 01, channel
+probes n<<4|0xF → empty, all complete exactly once).
+
+### CURRENT BLOCKER: TimeDBRA (lowmem 0xD00) never calibrated
+
+After the Egret sequence, an OS trap converts a delay via
+`muluw #2656 / divuw (0xD00).W` at 0x40843a8c (caller 0x408422fc, via
+the A-trap dispatcher; outer frames 0x40816aba/0x40809ae6) and 0xD00 is
+still zero → SysError 4 → debug nub.  gdb-patching 0xD00=2656 (the
+IIsi's documented TimeDBRA) at the post-Egret point (break 0x4080a96e,
+script /tmp/maciisi-patch.gdb) lets the boot advance to the **SCSI
+boot-device scan** (5380 arbitration: mode=0x01 etc.) — so this is the
+last software gate before the boot-device hunt and, after it, video.
+
+The ROM's calibration helpers (dbra loops timed against VIA1 T2, four
+variants for different wait-sources) are at 0x40800884..0x408008d0; the
+nub-era ACR writes at pc 0x40847100/0x40847106 look like a T1-based
+calibration in the test phase.  Open question: which boot step populates
+the OS-world 0xD00 block (Time Mgr init?) and why it hasn't run by the
+time the Egret/ADB layer wants a delay — possibly our Egret exchange
+timing (100us/byte) diverts the ADB layer into a timeout path that
+real hardware doesn't take that early.
+
+Next session: (1) find the 0xD00-block populator (watchpoint on 0xD00
+after the RAM tests, under -icount), or check whether shortening the
+Egret interrupt delay avoids the delay-trap entirely; (2) then SCSI scan
+(needs 5380 well-behaved-enough to report no devices), floppy check,
+and finally video init (VDAC/framebuffer) for the insert-disk icon.
 
 ### v1 skeleton (2026-07-20)
 
