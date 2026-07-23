@@ -61,6 +61,8 @@ struct WD33C93State {
 
     /* raised while a dma-mode transfer wants servicing */
     qemu_irq drq;
+    /* follows the INT bit in the auxiliary status register */
+    qemu_irq irq;
 
     /*
      * A written command is processed after a short delay, during which

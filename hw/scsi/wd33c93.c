@@ -35,7 +35,7 @@ static void wd33c93_do_int(WD33C93State *s, uint8_t scsi_stat)
 	DPRINTF("%s: 0x%02x\n", __func__, scsi_stat);
 	s->scsistatus = scsi_stat;
 	s->auxstat |= WD33C93_REG_AUXILIARYSTAT_INT;
-	// Raise hw irq here?
+	qemu_set_irq(s->irq, 1);
 }
 
 static uint8_t wd33c93_read_aux_stat(WD33C93State *s)
@@ -91,6 +91,7 @@ static uint8_t wd33c93_read_scsi_status(WD33C93State *s)
 	uint8_t val = s->scsistatus;
 
 	s->auxstat &= ~WD33C93_REG_AUXILIARYSTAT_INT;
+	qemu_set_irq(s->irq, 0);
 
 	/*
 	 * Once the completion interrupt has been consumed the target
@@ -801,6 +802,7 @@ static void wd33c93_reset(DeviceState *dev)
 	s->scsistatus = 0;
 	s->cmdphase = 0;
 	s->cmd_in_progress = false;
+	qemu_set_irq(s->irq, 0);
 	if (s->cmd_timer) {
 		timer_del(s->cmd_timer);
 	}
@@ -880,6 +882,7 @@ static void wd33c93_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(dev), &wd33c93_ops, s, TYPE_WD33C93, 0x20);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
     qdev_init_gpio_out_named(dev, &s->drq, "drq", 1);
+    qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
 
     scsi_bus_init(&s->bus, sizeof(s->bus), dev, &wd33c93_scsi_info);
 }
