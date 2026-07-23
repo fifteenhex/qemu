@@ -95,11 +95,17 @@ static uint8_t wd33c93_read_scsi_status(WD33C93State *s)
 
 	/*
 	 * Once the completion interrupt has been consumed the target
-	 * requests the next information transfer phase.
+	 * requests the next information transfer phase, or, at the end
+	 * of a select-and-transfer sequence, drops off the bus: the
+	 * disconnect is its own interrupt, and the A3000 driver only
+	 * completes a command when it sees it.
 	 */
 	if (s->srv_req_pending) {
 		s->srv_req_pending = false;
 		wd33c93_do_int(s, WD33C93_SCSISTATUS_SRV_REQ | s->bus_phase);
+	} else if (s->disconnect_pending) {
+		s->disconnect_pending = false;
+		wd33c93_do_int(s, WD33C93_SCSISTATUS_DISCONNECT);
 	}
 
 	return val;
@@ -436,6 +442,7 @@ static void wd33c93_sat_finish(WD33C93State *s)
 	/* the target's status byte lands in the lun register */
 	s->targetlun = s->req_status;
 	s->cmdphase = 0x60;
+	s->disconnect_pending = true;
 	wd33c93_do_int(s, WD33C93_SCSISTATUS_SEL_XFER_DONE);
 }
 
