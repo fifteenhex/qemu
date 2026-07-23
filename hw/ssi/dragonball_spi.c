@@ -38,18 +38,23 @@ static uint64_t dragonball_spi_read(void *opaque, hwaddr addr, unsigned int size
 
 static void dragonball_spi_do_transfer(DragonBallSPIState *s)
 {
-    /* Only 8 or 16 bits is supported */
-    assert(DATABITS(s) == 8 || DATABITS(s) == 16);
+    int bits = DATABITS(s);
+    uint16_t out = s->data_out & (0xffff >> (16 - bits));
 
     s->running = true;
 
-    /* If there are two bytes the first out is in the top */
+    /*
+     * Any count from 1 to 16 bits is allowed (PalmOS uses odd sizes
+     * to talk to the touchscreen ADC).  Shift out MSB-first in byte
+     * chunks, high byte first when there is more than one.
+     */
     s->data_in = 0;
-    if (DATABITS(s) == 16) {
-        s->data_in = ssi_transfer(s->spi, (s->data_out >> 8) & 0xff);
+    if (bits > 8) {
+        s->data_in = ssi_transfer(s->spi, (out >> 8) & 0xff);
         s->data_in <<= 8;
     }
-    s->data_in |= ssi_transfer(s->spi, s->data_out & 0xff);
+    s->data_in |= ssi_transfer(s->spi, out & 0xff);
+    s->data_in &= 0xffff >> (16 - bits);
 
     //printf("out: 0x%04x in: 0x%04x (%d bits)\n",
     //        (unsigned) s->data_out, (unsigned) s->data_in, DATABITS(s));
