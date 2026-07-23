@@ -562,6 +562,21 @@ static void wd33c93_cmd_sel_atn_tfr(WD33C93State *s)
 
 	DPRINTF("%s\n", __func__);
 
+	/*
+	 * Issued mid-transaction (the command phase register at or past
+	 * "command transferred"), select-and-transfer resumes the current
+	 * command instead of starting one: drivers run the early phases
+	 * by hand and let the chip collect status and command complete.
+	 */
+	if (s->cmdphase >= 0x41 && s->cmdphase < 0x60) {
+		s->sat_active = true;
+		if (s->req_done || !s->current_req) {
+			wd33c93_sat_finish(s);
+		}
+		/* otherwise the data completion finishes the sequence */
+		return;
+	}
+
 	s->current_dev = scsi_device_find(&s->bus, 0, target, 0);
 	if (!s->current_dev) {
 		s->bus_phase = WD33C93_PHASE_BUS_FREE;
