@@ -323,28 +323,102 @@ everything — beware, the idle loop makes that huge — or the targeted
   CSR0 = INIT and endless CSR0 polling for IDON.  With 0.0.0.0
   addresses it will BOOTP first ("Received BOOTP response" string).
 
-## Netboot status (2026-07-20, late night)
+## Netboot status: WORKS end to end (2026-07-20, later)
 
 The LANCE is wired up (see the "wire up the LANCE" commit for the
 model details — it is an Am79C900 ILACC, 32-bit init block and
 descriptors, full byte lane reversal on descriptor DMA, pass-through
 data).  With e17-tools/netserv.py as the network peer, RMON's
-netboot now: initialises the chip (IDON), transmits a CORRECT RARP
-request, gets the reply DMA'd into the right RX buffer (verified in
-guest memory at the ring from the init block) — and then the TLANCE
-driver rejects it with "TLANCE: chain err 2".
+netboot completes: RARP assigns the addresses, TFTP transfers the
+boot file, the header is validated and the image is executed at its
+entry point (verified with a payload that dumps its own entry state,
+see below).
 
-State at the error (rings from init block: RX 0x8020 x8, TX 0x80a0
-x1, RMDs re-armed by the driver as 0x8040fa12/0x8000fa12): RMD2
-(message count) reads 0 where the driver expects MCNT — either
-pcnet's rmd store didn't land (check e17_lance_swap on the store
-path) or the driver checks a different RMD2 bit layout (ILACC RMD2
-has RCC/RPC fields above MCNT).  Next: instrument pcnet_rmd_store
-(or enable PCNET_DEBUG_RMD) and compare the written RMD1/RMD2
-against what the TLANCE driver's chain checks want (driver error
-strings are around the "TLANCE:" cluster in the ROM).  After that:
-BOOTP/TFTP against netserv.py and then RE the loaded-image header
-("boot file cpu type mismatch") for u-boot payloads.
+### "TLANCE: chain err 2" root cause (fixed in hw/net/pcnet.c)
+
+The TLANCE driver's RX path (fe817152) polls the OWN bit of RMD1 in
+a tight loop (byte at RMD+4: OWN=7 ERR=6 ... STP=1 ENP=0), then
+requires ERR clear and STP|ENP both set — "chain err 2" is
+literally `(RMD1_byte & 3) != 3`.  QEMU's pcnet core stored the
+final descriptor of a received frame TWICE: once from
+PCNET_RECV_STORE() with OWN already cleared but ENP/MCNT not yet
+written, then again with ENP+MCNT.  The polling guest hits the
+window between the stores every time (the iothread does the DMA
+while the TCG thread spins) and sees OWN=0, STP=1, ENP=0, MCNT=0.
+The journal's earlier ring dump confirms it post-mortem: descriptors
+read 0x8040fa12 — 0x40 at byte RMD+5 is pcnet's PAM bit (0x0040,
+unicast match) from the SECOND store, layered under the driver's
+re-arm which only rewrites byte +4 and clears the MCNT word at +10.
+
+Fix: pcnet_receive now stores every non-final descriptor as before
+but releases the final one with a single RMDSTORE carrying ENP, the
+match bits and MCNT together (real chips also write MCNT before
+relinquishing OWN).  This is an upstreamable fix — any driver that
+polls (or races the interrupt) can hit it.
+
+### TLANCE driver RMD/TMD semantics (from the disassembly)
+
+RX (fe817152): poll byte RMD+4 for OWN clear; ERR set -> decode
+FRAM/CRC/BUFF ("chain err" alone = ENP missing on an error frame);
+else require STP|ENP==3; MCNT = word at RMD+10; frame copied from
+buffer+14 (after dst/src/ethertype), length MCNT-14; re-arm = clear
+word +10, byte +4 = 0x80.  TX (fe816fec): descriptor built with
+word +6 = -length, word +8 cleared, byte +4 = 0x83 (OWN|STP|ENP);
+after OWN clears, ERR -> word at TMD+8 decoded: bit15 BUFF ("
+transmit buffer error"), bit14 UFLO, bit10 RTRY with TDR in the low
+10 bits ("cable jammed. tdr = %d").
+
+## The netboot image format (RE'd, VERIFIED by booting a payload)
+
+Header check: block callback fe819016 (first TFTP block), error
+code -> message dispatch at fe81851a (10 bad header, 11 bad size,
+12 bad load address, 13 bad entry address, 14 bad checksum, 7 cpu
+type mismatch — the last one is NOT produced by the TFTPBOOT path;
+its trigger is still unlocated, likely another loader/protocol).
+
+All big-endian, 22 bytes, image data follows immediately:
+
+    +0  u32  magic 0x134FEE73
+    +4  u16  cpu type — never read by the TFTPBOOT loader, only
+             covered by the header checksum; 0 works
+    +6  u32  size (must be > 100 and <= 0x01FE0000)
+    +10 u32  load address (checked against RAM bounds; load+size+2
+             must fit)
+    +14 u32  entry address; if 0 the firmware uses the u32 at image
+             offset 4; must be load <= entry < load+size
+    +18 u16  image checksum — the firmware stores this word at
+             load+size and the checksum over (load, size+2) must
+             verify
+    +20 u16  header checksum — makes the 22-byte header verify
+
+Checksum (fe819bf8) = RFC1071 internet checksum: one's-complement
+sum of big-endian u16s (trailing odd byte counts as high byte),
+returns ~sum & 0xffff, 0 == valid.  First TFTP block must be >= 30
+bytes.  e17-tools/mke17boot.py wraps a raw binary accordingly.
+
+### Entry state (measured with a register-dump payload)
+
+Launch path: fe80bd66 -> context block -> fe80714c, which does
+move #0x2700,SR, restores DFC/SFC/CACR/VBR/USP/ISP/MSP from the
+block, pushes a fake format-0 frame and RTEs into the image:
+
+    SR = 0x2000 (supervisor, interrupt mask 0 — interrupts ON)
+    VBR = 0 (RMON's vector table), CACR = 0 (caches off)
+    a0 = entry address, sp = 0x7ec4 (RMON low-DRAM stack)
+    other regs: d0=d1=0xc20 d4=0xc d5=0x16 d6=0xffff0000
+    d7=0xffffffff a2=0xe00 a5=0x7eec (RMON internals, don't rely)
+
+An exception (e.g. illegal instruction) returns cleanly to the
+monitor prompt — RMON's generic handler longjmps back, so payload
+tests are cheap.  Repro/driver scripts: ~/e17-re/netbt8.py (boots,
+serves a wrapped image via netserv.py on unique ports 18485/18487,
+gdb-dumps the result); payloads built with mke17boot.py.
+
+Next for u-boot: build still blocked on bison/flex (waiting for
+Daniel).  Once it builds: wrap u-boot.bin with mke17boot.py at
+TEXT_BASE 0x600000 (entry = start), serve via netserv.py, and it
+should get control in supervisor mode with caches off — exactly
+what its start.S expects.
 
 ## Netboot plan (for loading u-boot or other payloads)
 
@@ -361,11 +435,8 @@ BOOTP/TFTP against netserv.py and then RE the loaded-image header
    00:00:5B:00:49:62 without it).
 3. Use slirp's built-in BOOTP+TFTP: -netdev user,tftp=DIR,
    bootfile=FILE; the bootstrap does BOOTP then TFTP.
-4. Payload format: unknown yet — "boot file cpu type mismatch"
-   string implies a header check on the loaded image (OS-9 module
-   header? ELTEC wrapper?).  RE the TFTP-done path once transfers
-   work to learn the expected format and entry convention; then a
-   u-boot binary can be wrapped accordingly.
+4. DONE: payload format RE'd and verified — see "The netboot image
+   format" below; wrap payloads with e17-tools/mke17boot.py.
    (Alternative payload path that needs no network: `sload`
    S-record download over serial + `gm` start user module.)
 - Session hygiene: other Claude sessions also run QEMU here — always
