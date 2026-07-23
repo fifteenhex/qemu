@@ -195,6 +195,14 @@ static void ncr5380_flush_data_out(NCR5380State *s)
     ncr5380_pump(s);
     s->collecting = false;
     ncr5380_enter_status(s);
+    /*
+     * In DMA send mode the empty output register re-asserts DRQ once
+     * the target has taken the final byte; the Mac Plus ROM's blind
+     * writer waits for that trailing DRQ before it drops DMA mode.
+     */
+    if (s->mr & MR_DMA_MODE) {
+        s->bsr |= BSR_DRQ;
+    }
 }
 
 static void ncr5380_do_command(NCR5380State *s)
