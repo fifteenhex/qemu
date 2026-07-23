@@ -83,8 +83,8 @@
 
 /* /PENIRQ is also readable as a GPIO: port F bit 1 (low = pen down) */
 #define PALM_PENIRQ_GPIO     (5 * 8 + 1)
-/* /POWERFAIL from the supply supervisor: port G bit 2, low = battery dead */
-#define PALM_POWERFAIL_GPIO  (6 * 8 + 2)
+/* /POWERFAIL from the supply supervisor: port D bit 7, low = battery dead */
+#define PALM_POWERFAIL_GPIO  (3 * 8 + 7)
 
 typedef struct PalmMachineState {
     MachineState parent_obj;

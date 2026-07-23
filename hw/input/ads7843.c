@@ -38,11 +38,16 @@
 #define ADS7843_CMD_CHANNEL(_c) (((_c) >> 4) & 7)
 #define ADS7843_CMD_8BIT    0x08
 
-/* differential-mode channel assignments */
-#define ADS7843_CHANNEL_XPOS  1
+/*
+ * Channel assignments as wired on the Palm V (POSE's kChannelSet2):
+ * note Y on channel 1 and X on channel 5.
+ */
+#define ADS7843_CHANNEL_YPOS  1
+#define ADS7843_CHANNEL_BATT  2
 #define ADS7843_CHANNEL_Z1    3
 #define ADS7843_CHANNEL_Z2    4
-#define ADS7843_CHANNEL_YPOS  5
+#define ADS7843_CHANNEL_XPOS  5
+#define ADS7843_CHANNEL_DOCK  6
 
 #define ADS7843_MAX 0xfff
 
@@ -58,16 +63,14 @@ static uint16_t ads7843_sample(ADS7843State *s, int channel)
         return s->pen_down ? 0x600 : 0;
     case ADS7843_CHANNEL_Z2:
         return s->pen_down ? 0x600 : ADS7843_MAX;
-    case 2:
-        return 0xbd0; /* ch2 */
-    case 6:
-        return 0xbd0; /* ch6 */
-    default:
-        /*
-         * IN3/IN4: the Palm V measures its battery here.  Report a
-         * healthy Li-ion voltage or PalmOS goes straight to sleep.
-         */
+    case ADS7843_CHANNEL_BATT:
+        /* a healthy battery, or PalmOS goes straight to sleep */
         return 0xbd0;
+    case ADS7843_CHANNEL_DOCK:
+        /* dock sense: reads 0 when undocked */
+        return 0;
+    default:
+        return 0;
     }
 }
 
@@ -122,19 +125,21 @@ static void ads7843_input_event(DeviceState *dev, QemuConsole *src,
     switch (evt->type) {
     case INPUT_EVENT_KIND_ABS: {
         /*
-         * Produce what a real Palm V panel produces, so that the
-         * PalmOS *default* pen calibration (screenX = 0.72*raw8 - 2,
-         * screenY = raw8 - 3, measured against the OS 3.1 ROM) maps
-         * the pen exactly onto the pixel being pointed at.
+         * Produce what a real Palm V panel produces.  The raw values
+         * *decrease* as the screen coordinate grows — the PalmOS HAL
+         * inverts the ADC byte (255 - raw) before anything else sees
+         * it, verified by catching PenCalibrate's arguments in the
+         * OS 3.1 ROM.  The scale factors make PalmOS's default pen
+         * calibration land the pen on the pixel being pointed at.
          */
         int val = qemu_input_scale_axis(evt->abs.value,
                                         INPUT_EVENT_ABS_MIN,
                                         INPUT_EVENT_ABS_MAX,
                                         0, 159);
         if (evt->abs.axis == INPUT_AXIS_X) {
-            s->x = ((val * 1387) / 1000 + 3) << 4;
+            s->x = (252 - (val * 1387) / 1000) << 4;
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            s->y = (val + 3) << 4;
+            s->y = (252 - val) << 4;
         }
         break;
     }

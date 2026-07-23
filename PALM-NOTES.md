@@ -171,6 +171,47 @@ pen work — recorded because none of this is in the chip manual:
     div 0xb9/0xfc, off 0x14/0x12) and the Setup app resets the
     globals to identity (div 0x100, off 0) before calibrating.
 
+### 2026-07-20 (night) — SOLVED: full boot to the launcher
+
+With Daniel's permission, pulled the POSE-derived sources from
+CloudpilotEmu (github.com/cloudpilot-emu, local copy in
+/workspace/src/pose-ref/) as a reference.  Corrections that came out
+of it, plus one final RE discovery:
+
+  - ADS784x channel map (POSE kChannelSet2 for the Palm V): Y is
+    channel 1, X is channel 5 — the reverse of what the ADS7846
+    datasheet's differential table suggests.  Battery is channel 2
+    (a fixed healthy value works), channel 6 is the dock sense and
+    must read 0 = undocked.
+  - /POWERFAIL is port D bit 7 (hwrEZPortDPowerFail, active low),
+    not port G.  POSE forces it high for the same reason we do.
+  - The ADC chip select is port G bit 5 (hwrEZPortGADCOff) — the
+    0xfffff431 accesses in the HAL are PGDATA, not PDDATA.
+  - Buttons (future): 3x4 matrix, rows = port F bits 4-6 driven low,
+    columns = port D bits 0-3 read active-high.
+  - POSE itself returns 0 for pen X/Y at the ADC level — it injects
+    pen events by patching PalmOS APIs, so POSE never exercised the
+    hardware sampling path we emulate.  Its bit-level SPI slave
+    matches our model (response = null bit + 12 bits, i.e. the HAL's
+    (frame >> 3) & 0xfff).
+  - THE decisive fact (found by breaking at PenCalibrate with a
+    little gdb-remote-protocol client, /tmp/rsp.py): the PalmOS HAL
+    inverts the ADC byte (255 - raw8) before anything else sees it.
+    A real panel therefore produces raw values that *decrease* as
+    screen coordinates grow; our model produced increasing values,
+    so the (identity-calibrated) points came out mirrored and
+    PenCalibrate's monotonicity check rejected every pair.
+    Panel model now: raw8_x = 252 - screenX*1.387,
+    raw8_y = 252 - screenY.
+
+With the inverted panel: OS 3.1 completes the whole Setup wizard —
+digitizer calibration (targets at (10,10) and (150,150), confirm
+target at (79,57); the confirm tap must land within a few pixels) —
+reaches the LAUNCHER, and Memo Pad opens with the built-in memos, so
+the RAM store / databases work as well.  OS 3.3's Setup page 1 also
+advances now (it evidently validates the raw point where 3.1
+didn't).
+
 ## Journal
 
 ### 2026-07-20 (evening) — pen works; Setup advances on OS 3.1
