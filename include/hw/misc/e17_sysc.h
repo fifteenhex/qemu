@@ -39,6 +39,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(E17SysCState, E17_SYSC)
 
 #define E17_SYSC_SIZE      0x80000
 
+/* secondary CPU control register bit */
+#define E17_SYSC_SLAVE_RUN 0x20
+
 /* Z8536 CIO: A1/A0 wiring is portC/portB/portA/control */
 #define E17_CIO_PORTC      0
 #define E17_CIO_PORTB      1
@@ -77,6 +80,7 @@ struct E17SysCState {
     uint32_t dramc[2];      /* 0x080f0/0x080f4 */
 
     uint8_t slave_ctl;
+    qemu_irq slave_run;     /* raised while the RUN bit is set */
     uint8_t misc_5c;
     uint8_t cputype;
     uint8_t post_code;      /* last value written to the POST display */

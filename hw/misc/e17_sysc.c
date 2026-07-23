@@ -16,6 +16,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/e17_sysc.h"
 #include "migration/vmstate.h"
@@ -233,8 +234,9 @@ static void e17_sysc_write(void *opaque, hwaddr addr, uint64_t val,
         /* no EEPROM fitted */
         return;
     case E17_SYSC_SLAVE:
-        /* 0x20 releases the (absent) secondary CPU */
+        /* 0x20 releases the secondary CPU from halt */
         s->slave_ctl = val;
+        qemu_set_irq(s->slave_run, (val & E17_SYSC_SLAVE_RUN) != 0);
         return;
     case E17_SYSC_MISC:
         s->misc_5c = val;
@@ -336,6 +338,7 @@ static void e17_sysc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &e17_sysc_ops, s, "e17-sysc",
                           E17_SYSC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->slave_run, "slave-run", 1);
 }
 
 static const VMStateDescription vmstate_e17_cio = {

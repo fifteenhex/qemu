@@ -28,6 +28,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/cd2401.h"
 #include "hw/display/e17_vid.h"
@@ -69,10 +70,42 @@ static void e17_cpu_reset(void *opaque)
     ri->cpu->env.pc = ri->initial_pc;
 }
 
+/* The secondary CPU is held in halt until released via the sysc */
+static void e17_slave_cpu_reset(void *opaque)
+{
+    M68kCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+
+    cpu_reset(cs);
+    cs->halted = 1;
+}
+
+/*
+ * Releasing the secondary CPU (0x20 to the control register at
+ * 0xfec58000) makes it fetch SP and PC from DRAM 0/4, where the
+ * primary has planted a trampoline.
+ */
+static void e17_slave_run(void *opaque, int n, int level)
+{
+    M68kCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+
+    if (!level || !cs->halted) {
+        return;
+    }
+    cpu_reset(cs);
+    cpu->env.aregs[7] = address_space_ldl(&address_space_memory, 0,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+    cpu->env.pc = address_space_ldl(&address_space_memory, 4,
+                                    MEMTXATTRS_UNSPECIFIED, NULL);
+    cs->halted = 0;
+    qemu_cpu_kick(cs);
+}
 
 static void e17_init(MachineState *machine)
 {
     M68kCPU *cpu;
+    M68kCPU *slave_cpu = NULL;
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *rom = g_new(MemoryRegion, 1);
     MemoryRegion *sram = g_new(MemoryRegion, 1);
@@ -84,6 +117,12 @@ static void e17_init(MachineState *machine)
     int i;
 
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
+
+    /* the optional secondary CPU, released through the sysc */
+    if (machine->smp.cpus > 1) {
+        slave_cpu = M68K_CPU(cpu_create(machine->cpu_type));
+        qemu_register_reset(e17_slave_cpu_reset, slave_cpu);
+    }
 
     /* DRAM */
     memory_region_add_subregion(sysmem, 0, machine->ram);
@@ -143,6 +182,11 @@ static void e17_init(MachineState *machine)
     sysc_dev = qdev_new(TYPE_E17_SYSC);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sysc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sysc_dev), 0, E17_IO_BASE);
+    if (slave_cpu) {
+        qdev_connect_gpio_out_named(sysc_dev, "slave-run", 0,
+                                    qemu_allocate_irq(e17_slave_run,
+                                                      slave_cpu, 0));
+    }
 
     /* onboard video: VRAM plus the DAC/CRTC blocks inside the sysc */
     vid_dev = qdev_new(TYPE_E17_VID);
@@ -173,6 +217,9 @@ static void e17_machine_init(MachineClass *mc)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
     mc->default_ram_size = E17_DEFAULT_RAM_SIZE;
     mc->default_ram_id = "dram";
+    /* the board carries a second 68040; -smp 1 removes it */
+    mc->max_cpus = 2;
+    mc->default_cpus = 2;
 }
 
 DEFINE_MACHINE("e17", e17_machine_init)
