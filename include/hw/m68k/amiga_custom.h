@@ -56,6 +56,8 @@ struct AmigaCustomState {
     /* backing store for the (mostly write-only) chipset registers */
     uint16_t regs[0x100];
 
+    bool blit_zero;             /* last blit produced only zeroes */
+
     int64_t frame_origin_ns;
     QEMUTimer vblank_timer;
 };

@@ -22,6 +22,8 @@
 #include "hw/core/irq.h"
 #include "hw/m68k/amiga_custom.h"
 #include "migration/vmstate.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
 
 /* PAL timing: 227 colour clocks (~64us) per line, 312 lines per frame */
 #define LINE_NS         64000
@@ -44,6 +46,24 @@
 #define REG_SERDAT      0x030
 #define REG_SERPER      0x032
 #define REG_POTGO       0x034
+#define REG_BLTCON0     0x040
+#define REG_BLTCON1     0x042
+#define REG_BLTAFWM     0x044
+#define REG_BLTALWM     0x046
+#define REG_BLTCPT      0x048
+#define REG_BLTBPT      0x04c
+#define REG_BLTAPT      0x050
+#define REG_BLTDPT      0x054
+#define REG_BLTSIZE     0x058
+#define REG_BLTSIZV     0x05c
+#define REG_BLTSIZH     0x05e
+#define REG_BLTCMOD     0x060
+#define REG_BLTBMOD     0x062
+#define REG_BLTAMOD     0x064
+#define REG_BLTDMOD     0x066
+#define REG_BLTCDAT     0x070
+#define REG_BLTBDAT     0x072
+#define REG_BLTADAT     0x074
 #define REG_DENISEID    0x07c
 #define REG_DMACON      0x096
 #define REG_INTENA      0x09a
@@ -94,6 +114,214 @@ static uint16_t setclr(uint16_t reg, uint16_t val, uint16_t mask)
         return reg | (val & mask);
     }
     return reg & ~(val & mask);
+}
+
+/* --- blitter --- */
+
+#define BLTCON0_USEA    (1 << 11)
+#define BLTCON0_USEB    (1 << 10)
+#define BLTCON0_USEC    (1 << 9)
+#define BLTCON0_USED    (1 << 8)
+#define BLTCON1_EFE     (1 << 4)
+#define BLTCON1_IFE     (1 << 3)
+#define BLTCON1_FCI     (1 << 2)
+#define BLTCON1_DESC    (1 << 1)
+#define BLTCON1_LINE    (1 << 0)
+
+/* Agnus addresses chip RAM only */
+#define CHIP_MASK       0x1ffffe
+
+static uint16_t amiga_custom_reg(AmigaCustomState *s, unsigned reg)
+{
+    return s->regs[reg >> 1];
+}
+
+static uint32_t amiga_custom_ptr(AmigaCustomState *s, unsigned reg)
+{
+    return ((uint32_t)s->regs[reg >> 1] << 16) | s->regs[(reg >> 1) + 1];
+}
+
+static void amiga_custom_set_ptr(AmigaCustomState *s, unsigned reg,
+                                 uint32_t val)
+{
+    s->regs[reg >> 1] = val >> 16;
+    s->regs[(reg >> 1) + 1] = val;
+}
+
+static uint16_t chip_read16(uint32_t addr)
+{
+    uint8_t buf[2];
+
+    dma_memory_read(&address_space_memory, addr & CHIP_MASK, buf, 2,
+                    MEMTXATTRS_UNSPECIFIED);
+    return (buf[0] << 8) | buf[1];
+}
+
+static void chip_write16(uint32_t addr, uint16_t val)
+{
+    uint8_t buf[2] = { val >> 8, val };
+
+    dma_memory_write(&address_space_memory, addr & CHIP_MASK, buf, 2,
+                     MEMTXATTRS_UNSPECIFIED);
+}
+
+static uint16_t blit_minterm(uint8_t lf, uint16_t a, uint16_t b, uint16_t c)
+{
+    uint16_t d = 0;
+
+    if (lf & 0x80) {
+        d |= a & b & c;
+    }
+    if (lf & 0x40) {
+        d |= a & b & ~c;
+    }
+    if (lf & 0x20) {
+        d |= a & ~b & c;
+    }
+    if (lf & 0x10) {
+        d |= a & ~b & ~c;
+    }
+    if (lf & 0x08) {
+        d |= ~a & b & c;
+    }
+    if (lf & 0x04) {
+        d |= ~a & b & ~c;
+    }
+    if (lf & 0x02) {
+        d |= ~a & ~b & c;
+    }
+    if (lf & 0x01) {
+        d |= ~a & ~b & ~c;
+    }
+    return d;
+}
+
+/*
+ * Area fill: the carry enters each word at the right (bit 0, since
+ * fill requires descending mode) and toggles at every set bit.
+ */
+static uint16_t blit_fill(uint16_t d, bool exclusive, bool *fc)
+{
+    uint16_t out = 0;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        int bit = (d >> i) & 1;
+
+        if (exclusive ? bit ^ *fc : bit | *fc) {
+            out |= 1 << i;
+        }
+        *fc ^= bit;
+    }
+    return out;
+}
+
+static void amiga_custom_do_blit(AmigaCustomState *s, int width, int height)
+{
+    uint16_t con0 = amiga_custom_reg(s, REG_BLTCON0);
+    uint16_t con1 = amiga_custom_reg(s, REG_BLTCON1);
+    uint16_t afwm = amiga_custom_reg(s, REG_BLTAFWM);
+    uint16_t alwm = amiga_custom_reg(s, REG_BLTALWM);
+    uint16_t adat = amiga_custom_reg(s, REG_BLTADAT);
+    uint16_t bdat = amiga_custom_reg(s, REG_BLTBDAT);
+    uint16_t cdat = amiga_custom_reg(s, REG_BLTCDAT);
+    int16_t amod = amiga_custom_reg(s, REG_BLTAMOD);
+    int16_t bmod = amiga_custom_reg(s, REG_BLTBMOD);
+    int16_t cmod = amiga_custom_reg(s, REG_BLTCMOD);
+    int16_t dmod = amiga_custom_reg(s, REG_BLTDMOD);
+    uint32_t apt = amiga_custom_ptr(s, REG_BLTAPT);
+    uint32_t bpt = amiga_custom_ptr(s, REG_BLTBPT);
+    uint32_t cpt = amiga_custom_ptr(s, REG_BLTCPT);
+    uint32_t dpt = amiga_custom_ptr(s, REG_BLTDPT);
+    int ash = con0 >> 12, bsh = con1 >> 12;
+    uint8_t lf = con0;
+    bool desc = con1 & BLTCON1_DESC;
+    bool fill = desc && (con1 & (BLTCON1_EFE | BLTCON1_IFE));
+    int step = desc ? -2 : 2;
+    uint16_t aprev = 0, bprev = 0;
+    bool zero = true;
+    int x, y;
+
+    if (con1 & BLTCON1_LINE) {
+        qemu_log_mask(LOG_UNIMP, "amiga-custom: blitter line mode\n");
+        amiga_custom_post_int(s, INT_BLIT);
+        return;
+    }
+
+    for (y = 0; y < height; y++) {
+        bool fc = con1 & BLTCON1_FCI;
+
+        for (x = 0; x < width; x++) {
+            uint16_t araw, ahold, bhold, c, d;
+            uint16_t mask = 0xffff;
+
+            if (x == 0) {
+                mask &= afwm;
+            }
+            if (x == width - 1) {
+                mask &= alwm;
+            }
+            if (con0 & BLTCON0_USEA) {
+                adat = chip_read16(apt);
+                apt += step;
+            }
+            araw = adat & mask;
+            if (desc) {
+                ahold = (((uint32_t)araw << 16) | aprev) >> (16 - ash);
+            } else {
+                ahold = (((uint32_t)aprev << 16) | araw) >> ash;
+            }
+            aprev = araw;
+
+            if (con0 & BLTCON0_USEB) {
+                bdat = chip_read16(bpt);
+                bpt += step;
+            }
+            if (desc) {
+                bhold = (((uint32_t)bdat << 16) | bprev) >> (16 - bsh);
+            } else {
+                bhold = (((uint32_t)bprev << 16) | bdat) >> bsh;
+            }
+            bprev = bdat;
+
+            if (con0 & BLTCON0_USEC) {
+                cdat = chip_read16(cpt);
+                cpt += step;
+            }
+            c = cdat;
+
+            d = blit_minterm(lf, ahold, bhold, c);
+            if (fill) {
+                d = blit_fill(d, con1 & BLTCON1_EFE, &fc);
+            }
+            if (d) {
+                zero = false;
+            }
+            if (con0 & BLTCON0_USED) {
+                chip_write16(dpt, d);
+                dpt += step;
+            }
+        }
+        if (con0 & BLTCON0_USEA) {
+            apt += desc ? -amod : amod;
+        }
+        if (con0 & BLTCON0_USEB) {
+            bpt += desc ? -bmod : bmod;
+        }
+        if (con0 & BLTCON0_USEC) {
+            cpt += desc ? -cmod : cmod;
+        }
+        if (con0 & BLTCON0_USED) {
+            dpt += desc ? -dmod : dmod;
+        }
+    }
+
+    amiga_custom_set_ptr(s, REG_BLTAPT, apt);
+    amiga_custom_set_ptr(s, REG_BLTBPT, bpt);
+    amiga_custom_set_ptr(s, REG_BLTCPT, cpt);
+    amiga_custom_set_ptr(s, REG_BLTDPT, dpt);
+    s->blit_zero = zero;
+    amiga_custom_post_int(s, INT_BLIT);
 }
 
 /* --- beam counters --- */
@@ -149,8 +377,8 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
     case REG_BLTDDAT:
         return 0;
     case REG_DMACONR:
-        /* blitter never busy, always produced a zero result */
-        return s->dmacon;
+        /* blits complete instantly, so the blitter is never busy */
+        return s->dmacon | (s->blit_zero ? 0x2000 : 0);
     case REG_VPOSR:
         amiga_custom_beam_pos(s, &vpos, &hpos);
         return 0x8000 | (s->agnus_id << 8) | ((vpos >> 8) & 7);
@@ -224,6 +452,20 @@ static void amiga_custom_write(void *opaque, hwaddr addr, uint64_t val,
     case REG_ADKCON:
         s->adkcon = setclr(s->adkcon, val, 0x7fff);
         break;
+    case REG_BLTSIZE: {
+        int h = (val >> 6) & 0x3ff;
+        int w = val & 0x3f;
+
+        amiga_custom_do_blit(s, w ? w : 64, h ? h : 1024);
+        break;
+    }
+    case REG_BLTSIZH: {
+        int h = amiga_custom_reg(s, REG_BLTSIZV) & 0x7fff;
+        int w = val & 0x7ff;
+
+        amiga_custom_do_blit(s, w ? w : 2048, h ? h : 32768);
+        break;
+    }
     default:
         s->regs[(addr & 0x1fe) >> 1] = val;
         break;
@@ -291,6 +533,7 @@ static void amiga_custom_reset(DeviceState *dev)
     s->serial_rx = 0;
     s->ports_levels = 0;
     s->exter_levels = 0;
+    s->blit_zero = false;
     memset(s->regs, 0, sizeof(s->regs));
     s->frame_origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
@@ -338,6 +581,7 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT8(ports_levels, AmigaCustomState),
         VMSTATE_UINT8(exter_levels, AmigaCustomState),
         VMSTATE_UINT16_ARRAY(regs, AmigaCustomState, 0x100),
+        VMSTATE_BOOL(blit_zero, AmigaCustomState),
         VMSTATE_INT64(frame_origin_ns, AmigaCustomState),
         VMSTATE_TIMER(vblank_timer, AmigaCustomState),
         VMSTATE_END_OF_LIST()
