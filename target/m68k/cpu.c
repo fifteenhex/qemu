@@ -254,6 +254,7 @@ static void m68010_cpu_initfn(Object *obj)
     m68k_set_feature(env, M68K_FEATURE_BKPT);
     m68k_set_feature(env, M68K_FEATURE_MOVEC);
     m68k_set_feature(env, M68K_FEATURE_MOVEFROMSR_PRIV);
+    m68k_set_feature(env, M68K_FEATURE_MOVEFROMCCR);
     m68k_set_feature(env, M68K_FEATURE_EXCEPTION_FORMAT_VEC);
 }
 
@@ -272,6 +273,7 @@ static void m68020_cpu_initfn(Object *obj)
     m68k_unset_feature(env, M68K_FEATURE_M68010);
     m68k_unset_feature(env, M68K_FEATURE_ADDR24);
     m68k_set_feature(env, M68K_FEATURE_M68020);
+    m68k_set_feature(env, M68K_FEATURE_EXTB);
     m68k_set_feature(env, M68K_FEATURE_QUAD_MULDIV);
     m68k_set_feature(env, M68K_FEATURE_BRAL);
     m68k_set_feature(env, M68K_FEATURE_BCCL);
