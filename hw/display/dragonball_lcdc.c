@@ -21,7 +21,24 @@
 #define DRAGBONBALL_LCDC_HEIGHT(_s) (_s->lymax + 1)
 
 /*
- * 1-bit colour
+ * The panel: interpolate between the pale green-grey of an idle LCD
+ * and dark ink, by 4-bit grey intensity (0 = clear paper, 15 = ink).
+ */
+static uint32_t dragonball_lcdc_shade(unsigned int intensity)
+{
+    static const uint8_t bg[3] = { 0xb8, 0xc0, 0xa8 };
+    static const uint8_t ink[3] = { 0x20, 0x28, 0x20 };
+    uint8_t rgb[3];
+    int i;
+
+    for (i = 0; i < 3; i++)
+        rgb[i] = bg[i] + ((ink[i] - bg[i]) * (int)intensity) / 15;
+
+    return rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
+}
+
+/*
+ * 1-bit
  */
 static void draw_line1_32(void *opaque, uint8_t *d, const uint8_t *s,
                           int width, int deststep)
@@ -29,39 +46,56 @@ static void draw_line1_32(void *opaque, uint8_t *d, const uint8_t *s,
     int i, j;
     assert(deststep == sizeof(uint32_t));
 
-
     for (i = 0; i < width; i += 8) {
         uint8_t pixels = *s++;
         for (j = 0; j < 8; j++) {
-            //printf("%s:%d %d\n", __func__, __LINE__, i + j);
-            bool pixel = (pixels & (1 << (7 - j))) ? true : false;
             uint32_t *rgbpixel = ((uint32_t *) d) + (i + j);
 
-            /* Set bits are ink on a pale green-grey LCD */
-            if (pixel)
-                *rgbpixel = rgb_to_pixel32(0x20, 0x28, 0x20);
-            else
-                *rgbpixel = rgb_to_pixel32(0xb8, 0xc0, 0xa8);
+            *rgbpixel = dragonball_lcdc_shade(((pixels >> (7 - j)) & 1) * 15);
         }
     }
 }
 
 /*
- * 2-bit colour
+ * 2-bit grey.  The four pixel codes are mapped to intensities by the
+ * gray palette register (LGPMR): code 0 -> 0, code 3 -> 15, codes 1/2
+ * -> the register's low/high nibble (per POSE's GetLCD2bitMapping).
  */
 static void draw_line2_32(void *opaque, uint8_t *d, const uint8_t *s,
                           int width, int deststep)
 {
-   //printf("%s:%d\n", __func__, __LINE__);
+    DragonBallLCDCState *lcdc = opaque;
+    uint8_t map[4] = { 0, lcdc->lgpmr & 0x0f, lcdc->lgpmr >> 4, 0x0f };
+    int i, j;
+    assert(deststep == sizeof(uint32_t));
+
+    for (i = 0; i < width; i += 4) {
+        uint8_t pixels = *s++;
+        for (j = 0; j < 4; j++) {
+            uint32_t *rgbpixel = ((uint32_t *) d) + (i + j);
+
+            *rgbpixel = dragonball_lcdc_shade(map[(pixels >> (6 - j * 2)) & 3]);
+        }
+    }
 }
 
 /*
- * 4-bit
+ * 4-bit grey: the pixel value is the intensity directly (the 8-bit
+ * palette register only holds the two 2bpp codes).
  */
 static void draw_line4_32(void *opaque, uint8_t *d, const uint8_t *s,
                           int width, int deststep)
 {
-   //printf("%s:%d\n", __func__, __LINE__);
+    int i;
+    assert(deststep == sizeof(uint32_t));
+
+    for (i = 0; i < width; i += 2) {
+        uint8_t pixels = *s++;
+        uint32_t *rgbpixel = ((uint32_t *) d) + i;
+
+        rgbpixel[0] = dragonball_lcdc_shade(pixels >> 4);
+        rgbpixel[1] = dragonball_lcdc_shade(pixels & 0xf);
+    }
 }
 
 
@@ -148,6 +182,15 @@ static void dragonball_lcdc_write(void *opaque, hwaddr addr, uint64_t value,
         case DRAGONBALL_LCDC_LYMAX:
             s->lymax = value;
             break;
+        case DRAGONBALL_LCDC_LPICF:
+            s->lpicf = value;
+            break;
+        case DRAGONBALL_LCDC_LPOLCF:
+            s->lpolcf = value;
+            break;
+        case DRAGONBALL_LCDC_LGPMR:
+            s->lgpmr = value;
+            break;
     }
 }
 
@@ -220,7 +263,7 @@ static bool dragonball_update_display(void *opaque)
                                surfacebpp / 8,
                                1,
                                fn,
-                               NULL,
+                               s,
                                &first,
                                &last);
 
