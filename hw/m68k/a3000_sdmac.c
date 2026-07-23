@@ -29,6 +29,7 @@
 #include "hw/core/irq.h"
 #include "hw/m68k/a3000_sdmac.h"
 #include "migration/vmstate.h"
+#include "system/dma.h"
 
 #define REG_DAWR        0x02
 #define REG_WTC         0x04
@@ -84,6 +85,64 @@ static uint8_t a3000_sdmac_istr(A3000SDMACState *s)
         }
     }
     return istr;
+}
+
+/*
+ * Move data between memory (at ACR) and the SBIC while the SBIC keeps
+ * DRQ up.  With CNTR_TCEN the word transfer count limits the transfer
+ * and raises end-of-process at terminal count; without it the SBIC's
+ * own transfer count terminates the exchange.
+ */
+static void a3000_sdmac_run(A3000SDMACState *s)
+{
+    uint8_t buf[512];
+
+    while (s->dma_active && s->drq) {
+        int dir = wd33c93_dma_dir(s->sbic);
+        size_t chunk = sizeof(buf);
+        size_t n;
+
+        if (!dir) {
+            break;
+        }
+        if ((dir > 0) != !!(s->cntr & CNTR_DDIR)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "a3000-sdmac: dma direction mismatch (CNTR 0x%x)\n",
+                          s->cntr);
+        }
+        if (s->cntr & CNTR_TCEN) {
+            if (!s->wtc) {
+                break;
+            }
+            chunk = MIN(chunk, (size_t)s->wtc * 2);
+        }
+        if (dir > 0) {
+            n = wd33c93_dma_pull(s->sbic, buf, chunk);
+            if (!n) {
+                break;
+            }
+            dma_memory_write(&address_space_memory, s->acr, buf, n,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else {
+            dma_memory_read(&address_space_memory, s->acr, buf, chunk,
+                            MEMTXATTRS_UNSPECIFIED);
+            n = wd33c93_dma_push(s->sbic, buf, chunk);
+            if (!n) {
+                break;
+            }
+        }
+        s->acr += n;
+        if (s->cntr & CNTR_TCEN) {
+            uint32_t words = (n + 1) / 2;
+
+            s->wtc = s->wtc > words ? s->wtc - words : 0;
+            if (!s->wtc) {
+                s->dma_active = false;
+                s->e_int = true;
+                a3000_sdmac_update_irq(s);
+            }
+        }
+    }
 }
 
 static uint64_t a3000_sdmac_read(void *opaque, hwaddr addr, unsigned size)
@@ -163,10 +222,12 @@ static void a3000_sdmac_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REG_ST_DMA:
     case REG_ST_DMA + 1:
-        qemu_log_mask(LOG_UNIMP, "a3000-sdmac: ST_DMA (dma not modelled)\n");
+        s->dma_active = true;
+        a3000_sdmac_run(s);
         break;
     case REG_FLUSH:
     case REG_FLUSH + 1:
+        s->dma_active = false;
         break;
     case REG_CINT:
     case REG_CINT + 1:
@@ -212,6 +273,9 @@ static void a3000_sdmac_sbic_drq(void *opaque, int n, int level)
     A3000SDMACState *s = opaque;
 
     s->drq = level;
+    if (level) {
+        a3000_sdmac_run(s);
+    }
 }
 
 static void a3000_sdmac_reset(DeviceState *dev)
