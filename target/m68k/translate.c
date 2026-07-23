@@ -2246,6 +2246,17 @@ DISAS_INSN(arith_im)
     int opsize;
     bool with_SR = ((insn & 0x3f) == 0x3c);
 
+    /*
+     * Size 0b11 in this block is the CAS/CAS2/CMP2/CHK2 space; what
+     * the opcode table hasn't claimed is not an arith-immediate insn,
+     * so raise the illegal-instruction exception rather than assert.
+     * Kickstart 1.3's crashed-boot path can run into such bytes.
+     */
+    if ((insn & 0x00c0) == 0x00c0) {
+        disas_undef(env, s, insn);
+        return;
+    }
+
     op = (insn >> 9) & 7;
     opsize = insn_opsize(insn);
     switch (opsize) {
