@@ -62,6 +62,20 @@ config MC68EZ328
     select DRAGONBALL_RTC
     select DS1305
 
+config PALM
+    bool
+    default y
+    depends on M68K
+    select M68K_IRQC
+    select DRAGONBALL_PLL
+    select DRAGONBALL_GPIO
+    select DRAGONBALL_INTC
+    select DRAGONBALL_UART
+    select DRAGONBALL_TIMER
+    select DRAGONBALL_SPI
+    select DRAGONBALL_LCDC
+    select DRAGONBALL_RTC
+
 config MVME147
     bool
     default y
