@@ -163,12 +163,21 @@ static void mvme147_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bbram_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bbram_dev), 0, MVME147_BBRAM);
 
+    /* SCSI */
+    scsi_dev = qdev_new(TYPE_WD33C93);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(scsi_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(scsi_dev), 0, MVME147_SCSI);
+
     /* PCC */
     pcc_dev = qdev_new(TYPE_MVME147_PCC);
+    object_property_set_link(OBJECT(pcc_dev), "sbic", OBJECT(scsi_dev),
+                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(pcc_dev), 0, MVME147_PCC);
     sysbus_connect_irq(SYS_BUS_DEVICE(pcc_dev), 0,
                        qemu_allocate_irq(mvme147_pcc_irq, cpu, 0));
+    qdev_connect_gpio_out_named(scsi_dev, "drq", 0,
+                                qdev_get_gpio_in_named(pcc_dev, "dma-drq", 0));
 
     /* LANCE */
     lance_dev = qdev_new(TYPE_LANCE);
@@ -200,10 +209,6 @@ static void mvme147_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, MVME147_SCC2);
 
-    /* SCSI */
-    scsi_dev = qdev_new(TYPE_WD33C93);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(scsi_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(scsi_dev), 0, MVME147_SCSI);
 }
 
 #define MVME147_DEFAULT_SDRAM_SIZE (16 * MiB)

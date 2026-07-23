@@ -11,6 +11,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "hw/misc/mvme147_pcc.h"
+#include "system/dma.h"
 #include "migration/vmstate.h"
 
 /*
@@ -40,6 +41,69 @@ static void mvme147_pcc_update_irq(MVME147PCCState *s)
         }
     }
     qemu_set_irq(s->irq, (level << 8) | vector);
+}
+
+/*
+ * Move bytes between the SBIC and memory while it requests service,
+ * the transfer is enabled and the byte counter (low 24 bits of the
+ * count register) has not expired.  Completion sets the done flag the
+ * firmware polls for in the control/status register.
+ */
+static void mvme147_pcc_dma_run(MVME147PCCState *s)
+{
+    uint32_t count = s->link & 0xffffff;
+    uint8_t buf[512];
+
+    if (!(s->dma_ctrl & MVME147_PCC_DMA_CTRL_STAT_ENABLE) ||
+        !s->dma_drq || !s->sbic) {
+        return;
+    }
+
+    while (count) {
+        size_t chunk = MIN(count, sizeof(buf));
+        size_t n;
+
+        switch (wd33c93_dma_dir(s->sbic)) {
+        case 1:
+            n = wd33c93_dma_pull(s->sbic, buf, chunk);
+            if (n) {
+                dma_memory_write(&address_space_memory, s->data_address,
+                                 buf, n, MEMTXATTRS_UNSPECIFIED);
+            }
+            break;
+        case -1:
+            n = MIN(chunk, sizeof(buf));
+            dma_memory_read(&address_space_memory, s->data_address,
+                            buf, n, MEMTXATTRS_UNSPECIFIED);
+            n = wd33c93_dma_push(s->sbic, buf, n);
+            break;
+        default:
+            n = 0;
+            break;
+        }
+
+        if (!n) {
+            /* nothing to move right now, wait for the next request */
+            return;
+        }
+
+        s->data_address += n;
+        count -= n;
+        s->link = (s->link & 0xff000000) | count;
+    }
+
+    s->dma_ctrl &= ~MVME147_PCC_DMA_CTRL_STAT_ENABLE;
+    s->dma_ctrl |= MVME147_PCC_DMA_CTRL_STAT_DONE;
+}
+
+static void mvme147_pcc_dma_drq(void *opaque, int n, int level)
+{
+    MVME147PCCState *s = opaque;
+
+    s->dma_drq = level;
+    if (level) {
+        mvme147_pcc_dma_run(s);
+    }
 }
 
 static uint16_t mvme147_pcc_timer_get_count(MVME147PCCState *s, unsigned int which)
@@ -91,7 +155,9 @@ static uint64_t mvme147_pcc_read(void *opaque, hwaddr addr, unsigned size)
     case MVME147_PCC_PRINTER_CTRL:
     	return 0;
     case MVME147_PCC_DMA_INT_CTRL:
-    	return 0;
+    	return s->dma_int_ctrl;
+    case MVME147_PCC_DMA_CTRL_STAT:
+    	return s->dma_ctrl;
     case MVME147_PCC_BUS_ERROR_INT_CTRL:
     	return 0;
     case MVME147_PCC_AC_FAIL_INT_CTRL:
@@ -197,15 +263,15 @@ static void mvme147_pcc_write(void *opaque, hwaddr addr, uint64_t value,
     case MVME147_PCC_PRINTER_CTRL:
     	break;
     case MVME147_PCC_DMA_INT_CTRL:
+    	s->dma_int_ctrl = value;
     	break;
     case MVME147_PCC_AC_FAIL_INT_CTRL:
     	break;
     case MVME147_PCC_DMA_CTRL_STAT:
+    	s->dma_ctrl = value;
     	if (value & MVME147_PCC_DMA_CTRL_STAT_ENABLE) {
-    		printf("PCC: DMA enabled\n");
+    		mvme147_pcc_dma_run(s);
     	}
-    	else
-    		printf("PCC: DMA disabled\n");
     	break;
     case MVME147_PCC_BUS_ERROR_INT_CTRL:
     	break;
@@ -269,6 +335,7 @@ static void mvme147_pcc_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(dev), &mvme147_pcc_ops, s, TYPE_MVME147_PCC, 0x30);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    qdev_init_gpio_in_named(dev, mvme147_pcc_dma_drq, "dma-drq", 1);
 }
 
 static const VMStateDescription vmstate_mvme147_pcc = {
@@ -280,9 +347,10 @@ static const VMStateDescription vmstate_mvme147_pcc = {
         }
 };
 
-//static Property mvme147_pcc_properties[] = {
-//    DEFINE_PROP_END_OF_LIST(),
-//};
+static const Property mvme147_pcc_properties[] = {
+    DEFINE_PROP_LINK("sbic", MVME147PCCState, sbic, TYPE_WD33C93,
+                     WD33C93State *),
+};
 
 static void mvme147_pcc_timer_overflow(MVME147PCCState *s, unsigned int which)
 {
@@ -327,7 +395,7 @@ static void mvme147_pcc_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->legacy_reset = mvme147_pcc_reset;
-//    device_class_set_props(dc, mvme147_pcc_properties);
+    device_class_set_props(dc, mvme147_pcc_properties);
     dc->realize = mvme147_pcc_realize;
     dc->vmsd = &vmstate_mvme147_pcc;
 }
