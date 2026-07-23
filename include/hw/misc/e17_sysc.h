@@ -13,6 +13,7 @@
 #define HW_MISC_E17_SYSC_H
 
 #include "hw/core/sysbus.h"
+#include "hw/input/ps2.h"
 #include "qom/object.h"
 
 #define TYPE_E17_SYSC "e17-sysc"
@@ -81,8 +82,8 @@ struct E17SysCState {
     uint8_t vic_regs[256];  /* VIC068A, one byte per 32bit word */
     bool cd2401_irq;        /* level of the CD2401 interrupt line */
 
-    uint8_t kbd_data;       /* AT keyboard controller data register */
-    uint8_t kbd_status;
+    PS2KbdState ps2kbd;     /* the AT keyboard (raw scan code set 2) */
+    bool kbd_obf;           /* a byte is waiting in the data register */
 
     uint32_t csctl[0x2c];   /* chip select controller, 0xb0 bytes */
     uint32_t dramc[2];      /* 0x080f0/0x080f4 */

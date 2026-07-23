@@ -20,6 +20,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/e17_sysc.h"
 #include "migration/vmstate.h"
+#include "hw/input/ps2.h"
 #include "trace.h"
 
 /* Z8536 register numbers used by RMON */
@@ -30,12 +31,17 @@
 #define Z8536_PADDR         0x23
 #define Z8536_PBDDR         0x2b
 
-/* AT keyboard controller status bits polled by RMON */
-#define E17_KBC_STAT_OBF    0x01
-#define E17_KBC_STAT_RDY    0x02
-
-#define E17_KBC_CMD_RESET   0xff
-#define E17_KBC_RSP_BAT_OK  0xaa
+/*
+ * AT keyboard interface status bits, from the RMON driver
+ * (fe81ac7c reset probe, fe81ad1c LED update, fe81af2a reader):
+ * bit 1 = a scancode/reply byte is waiting in the data register,
+ * bit 0 = keyboard interface ready/present (polled high).  The
+ * keyboard talks raw AT scan code set 2 (the RMON translation
+ * table at fe81b01c is laid out in set 2 order) and the usual
+ * commands: 0xFF reset (0xFA+0xAA), 0xED LEDs, 0xF3 typematic.
+ */
+#define E17_KBC_STAT_RDY    0x01
+#define E17_KBC_STAT_OBF    0x02
 
 /*
  * Chip select controller: reg 0 reads back the region base address,
@@ -173,10 +179,9 @@ static uint64_t e17_sysc_read_impl(void *opaque, hwaddr addr, unsigned size)
         return s->cputype;
     case E17_SYSC_KBC:
         if ((addr & 7) == 0) {
-            s->kbd_status &= ~(E17_KBC_STAT_OBF | E17_KBC_STAT_RDY);
-            return s->kbd_data;
+            return s->kbd_obf ? ps2_read_data(PS2_DEVICE(&s->ps2kbd)) : 0;
         } else if ((addr & 7) == 1) {
-            return s->kbd_status;
+            return E17_KBC_STAT_RDY | (s->kbd_obf ? E17_KBC_STAT_OBF : 0);
         }
         break;
     case E17_SYSC_CSCTL:
@@ -249,13 +254,7 @@ static void e17_sysc_write_impl(void *opaque, hwaddr addr, uint64_t val,
         return;
     case E17_SYSC_KBC:
         if ((addr & 7) == 0) {
-            if (val == E17_KBC_CMD_RESET) {
-                s->kbd_data = E17_KBC_RSP_BAT_OK;
-                s->kbd_status |= E17_KBC_STAT_OBF | E17_KBC_STAT_RDY;
-            } else {
-                qemu_log_mask(LOG_UNIMP, "e17-sysc: kbd command 0x%02"
-                              PRIx64 "\n", val);
-            }
+            ps2_write_keyboard(&s->ps2kbd, val);
             return;
         }
         break;
@@ -321,9 +320,6 @@ static void e17_sysc_reset(DeviceState *dev)
     s->cio[0].in[E17_CIO_PORTA] = 0x80;
     s->cio[0].in[E17_CIO_PORTC] = 0x00;
 
-    s->kbd_data = 0;
-    s->kbd_status = 0;
-
     memset(s->csctl, 0, sizeof(s->csctl));
     s->csctl[E17_CSCTL_STATUS] = E17_CSCTL_STATUS_READY;
 
@@ -341,6 +337,25 @@ static void e17_sysc_cd2401_irq(void *opaque, int n, int level)
     s->cd2401_irq = level;
 }
 
+/* the PS2 keyboard core raises its "irq" while a byte is waiting */
+static void e17_sysc_kbd_irq(void *opaque, int n, int level)
+{
+    E17SysCState *s = E17_SYSC(opaque);
+
+    s->kbd_obf = level;
+}
+
+static void e17_sysc_realize(DeviceState *dev, Error **errp)
+{
+    E17SysCState *s = E17_SYSC(dev);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ps2kbd), errp)) {
+        return;
+    }
+    qdev_connect_gpio_out(DEVICE(&s->ps2kbd), PS2_DEVICE_IRQ,
+                          qdev_get_gpio_in_named(dev, "ps2-kbd-irq", 0));
+}
+
 static void e17_sysc_init(Object *obj)
 {
     E17SysCState *s = E17_SYSC(obj);
@@ -350,6 +365,8 @@ static void e17_sysc_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->slave_run, "slave-run", 1);
     qdev_init_gpio_in_named(DEVICE(obj), e17_sysc_cd2401_irq, "cd2401-irq", 1);
+    object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_PS2_KBD_DEVICE);
+    qdev_init_gpio_in_named(DEVICE(obj), e17_sysc_kbd_irq, "ps2-kbd-irq", 1);
 }
 
 static const VMStateDescription vmstate_e17_cio = {
@@ -375,8 +392,7 @@ static const VMStateDescription vmstate_e17_sysc = {
                              E17CIOState),
         VMSTATE_UINT8_ARRAY(vic_regs, E17SysCState, 256),
         VMSTATE_BOOL(cd2401_irq, E17SysCState),
-        VMSTATE_UINT8(kbd_data, E17SysCState),
-        VMSTATE_UINT8(kbd_status, E17SysCState),
+        VMSTATE_BOOL(kbd_obf, E17SysCState),
         VMSTATE_UINT32_ARRAY(csctl, E17SysCState, 0x2c),
         VMSTATE_UINT32_ARRAY(dramc, E17SysCState, 2),
         VMSTATE_UINT8(slave_ctl, E17SysCState),
@@ -396,6 +412,7 @@ static void e17_sysc_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->desc = "ELTEC Eurocom E17 onboard I/O";
+    dc->realize = e17_sysc_realize;
     device_class_set_legacy_reset(dc, e17_sysc_reset);
     dc->vmsd = &vmstate_e17_sysc;
     device_class_set_props(dc, e17_sysc_properties);

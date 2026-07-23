@@ -271,6 +271,7 @@ config MVME147_VMECHIP
 
 config E17_SYSC
     bool
+    select PS2
 
 config MEGADRIVE_EVERDRIVE
     bool
