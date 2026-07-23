@@ -899,3 +899,28 @@ Artifacts (~/e17-re): modecap.py, allmodes.py, viddrive.py; raw
 per-mode traces were in /tmp/vidcap-*.txt (regenerate with the
 scripts — they are cheap).  Menu screenshots proved the field is
 SPACE-cycled ("Use <SPACE> to toggle and <RETURN> to accept").
+
+## Dual-CPU: how the sockets are told apart (2026-07-21)
+
+The two 68040/68060 sockets are NOT symmetric and no CPU reads a
+socket-ID register.  Discrimination is by hardware reset-hold:
+- The master socket runs at power-on; the secondary is held in
+  reset.  The whole reset path (fe8005d0..) has no per-CPU branch.
+- The master (fe800ba0) plants a DRAM reset vector — [0]=SSP=0,
+  [4]=PC=0xfe800bec — drops a 0xdead marker at 0x1004, then pulses
+  0xfec58000 bit 5 (write 0x20 then 0) to release the secondary.
+- The freed secondary fetches SP/PC from DRAM 0/4 (ROM is no longer
+  at 0 by now) and runs the master-planted trampoline at fe800bec:
+  it writes 0xfeed to 0x1004 and STOPs.  The master polls 0x1004
+  for 0xfeed to set the d7 "secondary present" bit (bit 18) ->
+  "Secondary CPU : Installed".
+So the master knows it is master because it is the only one
+executing; the secondary only ever runs code and from an address
+the master gave it.  No self-identification is needed or done.
+Register evidence (all four ROM mirrors): 0xfec58000 (slave
+run/reset) and 0xfec5c000 ("slave select") are WRITE-ONLY in RMON;
+0xfec5e000 returns the CPU type (same for both matched sockets).
+Caveat: a real SMP OS (LynxOS) might use a per-socket strap or the
+VME geographical address that RMON never touches — unconfirmed;
+candidates would be a byte the trampoline reads before STOP or the
+2-bit fields at 0xfec660fb.
