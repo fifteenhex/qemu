@@ -156,6 +156,8 @@ typedef struct CPUArchState {
     uint32_t rambar0;
     uint32_t cacr;
     uint32_t caar;
+    uint32_t pcr;               /* MC68060 processor configuration */
+    uint32_t buscr;             /* MC68060 bus control */
     uint32_t sfc;
     uint32_t dfc;
 
