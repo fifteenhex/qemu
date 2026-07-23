@@ -122,7 +122,101 @@ user's manual:
     correct family for the EZ's 68EC000 — fine.
   - Nothing Palm-specific anywhere in the tree.
 
+## PalmOS-facing hardware behaviour (learned by RE)
+
+Facts about how PalmOS 3.x drives the EZ, discovered while making the
+pen work — recorded because none of this is in the chip manual:
+
+  - Event loop: blocks in `SysEvGroupWait` with a ~500-tick timeout,
+    dozing via `stop #2000` (PrvShutDownCPU at ROM offset ~0x4af8).
+    Idle wakeups come from the timer tick.
+  - Interrupt vectors: PalmOS sets IVR=0x18, so INTC vectors coincide
+    with the 68k autovectors (0x19..0x1f for levels 1..7).
+  - IMR is accessed as *two 16-bit halves* (0xfffff304/306); the INTC
+    register file must honour access size/offset or masking breaks in
+    subtle ways.
+  - The pen ISR (level 5, IPR bit 20) masks PEN in IMR, and the tick
+    sampler *polls IPR bit 20 as a live pen-down level* (`movew
+    0xfffff310; and #0x10`).  PEN must therefore NOT be modelled as an
+    ack-clearable edge latch — the IPR bit follows the /PENIRQ pin.
+    The interrupt storm is prevented by PalmOS's own IMR masking.
+  - Pen sampling (per tick while tracking): reads X twice, Y twice
+    through the ADC for consistency; a debounce counter discards the
+    first sample(s); three consecutive invalid samples = pen up.
+  - ADC exchange (HwrPen, ROM ~0x21842 in the 3.3 image): asserts CS
+    via *port D bit 5*, sends the ADS784x command as a 7-bit SPI frame
+    (cmd>>1) plus a 1-bit frame (cmd&1), then clocks a 16-bit frame
+    and takes `(response >> 3) & 0xfff`.  Commands seen: 0x98/0xd8
+    (X/Y, 8-bit mode), 0x91/0x93, 0xac/0xec (battery on ch2/ch6).
+    The SPI master must run *bit-exact* — byte-chunked SSI transfers
+    mangle the framing (commands land at bits 14..7 of a frame).
+  - The SPIM completion (IRQ bit, 0x80 in SPIMCONT) is polled after
+    every XCH; a new XCH while the previous completion is pending
+    must not be dropped.
+  - Port F bit 1 is /PENIRQ as a GPIO (low = pen down); PalmOS reads
+    PFDATA during init.  Port G bit 2 is /POWERFAIL from the supply
+    supervisor — if it reads low, PalmOS decides the battery is dead
+    and goes to sleep a few seconds after boot (wake mask = buttons
+    only: KB + INT0-3 + IRQ1).  This was the mysterious "sleeps at
+    5.4s" symptom.
+  - Timer: PalmOS clocks the tick from SYSCLK/16 (TCTL CLKSOURCE=2),
+    not the 32kHz crystal — getting this wrong runs the OS 32x slow.
+  - Pen calibration (`PenCalibrate`, args (rawPt1, rawPt2, scr1
+    (10,10), scr2 (150,150))): transforms both raw points with the
+    current calibration globals ([0x16c]+2/+4 offsets, +6/+8 divisors;
+    screen = (raw8<<8)/div + off) and only requires monotonicity
+    (scaled2.x > scaled1.x && scaled2.y > scaled1.y), then writes new
+    values and saves them into the "psys" prefs database.
+  - Default calibration constants differ per OS version (3.1:
+    div 0xb9/0xfc, off 0x14/0x12) and the Setup app resets the
+    globals to identity (div 0x100, off 0) before calibrating.
+
 ## Journal
+
+### 2026-07-20 (evening) — pen works; Setup advances on OS 3.1
+
+Long debugging chain, each step unlocked by the previous (details in
+the RE section above):
+
+  1. `dc->legacy_reset = fn` is a silent no-op in current QEMU — the
+     hook must be installed with device_class_set_legacy_reset().
+     ALL the dragonball devices (and ds1305) had this bug, so no
+     device model was ever reset: INTC started with IMR=0 instead of
+     0xffffff, GPIO/LCDC/timer state was garbage.  (mvme147 has the
+     same bug — left alone, other session owns it.)
+  2. INTC presented each active level to the core separately, but the
+     m68k core latches only one pending level/vector pair — a timer
+     tick could cancel a still-pending pen interrupt.  Now only the
+     highest active level is presented.
+  3. INTC register file was width-blind (see RE notes: IMR halves) and
+     ISR writes were ignored.  Rewrote read/write with proper
+     size/offset handling; ISR-write acks only the external-IRQ edge
+     latches, NOT PEN.
+  4. Timer ignored TCTL.CLKSOURCE (always 32kHz) — PalmOS uses
+     SYSCLK/16, so everything ran 32x slow and taps fell between
+     ticks.
+  5. SPI dropped an XCH written while the previous transfer's
+     completion ptimer was still pending — PalmOS's back-to-back
+     consistency reads got stale data.  Now a pending completion is
+     flushed when a new exchange starts.
+  6. New ADS7843 touchscreen model (hw/input/ads7843.c): bit-stream
+     SPI slave (needs the SPI master's new "bitwise" mode), pen-down
+     gpio for PENIRQ + port F, X/Y float to a rail when the pen is
+     up, battery channels report a healthy cell.
+  7. Machine: pen line fans out (split-irq) to INTC PEN and inverted
+     into port F bit 1; port G bit 2 (/POWERFAIL) tied high.
+
+State: OS 3.1 boots, taps work, Setup advances to the digitizer
+calibration screen.  Calibration itself loops: PenCalibrate's
+monotonicity checks should pass with our values (verified statically
++ the pen ring contains sane, increasing points), yet the reject exit
+is the one that runs — the Y comparison fails.  The pen history ring
+shows (x, -1) mixed pairs after pen-up which likely feed the captured
+points.  Next steps: pin down what point the Setup app actually
+passes to PenCalibrate (dump its stack frame at the trap), and/or
+cross-check the ADC value ranges against POSE's EmSPISlaveADS784x
+(needs the POSE source, i.e. a download).  OS 3.3's Setup page 1
+also doesn't advance on tap — likely related.
 
 ### 2026-07-20 (later) — PalmOS 3.3 boots to the Setup wizard
 
