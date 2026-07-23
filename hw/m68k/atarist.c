@@ -1,5 +1,5 @@
 /*
- * QEMU Atari 1040STF hardware system emulator
+ * QEMU Atari 1040STF/1040STE hardware system emulator
  *
  * 68000 at 8 MHz, up to 4MB of RAM in two banks behind the GLUE/MMU
  * pair, TOS in 192KB of ROM at 0xFC0000, and the ST chip set: the
@@ -9,18 +9,30 @@
  * drives the floppy select lines), and the WD1772 FDC behind the ST's
  * DMA controller.
  *
+ * The `atariste` machine variant models the 1040STE on top of the same
+ * chip set: TOS 2.06 in 256KB of ROM at 0xE00000 (0xFC0000 is left
+ * open and bus-errors), the Shifter gains the 4096-colour palette,
+ * video base low byte, horizontal fine scroll and line-width
+ * registers, and the board adds the BLiTTER at 0xFF8A00, DMA sound at
+ * 0xFF8900 (register/counter model, no audio backend) and the
+ * enhanced joystick ports at 0xFF9200.
+ *
  * Memory map (68000, 24-bit bus):
  *   0x000000  RAM (the first 8 bytes read from ROM: the GLUE feeds the
  *             reset vector fetch from ROM, writes still land in RAM)
  *   0x400000  unassigned - bus errors, TOS sizes hardware by probing
+ *   0xE00000  ROM 256KB (STE only)
  *   0xFA0000  cartridge port, reads float to 0xFF with nothing plugged
- *   0xFC0000  ROM 192KB
+ *   0xFC0000  ROM 192KB (STF only, open on the STE)
  *   0xFF8000  MMU memory config
  *   0xFF8200  Shifter video base/counter, sync mode
  *   0xFF8240  Shifter palette, 0xFF8260 resolution
  *   0xFF8604  FDC/HDC access port + DMA control (0xFF8606 mode/status,
  *             0xFF8609/0B/0D DMA base address)
  *   0xFF8800  YM2149 PSG
+ *   0xFF8900  DMA sound (STE only)
+ *   0xFF8A00  BLiTTER (STE only)
+ *   0xFF9200  enhanced joystick ports (STE only)
  *   0xFFFA01  MFP 68901 (odd bytes)
  *   0xFFFC00  keyboard ACIA, 0xFFFC04 MIDI ACIA
  *
@@ -73,10 +85,18 @@
 #define ATARIST_ROM_SIZE      0x30000     /* 192KB TOS 1.0x */
 #define ATARIST_ROM_FILENAME  "tos104uk.rom"
 
+/* the STE maps its 256KB TOS 2.0x ROM at 0xE00000; 0xFC0000 is open */
+#define ATARISTE_ROM_BASE     0xE00000
+#define ATARISTE_ROM_SIZE     0x40000
+#define ATARISTE_ROM_FILENAME "tos206.rom"
+
 #define ATARIST_MEMCFG_BASE   0xFF8000
 #define ATARIST_VIDEO_BASE    0xFF8200
 #define ATARIST_DMA_BASE      0xFF8604
 #define ATARIST_PSG_BASE      0xFF8800
+#define ATARIST_DMASND_BASE   0xFF8900    /* STE */
+#define ATARIST_BLITTER_BASE  0xFF8A00    /* STE */
+#define ATARIST_JOY_BASE      0xFF9200    /* STE */
 #define ATARIST_MFP_BASE      0xFFFA00
 #define ATARIST_ACIA_BASE     0xFFFC00
 
@@ -95,7 +115,8 @@
 #define FRAME_LINES_60HZ      263
 #define FRAME_VISIBLE_LINES   200
 #define FRAME_BYTES           32000
-#define FRAME_LINE_BYTES      160
+#define FRAME_LINE_BYTES      160         /* colour modes */
+#define FRAME_LINE_BYTES_HIGH 80          /* 640x400 mono, 1 bpp */
 
 /*
  * ---------------------------------------------------------------------
@@ -703,9 +724,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(AtaristVideoState, ATARIST_VIDEO)
 #define VID_REG_COUNT_MID     0x07
 #define VID_REG_COUNT_LO      0x09
 #define VID_REG_SYNC          0x0a
+#define VID_REG_BASE_LO       0x0d        /* STE: video base bits 7-1 */
+#define VID_REG_LINEWID       0x0f        /* STE: words added per line */
 #define VID_REG_PALETTE       0x40
 #define VID_REG_PALETTE_END   0x5f
 #define VID_REG_RES           0x60
+#define VID_REG_HSCROLL_NOPF  0x64        /* STE: fine scroll, no prefetch */
+#define VID_REG_HSCROLL       0x65        /* STE: fine scroll, 0-15 pixels */
 
 #define VID_SYNC_50HZ         0x02
 
@@ -720,9 +745,13 @@ struct AtaristVideoState {
     MemoryRegion *ram;
     uint32_t ram_size;
     qemu_irq vbl;
+    bool ste;                   /* STE Shifter extensions present */
 
     uint8_t base_hi;
     uint8_t base_mid;
+    uint8_t base_lo;            /* STE */
+    uint8_t linewid;            /* STE */
+    uint8_t hscroll;            /* STE */
     uint8_t sync;
     uint8_t res;
     uint8_t pal[32];
@@ -735,6 +764,7 @@ struct AtaristVideoState {
     MemoryRegionSection fbsection;
     int invalidate;
     uint32_t fb_base;
+    uint32_t fb_pitch;
     int fb_mode;
 };
 
@@ -750,7 +780,9 @@ static int video_frame_lines(AtaristVideoState *s)
 
 static uint32_t video_base(AtaristVideoState *s)
 {
-    return ((uint32_t)s->base_hi << 16) | ((uint32_t)s->base_mid << 8);
+    /* the STE can start the frame on any word, not just a 256B page */
+    return ((uint32_t)s->base_hi << 16) | ((uint32_t)s->base_mid << 8) |
+           (s->ste ? s->base_lo : 0);
 }
 
 /*
@@ -827,11 +859,28 @@ static uint64_t atarist_video_read(void *opaque, hwaddr addr, unsigned size)
         return video_counter(s);
     case VID_REG_SYNC:
         return s->sync;
+    case VID_REG_BASE_LO:
+        if (s->ste) {
+            return s->base_lo;
+        }
+        goto unimp;
+    case VID_REG_LINEWID:
+        if (s->ste) {
+            return s->linewid;
+        }
+        goto unimp;
     case VID_REG_PALETTE ... VID_REG_PALETTE_END:
         return s->pal[addr - VID_REG_PALETTE];
     case VID_REG_RES:
         return s->res;
+    case VID_REG_HSCROLL_NOPF:
+    case VID_REG_HSCROLL:
+        if (s->ste) {
+            return s->hscroll;
+        }
+        goto unimp;
     default:
+    unimp:
         qemu_log_mask(LOG_UNIMP, "atarist video: read +0x%02x\n",
                       (unsigned)addr);
         return 0;
@@ -845,24 +894,66 @@ static void atarist_video_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case VID_REG_BASE_HI:
-        s->base_hi = val & 0x3f;
-        s->invalidate = 1;
-        break;
     case VID_REG_BASE_MID:
-        s->base_mid = val;
+        if (addr == VID_REG_BASE_HI) {
+            s->base_hi = val & 0x3f;
+        } else {
+            s->base_mid = val;
+        }
+        /*
+         * STE: the MCU clears the low byte whenever the pre-STE base
+         * registers are written, so ST software that only knows
+         * hi/mid gets the page-aligned address it asked for.
+         */
+        s->base_lo = 0;
         s->invalidate = 1;
         break;
     case VID_REG_SYNC:
         s->sync = val;
         break;
+    case VID_REG_BASE_LO:
+        if (s->ste) {
+            s->base_lo = val & 0xfe;    /* word addresses only */
+            s->invalidate = 1;
+            break;
+        }
+        goto unimp;
+    case VID_REG_LINEWID:
+        if (s->ste) {
+            s->linewid = val;
+            s->invalidate = 1;
+            break;
+        }
+        goto unimp;
     case VID_REG_PALETTE ... VID_REG_PALETTE_END:
-        s->pal[addr - VID_REG_PALETTE] = val & ((addr & 1) ? 0x77 : 0x07);
+        /*
+         * STF: 3 bits per channel (0RRR 0GGG 0BBB).  STE: 4 bits per
+         * channel; the added bit sits at bit 3 of each nibble and is
+         * the *least* significant intensity bit, which keeps the ST
+         * values compatible.
+         */
+        s->pal[addr - VID_REG_PALETTE] =
+            val & (s->ste ? ((addr & 1) ? 0xff : 0x0f)
+                          : ((addr & 1) ? 0x77 : 0x07));
         break;
     case VID_REG_RES:
         s->res = val & 3;
         s->invalidate = 1;
         break;
+    case VID_REG_HSCROLL_NOPF:
+    case VID_REG_HSCROLL:
+        /*
+         * 0xFF8264 is the prefetch-less variant of the same 4-bit
+         * latch; the missing-prefetch subtlety is not modelled.
+         */
+        if (s->ste) {
+            s->hscroll = val & 0x0f;
+            s->invalidate = 1;
+            break;
+        }
+        goto unimp;
     default:
+    unimp:
         qemu_log_mask(LOG_UNIMP,
                       "atarist video: write +0x%02x <- 0x%02x\n",
                       (unsigned)addr, (unsigned)val);
@@ -884,9 +975,19 @@ static const MemoryRegionOps atarist_video_ops = {
     },
 };
 
-/* 3-bit STF colour channel to 8 bits */
-static inline uint32_t st_col(unsigned c)
+/* one palette nibble to 8 bits */
+static inline uint32_t st_col(AtaristVideoState *s, unsigned c)
 {
+    if (s->ste) {
+        /*
+         * STE: 4 bits per channel, but bit 3 of the nibble is the
+         * *least* significant intensity bit (ST compatibility keeps
+         * bits 2-0 as the top bits).
+         */
+        unsigned v = ((c & 7) << 1) | ((c >> 3) & 1);
+
+        return v * 0x11;
+    }
     c &= 7;
     return (c << 5) | (c << 2) | (c >> 1);
 }
@@ -898,22 +999,31 @@ static void video_palette_rgb(AtaristVideoState *s, uint32_t *rgb, int n)
     for (i = 0; i < n; i++) {
         uint16_t e = (s->pal[i * 2] << 8) | s->pal[i * 2 + 1];
 
-        rgb[i] = 0xff000000 | (st_col(e >> 8) << 16) |
-                 (st_col(e >> 4) << 8) | st_col(e);
+        rgb[i] = 0xff000000 | (st_col(s, e >> 8) << 16) |
+                 (st_col(s, e >> 4) << 8) | st_col(s, e);
     }
 }
 
+/*
+ * With the STE's horizontal fine scroll active, each line fetches one
+ * extra word per plane and the visible window starts `hscroll` pixels
+ * into the decoded data.  The decoders render into a spill buffer of
+ * width + 16 pixels and the visible slice is copied out.
+ */
 static void atarist_fb_draw_line_low(void *opaque, uint8_t *d,
                                      const uint8_t *src, int width,
                                      int pitch)
 {
     AtaristVideoState *s = opaque;
-    uint32_t *buf = (uint32_t *)d;
+    unsigned hs = s->ste ? s->hscroll : 0;
+    uint32_t line[320 + 16];
+    uint32_t *buf = hs ? line : (uint32_t *)d;
     uint32_t rgb[16];
+    int groups = FRAME_LINE_BYTES / 8 + (hs ? 1 : 0);
     int g, b;
 
     video_palette_rgb(s, rgb, 16);
-    for (g = 0; g < FRAME_LINE_BYTES / 8; g++) {
+    for (g = 0; g < groups; g++) {
         uint16_t p0 = lduw_be_p(src + g * 8);
         uint16_t p1 = lduw_be_p(src + g * 8 + 2);
         uint16_t p2 = lduw_be_p(src + g * 8 + 4);
@@ -926,6 +1036,9 @@ static void atarist_fb_draw_line_low(void *opaque, uint8_t *d,
             *buf++ = rgb[idx];
         }
     }
+    if (hs) {
+        memcpy(d, line + hs, 320 * sizeof(uint32_t));
+    }
 }
 
 static void atarist_fb_draw_line_med(void *opaque, uint8_t *d,
@@ -933,12 +1046,15 @@ static void atarist_fb_draw_line_med(void *opaque, uint8_t *d,
                                      int pitch)
 {
     AtaristVideoState *s = opaque;
-    uint32_t *buf = (uint32_t *)d;
+    unsigned hs = s->ste ? s->hscroll : 0;
+    uint32_t line[640 + 16];
+    uint32_t *buf = hs ? line : (uint32_t *)d;
     uint32_t rgb[4];
+    int groups = FRAME_LINE_BYTES / 4 + (hs ? 1 : 0);
     int g, b;
 
     video_palette_rgb(s, rgb, 4);
-    for (g = 0; g < FRAME_LINE_BYTES / 4; g++) {
+    for (g = 0; g < groups; g++) {
         uint16_t p0 = lduw_be_p(src + g * 4);
         uint16_t p1 = lduw_be_p(src + g * 4 + 2);
 
@@ -948,6 +1064,9 @@ static void atarist_fb_draw_line_med(void *opaque, uint8_t *d,
             *buf++ = rgb[idx];
         }
     }
+    if (hs) {
+        memcpy(d, line + hs, 640 * sizeof(uint32_t));
+    }
 }
 
 static void atarist_fb_draw_line_high(void *opaque, uint8_t *d,
@@ -955,36 +1074,64 @@ static void atarist_fb_draw_line_high(void *opaque, uint8_t *d,
                                       int pitch)
 {
     AtaristVideoState *s = opaque;
-    uint32_t *buf = (uint32_t *)d;
+    unsigned hs = s->ste ? s->hscroll : 0;
+    uint32_t line[640 + 16];
+    uint32_t *buf = hs ? line : (uint32_t *)d;
     /* palette register 0 bit 0 set: set bits paint black on white */
     uint32_t fg = (s->pal[1] & 1) ? 0xff000000 : 0xffffffff;
     uint32_t bg = (s->pal[1] & 1) ? 0xffffffff : 0xff000000;
+    int groups = FRAME_LINE_BYTES_HIGH / 2 + (hs ? 1 : 0);
     int g, b;
 
-    for (g = 0; g < FRAME_LINE_BYTES / 2; g++) {
+    for (g = 0; g < groups; g++) {
         uint16_t p0 = lduw_be_p(src + g * 2);
 
         for (b = 15; b >= 0; b--) {
             *buf++ = ((p0 >> b) & 1) ? fg : bg;
         }
     }
+    if (hs) {
+        memcpy(d, line + hs, 640 * sizeof(uint32_t));
+    }
 }
 
 static const struct {
-    int width, height, lines;
+    int width, height, lines, line_bytes, hs_prefetch;
     drawfn fn;
 } atarist_fb_modes[3] = {
-    [VID_RES_LOW]  = { 320, 200, 200, atarist_fb_draw_line_low },
-    [VID_RES_MED]  = { 640, 200, 200, atarist_fb_draw_line_med },
-    [VID_RES_HIGH] = { 640, 400, 400, atarist_fb_draw_line_high },
+    /* hs_prefetch: extra bytes (one word per plane) the STE fetches
+     * per line when the fine-scroll register is non-zero */
+    [VID_RES_LOW]  = { 320, 200, 200, FRAME_LINE_BYTES, 8,
+                       atarist_fb_draw_line_low },
+    [VID_RES_MED]  = { 640, 200, 200, FRAME_LINE_BYTES, 4,
+                       atarist_fb_draw_line_med },
+    [VID_RES_HIGH] = { 640, 400, 400, FRAME_LINE_BYTES_HIGH, 2,
+                       atarist_fb_draw_line_high },
 };
+
+/* bytes the video pointer advances per displayed line */
+static uint32_t video_line_pitch(AtaristVideoState *s, int mode)
+{
+    uint32_t pitch = atarist_fb_modes[mode].line_bytes;
+
+    if (s->ste) {
+        /* the STE line-width register skips words between lines, and
+         * an active fine scroll makes the extra prefetch words part
+         * of the fetched stream */
+        pitch += 2 * s->linewid;
+        if (s->hscroll) {
+            pitch += atarist_fb_modes[mode].hs_prefetch;
+        }
+    }
+    return pitch;
+}
 
 static bool atarist_fb_update(void *opaque)
 {
     AtaristVideoState *s = ATARIST_VIDEO(opaque);
     DisplaySurface *surface;
     int mode = s->res & 3;
-    uint32_t base;
+    uint32_t base, pitch, total;
     int first = 0, last = 0;
 
     if (mode == 3) {
@@ -997,12 +1144,27 @@ static bool atarist_fb_update(void *opaque)
         s->invalidate = 1;
     }
 
-    base = video_base(s) & (ATARIST_RAM_WINDOW - 1);
-    if (base + FRAME_BYTES > s->ram_size) {
-        base = s->ram_size - FRAME_BYTES;
+    pitch = video_line_pitch(s, mode);
+    total = pitch * atarist_fb_modes[mode].lines;
+    if (total > s->ram_size) {
+        /*
+         * Insane line-width setting: fall back to a packed frame (but
+         * keep the fine-scroll prefetch, which the line decoders
+         * always consume when scrolling is active).
+         */
+        pitch = atarist_fb_modes[mode].line_bytes;
+        if (s->ste && s->hscroll) {
+            pitch += atarist_fb_modes[mode].hs_prefetch;
+        }
+        total = pitch * atarist_fb_modes[mode].lines;
     }
 
-    if (s->invalidate || base != s->fb_base) {
+    base = video_base(s) & (ATARIST_RAM_WINDOW - 1);
+    if (base + total > s->ram_size) {
+        base = s->ram_size - total;
+    }
+
+    if (s->invalidate || base != s->fb_base || pitch != s->fb_pitch) {
         /*
          * Address the RAM region directly instead of resolving the
          * address through the CPU-visible flatview: the video scanner
@@ -1010,10 +1172,11 @@ static bool atarist_fb_update(void *opaque)
          * there (see the mac128k overlay lesson).
          */
         s->fb_base = base;
+        s->fb_pitch = pitch;
         s->fbsection = (MemoryRegionSection) {
             .mr = s->ram,
             .offset_within_region = base,
-            .size = int128_make64(FRAME_BYTES),
+            .size = int128_make64(total),
         };
         s->invalidate = 0;
     }
@@ -1022,7 +1185,7 @@ static bool atarist_fb_update(void *opaque)
     framebuffer_update_display(surface, &s->fbsection,
                                atarist_fb_modes[mode].width,
                                atarist_fb_modes[mode].lines,
-                               FRAME_LINE_BYTES,
+                               pitch,
                                atarist_fb_modes[mode].width * 4,
                                0, 1, atarist_fb_modes[mode].fn, s,
                                &first, &last);
@@ -1051,6 +1214,9 @@ static void atarist_video_reset_hold(Object *obj, ResetType type)
 
     s->base_hi = 0;
     s->base_mid = 0;
+    s->base_lo = 0;
+    s->linewid = 0;
+    s->hscroll = 0;
     s->sync = 0;
     s->res = 0;
     memset(s->pal, 0, sizeof(s->pal));
@@ -1081,6 +1247,10 @@ static void atarist_video_realize(DeviceState *dev, Error **errp)
     qemu_console_resize(s->con, 320, 200);
 }
 
+static const Property atarist_video_properties[] = {
+    DEFINE_PROP_BOOL("ste", AtaristVideoState, ste, false),
+};
+
 static void atarist_video_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -1088,6 +1258,7 @@ static void atarist_video_class_init(ObjectClass *oc, const void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = atarist_video_realize;
+    device_class_set_props(dc, atarist_video_properties);
     rc->phases.hold = atarist_video_reset_hold;
 }
 
@@ -2544,12 +2715,660 @@ static void atarist_fdc_class_init(ObjectClass *klass, const void *data)
 
 /*
  * ---------------------------------------------------------------------
+ * BLiTTER (STE)
+ *
+ * The bit-block transfer processor at 0xFF8A00.  TOS 2.06 requires it
+ * on STE hardware (the AES/VDI raster routines use it once detected),
+ * so the full register file and operation are modelled; the blit runs
+ * to completion within the register write that sets the busy bit,
+ * which makes hog and shared-bus mode behave identically and lets the
+ * recommended non-hog restart loop (`bset #7` / branch while the bit
+ * was still set) terminate on its first iteration.
+ *
+ * Data path facts encoded below (from the Atari STE developer
+ * documentation):
+ *  - each source fetch shifts into a 32-bit register: into the low
+ *    word in ascending mode (source X increment >= 0), into the high
+ *    word in descending mode; the emitted word is the register >> skew
+ *    ascending, >> (16 - skew) descending.  GEM's VDI exploits the
+ *    direction bit alone (single-word blits with a negative X
+ *    increment) to tap the other end of the buffer.
+ *  - FXSR forces one extra fetch before a line's first emitted word,
+ *    NFSR suppresses the fetch for its last; the final fetch of a
+ *    line advances the source address by the Y increment instead of
+ *    the X increment.
+ *  - the endmasks select destination bits to preserve: endmask 1 for
+ *    the first word of a line, 3 for the last, 2 between (a
+ *    single-word line uses endmask 1 only).
+ *  - HOP composes the source operand (1s / halftone / source /
+ *    source AND halftone); OP is one of the 16 boolean functions of
+ *    that operand and the old destination.
+ *  - the halftone line index lives in the low nibble of the control
+ *    register and steps up (down for negative dest Y increments)
+ *    after each line; in smudge mode the index comes from the low
+ *    nibble of the skewed source word instead.
+ *  - restarting with an exhausted Y counter performs no transfer and
+ *    simply drops the busy bit again.
+ * ---------------------------------------------------------------------
+ */
+
+#define TYPE_ATARIST_BLITTER "atarist-blitter"
+OBJECT_DECLARE_SIMPLE_TYPE(AtaristBlitterState, ATARIST_BLITTER)
+
+/* byte offsets into the 0xFF8A00 register file */
+#define BLT_REG_HALFTONE      0x00        /* 16 words of pattern RAM */
+#define BLT_REG_SRC_XINC      0x20        /* signed, even */
+#define BLT_REG_SRC_YINC      0x22        /* signed, even */
+#define BLT_REG_SRC_ADDR      0x24        /* 24-bit, even */
+#define BLT_REG_ENDMASK1      0x28
+#define BLT_REG_ENDMASK2      0x2a
+#define BLT_REG_ENDMASK3      0x2c
+#define BLT_REG_DST_XINC      0x2e
+#define BLT_REG_DST_YINC      0x30
+#define BLT_REG_DST_ADDR      0x32
+#define BLT_REG_XCOUNT        0x36        /* words per line, 0 = 65536 */
+#define BLT_REG_YCOUNT        0x38        /* lines */
+#define BLT_REG_HOP           0x3a        /* halftone operation, 2 bits */
+#define BLT_REG_OP            0x3b        /* logic operation, 4 bits */
+#define BLT_REG_CTRL          0x3c
+#define BLT_REG_SKEW          0x3d
+#define BLT_REGS_SIZE         0x40
+
+#define BLT_CTRL_BUSY         0x80        /* write 1: start */
+#define BLT_CTRL_HOG          0x40
+#define BLT_CTRL_SMUDGE       0x20
+#define BLT_CTRL_LINE_MASK    0x0f        /* halftone line index */
+
+#define BLT_SKEW_FXSR         0x80        /* force extra source read */
+#define BLT_SKEW_NFSR         0x40        /* no final source read */
+#define BLT_SKEW_MASK         0x0f
+
+#define BLT_HOP_SOURCE        0x02        /* HOP values with bit 1 read
+                                             the source channel */
+#define BLT_HOP_HALFTONE      0x01
+
+struct AtaristBlitterState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint8_t regs[BLT_REGS_SIZE];
+    uint32_t src_buf;           /* 32-bit source shift register */
+};
+
+/*
+ * Writable bits per register byte: increment and address low bytes
+ * force bit 0 clear (the blitter moves words), address high bytes are
+ * 24-bit, HOP/OP/control/skew have documented holes that read zero.
+ */
+static const uint8_t atarist_blitter_wmask[BLT_REGS_SIZE] = {
+    [BLT_REG_HALFTONE ... BLT_REG_HALFTONE + 0x1f] = 0xff,
+    [BLT_REG_SRC_XINC] = 0xff, [BLT_REG_SRC_XINC + 1] = 0xfe,
+    [BLT_REG_SRC_YINC] = 0xff, [BLT_REG_SRC_YINC + 1] = 0xfe,
+    [BLT_REG_SRC_ADDR] = 0x00, [BLT_REG_SRC_ADDR + 1] = 0xff,
+    [BLT_REG_SRC_ADDR + 2] = 0xff, [BLT_REG_SRC_ADDR + 3] = 0xfe,
+    [BLT_REG_ENDMASK1 ... BLT_REG_ENDMASK3 + 1] = 0xff,
+    [BLT_REG_DST_XINC] = 0xff, [BLT_REG_DST_XINC + 1] = 0xfe,
+    [BLT_REG_DST_YINC] = 0xff, [BLT_REG_DST_YINC + 1] = 0xfe,
+    [BLT_REG_DST_ADDR] = 0x00, [BLT_REG_DST_ADDR + 1] = 0xff,
+    [BLT_REG_DST_ADDR + 2] = 0xff, [BLT_REG_DST_ADDR + 3] = 0xfe,
+    [BLT_REG_XCOUNT ... BLT_REG_YCOUNT + 1] = 0xff,
+    [BLT_REG_HOP] = 0x03,
+    [BLT_REG_OP] = 0x0f,
+    [BLT_REG_CTRL] = 0xef,
+    [BLT_REG_SKEW] = 0xcf,
+};
+
+static uint16_t blt_r16(AtaristBlitterState *s, unsigned off)
+{
+    return lduw_be_p(&s->regs[off]);
+}
+
+static void blt_w16(AtaristBlitterState *s, unsigned off, uint16_t val)
+{
+    stw_be_p(&s->regs[off], val);
+}
+
+static uint32_t blt_r32(AtaristBlitterState *s, unsigned off)
+{
+    return ldl_be_p(&s->regs[off]);
+}
+
+static void blt_w32(AtaristBlitterState *s, unsigned off, uint32_t val)
+{
+    stl_be_p(&s->regs[off], val);
+}
+
+static uint16_t blitter_bus_read(uint32_t addr)
+{
+    return address_space_lduw_be(&address_space_memory,
+                                 addr & (ATARIST_ADDR_SPACE - 1) & ~1,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+static void blitter_bus_write(uint32_t addr, uint16_t val)
+{
+    address_space_stw_be(&address_space_memory,
+                         addr & (ATARIST_ADDR_SPACE - 1) & ~1,
+                         val, MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+/* the 16 boolean functions of source-operand and old destination */
+static uint16_t blitter_op(unsigned op, uint16_t src, uint16_t dst)
+{
+    switch (op & 0xf) {
+    case 0:
+        return 0;
+    case 1:
+        return src & dst;
+    case 2:
+        return src & ~dst;
+    case 3:
+        return src;
+    case 4:
+        return ~src & dst;
+    case 5:
+        return dst;
+    case 6:
+        return src ^ dst;
+    case 7:
+        return src | dst;
+    case 8:
+        return ~src & ~dst;
+    case 9:
+        return ~src ^ dst;
+    case 10:
+        return ~dst;
+    case 11:
+        return src | ~dst;
+    case 12:
+        return ~src;
+    case 13:
+        return ~src | dst;
+    case 14:
+        return ~src | ~dst;
+    default:
+        return 0xffff;
+    }
+}
+
+/*
+ * One source word enters the 32-bit FIFO: from the bottom in ascending
+ * mode, from the top in descending mode.
+ */
+static void blitter_src_shift_in(AtaristBlitterState *s, bool desc,
+                                 uint16_t word)
+{
+    if (desc) {
+        s->src_buf = ((uint32_t)word << 16) | (s->src_buf >> 16);
+    } else {
+        s->src_buf = (s->src_buf << 16) | word;
+    }
+}
+
+static void atarist_blitter_run(AtaristBlitterState *s)
+{
+    int16_t sxinc = blt_r16(s, BLT_REG_SRC_XINC);
+    int16_t syinc = blt_r16(s, BLT_REG_SRC_YINC);
+    int16_t dxinc = blt_r16(s, BLT_REG_DST_XINC);
+    int16_t dyinc = blt_r16(s, BLT_REG_DST_YINC);
+    uint32_t saddr = blt_r32(s, BLT_REG_SRC_ADDR);
+    uint32_t daddr = blt_r32(s, BLT_REG_DST_ADDR);
+    uint16_t em1 = blt_r16(s, BLT_REG_ENDMASK1);
+    uint16_t em2 = blt_r16(s, BLT_REG_ENDMASK2);
+    uint16_t em3 = blt_r16(s, BLT_REG_ENDMASK3);
+    uint32_t xcount = blt_r16(s, BLT_REG_XCOUNT);
+    uint32_t ycount = blt_r16(s, BLT_REG_YCOUNT);
+    unsigned hop = s->regs[BLT_REG_HOP];
+    unsigned op = s->regs[BLT_REG_OP];
+    unsigned line = s->regs[BLT_REG_CTRL] & BLT_CTRL_LINE_MASK;
+    bool smudge = s->regs[BLT_REG_CTRL] & BLT_CTRL_SMUDGE;
+    unsigned skew = s->regs[BLT_REG_SKEW] & BLT_SKEW_MASK;
+    bool fxsr = s->regs[BLT_REG_SKEW] & BLT_SKEW_FXSR;
+    bool nfsr = s->regs[BLT_REG_SKEW] & BLT_SKEW_NFSR;
+    bool read_src = hop & BLT_HOP_SOURCE;
+    uint32_t x, y;
+
+    s->regs[BLT_REG_CTRL] &= ~BLT_CTRL_BUSY;
+    if (!ycount) {
+        return;                 /* restart with Y exhausted: no-op */
+    }
+    if (!xcount) {
+        xcount = 0x10000;
+    }
+
+    for (y = 0; y < ycount; y++) {
+        bool desc = sxinc < 0;      /* descending-mode source FIFO */
+
+        if (read_src && fxsr) {
+            /* forced extra read before the line's first emitted word */
+            blitter_src_shift_in(s, desc, blitter_bus_read(saddr));
+            saddr += sxinc;
+        }
+        for (x = 0; x < xcount; x++) {
+            bool last = (x == xcount - 1);
+            uint16_t srcword = 0, sval, dold, mask, result;
+
+            if (read_src) {
+                if (last && nfsr) {
+                    /* suppressed final read: shift only */
+                    if (desc) {
+                        s->src_buf >>= 16;
+                    } else {
+                        s->src_buf <<= 16;
+                    }
+                } else {
+                    blitter_src_shift_in(s, desc,
+                                         blitter_bus_read(saddr));
+                }
+                /*
+                 * The last word of a line always advances the source
+                 * by the Y increment - even when NFSR suppressed the
+                 * read itself; earlier words take the X increment.
+                 */
+                saddr += last ? syinc : sxinc;
+                srcword = (s->src_buf >> (desc ? 16 - skew : skew)) &
+                          0xffff;
+            }
+
+            switch (hop) {
+            case 0:
+                sval = 0xffff;
+                break;
+            case BLT_HOP_HALFTONE:
+                sval = blt_r16(s, BLT_REG_HALFTONE + 2 * line);
+                break;
+            case BLT_HOP_SOURCE:
+                sval = srcword;
+                break;
+            default:
+                sval = srcword &
+                       blt_r16(s, BLT_REG_HALFTONE +
+                               2 * (smudge ? (srcword & 0xf) : line));
+                break;
+            }
+
+            dold = blitter_bus_read(daddr);
+            mask = (x == 0) ? em1 : (x == xcount - 1) ? em3 : em2;
+            result = (blitter_op(op, sval, dold) & mask) | (dold & ~mask);
+            blitter_bus_write(daddr, result);
+            daddr += (x == xcount - 1) ? dyinc : dxinc;
+        }
+
+        line = (line + (dyinc < 0 ? -1 : 1)) & BLT_CTRL_LINE_MASK;
+    }
+
+    /* registers a completed blit leaves behind */
+    blt_w32(s, BLT_REG_SRC_ADDR, saddr & (ATARIST_ADDR_SPACE - 1) & ~1);
+    blt_w32(s, BLT_REG_DST_ADDR, daddr & (ATARIST_ADDR_SPACE - 1) & ~1);
+    blt_w16(s, BLT_REG_YCOUNT, 0);
+    s->regs[BLT_REG_CTRL] = (s->regs[BLT_REG_CTRL] & ~BLT_CTRL_LINE_MASK) |
+                            line;
+}
+
+static uint64_t atarist_blitter_read(void *opaque, hwaddr addr,
+                                     unsigned size)
+{
+    AtaristBlitterState *s = opaque;
+
+    if (size == 2) {
+        return lduw_be_p(&s->regs[addr]);
+    }
+    return s->regs[addr];
+}
+
+/*
+ * Writes must land as a unit before the busy bit acts: GEM's VDI
+ * starts blits with a single word write to 0xFF8A3C carrying the
+ * control byte *and* the new skew byte, so splitting it into byte
+ * writes would run the blit with the previous skew still latched.
+ */
+static void atarist_blitter_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    AtaristBlitterState *s = opaque;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        s->regs[addr + i] = (val >> (8 * (size - 1 - i))) &
+                            atarist_blitter_wmask[addr + i];
+    }
+    if (addr <= BLT_REG_CTRL && addr + size > BLT_REG_CTRL &&
+        (s->regs[BLT_REG_CTRL] & BLT_CTRL_BUSY)) {
+        atarist_blitter_run(s);
+    }
+}
+
+static const MemoryRegionOps atarist_blitter_ops = {
+    .read = atarist_blitter_read,
+    .write = atarist_blitter_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+};
+
+static void atarist_blitter_reset_hold(Object *obj, ResetType type)
+{
+    AtaristBlitterState *s = ATARIST_BLITTER(obj);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->src_buf = 0;
+}
+
+static void atarist_blitter_init(Object *obj)
+{
+    AtaristBlitterState *s = ATARIST_BLITTER(obj);
+
+    memory_region_init_io(&s->iomem, obj, &atarist_blitter_ops, s,
+                          "atarist.blitter", BLT_REGS_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+}
+
+static void atarist_blitter_class_init(ObjectClass *klass, const void *data)
+{
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    rc->phases.hold = atarist_blitter_reset_hold;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * STE DMA sound
+ *
+ * Register file and frame counter only - there is no audio backend, so
+ * a "playing" frame is just the counter advancing at the programmed
+ * sample rate between the frame base and end addresses.  In single
+ * mode the enable bit drops when the frame completes; in repeat mode
+ * the counter wraps.  The Microwire interface to the LMC1992 mixer
+ * completes its 16-clock transfer instantly: on real hardware the data
+ * register shifts left towards zero while the mask register rotates
+ * back around to its written value, and software waits on one or the
+ * other (TOS 2.06's boot-time mixer setup polls the data register
+ * until it reads zero), so here a write leaves data = 0 and the mask
+ * as written.  The frame-end pulse into MFP timer A / GPIP7 is not
+ * modelled.
+ * ---------------------------------------------------------------------
+ */
+
+#define TYPE_ATARIST_DMASND "atarist-dmasound"
+OBJECT_DECLARE_SIMPLE_TYPE(AtaristDmaSndState, ATARIST_DMASND)
+
+/* byte offsets into the 0xFF8900 region (registers on odd bytes) */
+#define DMASND_REG_CTRL       0x01
+#define DMASND_REG_BASE_HI    0x03
+#define DMASND_REG_BASE_MID   0x05
+#define DMASND_REG_BASE_LO    0x07
+#define DMASND_REG_CNT_HI     0x09        /* read-only frame counter */
+#define DMASND_REG_CNT_MID    0x0b
+#define DMASND_REG_CNT_LO     0x0d
+#define DMASND_REG_END_HI     0x0f
+#define DMASND_REG_END_MID    0x11
+#define DMASND_REG_END_LO     0x13
+#define DMASND_REG_MODE       0x21
+#define DMASND_REG_MW_DATA    0x22        /* word */
+#define DMASND_REG_MW_MASK    0x24        /* word */
+#define DMASND_REGS_SIZE      0x26
+
+#define DMASND_CTRL_ENABLE    0x01
+#define DMASND_CTRL_REPEAT    0x02
+
+#define DMASND_MODE_MONO      0x80
+#define DMASND_MODE_RATE_MASK 0x03
+#define DMASND_MODE_MASK      (DMASND_MODE_MONO | DMASND_MODE_RATE_MASK)
+
+/* sample rates derived from the STE's 8.010612 MHz sound clock */
+static const uint32_t dmasnd_rate_hz[4] = { 6258, 12517, 25033, 50066 };
+
+struct AtaristDmaSndState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+
+    uint8_t ctrl;
+    uint8_t mode;
+    uint32_t base;              /* frame base, even 24-bit address */
+    uint32_t end;               /* frame end (exclusive) */
+    uint16_t mw_data;           /* last command shifted out (reads 0) */
+    uint16_t mw_mask;
+
+    int64_t start_ns;           /* when the enable bit last rose */
+};
+
+static uint32_t dmasnd_bytes_per_sec(AtaristDmaSndState *s)
+{
+    uint32_t rate = dmasnd_rate_hz[s->mode & DMASND_MODE_RATE_MASK];
+
+    return rate * ((s->mode & DMASND_MODE_MONO) ? 1 : 2);
+}
+
+/*
+ * The frame counter, computed from the virtual clock.  Completion of a
+ * single-shot frame clears the enable bit as a side effect, exactly as
+ * the hardware's shift-register empty condition does.
+ */
+static uint32_t dmasnd_counter(AtaristDmaSndState *s)
+{
+    int64_t len = (int64_t)s->end - s->base;
+    int64_t bytes;
+
+    if (!(s->ctrl & DMASND_CTRL_ENABLE) || len <= 0) {
+        return s->base;
+    }
+    bytes = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->start_ns) *
+            dmasnd_bytes_per_sec(s) / NANOSECONDS_PER_SECOND;
+    if (bytes >= len) {
+        if (s->ctrl & DMASND_CTRL_REPEAT) {
+            bytes %= len;
+        } else {
+            s->ctrl &= ~DMASND_CTRL_ENABLE;
+            return s->base;
+        }
+    }
+    return s->base + (bytes & ~1);
+}
+
+static uint64_t atarist_dmasnd_read(void *opaque, hwaddr addr,
+                                    unsigned size)
+{
+    AtaristDmaSndState *s = opaque;
+
+    switch (addr) {
+    case DMASND_REG_CTRL:
+        dmasnd_counter(s);      /* fold in a completed one-shot frame */
+        return s->ctrl;
+    case DMASND_REG_BASE_HI:
+        return (s->base >> 16) & 0x3f;
+    case DMASND_REG_BASE_MID:
+        return s->base >> 8;
+    case DMASND_REG_BASE_LO:
+        return s->base;
+    case DMASND_REG_CNT_HI:
+        return (dmasnd_counter(s) >> 16) & 0x3f;
+    case DMASND_REG_CNT_MID:
+        return dmasnd_counter(s) >> 8;
+    case DMASND_REG_CNT_LO:
+        return dmasnd_counter(s);
+    case DMASND_REG_END_HI:
+        return (s->end >> 16) & 0x3f;
+    case DMASND_REG_END_MID:
+        return s->end >> 8;
+    case DMASND_REG_END_LO:
+        return s->end;
+    case DMASND_REG_MODE:
+        return s->mode;
+    case DMASND_REG_MW_DATA:
+    case DMASND_REG_MW_DATA + 1:
+        /*
+         * The shift register has already pushed the whole command out
+         * to the mixer: it reads back empty.  TOS 2.06 polls this for
+         * zero after every mixer command it writes at boot.
+         */
+        return 0;
+    case DMASND_REG_MW_MASK:
+        return s->mw_mask >> 8;
+    case DMASND_REG_MW_MASK + 1:
+        return s->mw_mask;
+    default:
+        return 0;               /* even bytes read zero */
+    }
+}
+
+static void atarist_dmasnd_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    AtaristDmaSndState *s = opaque;
+
+    switch (addr) {
+    case DMASND_REG_CTRL: {
+        uint8_t old = s->ctrl;
+
+        s->ctrl = val & (DMASND_CTRL_ENABLE | DMASND_CTRL_REPEAT);
+        if (!(old & DMASND_CTRL_ENABLE) && (val & DMASND_CTRL_ENABLE)) {
+            s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+        break;
+    }
+    case DMASND_REG_BASE_HI:
+        s->base = deposit32(s->base, 16, 8, val & 0x3f);
+        break;
+    case DMASND_REG_BASE_MID:
+        s->base = deposit32(s->base, 8, 8, val);
+        break;
+    case DMASND_REG_BASE_LO:
+        s->base = deposit32(s->base, 0, 8, val & 0xfe);
+        break;
+    case DMASND_REG_END_HI:
+        s->end = deposit32(s->end, 16, 8, val & 0x3f);
+        break;
+    case DMASND_REG_END_MID:
+        s->end = deposit32(s->end, 8, 8, val);
+        break;
+    case DMASND_REG_END_LO:
+        s->end = deposit32(s->end, 0, 8, val & 0xfe);
+        break;
+    case DMASND_REG_MODE:
+        s->mode = val & DMASND_MODE_MASK;
+        break;
+    case DMASND_REG_MW_DATA:
+        s->mw_data = deposit32(s->mw_data, 8, 8, val);
+        break;
+    case DMASND_REG_MW_DATA + 1:
+        s->mw_data = deposit32(s->mw_data, 0, 8, val);
+        break;
+    case DMASND_REG_MW_MASK:
+        s->mw_mask = deposit32(s->mw_mask, 8, 8, val);
+        break;
+    case DMASND_REG_MW_MASK + 1:
+        s->mw_mask = deposit32(s->mw_mask, 0, 8, val);
+        break;
+    default:
+        break;                  /* counter and even bytes: read-only */
+    }
+}
+
+static const MemoryRegionOps atarist_dmasnd_ops = {
+    .read = atarist_dmasnd_read,
+    .write = atarist_dmasnd_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static void atarist_dmasnd_reset_hold(Object *obj, ResetType type)
+{
+    AtaristDmaSndState *s = ATARIST_DMASND(obj);
+
+    s->ctrl = 0;
+    s->mode = 0;
+    s->base = 0;
+    s->end = 0;
+    s->mw_data = 0;
+    s->mw_mask = 0;
+    s->start_ns = 0;
+}
+
+static void atarist_dmasnd_init(Object *obj)
+{
+    AtaristDmaSndState *s = ATARIST_DMASND(obj);
+
+    memory_region_init_io(&s->iomem, obj, &atarist_dmasnd_ops, s,
+                          "atarist.dmasound", DMASND_REGS_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+}
+
+static void atarist_dmasnd_class_init(ObjectClass *klass, const void *data)
+{
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    rc->phases.hold = atarist_dmasnd_reset_hold;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * STE enhanced joystick ports at 0xFF9200: fire buttons and direction
+ * lines are active low, so with nothing plugged in every input reads
+ * as ones.  Writes (the pad matrix row selects) are accepted and
+ * ignored.
+ * ---------------------------------------------------------------------
+ */
+
+#define ATARIST_JOY_SIZE      4           /* 0xFF9200 fire, 0xFF9202 dirs */
+
+static uint64_t atarist_joy_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return (1ULL << (size * 8)) - 1;
+}
+
+static void atarist_joy_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+}
+
+static const MemoryRegionOps atarist_joy_ops = {
+    .read = atarist_joy_read,
+    .write = atarist_joy_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/*
+ * ---------------------------------------------------------------------
  * Machine
  * ---------------------------------------------------------------------
  */
 
-#define TYPE_ATARIST_MACHINE MACHINE_TYPE_NAME("atarist")
-OBJECT_DECLARE_SIMPLE_TYPE(AtaristMachineState, ATARIST_MACHINE)
+#define TYPE_ATARIST_BASE_MACHINE MACHINE_TYPE_NAME("atarist-base")
+#define TYPE_ATARIST_MACHINE      MACHINE_TYPE_NAME("atarist")
+#define TYPE_ATARISTE_MACHINE     MACHINE_TYPE_NAME("atariste")
+
+typedef struct AtaristMachineState AtaristMachineState;
+
+/* what tells a 1040STE apart from a 1040STF */
+typedef struct AtaristMachineClass {
+    MachineClass parent_class;
+
+    bool ste;
+    hwaddr rom_base;
+    uint32_t rom_size;
+    const char *rom_default;
+} AtaristMachineClass;
+
+DECLARE_OBJ_CHECKERS(AtaristMachineState, AtaristMachineClass,
+                     ATARIST_MACHINE, TYPE_ATARIST_BASE_MACHINE)
 
 typedef struct AtaristBank {
     struct AtaristMachineState *m;
@@ -2563,6 +3382,8 @@ typedef struct AtaristBank {
 struct AtaristMachineState {
     MachineState parent_obj;
 
+    bool ste;
+
     M68kCPU cpu;
     AtaristGlueState glue;
     AtaristMfpState mfp;
@@ -2570,6 +3391,9 @@ struct AtaristMachineState {
     AtaristPsgState psg;
     AtaristIkbdState ikbd;
     AtaristFdcState fdc;
+    AtaristBlitterState blitter;    /* STE only */
+    AtaristDmaSndState dmasnd;      /* STE only */
+    MemoryRegion joy;               /* STE only */
 
     MemoryRegion rom;
     MemoryRegion rom_low;       /* reset vectors readable at 0 */
@@ -2634,17 +3458,25 @@ static const MemoryRegionOps atarist_bank_empty_ops = {
 
 /*
  * A bank whose configured window exceeds the installed chips: the DRAM
- * ignores the top column/row address bits the MMU multiplexes out, so
- * the word address folds - TOS's sizing probes at +0x208/+0x408 rely
- * on exactly this.
+ * ignores address bits the memory controller multiplexes out, so the
+ * bank contents alias.  The ST MMU drops the top *column* bits, which
+ * interleaves the fold - TOS's ST sizing probes at +0x208/+0x408 rely
+ * on exactly this.  The STE MCU instead drops the top bits of the
+ * linear address, so an undersized bank simply mirrors every
+ * chip-size bytes - TOS 2.06's STE sizing (taken once writing
+ * 0xFF820D sticks) probes for mirrors at +0x40000 and +0x80000.
  */
 static uint32_t atarist_bank_fold(AtaristBank *b, hwaddr addr)
 {
     unsigned ccol = b->cfg_colbits;
     unsigned scol = b->chip_colbits;
-    uint32_t word = ((addr >> 1) & ((1 << scol) - 1)) |
-                    (((addr >> (1 + ccol)) & ((1 << scol) - 1)) << scol);
+    uint32_t word;
 
+    if (b->m->ste) {
+        return b->ram_off + (addr & (b->chip_size - 1));
+    }
+    word = ((addr >> 1) & ((1 << scol) - 1)) |
+           (((addr >> (1 + ccol)) & ((1 << scol) - 1)) << scol);
     return b->ram_off + word * 2;
 }
 
@@ -2883,18 +3715,25 @@ static void atarist_reset_out(void *opaque, int n, int level)
     device_cold_reset(DEVICE(&m->psg));
     device_cold_reset(DEVICE(&m->ikbd));
     device_cold_reset(DEVICE(&m->fdc));
+    if (m->ste) {
+        device_cold_reset(DEVICE(&m->blitter));
+        device_cold_reset(DEVICE(&m->dmasnd));
+    }
 }
 
 static void atarist_machine_init(MachineState *machine)
 {
     AtaristMachineState *m = ATARIST_MACHINE(machine);
+    AtaristMachineClass *amc = ATARIST_MACHINE_GET_CLASS(machine);
     MemoryRegion *sysmem = get_system_memory();
     ram_addr_t ram_size = machine->ram_size;
-    const char *bios_name = machine->firmware ?: ATARIST_ROM_FILENAME;
+    const char *bios_name = machine->firmware ?: amc->rom_default;
     char *filename;
     int bios_size;
     uint32_t bank_sizes[2];
     int i;
+
+    m->ste = amc->ste;
 
     /* the two DRAM banks take 128K, 512K or 2MB chip sets */
     switch (ram_size) {
@@ -2951,14 +3790,14 @@ static void atarist_machine_init(MachineState *machine)
     atarist_apply_memcfg(m);
 
     /* ROM */
-    memory_region_init_rom(&m->rom, NULL, "atarist.rom", ATARIST_ROM_SIZE,
+    memory_region_init_rom(&m->rom, NULL, "atarist.rom", amc->rom_size,
                            &error_abort);
-    memory_region_add_subregion(sysmem, ATARIST_ROM_BASE, &m->rom);
+    memory_region_add_subregion(sysmem, amc->rom_base, &m->rom);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
-        bios_size = load_image_targphys(filename, ATARIST_ROM_BASE,
-                                        ATARIST_ROM_SIZE, NULL);
+        bios_size = load_image_targphys(filename, amc->rom_base,
+                                        amc->rom_size, NULL);
         g_free(filename);
     } else {
         bios_size = -1;
@@ -2966,12 +3805,13 @@ static void atarist_machine_init(MachineState *machine)
     if (!qtest_enabled()) {
         uint8_t *ptr;
 
-        if (bios_size <= 0 || bios_size > ATARIST_ROM_SIZE) {
-            error_report("could not load TOS ROM '%s' (192KB TOS 1.0x "
-                         "images map at 0xFC0000)", bios_name);
+        if (bios_size <= 0 || bios_size > amc->rom_size) {
+            error_report("could not load TOS ROM '%s' (%dKB image "
+                         "mapping at 0x%06" HWADDR_PRIx ")", bios_name,
+                         amc->rom_size / 1024, amc->rom_base);
             exit(1);
         }
-        ptr = rom_ptr(ATARIST_ROM_BASE, 8);
+        ptr = rom_ptr(amc->rom_base, 8);
         assert(ptr != NULL);
         memcpy(m->rom_head, ptr, 8);
         m->reset_sp = ldl_be_p(ptr);
@@ -3005,6 +3845,8 @@ static void atarist_machine_init(MachineState *machine)
                             TYPE_ATARIST_VIDEO);
     m->video.ram = machine->ram;
     m->video.ram_size = ram_size;
+    object_property_set_bool(OBJECT(&m->video), "ste", amc->ste,
+                             &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&m->video), &error_fatal);
     memory_region_add_subregion(sysmem, ATARIST_VIDEO_BASE,
                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->video),
@@ -3079,25 +3921,69 @@ static void atarist_machine_init(MachineState *machine)
                                                            "porta", i));
     }
 
+    /* the STE additions */
+    if (amc->ste) {
+        object_initialize_child(OBJECT(machine), "blitter", &m->blitter,
+                                TYPE_ATARIST_BLITTER);
+        sysbus_realize(SYS_BUS_DEVICE(&m->blitter), &error_fatal);
+        memory_region_add_subregion(sysmem, ATARIST_BLITTER_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->blitter), 0));
+
+        object_initialize_child(OBJECT(machine), "dmasound", &m->dmasnd,
+                                TYPE_ATARIST_DMASND);
+        sysbus_realize(SYS_BUS_DEVICE(&m->dmasnd), &error_fatal);
+        memory_region_add_subregion(sysmem, ATARIST_DMASND_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&m->dmasnd), 0));
+
+        memory_region_init_io(&m->joy, OBJECT(machine), &atarist_joy_ops,
+                              NULL, "atarist.joy", ATARIST_JOY_SIZE);
+        memory_region_add_subregion(sysmem, ATARIST_JOY_BASE, &m->joy);
+    }
+
     qemu_register_reset(atarist_machine_reset, m);
 }
 
-static void atarist_machine_class_init(ObjectClass *oc, const void *data)
+static const char * const atarist_valid_cpu_types[] = {
+    M68K_CPU_TYPE_NAME("m68000"),
+    NULL
+};
+
+static void atarist_base_machine_class_init(ObjectClass *oc,
+                                            const void *data)
 {
-    static const char * const valid_cpu_types[] = {
-        M68K_CPU_TYPE_NAME("m68000"),
-        NULL
-    };
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Atari 1040STF";
     mc->init = atarist_machine_init;
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68000");
-    mc->valid_cpu_types = valid_cpu_types;
+    mc->valid_cpu_types = atarist_valid_cpu_types;
     mc->max_cpus = 1;
     mc->block_default_type = IF_FLOPPY;
     mc->default_ram_size = 1 * MiB;
     mc->default_ram_id = "atarist.ram";
+}
+
+static void atarist_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    AtaristMachineClass *amc = ATARIST_MACHINE_CLASS(oc);
+
+    mc->desc = "Atari 1040STF";
+    amc->ste = false;
+    amc->rom_base = ATARIST_ROM_BASE;
+    amc->rom_size = ATARIST_ROM_SIZE;
+    amc->rom_default = ATARIST_ROM_FILENAME;
+}
+
+static void atariste_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    AtaristMachineClass *amc = ATARIST_MACHINE_CLASS(oc);
+
+    mc->desc = "Atari 1040STE";
+    amc->ste = true;
+    amc->rom_base = ATARISTE_ROM_BASE;
+    amc->rom_size = ATARISTE_ROM_SIZE;
+    amc->rom_default = ATARISTE_ROM_FILENAME;
 }
 
 static const TypeInfo atarist_machine_typeinfo[] = {
@@ -3144,10 +4030,36 @@ static const TypeInfo atarist_machine_typeinfo[] = {
         .class_init = atarist_psg_class_init,
     },
     {
-        .name       = TYPE_ATARIST_MACHINE,
+        .name       = TYPE_ATARIST_BLITTER,
+        .parent     = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AtaristBlitterState),
+        .instance_init = atarist_blitter_init,
+        .class_init = atarist_blitter_class_init,
+    },
+    {
+        .name       = TYPE_ATARIST_DMASND,
+        .parent     = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AtaristDmaSndState),
+        .instance_init = atarist_dmasnd_init,
+        .class_init = atarist_dmasnd_class_init,
+    },
+    {
+        .name       = TYPE_ATARIST_BASE_MACHINE,
         .parent     = TYPE_MACHINE,
+        .abstract   = true,
         .instance_size = sizeof(AtaristMachineState),
+        .class_size = sizeof(AtaristMachineClass),
+        .class_init = atarist_base_machine_class_init,
+    },
+    {
+        .name       = TYPE_ATARIST_MACHINE,
+        .parent     = TYPE_ATARIST_BASE_MACHINE,
         .class_init = atarist_machine_class_init,
+    },
+    {
+        .name       = TYPE_ATARISTE_MACHINE,
+        .parent     = TYPE_ATARIST_BASE_MACHINE,
+        .class_init = atariste_machine_class_init,
     },
 };
 
