@@ -947,3 +947,38 @@ candidates would be a byte the trampoline reads before STOP or the
   0->1 pulse while it is halted, and a STOPped secondary is halted,
   so a fresh 0x20 pulse would restart it into OS-supplied AP code.
   Nothing to observe until such an image exists.
+
+## Loading u-boot over serial with RMON `sload` (2026-07-21, works)
+
+RMON's `sload` (S-record download) + `gm` (start module) loads and
+runs the u-boot build over the serial console — validated in QEMU,
+and this is exactly the procedure for the real board.
+
+Make the S-record FROM u-boot.bin (NOT from the ELF — objcopy -O
+srec on the ELF emits a wrong module header, [+4]=0, and gm then
+jumps to 0 and F-lines):
+    m68k-linux-gnu-objcopy -I binary -O srec --change-addresses=0x600000 \
+        --srec-forceS3 u-boot.bin u-boot.srec
+First record must read S3 15 00600000 00500000 00600400 ... i.e. the
+module header the port builds: SP=0x00500000 at +0, entry=0x00600400
+(_start) at +4 — this is what `gm` consumes (SP from offset 0, PC
+from offset 4; it is NOT a raw jump).
+
+On the board (console = Serial Port 1):
+    ***> sload 1 0            <- download on port 1, offset 0
+     Waiting                  <- then upload u-boot.srec as plain text
+     Transfer complete
+    ***> gm 600000            <- start: SP<-[600000], PC<-[600004]
+    U-Boot 2026.01-... e17 =>
+
+Flow control: sload uses XON/XOFF (it emits XOFF 0x13 when its input
+buffer fills, XON 0x11 to resume) — a normal terminal upload with
+software flow control handles this; a raw blast overruns it and
+loses records (which then F-lines in gm).  Needs the board's TEXT_BASE
+(0x600000) and >=~6MB RAM below the relocation target; u-boot copies
+itself to the top of RAM and runs there.
+
+Helpers in ~/e17-re: u-boot.srec (regenerate as above), sloadtest.py
+(drives the whole sload+gm sequence over the serial socket with
+proper XON/XOFF pacing), sloadgdb.py (same but dumps the loaded
+image for debugging).
