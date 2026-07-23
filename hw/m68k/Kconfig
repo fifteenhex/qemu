@@ -45,6 +45,7 @@ config MACIISI
     select SWIM
     select ASC
     select OR_IRQ
+    select FRAMEBUFFER
 
 config M68K_VIRT
     bool

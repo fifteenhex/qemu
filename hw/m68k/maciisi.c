@@ -44,6 +44,8 @@
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
+#include "ui/console.h"
+#include "hw/display/framebuffer.h"
 #include "system/rtc.h"
 #include "system/qtest.h"
 #include "system/reset.h"
@@ -329,6 +331,14 @@ static void via1_rtc_update(MOS6522MacIIsiState *v1s)
             if (v1s->cmd & 0x80) {
                 /* it's a read */
                 v1s->data_in = v1s->PRAM[sector * 32 + addr];
+                /*
+                 * Force 32-bit addressing (XPRAM 0x8A): the 24-bit MMU
+                 * path derefs tagged handles that our translation
+                 * doesn't wrap; 32-bit-clean boot avoids it entirely.
+                 */
+                if (sector * 32 + addr == 0x8a) {
+                    v1s->data_in |= 0x05;
+                }
                 v1s->data_in_cnt = 8;
                 v1s->cmd = REG_EMPTY;
             } else {
@@ -426,6 +436,98 @@ static void mos6522_maciisi_class_init(ObjectClass *klass, const void *data)
                                        NULL, &mdc->parent_phases);
 }
 
+/*
+ * Onboard video framebuffer: 640x480 1-bit at the slot $E aperture
+ * (ScrnBase 0xFEE00000), rowbytes 80.
+ */
+
+#define TYPE_MACIISI_FB "maciisi-fb"
+OBJECT_DECLARE_SIMPLE_TYPE(MacIIsiFbState, MACIISI_FB)
+
+#define MACIISI_FB_WIDTH   640
+#define MACIISI_FB_HEIGHT  480
+#define MACIISI_FB_ROWBYTES 80
+
+struct MacIIsiFbState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion vram;
+    MemoryRegionSection fbsection;
+    QemuConsole *con;
+    int invalidate;
+};
+
+static void maciisi_fb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
+                                 int width, int pitch)
+{
+    uint32_t *buf = (uint32_t *)d;
+    int i, b;
+
+    for (i = 0; i < MACIISI_FB_WIDTH / 8; i++) {
+        uint8_t src = s[i];
+
+        for (b = 0; b < 8; b++) {
+            buf[i * 8 + b] = (src & 0x80) ? 0xFF000000 : 0xFFFFFFFF;
+            src <<= 1;
+        }
+    }
+}
+
+static bool maciisi_fb_update(void *opaque)
+{
+    MacIIsiFbState *s = MACIISI_FB(opaque);
+    DisplaySurface *surface = qemu_console_surface(s->con);
+    int first = 0, last = 0;
+
+    if (s->invalidate) {
+        framebuffer_update_memory_section(&s->fbsection, &s->vram, 0,
+                                          MACIISI_FB_HEIGHT,
+                                          MACIISI_FB_ROWBYTES);
+        s->invalidate = 0;
+    }
+
+    framebuffer_update_display(surface, &s->fbsection,
+                               MACIISI_FB_WIDTH, MACIISI_FB_HEIGHT,
+                               MACIISI_FB_ROWBYTES, MACIISI_FB_WIDTH * 4,
+                               0, 1, maciisi_fb_draw_line, s,
+                               &first, &last);
+    qemu_console_update(s->con, 0, 0, MACIISI_FB_WIDTH, MACIISI_FB_HEIGHT);
+    return true;
+}
+
+static void maciisi_fb_invalidate(void *opaque)
+{
+    MacIIsiFbState *s = MACIISI_FB(opaque);
+
+    s->invalidate = 1;
+}
+
+static const GraphicHwOps maciisi_fb_ops = {
+    .invalidate = maciisi_fb_invalidate,
+    .gfx_update = maciisi_fb_update,
+};
+
+static void maciisi_fb_realize(DeviceState *dev, Error **errp)
+{
+    MacIIsiFbState *s = MACIISI_FB(dev);
+
+    memory_region_init_ram(&s->vram, OBJECT(dev), "maciisi.vram", 0x180000,
+                           &error_fatal);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->vram);
+
+    s->invalidate = 1;
+    s->con = qemu_graphic_console_create(dev, 0, &maciisi_fb_ops, s);
+    qemu_console_resize(s->con, MACIISI_FB_WIDTH, MACIISI_FB_HEIGHT);
+}
+
+static void maciisi_fb_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    dc->realize = maciisi_fb_realize;
+}
+
 /* machine */
 
 struct MacIIsiMachineState {
@@ -439,6 +541,7 @@ struct MacIIsiMachineState {
     ASCState asc;
     Swim swim;
 
+    MacIIsiFbState fb;
     MemoryRegion rom;
     MemoryRegion rom_alias;
     MemoryRegion rom_slot_alias;
@@ -1423,6 +1526,13 @@ static void maciisi_machine_init(MachineState *machine)
                                 0xff000000 - MACIISI_ROM_SIZE,
                                 &m->rom_slot_alias);
 
+    /* onboard video framebuffer aperture in slot $E space (ScrnBase) */
+    object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACIISI_FB);
+    sysbus = SYS_BUS_DEVICE(&m->fb);
+    sysbus_realize(sysbus, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), 0xfee00000,
+                                sysbus_mmio_get_region(sysbus, 0));
+
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {
         bios_size = load_image_targphys(filename, MACIISI_ROM_ADDR,
@@ -1479,6 +1589,12 @@ static const TypeInfo maciisi_machine_typeinfo[] = {
         .instance_size = sizeof(MOS6522MacIIsiState),
         .instance_init = mos6522_maciisi_init,
         .class_init = mos6522_maciisi_class_init,
+    },
+    {
+        .name       = TYPE_MACIISI_FB,
+        .parent     = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(MacIIsiFbState),
+        .class_init = maciisi_fb_class_init,
     },
     {
         .name       = TYPE_MACIISI_MACHINE,
