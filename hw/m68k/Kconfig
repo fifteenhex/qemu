@@ -79,6 +79,7 @@ config AMIGA
     depends on M68K
     select PTIMER
     select UNIMP
+    select WD33C93
 
 config MEGADRIVE
     bool
