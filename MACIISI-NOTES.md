@@ -286,3 +286,58 @@ Screendump recipe:
   qemu ... -qmp unix:/tmp/maciisi-qmp.sock,server,nowait
   then QMP: qmp_capabilities; screendump filename=/tmp/shots/x.ppm
 Boot to sad mac takes ~4min real time at -icount shift=7.
+
+### DISK BOOT (2026-07-20, session 5) — insert-disk icon reached, NCR5380 added
+
+MILESTONE: the machine boots the ROM to the **blinking insert-disk floppy
+icon** (gray desktop, live cursor) — the stated goal.  Screenshots
+/tmp/shots/maciisi-blink-*.png.  Getting there needed, after the video
+work: real framebuffer base 0xFBB08000 (aliased to slot-$E ScrnBase
+0xFEE00000); VIA T2 one-shot (mos6522.c) so T2 sets IFR once per T2CH
+load; RBV slot-$E VBL as a POLLABLE line (SIFR bit6 pulses 1.3ms/frame)
+that does NOT raise a CPU interrupt (raising it = dsBadSlotInt / SysError
+0x33).
+
+NCR5380 SCSI controller written from scratch: hw/scsi/ncr5380.c (backed by
+QEMU's SCSI bus), wired at 0x50F10000 (regs, reg-shift 4) with pseudo-DMA
+aperture at 0x50F12000.  Boot media: _maciisi_assets/macos753.hda (OS
+7.5.3, archive.org item hd-0-imaged-001, BlueSCSI raw image, 234MB, valid
+Apple DDM 'ER' at block 0).  Attach with:
+  -drive file=_maciisi_assets/macos753.hda,format=raw,if=none,id=hd0 \
+  -device scsi-hd,drive=hd0,scsi-id=0
+
+5380 protocol as the Mac SCSI Manager drives it (all reverse-engineered
+from the ROM at 0x408076xx-0x408079xx):
+- Arbitration wins immediately; ICR bits 6/5 (AIP/lost-arb) are read-only
+  status the ROM polls — DO NOT mask them off on ICR read (that was the
+  first bug: no arbitration ever completed).
+- Selection completes on the ICR write where SEL+DATA are asserted and BSY
+  is released; target id = ODR & 0x7f. Disk is at ID 0.
+- Command/status/message bytes: register REQ/ACK handshake.  Wait-for-REQ
+  helper 0x408078a4 reads CSB (reg4) bit5; phase-match helper 0x40807930
+  reads BSR (reg5) bit3 = TCR-programmed phase == bus phase.  CRUCIAL: REQ
+  for a new phase must be asserted only when the initiator RELEASES ACK on
+  the previous phase's last byte, else the ROM's "wait REQ clear" deadlocks.
+- Data-in: the ROM does BLIND reads (read CSD repeatedly, no per-byte ACK).
+  CSD read in DI phase must deliver the current byte and auto-advance.
+- Power-on UNIT ATTENTION must be cleared before each command (the ROM's
+  blind reader issues no TEST UNIT READY / REQUEST SENSE).
+- scsi-disk reads are ASYNC (aiocb): single-buffer with an xfer_pending
+  guard or you hit `r->req.aiocb == NULL` in scsi_read_data.
+
+CURRENT STATE: the ROM selects the disk and reads block 0 / partition map /
+boot blocks (READ(6), GOOD status) but only ~4-8 reads happen then it
+returns to the insert-disk search (or earlier it sad-mac'd at ROM
+0x40836180 deref of a disk-loaded structure).  The data path is not yet
+coherent across sustained multi-block transfers — completes:commands is
+~1:2, so half the commands stall.  NEXT:
+1. Verify byte-exact data integrity: dump the bytes my controller delivers
+   for block 0 and diff against the image (should be 45 52 02 00 ...).
+2. Find why half the commands don't complete — likely the DI→ST phase
+   transition or a REQ/ACK edge case when the ROM mixes blind reads with
+   handshake polling; trace a single READ end-to-end.
+3. The transfer_data async callback asserting REQ vs the blind-read
+   advance may race — consider making data-in fully synchronous by
+   pre-reading the whole transfer into the buffer on do_command.
+4. Only then will the loaded System boot; may also need real ADB (mouse/kbd
+   via Egret) for the Finder.
