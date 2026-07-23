@@ -2497,6 +2497,15 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
         return 0;
     }
 
+    /*
+     * The illegal-command and CRC-error status bits are "cleared by
+     * the next valid command": each response must reflect only the
+     * command currently being processed, not a stale error left by a
+     * previous one — e.g. the optional SDIO commands (CMD5/52/53) a
+     * host probes a memory card with before reading it.
+     */
+    sd->card_status &= ~(ILLEGAL_COMMAND | COM_CRC_ERROR);
+
     if (sd->state == sd_inactive_state) {
         rtype = sd_illegal;
         goto send_response;
