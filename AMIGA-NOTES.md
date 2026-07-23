@@ -207,6 +207,25 @@ callbacks run inside the timer's transaction).
   port at 0xdd2020, Gayle-ish; currently open bus, so no hard disk).
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
+- AMIX (Amiga UNIX SVR4) — the 68030 MMU probe.  AMIX 2.1 install disks
+  (boot+root, 880K ADFs) are on archive.org
+  `commodore-amiga-operating-systems-amix`.  Booting the boot disk on
+  the a3000 (`-m 16M`) gets far: the loader decompresses the SVR4 kernel
+  into fast RAM (~0x07000000) and starts it, which probes hardware
+  (Ramsey 0xde0000-0002) — then instantly drowns in **Access Fault
+  (0x8)** exceptions (414k in 50s with `-d int`), looping at
+  pc=0x071234ac with a corrupted supervisor SP (0xfffffff4).
+  Root cause: **QEMU's m68k MMU is 68040-only.**  get_physical_address()
+  (target/m68k/helper.c) walks 68040-format tables via URP/SRP (loaded
+  by MOVEC).  The 68030 PMMU is a stub: translate.c's pmmu030 stores
+  PMOVE of TC/CRP/SRP/TT0/TT1 into mmu.{tc030,crp030,srp030,tt030} but
+  nothing translates through them, PFLUSH/PLOAD are no-ops, and PTEST
+  lies "valid".  Kickstart only *probes* those registers, so AmigaOS
+  boots; AMIX actually enables demand paging, so it fails at the first
+  translated access.  Fixing it means implementing the 030 table walk
+  (configurable TC IS/TIA-TID levels, short/long + indirect descriptors,
+  the ATC, real PTEST/PFLUSH) and a resumable bus-fault frame — the one
+  thing standing between us and Amiga Unix.
 
 ## Debugging recipes that worked
 
