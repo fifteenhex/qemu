@@ -1,20 +1,21 @@
 /*
- * Palm V PDA (Motorola MC68EZ328 "DragonBall EZ")
+ * Palm PDA machines on Motorola DragonBall SoCs:
  *
- * A Palm V is essentially the DragonBall EZ reference design: the SoC
- * provides everything except the flash ROM, the pseudo-static RAM and
- * the touchscreen ADC.
+ *   palmv    — Palm V, MC68EZ328 "DragonBall EZ" @ 16.58MHz
+ *   palmm500 — Palm m500, MC68VZ328 "DragonBall VZ" @ 33.16MHz
+ *
+ * Both are close to the reference designs: the SoC provides
+ * everything except the flash ROM, the RAM and the touchscreen ADC.
  *
  * Memory map (from the PalmOS ROM boot code, see PALM-NOTES.md):
- *   0x00000000  RAM (2MB on a Palm V), DRAM controller chip select
- *   0x10c00000  flash ROM window, CSA (CSGBA is set to 0x8600 by the
- *               boot code, i.e. base = 0x8600 << 13 = 0x10c00000)
- *   0x10c08000  "big ROM" — the PalmOS image proper.  ROM files from
- *               the usual archives contain only the big ROM (the card
- *               header at file offset 0 carries bigROMOffset =
- *               0x10c08000 and the reset vectors), so the file is
- *               loaded at +0x8000 and the small-ROM area reads as
- *               erased flash (0xff).
+ *   0x00000000  RAM, DRAM controller chip select
+ *   ROM window  0x10c00000 on the Palm V (CSGBA=0x8600 << 13),
+ *               0x10000000 on the m500; the PalmOS "big ROM" image
+ *               sits at a device-specific offset inside it (the
+ *               archive .rom files contain only the big ROM: the
+ *               card header at file offset 0 carries bigROMOffset
+ *               and the reset vectors), the rest reads as erased
+ *               flash (0xff).
  *   0xfffff000  on-chip peripherals
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -51,6 +52,7 @@
 #include "hw/core/split-irq.h"
 
 #include "hw/misc/dragonball_pll.h"
+#include "hw/misc/dragonball_scr.h"
 #include "hw/intc/dragonball_intc.h"
 #include "hw/gpio/dragonball_gpio.h"
 #include "hw/timer/dragonball_timer.h"
@@ -60,44 +62,61 @@
 #include "hw/rtc/dragonball_rtc.h"
 #include "hw/input/ads7843.h"
 
-#define PALM_ROM_BASE        0x10c00000
-#define PALM_ROM_SIZE        (4 * MiB)
-#define PALM_BIGROM_OFFSET   0x8000
-
+#define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
 #define PALM_MMIO_INTC       0xfffff300
 #define PALM_MMIO_GPIO       0xfffff400
-#define PALM_MMIO_TIMER      0xfffff600
+#define PALM_MMIO_TIMER1     0xfffff600
+#define PALM_MMIO_TIMER2     0xfffff610
 #define PALM_MMIO_SPI        0xfffff800
 #define PALM_MMIO_UART       0xfffff900
 #define PALM_MMIO_LCDC       0xfffffa00
 #define PALM_MMIO_RTC        0xfffffb00
 
-/* IPR/IMR bit numbers of the on-chip interrupt sources */
-#define DRAGONBALL_IRQ_SPI   0
-#define DRAGONBALL_IRQ_TMR   1
-#define DRAGONBALL_IRQ_UART  2
-#define DRAGONBALL_IRQ_WDT   3
-#define DRAGONBALL_IRQ_RTC   4
-#define DRAGONBALL_IRQ_PEN   20
-
 /* /PENIRQ is also readable as a GPIO: port F bit 1 (low = pen down) */
 #define PALM_PENIRQ_GPIO     (5 * 8 + 1)
 /* /POWERFAIL from the supply supervisor: port D bit 7, low = battery dead */
 #define PALM_POWERFAIL_GPIO  (3 * 8 + 7)
+/* m500: SD card detect on port D bit 5, high = no card */
+#define PALM_M500_CARDDET_GPIO (3 * 8 + 5)
+/* m500: AC power sense on port K bit 2, high = not on the charger */
+#define PALM_M500_ACPWR_GPIO   (8 * 8 + 2)
+
+#define EZ_SYSCLK 16580608
+#define VZ_SYSCLK (2 * EZ_SYSCLK)
+
+typedef struct PalmMachineClass {
+    MachineClass parent_class;
+
+    hwaddr rom_base;
+    uint32_t rom_size;
+    uint32_t bigrom_offset;
+    uint32_t sysclk;
+    uint8_t chip_id;
+    uint8_t mask_id;
+    uint8_t gpio_ports;
+    uint16_t adc_dock_value;
+    bool has_timer2;
+} PalmMachineClass;
 
 typedef struct PalmMachineState {
     MachineState parent_obj;
     MemoryRegion rom;
+    hwaddr vector_base;
 } PalmMachineState;
 
-#define TYPE_PALM_MACHINE MACHINE_TYPE_NAME("palmv")
-OBJECT_DECLARE_SIMPLE_TYPE(PalmMachineState, PALM_MACHINE)
+#define TYPE_PALM_MACHINE MACHINE_TYPE_NAME("palm-common")
+OBJECT_DECLARE_TYPE(PalmMachineState, PalmMachineClass, PALM_MACHINE)
+
+typedef struct PalmResetInfo {
+    M68kCPU *cpu;
+    hwaddr vector_base;
+} PalmResetInfo;
 
 static void palm_cpu_reset(void *opaque)
 {
-    M68kCPU *cpu = opaque;
-    CPUState *cs = CPU(cpu);
+    PalmResetInfo *ri = opaque;
+    CPUState *cs = CPU(ri->cpu);
 
     /*
      * On silicon, CSA0 answers the whole address space out of reset so
@@ -106,27 +125,33 @@ static void palm_cpu_reset(void *opaque)
      * that aliasing.
      */
     cpu_reset(cs);
-    cpu->env.aregs[7] = ldl_phys(cs->as, PALM_ROM_BASE + PALM_BIGROM_OFFSET);
-    cpu->env.pc = ldl_phys(cs->as, PALM_ROM_BASE + PALM_BIGROM_OFFSET + 4);
+    ri->cpu->env.aregs[7] = ldl_phys(cs->as, ri->vector_base);
+    ri->cpu->env.pc = ldl_phys(cs->as, ri->vector_base + 4);
 }
 
 static void palm_init(MachineState *machine)
 {
     PalmMachineState *pms = PALM_MACHINE(machine);
+    PalmMachineClass *pmc = PALM_MACHINE_GET_CLASS(machine);
     M68kCPU *cpu;
-    DeviceState *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
+    PalmResetInfo *ri;
+    DeviceState *scr_dev, *pll_dev, *intc_dev, *gpio_dev, *timer_dev,
                 *spi_dev, *uart_dev, *lcdc_dev, *rtc_dev, *adc_dev,
                 *pen_split;
     MemoryRegion *sysmem = get_system_memory();
     ssize_t size;
 
     if (!machine->firmware) {
-        error_report("palmv: a PalmOS ROM must be given with -bios");
+        error_report("%s: a PalmOS ROM must be given with -bios",
+                     MACHINE_GET_CLASS(machine)->name);
         exit(1);
     }
 
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
-    qemu_register_reset(palm_cpu_reset, cpu);
+    ri = g_new0(PalmResetInfo, 1);
+    ri->cpu = cpu;
+    ri->vector_base = pmc->rom_base + pmc->bigrom_offset;
+    qemu_register_reset(palm_cpu_reset, ri);
 
     /* RAM */
     memory_region_add_subregion(sysmem, 0, machine->ram);
@@ -136,10 +161,10 @@ static void palm_init(MachineState *machine)
      * does not cover it — PalmOS looks for saved parameters in the
      * small-ROM area and must find "erased", not zeroes.
      */
-    memory_region_init_rom(&pms->rom, NULL, "palm.rom", PALM_ROM_SIZE,
+    memory_region_init_rom(&pms->rom, NULL, "palm.rom", pmc->rom_size,
                            &error_fatal);
-    memset(memory_region_get_ram_ptr(&pms->rom), 0xff, PALM_ROM_SIZE);
-    memory_region_add_subregion(sysmem, PALM_ROM_BASE, &pms->rom);
+    memset(memory_region_get_ram_ptr(&pms->rom), 0xff, pmc->rom_size);
+    memory_region_add_subregion(sysmem, pmc->rom_base, &pms->rom);
 
     /*
      * Load straight into the region instead of going through the ROM
@@ -148,12 +173,19 @@ static void palm_init(MachineState *machine)
      */
     size = load_image_size(machine->firmware,
                            (uint8_t *)memory_region_get_ram_ptr(&pms->rom) +
-                           PALM_BIGROM_OFFSET,
-                           PALM_ROM_SIZE - PALM_BIGROM_OFFSET);
+                           pmc->bigrom_offset,
+                           pmc->rom_size - pmc->bigrom_offset);
     if (size < 0) {
-        error_report("palmv: could not load ROM '%s'", machine->firmware);
+        error_report("palm: could not load ROM '%s'", machine->firmware);
         exit(1);
     }
+
+    /* System control / chip ID */
+    scr_dev = qdev_new(TYPE_DRAGONBALL_SCR);
+    qdev_prop_set_uint8(scr_dev, "chip-id", pmc->chip_id);
+    qdev_prop_set_uint8(scr_dev, "mask-id", pmc->mask_id);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(scr_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(scr_dev), 0, PALM_MMIO_SCR);
 
     /* PLL */
     pll_dev = qdev_new(TYPE_DRAGONBALL_PLL);
@@ -169,19 +201,31 @@ static void palm_init(MachineState *machine)
 
     /* GPIO */
     gpio_dev = qdev_new(TYPE_DRAGONBALL_GPIO);
+    qdev_prop_set_uint8(gpio_dev, "num-ports", pmc->gpio_ports);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio_dev), 0, PALM_MMIO_GPIO);
     /* the battery is always healthy here */
     qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_POWERFAIL_GPIO));
 
-    /* Timer */
+    /* Timer(s) */
     timer_dev = qdev_new(TYPE_DRAGONBALL_TIMER);
+    qdev_prop_set_uint32(timer_dev, "sysclk", pmc->sysclk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(timer_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(timer_dev), 0, PALM_MMIO_TIMER);
+    sysbus_mmio_map(SYS_BUS_DEVICE(timer_dev), 0, PALM_MMIO_TIMER1);
     qdev_connect_gpio_out_named(timer_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
-                                                       DRAGONBALL_IRQ_TMR));
+                                                       DRAGONBALL_INTC_TMR));
+    if (pmc->has_timer2) {
+        timer_dev = qdev_new(TYPE_DRAGONBALL_TIMER);
+        qdev_prop_set_uint32(timer_dev, "sysclk", pmc->sysclk);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(timer_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(timer_dev), 0, PALM_MMIO_TIMER2);
+        qdev_connect_gpio_out_named(timer_dev, "sysbus-irq", 0,
+                                    qdev_get_gpio_in_named(intc_dev,
+                                                       "peripheral_interrupts",
+                                                       DRAGONBALL_INTC_TMR2));
+    }
 
     /* SPI master: the touchscreen ADC lives here on real hardware */
     spi_dev = qdev_new(TYPE_DRAGONBALL_SPI);
@@ -191,29 +235,32 @@ static void palm_init(MachineState *machine)
     qdev_connect_gpio_out_named(spi_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
-                                                       DRAGONBALL_IRQ_SPI));
+                                                       DRAGONBALL_INTC_SPI));
 
     /*
      * Touchscreen ADC.  Pen-down asserts the PENIRQ interrupt source
      * and pulls the /PENIRQ pin (port F bit 1) low — PalmOS polls the
      * pin state through the GPIO block.
      */
-    adc_dev = ssi_create_peripheral(
-        (SSIBus *)qdev_get_child_bus(spi_dev, "ssi"), TYPE_ADS7843);
+    adc_dev = qdev_new(TYPE_ADS7843);
+    qdev_prop_set_uint16(adc_dev, "dock-value", pmc->adc_dock_value);
+    ssi_realize_and_unref(adc_dev,
+                          (SSIBus *)qdev_get_child_bus(spi_dev, "ssi"),
+                          &error_fatal);
     pen_split = qdev_new(TYPE_SPLIT_IRQ);
     qdev_prop_set_uint16(pen_split, "num-lines", 2);
     qdev_realize_and_unref(pen_split, NULL, &error_fatal);
     qdev_connect_gpio_out(pen_split, 0,
                           qdev_get_gpio_in_named(intc_dev,
                                                  "peripheral_interrupts",
-                                                 DRAGONBALL_IRQ_PEN));
+                                                 DRAGONBALL_INTC_IRQ5));
     qdev_connect_gpio_out(pen_split, 1,
                           qemu_irq_invert(qdev_get_gpio_in(gpio_dev,
                                                            PALM_PENIRQ_GPIO)));
     qdev_connect_gpio_out_named(adc_dev, "penirq", 0,
                                 qdev_get_gpio_in(pen_split, 0));
 
-    /* UART: the cradle serial port */
+    /* UART: cradle serial on the EZ devices, IR on the m500 */
     uart_dev = qdev_new(TYPE_DRAGONBALL_UART);
     qdev_prop_set_chr(uart_dev, "chardev", serial_hd(0));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(uart_dev), &error_fatal);
@@ -221,7 +268,7 @@ static void palm_init(MachineState *machine)
     qdev_connect_gpio_out_named(uart_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
-                                                       DRAGONBALL_IRQ_UART));
+                                                       DRAGONBALL_INTC_UART));
 
     /* LCDC: 160x160 panel */
     lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
@@ -237,28 +284,69 @@ static void palm_init(MachineState *machine)
     qdev_connect_gpio_out_named(rtc_dev, "sysbus-irq", 0,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
-                                                       DRAGONBALL_IRQ_WDT));
+                                                       DRAGONBALL_INTC_WDT));
     qdev_connect_gpio_out_named(rtc_dev, "sysbus-irq", 1,
                                 qdev_get_gpio_in_named(intc_dev,
                                                        "peripheral_interrupts",
-                                                       DRAGONBALL_IRQ_RTC));
+                                                       DRAGONBALL_INTC_RTC));
+
+    /* board-specific idle pin levels */
+    if (pmc->has_timer2) {
+        /* m500: no SD card inserted, not sitting on the charger */
+        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_CARDDET_GPIO));
+        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_M500_ACPWR_GPIO));
+    }
 }
 
-static void palm_machine_class_init(ObjectClass *oc, const void *data)
+static void palm_machine_common_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Palm V (MC68EZ328)";
     mc->init = palm_init;
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68000");
-    mc->default_ram_size = 2 * MiB;
     mc->default_ram_id = "palm.ram";
     /*
      * The whole 0xfffffxxx page is on-chip; nothing bus-errors on the
-     * real device even where we have no model yet (SCR, chip selects,
-     * DRAM controller).
+     * real device even where we have no model yet (chip selects, DRAM
+     * controller).
      */
     mc->ignore_memory_transaction_failures = true;
+}
+
+static void palmv_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    mc->desc = "Palm V (MC68EZ328)";
+    mc->default_ram_size = 2 * MiB;
+    pmc->rom_base = 0x10c00000;
+    pmc->rom_size = 4 * MiB;
+    pmc->bigrom_offset = 0x8000;
+    pmc->sysclk = EZ_SYSCLK;
+    pmc->chip_id = 0x43;        /* EZ */
+    pmc->mask_id = 0x01;
+    pmc->gpio_ports = 7;
+    pmc->adc_dock_value = 0;    /* serial dock sense idles low */
+    pmc->has_timer2 = false;
+}
+
+static void palmm500_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    mc->desc = "Palm m500 (MC68VZ328)";
+    mc->default_ram_size = 8 * MiB;
+    pmc->rom_base = 0x10000000;
+    pmc->rom_size = 4 * MiB;
+    pmc->bigrom_offset = 0x10000;
+    pmc->sysclk = VZ_SYSCLK;
+    pmc->chip_id = 0x56;        /* VZ */
+    pmc->mask_id = 0x01;
+    pmc->gpio_ports = 10;
+    pmc->adc_dock_value = 0xfff; /* "twister" dock sense idles high */
+    pmc->has_timer2 = true;
 }
 
 static const TypeInfo palm_machine_types[] = {
@@ -266,7 +354,19 @@ static const TypeInfo palm_machine_types[] = {
         .name          = TYPE_PALM_MACHINE,
         .parent        = TYPE_MACHINE,
         .instance_size = sizeof(PalmMachineState),
-        .class_init    = palm_machine_class_init,
+        .class_size    = sizeof(PalmMachineClass),
+        .class_init    = palm_machine_common_class_init,
+        .abstract      = true,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmv"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmv_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("palmm500"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = palmm500_machine_class_init,
     },
 };
 

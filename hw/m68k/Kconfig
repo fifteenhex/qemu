@@ -68,6 +68,7 @@ config PALM
     depends on M68K
     select M68K_IRQC
     select DRAGONBALL_PLL
+    select DRAGONBALL_SCR
     select DRAGONBALL_GPIO
     select DRAGONBALL_INTC
     select DRAGONBALL_UART
