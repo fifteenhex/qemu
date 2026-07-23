@@ -158,6 +158,41 @@ Remaining target bugs found & fixed here while chasing the boot:
   values appear byte-swapped.  Temporary CPU_LOG_MMU instrumentation in
   tlb_fill/transaction_failed (left in tree for now).
 
+### Egret exchange, fully decoded from the ROM driver (for next session)
+
+Wait loop: 0x4080a8a0 enables VIA1 IER=0x84 (SR int), state byte a3@(349)
+= 0x24, kicks the exchange, then polls bit5 of a3@(349) until the SR-int
+state machine clears it.  SR-int dispatch = 0x4080a700: a0 = continuation
+from a3@(312), tests ORB bit3 (/TREQ) so every continuation branches on
+"Egret has (more) data", then jmp (a0).
+
+Observed continuation chain for the startup exchange (host packet [0x00]):
+1. 0x4080a656 start-send: ACR|=0x1c (shift out), SR=byte0, save byte in
+   a3@(348), ORB &= ~0x30 (drop /TIP+/TACK) → SR_INT when Egret clocks it.
+2. cont 0x4080a612: if /TREQ deasserted → 0x4080a620; if asserted →
+   "collision" path (bset7 of 350).  Then d1=0x10, 0x4080a67c turnaround:
+   ACR &= ~0x10 (shift in), tst SR, ORB ^= 0x10 (TACK toggle).
+3. cont 0x4080a624: if /TREQ ASSERTED here → bset5 of a3@(350) = "response
+   coming" (CRITICAL: TREQ must be low at this interrupt or the response
+   is later discarded at 0x4080a646 which clears the byte count when
+   bit5(350) is unset).  count=0, then 0x4080a68e recv-byte: count++,
+   buf[count]=SR, ORB ^= 0x30 (TIP+TACK ack toggle).
+4. cont 0x4080a632/0x4080a63a: recv loop — each SR_INT reads SR, acks via
+   ORB^=0x30, until /TREQ deasserts (checked at dispatch) or 8 bytes.
+
+Model TODO: assert /TREQ (PB3 low) as soon as a response exists and keep
+it asserted through the SECOND-TO-LAST byte's interrupt; the byte-N clock
+should be driven by the host's TIP/TACK ack toggles (ORB writes), not by
+SR reads — hook portB eor-0x30/0x10 transitions during a session as the
+"clock next byte" strobe.  Current model advances on SR reads and the ROM
+discards the response (only 2 of 3 bytes consumed, then it reopens a
+receive session and polls forever at 0x4080a8e6).
+
+Consider fetching MAME's egret.cpp for the Egret-side firmware protocol
+(NEEDS DANIEL'S PERMISSION for the download) — it would confirm the
+attention/idle semantics (e.g. whether Egret sends an unsolicited
+power-on packet, which the ROM's second, empty receive session suggests).
+
 ### v1 skeleton (2026-07-20)
 
 - hw/m68k/maciisi.c: m68030, ramio container (unbacked reads return 0 for RAM
