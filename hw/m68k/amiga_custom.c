@@ -465,21 +465,40 @@ static void amiga_custom_do_blit(AmigaCustomState *s, int width, int height)
 static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
                                    uint16_t val);
 
+static void amiga_custom_beam_pos(AmigaCustomState *s, uint32_t *vpos,
+                                  uint32_t *hpos);
+
+#define MAX_PLANES      6
+
+/* the registers the renderer cares about, worth journalling per line */
+static bool amiga_custom_display_reg(unsigned reg)
+{
+    return (reg >= REG_DIWSTRT && reg <= REG_DDFSTOP) ||
+           (reg >= REG_BPL1PT && reg < REG_BPL1PT + MAX_PLANES * 4) ||
+           (reg >= REG_BPLCON0 && reg <= REG_BPL2MOD) ||
+           (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64);
+}
+
 /*
- * Frame-atomic copper: the whole list is executed at the vertical
+ * Line-atomic copper: the whole list is executed at the vertical
  * blank with every WAIT considered satisfied, so all the MOVEs for a
- * frame are applied in one go.  That is enough for displays that only
- * use the copper to reload pointers and palettes per frame; mid-frame
- * raster effects would need a beam-synchronous model.
+ * frame are applied in one go.  The vertical position of each WAIT is
+ * tracked along the way and display register writes are journalled
+ * with it, so the renderer can replay them at the right line: that
+ * covers per-line palettes and mid-frame screen splits.  Effects that
+ * depend on the horizontal beam position won't render.
  */
 static void amiga_custom_run_copper(AmigaCustomState *s, uint32_t pc)
 {
     int budget = 20000;
+    uint32_t line, hpos;
 
     if ((s->dmacon & (DMACON_DMAEN | DMACON_COPEN)) !=
         (DMACON_DMAEN | DMACON_COPEN)) {
         return;
     }
+
+    amiga_custom_beam_pos(s, &line, &hpos);
 
     while (budget-- > 0) {
         uint16_t ir1 = chip_read16(pc);
@@ -499,12 +518,27 @@ static void amiga_custom_run_copper(AmigaCustomState *s, uint32_t pc)
             } else if (reg == REG_COPJMP2) {
                 pc = amiga_custom_ptr(s, REG_COP2LC);
             } else {
+                if (amiga_custom_display_reg(reg) &&
+                    s->journal_len < AMIGA_COPPER_JOURNAL_MAX) {
+                    s->journal[s->journal_len].line = line;
+                    s->journal[s->journal_len].reg = reg;
+                    s->journal[s->journal_len].val = ir2;
+                    s->journal_len++;
+                }
                 amiga_custom_reg_write(s, reg, ir2);
             }
         } else if (!(ir2 & 1)) {
+            uint32_t vp = ir1 >> 8;
+
             /* WAIT: the conventional end-of-list marker never matches */
-            if ((ir1 >> 8) == 0xff && (ir1 & 0xfe) == 0xfe) {
+            if (vp == 0xff && (ir1 & 0xfe) == 0xfe) {
                 break;
+            }
+            /* the vertical compare wraps once past line 255 */
+            if (vp < (line & 0xff)) {
+                line = (line & ~0xff) + 0x100 + vp;
+            } else {
+                line = (line & ~0xff) | vp;
             }
         } else {
             /* SKIP: by end of frame the position has been reached */
@@ -534,7 +568,13 @@ static void amiga_custom_vblank(void *opaque)
 
     s->frame_origin_ns += FRAME_NS;
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
-    /* the copper restarts from the top of its list every frame */
+    /*
+     * Snapshot the display state the frame starts with, then let the
+     * copper journal its per-line changes on top; the copper restarts
+     * from the top of its list every frame.
+     */
+    memcpy(s->frame_regs, s->regs, sizeof(s->frame_regs));
+    s->journal_len = 0;
     amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
     amiga_custom_post_int(s, INT_VERTB);
 }
@@ -547,8 +587,6 @@ static void amiga_custom_vblank(void *opaque)
 #define BPLCON0_HAM     (1 << 11)
 #define BPLCON0_DBLPF   (1 << 10)
 
-#define MAX_PLANES      6
-
 static uint32_t amiga_rgb4(uint16_t c)
 {
     return (((c >> 8) & 0xf) * 0x11 << 16) |
@@ -556,31 +594,42 @@ static uint32_t amiga_rgb4(uint16_t c)
            ((c & 0xf) * 0x11);
 }
 
+#define DREG(r)     (dregs[(r) >> 1])
+#define DPTR(r)     (((uint32_t)dregs[(r) >> 1] << 16) | dregs[((r) >> 1) + 1])
+
 /*
- * Render the current frame from the bitplane pointers, which the
- * copper has just reloaded for this frame.  The geometry comes from
- * the data fetch registers; display window clipping is ignored.
+ * Render the current frame: start from the register state the frame
+ * began with and replay the copper's journalled writes line by line,
+ * which is what makes screen splits and per-line palettes come out.
+ * The geometry comes from the data fetch registers at the top of the
+ * frame; display window clipping is ignored.
  */
 static bool amiga_custom_gfx_update(void *opaque)
 {
     AmigaCustomState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
-    uint16_t bplcon0 = amiga_custom_reg(s, REG_BPLCON0);
-    uint16_t ddfstrt = amiga_custom_reg(s, REG_DDFSTRT) & 0xfc;
-    uint16_t ddfstop = amiga_custom_reg(s, REG_DDFSTOP) & 0xfc;
-    uint16_t diwstrt = amiga_custom_reg(s, REG_DIWSTRT);
-    uint16_t diwstop = amiga_custom_reg(s, REG_DIWSTOP);
-    bool hires = bplcon0 & BPLCON0_HIRES;
-    int planes = (bplcon0 >> 12) & 7;
+    uint16_t dregs[0x100];
+    uint16_t bplcon0, ddfstrt, ddfstop, diwstrt, diwstop;
+    bool hires;
     uint32_t palette[64];
+    bool pal_dirty = true;
     uint32_t bplpt[MAX_PLANES];
     uint8_t rowbuf[MAX_PLANES][1024 / 8];
+    unsigned ji = 0;
     int words, width, height, vstart, vstop;
     int p, x, y;
 
     if (!s->con || !surface) {
         return true;
     }
+
+    memcpy(dregs, s->frame_regs, sizeof(dregs));
+    bplcon0 = DREG(REG_BPLCON0);
+    ddfstrt = DREG(REG_DDFSTRT) & 0xfc;
+    ddfstop = DREG(REG_DDFSTOP) & 0xfc;
+    diwstrt = DREG(REG_DIWSTRT);
+    diwstop = DREG(REG_DIWSTOP);
+    hires = bplcon0 & BPLCON0_HIRES;
 
     vstart = diwstrt >> 8;
     vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
@@ -602,12 +651,11 @@ static bool amiga_custom_gfx_update(void *opaque)
         }
     }
 
-    if (planes == 0 || planes > MAX_PLANES ||
-        (s->dmacon & (DMACON_DMAEN | DMACON_BPLEN)) !=
+    if ((s->dmacon & (DMACON_DMAEN | DMACON_BPLEN)) !=
             (DMACON_DMAEN | DMACON_BPLEN) ||
         width < 16 || width > 1024 || height < 16 || height > 313) {
         /* no active display: show the background colour */
-        uint32_t bg = amiga_rgb4(amiga_custom_reg(s, REG_COLOR00));
+        uint32_t bg = amiga_rgb4(DREG(REG_COLOR00));
         uint32_t *dst;
 
         for (y = 0; y < surface_height(surface); y++) {
@@ -622,35 +670,56 @@ static bool amiga_custom_gfx_update(void *opaque)
         return true;
     }
 
-    if (bplcon0 & (BPLCON0_HAM | BPLCON0_DBLPF)) {
-        qemu_log_mask(LOG_UNIMP, "amiga-custom: HAM/dual-playfield mode\n");
-    }
-
     if (surface_width(surface) != width ||
         surface_height(surface) != height) {
         qemu_console_resize(s->con, width, height);
         surface = qemu_console_surface(s->con);
     }
 
-    for (p = 0; p < 32; p++) {
-        palette[p] = amiga_rgb4(amiga_custom_reg(s, REG_COLOR00 + p * 2));
-    }
-    /* extra-half-brite */
-    for (p = 32; p < 64; p++) {
-        palette[p] = (palette[p - 32] >> 1) & 0x7f7f7f;
-    }
-
-    for (p = 0; p < planes; p++) {
-        bplpt[p] = amiga_custom_ptr(s, REG_BPL1PT + p * 4);
+    for (p = 0; p < MAX_PLANES; p++) {
+        bplpt[p] = DPTR(REG_BPL1PT + p * 4);
     }
 
     for (y = 0; y < height; y++) {
         uint32_t *dst = (uint32_t *)(surface_data(surface) +
                                      y * surface_stride(surface));
+        int planes;
+
+        /* catch the display state up with the beam */
+        while (ji < s->journal_len && s->journal[ji].line <= vstart + y) {
+            unsigned reg = s->journal[ji].reg;
+
+            DREG(reg) = s->journal[ji].val;
+            if (reg >= REG_BPL1PT && reg < REG_BPL1PT + MAX_PLANES * 4) {
+                p = (reg - REG_BPL1PT) >> 2;
+                bplpt[p] = DPTR(REG_BPL1PT + p * 4);
+            } else if (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64) {
+                pal_dirty = true;
+            }
+            ji++;
+        }
+        if (pal_dirty) {
+            for (p = 0; p < 32; p++) {
+                palette[p] = amiga_rgb4(DREG(REG_COLOR00 + p * 2));
+            }
+            /* extra-half-brite */
+            for (p = 32; p < 64; p++) {
+                palette[p] = (palette[p - 32] >> 1) & 0x7f7f7f;
+            }
+            pal_dirty = false;
+        }
+
+        bplcon0 = DREG(REG_BPLCON0);
+        if (bplcon0 & (BPLCON0_HAM | BPLCON0_DBLPF)) {
+            qemu_log_mask(LOG_UNIMP, "amiga-custom: HAM/dual-playfield\n");
+        }
+        planes = (bplcon0 >> 12) & 7;
+        if (planes > MAX_PLANES) {
+            planes = MAX_PLANES;
+        }
 
         for (p = 0; p < planes; p++) {
-            int16_t mod = amiga_custom_reg(s, (p & 1) ? REG_BPL2MOD
-                                                      : REG_BPL1MOD);
+            int16_t mod = DREG((p & 1) ? REG_BPL2MOD : REG_BPL1MOD);
 
             dma_memory_read(&address_space_memory, bplpt[p] & CHIP_MASK,
                             rowbuf[p], words * 2, MEMTXATTRS_UNSPECIFIED);

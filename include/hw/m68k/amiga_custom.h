@@ -17,6 +17,9 @@
 #define TYPE_AMIGA_CUSTOM "amiga-custom"
 OBJECT_DECLARE_SIMPLE_TYPE(AmigaCustomState, AMIGA_CUSTOM)
 
+/* plenty for the few hundred entries a busy per-line copper list makes */
+#define AMIGA_COPPER_JOURNAL_MAX    4096
+
 /* INTENA/INTREQ bits */
 #define INT_TBE     (1 << 0)
 #define INT_DSKBLK  (1 << 1)
@@ -62,6 +65,18 @@ struct AmigaCustomState {
 
     /* backing store for the (mostly write-only) chipset registers */
     uint16_t regs[0x100];
+
+    /*
+     * Display state journal: the copper's writes to display registers,
+     * tagged with the beam line they take effect on.  The renderer
+     * replays them over the frame-start register snapshot, which is
+     * how mid-frame splits and per-line palette changes get drawn.
+     */
+    struct {
+        uint16_t line, reg, val;
+    } journal[AMIGA_COPPER_JOURNAL_MAX];
+    unsigned journal_len;
+    uint16_t frame_regs[0x100];
 
     bool blit_zero;             /* last blit produced only zeroes */
 
