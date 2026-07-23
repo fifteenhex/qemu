@@ -250,10 +250,38 @@ VZ facts used (sources: POSE EmRegsVZ*/M68VZ328Hwr.h in
   - LCDC: same block; the model now honours LPICF (writable) and
     draws 1/2/4bpp greyscale.
 
-Still open for both machines: on-chip RTC timekeeping (stub — the
-clock reads 12:00 am forever), hard buttons, UART2, the SPI1 FIFO
-unit, 8/16-gray screen modes' palette registers (LGPMR is stored but
-not applied per-shade), sound (PWM).
+### 2026-07-20 (later still) — RTC, UART2, hard buttons
+
+  - RTC implemented: counter = rtc-clock seconds + guest offset
+    (seeded from the QEMU guest RTC config), h/m/s in the EZ layout,
+    VZ day counter/day alarm, 1Hz-derived SEC/MIN/HR/DAY/ALM
+    interrupts.  The launcher clock tracks real time now.
+  - m500 UART2 at 0xfffff910 (the cradle serial; UART1 is IR there,
+    so -serial goes to UART2 on the m500 and UART1 on the V).
+  - Hard buttons work end to end (Date Book/Address/To Do/Memo
+    launch from F1-F4; Up/Down = rocker, F5 power, F6 contrast).
+    Three GPIO-model bugs had to die first, all found with the POSE
+    source as referee:
+      1. GPIO registers are BYTES; the model decoded DIR/PUDEN as
+         16-bit combos, so PalmOS's byte writes never configured
+         row directions (and corrupted DATA).
+      2. The port D interrupt block was missing: INT0-3 = level
+         match against PDPOL for enabled input pins; KB = OR of raw
+         enabled pins, no polarity (POSE UpdatePortDInterrupts).
+         Driving INTC INT0-3 without this gating = instant Fatal
+         Exception on keypress.
+      3. The keyboard scanner deselects rows by TRISTATING them
+         (DIR back to input, pull-up raises the line); the model
+         froze tristated lines at their last level, keeping every
+         row selected — only the one unambiguous column (Hard4)
+         ever decoded.
+    PalmOS scans with PDPOL=0x0f (columns active high, interrupt on
+    match), tick-polls the matrix while awake, and tristate-selects
+    one row at a time to disambiguate.
+
+Still open for both machines: the SPI1 FIFO unit, 8/16-gray screen
+modes' palette registers (LGPMR is stored but not applied
+per-shade), sound (PWM), watchdog, SD card (m500).
 
 ## Journal
 
