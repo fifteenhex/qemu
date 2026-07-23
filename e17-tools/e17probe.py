@@ -36,7 +36,11 @@ COMMANDS = [
     ('cputype',        'db fec5e000 4',  'CPU-type latch (1=040, 4=060)'),
     ('misc_5c',        'db fec5c000 4',  'misc / "slave select"'),
     ('status_ack',     'db fec50000 4',  'status/ack (mild read side effect)'),
-    ('i2c_ipin',       'db fec54000 4',  'I2C IPIN EEPROM port'),
+    # DO NOT read 0xfec54000 (I2C/IPIN): a raw read stalls the CPU on the
+    # I2C bus, the watchdog is not tickled, and the resulting Watchdog
+    # Reset drives VME SYSRESET -> it resets EVERY board in the crate.
+    # (Confirmed on real hardware, 2026-07-21.)  The IPIN EEPROM must be
+    # read through RMON's I2C helper routines, not a memory read.
     ('ramdac',         'db fec40000 8',  'RAMDAC; +2 should read 0x3a'),
     ('crtc',           'dl fec48000 8',  'CRTC direct regs'),
     ('macprom',        'db fec69d00 88', 'LANCE station-address PROM area'),
@@ -87,25 +91,40 @@ def read_until_prompt(link, log, overall=25.0, echo=True):
     """
     buf = b''
     t0 = time.time()
+    quiet = 0.0
     while time.time() - t0 < overall:
-        chunk = link.recv(1.0)
+        chunk = link.recv(0.5)
         if chunk:
+            quiet = 0.0
             buf += chunk
             if echo:
                 # show exactly what came back, verbatim
                 sys.stdout.write(chunk.decode('latin1'))
                 sys.stdout.flush()
-            if PROMPT in buf and time.time() - t0 > 0.3:
+            # the command is done only when the prompt is the tail of the
+            # output (not just anywhere - long dumps contain no prompt)
+            if buf.rstrip().endswith(PROMPT):
                 break
-        elif buf:
-            break   # went quiet with data in hand
+        else:
+            quiet += 0.5
+            # only give up on a long silence, so slow 9600-baud dumps
+            # don't get chopped and interleave with the next command
+            if buf and quiet >= 4.0:
+                break
     text = buf.decode('latin1')
     log.write(text)
     return text
 
 
+def drain_stale(link):
+    """Discard anything already buffered (e.g. the previous prompt)."""
+    while link.recv(0.3):
+        pass
+
+
 def send(link, log, data):
     """Send bytes to the board, echoing them to the terminal as '>>> ...'."""
+    drain_stale(link)
     shown = data.decode('latin1').replace('\r', '')
     if shown:
         sys.stdout.write(f'\n>>> {shown}\n')

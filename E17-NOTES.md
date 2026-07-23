@@ -1035,3 +1035,61 @@ real-board difference is the interesting result):
 Highest-value diffs to look for: the VIC068A registers, the IPIN I2C
 behaviour, the real NVRAM board-ID/serial block, and the RAMDAC 0x3a
 id + PLL regs (with video fitted).
+
+## First real-board probe results (shiro, 2026-07-21)
+
+Ran e17-tools/e17probe.py against the real board (log archived in
+e17-tools/real-board-logs/e17probe-shiro-20260721-124852.txt).  Board:
+this is a genuine EUROCOM 17 (banner "for the Eurocom 17", vs our ROM
+image's "Eurocom 27" default), Board Revision 1.M, Serial 187562,
+32 MB, Secondary CPU INSTALLED (real dual-68040), no video fitted
+(console came up on serial with no Output-Port trick, and the RAMDAC/
+CRTC read open-bus).
+
+!!! SAFETY: reading 0xfec54000 (I2C/IPIN) with `db` caused a
+"### Watchdog Reset" that drives VME SYSRESET and reset EVERY board in
+the crate.  The raw read stalls the CPU on the I2C bus so RMON never
+tickles the watchdog.  The I2C/IPIN must be read via RMON's I2C helper
+routines, never a memory read.  That probe has been removed from
+e17probe.py.
+
+Confirmed / newly learned (real value vs our model):
+- M48T02 RTC layout CONFIRMED: fec207f8 = 00 38 40 12 03 21 07 26 =
+  ctl/sec/min/hr/dow/date/mon/yr BCD -> 2026-07-21 12:40:38, dow 3.
+  Exactly our modelled layout.
+- Board ID block at fec20468 (read via NVRAM, safe) fully decoded:
+    +468 "1MA54700"            order/part number
+    +470 "187562"             serial number (matches banner)
+    +476 02 fc                (type/rev word?)
+    +478 "V-E17.-A547"        board type string
+    +484 "547" 00.. 
+    +48a 00 00 5B 00 49 62    ETHERNET ADDRESS (ELTEC OUI 00:00:5B)
+  So the real MAC is 00:00:5B:00:49:62 - the same value we already use
+  as the EPROM default (it is this board's).  Config checksum at
+  5fd-5ff = fb b1 93 (differs from the fresh-default fb b3 86).
+- NVRAM 0x00-0x1f = the VIC068A (value,offset) init pairs the firmware
+  replays into the VIC (00@ab f0@af 60@b3 40@57 10@a7 46@a3 ...).
+- VIC068A (fec01000, byte lane 3) on the real board is a live register
+  file: regs 0-7 = 0xf8..0xff (the CICR/interrupt vectors), reg10=0x37,
+  etc.  OUR MODEL RETURNS ALL ZERO here -> the sysc VIC block is plain
+  storage and RMON's replayed VIC init isn't reflected on read-back.
+  TODO: check whether our VIC init path stores lane 3 correctly.
+- CPU-type reg fec5e000 reads 0x40 on the real board (we write/return
+  0x01 for a 68040).  So the read-back encoding differs from the value
+  RMON writes; fec5e000 read != write.  TODO: model the read side.
+- fec5c000 ("slave select") real = 0x80 (model 0x05); fec50000 status/
+  ack real = 40 .. .. 80 (model 0).
+- chip-select unit: reg a8 real = 0x0000528b at the moment of the dump
+  (we force 0x4000); the real board also populates more CS banks
+  (DRAM/VME) than our ROM+SRAM-only model - not needed for boot.
+- Banner has two lines our model lacks: "Board Revision : 1.M" and
+  "Serial Number : 187562", both sourced from the IPIN/board-ID block
+  we don't populate.
+- Ethernet/RAMDAC/CRTC/MACPROM: board has no video, so those reads are
+  open-bus; RAMDAC 0x3a id needs a video-fitted board to confirm.
+
+Model-improvement candidates from this: populate a board-ID/IPIN so
+the banner shows revision+serial and a configurable MAC; make the VIC
+register file read back what RMON writes; give fec5e000 the real read
+encoding; seed the M48T02 with the real board-ID defaults.  None are
+required for booting - they are documentation/fidelity items.
