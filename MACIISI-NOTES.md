@@ -536,3 +536,32 @@ conditional-eval throttle makes busy-address watches crawl — watch
 0x108 is cheap, 0xf110 is not).  Boots are deterministic enough that
 two-stage capture (find PC in run N, dump live state in run N+1)
 works reliably.
+
+Addendum (session 7, later) — GRAY DESKTOP reached:
+- The post-splash SysError 1 was the ROM find-DRVR-by-name loop
+  dereferencing master pointer 0x80004cb5 — a 24-BIT-TAGGED handle
+  (state flags in address bits 31-29), identity-mapped by the ROM
+  tables into the top half of physical space.  On real hardware the
+  A31 half falls through to the RAM decode with only the LOW 24 BITS
+  significant (that is why the ROM maps the whole top half identity).
+  Modelled as a low-priority 0x80000000..0xFFFFFFFF region forwarding
+  to addr&0xFFFFFF (a plain alias at 0x80000000 is NOT enough — locked
+  resource handles carry 0xE0 in the top byte).  -d mmu ("txn fail"
+  lines, direct-to-file, NOT through a pipe/tail) confirmed the fault
+  gone; boot now paints the full-screen gray desktop pattern
+  (/tmp/shots/adbwork-run23-a.png, run24-a).
+- CURRENT FRONTIER: after the desktop pattern (menu bar not yet
+  drawn), the ROM heap-coalesce walk 0x4080e148-0x4080e17c spins on a
+  zero-size free block: zone a6=0x2000 (the 24-bit boot heap, size
+  mask d2=0xFFFFFF), free run start a1=0x7894, d1=0x360, dead block
+  a0=0x7bf4 with [0x7bf4]=0.  A5=0x400a78 → the memory-manager patch
+  install world is still live at that point.  Same failure shape as
+  session 3's PrimaryInit stack smash, different era.  A gdb
+  watchpoint on 0x7bf4 caught only the ROM RAM-test write before a
+  gdb printf quirk ($a6 in the format string errored out the command
+  list — print registers individually next time).  Boot remains
+  deterministic; two-stage capture will find the corruptor.
+- Cursor/input untested: display blocked before Finder; the ADB path
+  is exercised only by the probe sweep so far.  QMP input-send-event
+  reaches adb-kbd/adb-mouse (shift-at-boot test delivered the event,
+  though the OS ignored it at that phase).
