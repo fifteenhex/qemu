@@ -77,6 +77,7 @@
 #define REG_DDFSTRT     0x092
 #define REG_DDFSTOP     0x094
 #define REG_BPL1PT      0x0e0
+#define REG_SPR0PTH     0x120
 #define REG_BPLCON0     0x100
 #define REG_BPL1MOD     0x108
 #define REG_BPL2MOD     0x10a
@@ -474,11 +475,14 @@ static void amiga_custom_beam_pos(AmigaCustomState *s, uint32_t *vpos,
 
 #define MAX_PLANES      6
 
+#define MAX_SPRITES     8
+
 /* the registers the renderer cares about, worth journalling per line */
 static bool amiga_custom_display_reg(unsigned reg)
 {
     return (reg >= REG_DIWSTRT && reg <= REG_DDFSTOP) ||
            (reg >= REG_BPL1PT && reg < REG_BPL1PT + MAX_PLANES * 4) ||
+           (reg >= REG_SPR0PTH && reg < REG_SPR0PTH + MAX_SPRITES * 4) ||
            (reg >= REG_BPLCON0 && reg <= REG_BPL2MOD) ||
            (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64);
 }
@@ -586,6 +590,7 @@ static void amiga_custom_vblank(void *opaque)
 /* --- display --- */
 
 #define DMACON_BPLEN    (1 << 8)
+#define DMACON_SPREN    (1 << 5)
 
 #define BPLCON0_HIRES   (1 << 15)
 #define BPLCON0_HAM     (1 << 11)
@@ -596,6 +601,47 @@ static uint32_t amiga_rgb4(uint16_t c)
     return (((c >> 8) & 0xf) * 0x11 << 16) |
            (((c >> 4) & 0xf) * 0x11 << 8) |
            ((c & 0xf) * 0x11);
+}
+
+/* one sprite DMA channel, walked down the frame by the renderer */
+typedef struct AmigaSpriteChan {
+    uint32_t pt;
+    unsigned vstart, vstop, hstart;
+    bool loaded, dead;
+} AmigaSpriteChan;
+
+/*
+ * Fetch control words until an entry covering or below the beam line
+ * is found; entries wholly above it have already gone by.  A zero
+ * POS/CTL pair ends the channel's list.
+ */
+static void amiga_sprite_load_ctl(AmigaSpriteChan *c, unsigned beam)
+{
+    int guard = 64;
+
+    while (guard-- > 0) {
+        uint16_t pos = chip_read16(c->pt);
+        uint16_t ctl = chip_read16(c->pt + 2);
+
+        c->pt += 4;
+        if (pos == 0 && ctl == 0) {
+            c->dead = true;
+            return;
+        }
+        c->vstart = (pos >> 8) | ((ctl & 4) << 6);
+        c->vstop = (ctl >> 8) | ((ctl & 2) << 7);
+        c->hstart = ((pos & 0xff) << 1) | (ctl & 1);
+        if (c->vstop <= c->vstart) {
+            c->dead = true;
+            return;
+        }
+        if (beam < c->vstop) {
+            c->loaded = true;
+            return;
+        }
+        c->pt += (c->vstop - c->vstart) * 4;
+    }
+    c->dead = true;
 }
 
 #define DREG(r)     (dregs[(r) >> 1])
@@ -619,6 +665,7 @@ static bool amiga_custom_gfx_update(void *opaque)
     bool pal_dirty = true;
     uint32_t bplpt[MAX_PLANES];
     uint8_t rowbuf[MAX_PLANES][1024 / 8];
+    AmigaSpriteChan spr[MAX_SPRITES] = { 0 };
     unsigned ji = 0;
     int words, width, height, vstart, vstop;
     int p, x, y;
@@ -685,12 +732,14 @@ static bool amiga_custom_gfx_update(void *opaque)
     }
 
     for (y = 0; y < height; y++) {
-        uint32_t *dst = (uint32_t *)(surface_data(surface) +
+        uint32_t *row = (uint32_t *)(surface_data(surface) +
                                      y * surface_stride(surface));
+        uint32_t *dst = row;
+        unsigned beam = vstart + y;
         int planes;
 
         /* catch the display state up with the beam */
-        while (ji < s->journal_len && s->journal[ji].line <= vstart + y) {
+        while (ji < s->journal_len && s->journal[ji].line <= beam) {
             unsigned reg = s->journal[ji].reg;
 
             DREG(reg) = s->journal[ji].val;
@@ -701,6 +750,12 @@ static bool amiga_custom_gfx_update(void *opaque)
                 pal_dirty = true;
             }
             ji++;
+        }
+        if (y == 0) {
+            /* the copper has set the sprite pointers by now */
+            for (p = 0; p < MAX_SPRITES; p++) {
+                spr[p].pt = DPTR(REG_SPR0PTH + p * 4) & CHIP_MASK;
+            }
         }
         if (pal_dirty) {
             for (p = 0; p < 32; p++) {
@@ -736,6 +791,46 @@ static bool amiga_custom_gfx_update(void *opaque)
                 idx |= ((rowbuf[p][x >> 3] >> (7 - (x & 7))) & 1) << p;
             }
             *dst++ = palette[idx];
+        }
+
+        /* overlay the DMA sprites, lowest number in front */
+        if (s->dmacon & DMACON_SPREN) {
+            int px = (DREG(REG_BPLCON0) & BPLCON0_HIRES) ? 2 : 1;
+
+            for (p = MAX_SPRITES - 1; p >= 0; p--) {
+                AmigaSpriteChan *c = &spr[p];
+                uint32_t data;
+                int xlo, i;
+
+                if (!c->dead && !c->loaded) {
+                    amiga_sprite_load_ctl(c, beam);
+                }
+                if (!c->dead && beam >= c->vstop) {
+                    /* done with this entry, chain to the next */
+                    c->pt += (c->vstop - c->vstart) * 4;
+                    amiga_sprite_load_ctl(c, beam);
+                }
+                if (c->dead || beam < c->vstart || beam >= c->vstop) {
+                    continue;
+                }
+                data = c->pt + (beam - c->vstart) * 4;
+                data = ((uint32_t)chip_read16(data) << 16) |
+                       chip_read16(data + 2);
+                xlo = (int)c->hstart - (diwstrt & 0xff);
+                for (i = 0; i < 16; i++) {
+                    int idx = (((data >> (15 - i)) & 1) << 1) |
+                              ((data >> (31 - i)) & 1);
+                    int x0 = (xlo + i) * px;
+
+                    if (!idx || xlo + i < 0 || x0 >= width) {
+                        continue;
+                    }
+                    row[x0] = palette[16 + ((p >> 1) << 2) + idx];
+                    if (px == 2 && x0 + 1 < width) {
+                        row[x0 + 1] = palette[16 + ((p >> 1) << 2) + idx];
+                    }
+                }
+            }
         }
     }
     qemu_console_update(s->con, 0, 0, width, height);
