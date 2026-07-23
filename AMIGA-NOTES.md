@@ -71,13 +71,21 @@ callbacks run inside the timer's transaction).
 
 ## Open items / next steps
 
-- Hard disk boot: scsi.device finds the disk (selection, INQUIRY and
-  select-and-transfer all work) but the first TEST UNIT READY comes
-  back CHECK CONDITION with a power-on unit attention, which it
-  treats as "no disk" and never reads the RigidDiskBlock.  Needs RE
-  of scsi.device's error path (does it expect the chip/driver to run
-  REQUEST SENSE?) or a compatibility knob on the QEMU disk.  A
-  bootable image will also need an RDB with a filesystem.
+- SCSI works: the "unit attention" was a red herring — the wd33c93
+  model was mis-running scsi.device's select-and-transfer-at-phase-
+  0x46 trick as a fresh command (a phantom all-zero-CDB TEST UNIT
+  READY), and never raised the ending disconnect interrupt the
+  driver completes commands from.  Both fixed; the full probe runs
+  and an RDB + FFS disk (see _amiga_assets/make_rdb_disk.py) mounts
+  on the Workbench desktop.  HD *boot* (no floppy) untested.
+- Workbench text is invisible: every glyph blit arrives with
+  minterm 0x0a on every plane (fg pen 0 on bg 0), i.e. Text() runs
+  with unset RastPort pens — the blitter executes it faithfully, and
+  nothing glyph-shaped lands in the bitplanes.  Intuition's pen
+  setup (DrawInfo?) goes wrong somewhere upstream; needs gdb into
+  graphics Text() to see rp_FgPen.  Glyph staging buffer for text
+  blits lives around chip 0xee0 (B channel, cookie-cut 0xca/0x0a
+  pairs, h=8).
 - Keyboard: input path is CIA-A's serial register; the model already
   has mos8520_sdr_input() for injection.  Needs the handshake
   protocol and a QEMU keyboard event handler wiring scancodes.
