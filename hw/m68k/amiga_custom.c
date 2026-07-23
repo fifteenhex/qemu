@@ -85,9 +85,15 @@
 #define REG_BPL1PT      0x0e0
 #define REG_SPR0PTH     0x120
 #define REG_BPLCON0     0x100
+#define REG_BPLCON3     0x106       /* AGA: colour bank + LOCT */
 #define REG_BPL1MOD     0x108
 #define REG_BPL2MOD     0x10a
+#define REG_BPLCON4     0x10c       /* AGA: sprite/bitplane colour offsets */
 #define REG_COLOR00     0x180
+#define REG_FMODE       0x1fc       /* AGA: bitplane/sprite fetch width */
+
+#define BPLCON3_BANK(x) (((x) >> 13) & 7)
+#define BPLCON3_LOCT    (1 << 9)
 #define REG_COP1LC      0x080
 #define REG_COP2LC      0x084
 #define REG_COPJMP1     0x088
@@ -480,7 +486,7 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
 static void amiga_custom_beam_pos(AmigaCustomState *s, uint32_t *vpos,
                                   uint32_t *hpos);
 
-#define MAX_PLANES      6
+#define MAX_PLANES      8       /* AGA; OCS/ECS use at most 6 */
 
 #define MAX_SPRITES     8
 
@@ -600,6 +606,58 @@ static uint32_t amiga_rgb4(uint16_t c)
            ((c & 0xf) * 0x11);
 }
 
+/*
+ * Fold a 12-bit COLORxx value into a 24-bit palette entry.  LOCT picks
+ * whether it fills the low or the high nibble of each 8-bit gun; a high
+ * (normal) write duplicates the nibble so a 12-bit-only guest still
+ * scales to full range.
+ */
+static uint32_t amiga_color_mix(uint32_t old, uint16_t val, bool loct)
+{
+    if (loct) {
+        return (old & 0xf0f0f0) |
+               ((uint32_t)((val >> 8) & 0xf) << 16) |
+               (((val >> 4) & 0xf) << 8) | (val & 0xf);
+    }
+    return ((uint32_t)(((val >> 8) & 0xf) * 0x11) << 16) |
+           ((((val >> 4) & 0xf) * 0x11) << 8) | ((val & 0xf) * 0x11);
+}
+
+/*
+ * Hold-and-modify: a pixel either indexes the palette or replaces one
+ * gun of the previously held colour.  HAM6 carries 4 data + 2 control
+ * bits (16-colour base); HAM8 carries 6 data + 2 control bits (64-colour
+ * base) and the 6-bit gun value fills the top six bits of the 8-bit gun.
+ */
+static uint32_t amiga_ham_pixel(uint32_t held, int idx, int planes,
+                                const uint32_t *pal)
+{
+    int ctl, comp;
+
+    if (planes >= 7) {          /* HAM8 */
+        int data = idx >> 2;
+
+        ctl = idx & 3;
+        comp = (data << 2) | (data >> 4);
+        if (ctl == 0) {
+            return pal[data];
+        }
+    } else {                    /* HAM6 */
+        int data = idx & 0xf;
+
+        ctl = (idx >> 4) & 3;
+        comp = data * 0x11;
+        if (ctl == 0) {
+            return pal[data];
+        }
+    }
+    switch (ctl) {
+    case 1:  return (held & 0xffff00) | comp;           /* modify blue */
+    case 2:  return (held & 0x00ffff) | (comp << 16);   /* modify red */
+    default: return (held & 0xff00ff) | (comp << 8);    /* modify green */
+    }
+}
+
 /* one sprite DMA channel, walked down the frame by the renderer */
 typedef struct AmigaSpriteChan {
     uint32_t pt;
@@ -641,12 +699,26 @@ static void amiga_sprite_load_ctl(AmigaSpriteChan *c, unsigned beam)
     c->dead = true;
 }
 
-static int amiga_fetch_words(uint16_t ddfstrt, uint16_t ddfstop, bool hires)
+/*
+ * Words of bitplane data fetched per line.  FMODE widens each fetch to
+ * 2 or 4 words (32- or 64-bit), which AGA programs pair with a shorter
+ * DDF window; the plane data stays contiguous in memory, so only the
+ * word count changes.  fmode 0 keeps the exact OCS/ECS result.
+ */
+static int amiga_fetch_words(uint16_t ddfstrt, uint16_t ddfstop, bool hires,
+                             int fmode)
 {
-    if (hires) {
-        return ((ddfstop - ddfstrt) >> 2) + 2;
+    int wpf, unit;
+
+    if (fmode == 0) {
+        if (hires) {
+            return ((ddfstop - ddfstrt) >> 2) + 2;
+        }
+        return ((ddfstop - ddfstrt) >> 3) + 1;
     }
-    return ((ddfstop - ddfstrt) >> 3) + 1;
+    wpf = (fmode == 3) ? 4 : 2;          /* words per fetch block */
+    unit = (hires ? 4 : 8) * wpf;        /* colour clocks per block */
+    return (((ddfstop - ddfstrt) / unit) + 1) * wpf;
 }
 
 #define DREG(r)     (dregs[(r) >> 1])
@@ -666,18 +738,24 @@ static bool amiga_custom_gfx_update(void *opaque)
     uint16_t dregs[0x100];
     uint16_t bplcon0, ddfstrt, ddfstop, diwstrt, diwstop;
     bool hires, surf_hires = false;
-    uint32_t palette[64];
-    bool pal_dirty = true;
+    uint32_t pal[256];
     uint32_t bplpt[MAX_PLANES];
     uint8_t rowbuf[MAX_PLANES][1024 / 8];
     AmigaSpriteChan spr[MAX_SPRITES] = { 0 };
     unsigned ji = 0;
-    int words, width, height, vstart, vstop;
+    int words, width, height, vstart, vstop, fmode;
     int p, x, y;
 
     if (!s->con || !surface) {
         return true;
     }
+
+    /*
+     * Snapshot the palette as it stands entering the frame; the copper's
+     * per-line COLORxx writes are replayed onto it below, the same way
+     * the register journal drives the rest of the display.
+     */
+    memcpy(pal, s->aga_color, sizeof(pal));
 
     /*
      * Execute the copper for this frame now, at render time, not at the
@@ -699,6 +777,7 @@ static bool amiga_custom_gfx_update(void *opaque)
     diwstrt = DREG(REG_DIWSTRT);
     diwstop = DREG(REG_DIWSTOP);
     hires = bplcon0 & BPLCON0_HIRES;
+    fmode = DREG(REG_FMODE) & 3;
 
     vstart = diwstrt >> 8;
     vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
@@ -720,9 +799,9 @@ static bool amiga_custom_gfx_update(void *opaque)
         for (i = 0; i <= s->journal_len; i++) {
             if (c_con0 & BPLCON0_HIRES) {
                 surf_hires = true;
-                wh = MAX(wh, amiga_fetch_words(c_strt, c_stop, true));
+                wh = MAX(wh, amiga_fetch_words(c_strt, c_stop, true, fmode));
             } else {
-                wl = MAX(wl, amiga_fetch_words(c_strt, c_stop, false));
+                wl = MAX(wl, amiga_fetch_words(c_strt, c_stop, false, fmode));
             }
             if (i == s->journal_len) {
                 break;
@@ -775,7 +854,7 @@ static bool amiga_custom_gfx_update(void *opaque)
 
     if ((s->dmacon & (DMACON_DMAEN | DMACON_BPLEN)) !=
             (DMACON_DMAEN | DMACON_BPLEN) ||
-        width < 16 || width > 1024 || height < 16 || height > 313) {
+        width < 16 || width > 1024 || height < 16 || height > 512) {
         /* no active display: show the background colour */
         uint32_t bg = amiga_rgb4(DREG(REG_COLOR00));
         uint32_t *dst;
@@ -809,6 +888,9 @@ static bool amiga_custom_gfx_update(void *opaque)
         unsigned beam = vstart + y;
         int planes;
 
+        bool ham, ehb;
+        uint32_t held;
+
         /* catch the display state up with the beam */
         while (ji < s->journal_len && s->journal[ji].line <= beam) {
             unsigned reg = s->journal[ji].reg;
@@ -818,7 +900,12 @@ static bool amiga_custom_gfx_update(void *opaque)
                 p = (reg - REG_BPL1PT) >> 2;
                 bplpt[p] = DPTR(REG_BPL1PT + p * 4);
             } else if (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64) {
-                pal_dirty = true;
+                uint16_t con3 = DREG(REG_BPLCON3);
+                unsigned idx = BPLCON3_BANK(con3) * 32 +
+                               ((reg - REG_COLOR00) >> 1);
+
+                pal[idx] = amiga_color_mix(pal[idx], s->journal[ji].val,
+                                           con3 & BPLCON3_LOCT);
             }
             ji++;
         }
@@ -828,28 +915,21 @@ static bool amiga_custom_gfx_update(void *opaque)
                 spr[p].pt = DPTR(REG_SPR0PTH + p * 4) & CHIP_MASK;
             }
         }
-        if (pal_dirty) {
-            for (p = 0; p < 32; p++) {
-                palette[p] = amiga_rgb4(DREG(REG_COLOR00 + p * 2));
-            }
-            /* extra-half-brite */
-            for (p = 32; p < 64; p++) {
-                palette[p] = (palette[p - 32] >> 1) & 0x7f7f7f;
-            }
-            pal_dirty = false;
-        }
 
         bplcon0 = DREG(REG_BPLCON0);
-        if (bplcon0 & (BPLCON0_HAM | BPLCON0_DBLPF)) {
-            qemu_log_mask(LOG_UNIMP, "amiga-custom: HAM/dual-playfield\n");
+        if (bplcon0 & BPLCON0_DBLPF) {
+            qemu_log_mask(LOG_UNIMP, "amiga-custom: dual-playfield\n");
         }
-        planes = (bplcon0 >> 12) & 7;
+        /* AGA takes a fourth bitplane-count bit (BPU3) from BPLCON0 b4 */
+        planes = ((bplcon0 >> 12) & 7) | ((bplcon0 & 0x10) >> 1);
         if (planes > MAX_PLANES) {
             planes = MAX_PLANES;
         }
+        ham = bplcon0 & BPLCON0_HAM;
+        ehb = !ham && planes == 6;      /* extra-half-brite */
         hires = bplcon0 & BPLCON0_HIRES;
         words = amiga_fetch_words(DREG(REG_DDFSTRT) & 0xfc,
-                                  DREG(REG_DDFSTOP) & 0xfc, hires);
+                                  DREG(REG_DDFSTOP) & 0xfc, hires, fmode);
         words = MIN(MAX(words, 0), (int)sizeof(rowbuf[0]) / 2);
 
         for (p = 0; p < planes; p++) {
@@ -859,20 +939,30 @@ static bool amiga_custom_gfx_update(void *opaque)
                             rowbuf[p], words * 2, MEMTXATTRS_UNSPECIFIED);
             bplpt[p] += words * 2 + mod;
         }
+        held = pal[0];
         for (x = 0; x < words * 16; x++) {
             int scale = (surf_hires && !hires) ? 2 : 1;
+            uint32_t colour;
             int idx = 0;
 
             for (p = 0; p < planes; p++) {
                 idx |= ((rowbuf[p][x >> 3] >> (7 - (x & 7))) & 1) << p;
             }
+            if (ham) {
+                held = amiga_ham_pixel(held, idx, planes, pal);
+                colour = held;
+            } else if (ehb && idx >= 32) {
+                colour = (pal[idx - 32] >> 1) & 0x7f7f7f;
+            } else {
+                colour = pal[idx];
+            }
             while (scale-- > 0 && dst < row + width) {
-                *dst++ = palette[idx];
+                *dst++ = colour;
             }
         }
         /* a row narrower than the surface shows the background */
         while (dst < row + width) {
-            *dst++ = palette[0];
+            *dst++ = pal[0];
         }
 
         /* overlay the DMA sprites, lowest number in front */
@@ -907,9 +997,9 @@ static bool amiga_custom_gfx_update(void *opaque)
                     if (!idx || xlo + i < 0 || x0 >= width) {
                         continue;
                     }
-                    row[x0] = palette[16 + ((p >> 1) << 2) + idx];
+                    row[x0] = pal[16 + ((p >> 1) << 2) + idx];
                     if (px == 2 && x0 + 1 < width) {
-                        row[x0 + 1] = palette[16 + ((p >> 1) << 2) + idx];
+                        row[x0 + 1] = pal[16 + ((p >> 1) << 2) + idx];
                     }
                 }
             }
@@ -1251,6 +1341,21 @@ static uint64_t amiga_custom_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+/*
+ * A COLORxx write lands in one of the 256 AGA palette entries, selected
+ * by the BPLCON3 colour bank.  A plain OCS/ECS guest leaves bank and
+ * LOCT at zero and just writes the low 32 entries.
+ */
+static void amiga_custom_color_write(AmigaCustomState *s, unsigned reg,
+                                     uint16_t val)
+{
+    uint16_t bplcon3 = s->regs[REG_BPLCON3 >> 1];
+    unsigned idx = BPLCON3_BANK(bplcon3) * 32 + ((reg - REG_COLOR00) >> 1);
+
+    s->aga_color[idx] = amiga_color_mix(s->aga_color[idx], val,
+                                        bplcon3 & BPLCON3_LOCT);
+}
+
 static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
                                    uint16_t val)
 {
@@ -1322,6 +1427,9 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
         amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP2LC));
         break;
     default:
+        if (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64) {
+            amiga_custom_color_write(s, reg, val);
+        }
         s->regs[reg >> 1] = val;
         break;
     }
@@ -1403,6 +1511,7 @@ static void amiga_custom_reset(DeviceState *dev)
     timer_del(&s->disk_timer);
     memset(s->aud, 0, sizeof(s->aud));
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->aga_color, 0, sizeof(s->aga_color));
     s->frame_origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
     amiga_custom_update_irq(s);
@@ -1484,6 +1593,7 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT8(ports_levels, AmigaCustomState),
         VMSTATE_UINT8(exter_levels, AmigaCustomState),
         VMSTATE_UINT16_ARRAY(regs, AmigaCustomState, 0x100),
+        VMSTATE_UINT32_ARRAY(aga_color, AmigaCustomState, 256),
         VMSTATE_BOOL(blit_zero, AmigaCustomState),
         VMSTATE_INT64(frame_origin_ns, AmigaCustomState),
         VMSTATE_TIMER(vblank_timer, AmigaCustomState),

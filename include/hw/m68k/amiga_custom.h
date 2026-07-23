@@ -103,6 +103,13 @@ struct AmigaCustomState {
     unsigned journal_len;
     uint16_t frame_regs[0x100];
 
+    /*
+     * AGA palette: 256 colours of 24-bit RGB, maintained as the guest
+     * writes the 32 COLORxx registers through the bank and LOCT fields
+     * of BPLCON3.  ECS/OCS just uses the low 32 as 12-bit colours.
+     */
+    uint32_t aga_color[256];
+
     bool blit_zero;             /* last blit produced only zeroes */
 
     int64_t frame_origin_ns;
