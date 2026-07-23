@@ -265,11 +265,15 @@ static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
 static const MStarRegDefault mstarv7_disp_cfg8_defaults[] = {
     { 0x000, 0x11b2 },              /* 0x1f283e00, read during USB-PHY bring-up */
 };
+static const MStarRegDefault mstarv7_disp_cfg12_defaults[] = {
+    { 0x000, 0x1000 },              /* 0x1f2a4a00, mipi/dsi analog */
+};
 static const struct {
     const MStarRegDefault *defaults;
     unsigned num;
 } mstarv7_disp_cfg_defaults[MSTARV7_NUM_DISP_CFG] = {
-    [8] = { mstarv7_disp_cfg8_defaults, ARRAY_SIZE(mstarv7_disp_cfg8_defaults) },
+    [8]  = { mstarv7_disp_cfg8_defaults, ARRAY_SIZE(mstarv7_disp_cfg8_defaults) },
+    [12] = { mstarv7_disp_cfg12_defaults, ARRAY_SIZE(mstarv7_disp_cfg12_defaults) },
 };
 
 /*
