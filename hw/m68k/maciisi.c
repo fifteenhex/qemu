@@ -482,6 +482,7 @@ struct MacIIsiMachineState {
     int egret_resp_len;
     int egret_resp_idx;
     bool egret_session;
+    bool egret_no_resp;
 };
 
 #define TYPE_MACIISI_MACHINE MACHINE_TYPE_NAME("maciisi")
@@ -856,35 +857,54 @@ static void maciisi_egret_process(MacIIsiMachineState *m)
         return;
     }
 
+    m->egret_no_resp = false;
     switch (c[0]) {
-    case 0x01:                          /* pseudo/system command */
-        m->egret_resp[m->egret_resp_len++] = c[0];
-        m->egret_resp[m->egret_resp_len++] = n > 1 ? c[1] : 0;
-        m->egret_resp[m->egret_resp_len++] = 0;         /* status ok */
-        break;
-    case 0x00:                          /* ADB command */
-        m->egret_resp[m->egret_resp_len++] = c[0];
-        m->egret_resp[m->egret_resp_len++] = 0x00;      /* status ok */
-        m->egret_resp[m->egret_resp_len++] = n > 1 ? c[1] : 0;
+    case 0x00:                          /* get version */
+        /* Egret 341S0851 (IIsi) reports firmware 1.01 */
+        m->egret_resp[m->egret_resp_len++] = 0x01;
+        m->egret_resp[m->egret_resp_len++] = 0x01;
         break;
     default:
-        m->egret_resp[m->egret_resp_len++] = c[0];
+        /*
+         * No response: run the same interrupt sequence but with /XCVR
+         * high at the turnaround so the ROM discards the bytes (count
+         * is zeroed when the response-pending flag is unset).
+         */
+        m->egret_no_resp = true;
+        m->egret_resp[m->egret_resp_len++] = 0x00;
+        m->egret_resp[m->egret_resp_len++] = 0x00;
         break;
     }
 }
 
-static void maciisi_egret_feed_byte(MOS6522MacIIsiState *v1s)
+/*
+ * /XCVR_SESSION (PB3) as sampled by the ROM at each shift interrupt:
+ * LOW at the turnaround interrupt ("a response follows", the first byte
+ * is already in SR), HIGH at the interrupts delivering the middle
+ * bytes, and LOW again at the final interrupt after the last byte's
+ * ack toggle — that pattern is the receive loop's exit condition.
+ */
+static void maciisi_egret_ack_toggle(MOS6522MacIIsiState *v1s)
 {
     MacIIsiMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
     if (m->egret_resp_idx < m->egret_resp_len) {
         s->sr = m->egret_resp[m->egret_resp_idx++];
-        /* /TREQ deasserts along with the final byte's interrupt */
-        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx < m->egret_resp_len);
+        /* PB3 low only for the first byte's (turnaround) interrupt */
+        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx == 1 &&
+                                    !m->egret_no_resp);
         maciisi_egret_schedule_int(m);
         qemu_log_mask(LOG_UNIMP, "maciisi egret: feed 0x%02x (#%d/%d)\n",
                       s->sr, m->egret_resp_idx, m->egret_resp_len);
+    } else {
+        /* final ack: signal end-of-transfer, the exchange is over */
+        m->egret_resp_len = 0;
+        m->egret_resp_idx = 0;
+        m->egret_session = false;
+        maciisi_egret_set_xcvr(v1s, true);      /* PB3 low: done */
+        maciisi_egret_schedule_int(m);
+        qemu_log_mask(LOG_UNIMP, "maciisi egret: response complete\n");
     }
 }
 
@@ -901,6 +921,8 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
         m->egret_cmd_len = 0;
         m->egret_resp_len = 0;
         m->egret_resp_idx = 0;
+        /* /XCVR returns to idle before the new exchange */
+        maciisi_egret_set_xcvr(v1s, false);
         /* the ROM preloads the first byte before asserting the session */
         if (s->acr & SR_OUT) {
             maciisi_egret_sr_written(v1s);
@@ -914,22 +936,16 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
      * so it does not signify session end while a response is flowing.
      */
     if (m->egret_session && !(s->acr & SR_OUT) && hs_change
-        && m->egret_resp_idx < m->egret_resp_len) {
-        maciisi_egret_feed_byte(v1s);
+        && m->egret_resp_len > 0) {
+        maciisi_egret_ack_toggle(v1s);
         return;
     }
 
     if (!sys && m->egret_session) {
-        bool had_resp = m->egret_resp_len > 0;
-
         m->egret_session = false;
         m->egret_resp_len = 0;
         m->egret_resp_idx = 0;
         maciisi_egret_set_xcvr(v1s, false);
-        if (had_resp) {
-            /* closing edge: one final shift-complete interrupt */
-            maciisi_egret_schedule_int(m);
-        }
     }
 }
 
