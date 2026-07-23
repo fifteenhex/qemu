@@ -145,6 +145,7 @@ config AMIGA
     select OR_IRQ
     select PCNET_COMMON
     select WD33C93
+    select IDE_GAYLE
 
 config ATARIST
     bool

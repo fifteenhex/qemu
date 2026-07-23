@@ -18,6 +18,9 @@
 #define TYPE_AMIGA_MACHINE MACHINE_TYPE_NAME("amiga-common")
 OBJECT_DECLARE_TYPE(AmigaMachineState, AmigaMachineClass, AMIGA_MACHINE)
 
+/* board devices that also listen to the CPU's /RSTO line */
+#define AMIGA_RSTO_DEVS 4
+
 /* the open-collector lines the floppy drives share */
 enum {
     FLOPPY_LINE_CHNG,
@@ -40,6 +43,12 @@ struct AmigaMachineState {
     DeviceState *custom;
     DeviceState *kbd;
     DeviceState *fdc[AMIGA_FLOPPY_DRIVES];
+    /*
+     * Board-specific chips on /RSTO: boards deposit devices here from
+     * their board_init hook and the RESET instruction cold-resets them
+     * along with the shared chips.
+     */
+    DeviceState *rsto_dev[AMIGA_RSTO_DEVS];
 
     /*
      * The floppy status lines are open collector and shared by all
@@ -76,5 +85,12 @@ struct AmigaMachineClass {
  * relies on this to see 0xff ("no board") in empty config space.
  */
 extern const MemoryRegionOps amiga_open_bus_ops;
+
+/*
+ * The Gayle IDE interface at its A600/A1200 addresses, interrupting
+ * on INT2, with the IF_IDE drives attached; for the board_init hook
+ * of the machines built around Gayle.
+ */
+void amiga_gayle_init(AmigaMachineState *ams);
 
 #endif

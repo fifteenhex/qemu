@@ -29,6 +29,7 @@
 #include "hw/m68k/amiga_fdc.h"
 #include "hw/m68k/amiga_kbd.h"
 #include "hw/m68k/mos8520.h"
+#include "hw/ide/gayle.h"
 #include "system/blockdev.h"
 #include "target/m68k/cpu.h"
 
@@ -117,6 +118,11 @@ static void amiga_reset_out(void *opaque, int n, int level)
     for (i = 0; i < AMIGA_FLOPPY_DRIVES; i++) {
         device_cold_reset(ams->fdc[i]);
     }
+    for (i = 0; i < AMIGA_RSTO_DEVS; i++) {
+        if (ams->rsto_dev[i]) {
+            device_cold_reset(ams->rsto_dev[i]);
+        }
+    }
     memory_region_set_enabled(&ams->rom_overlay, true);
 }
 
@@ -153,6 +159,30 @@ const MemoryRegionOps amiga_open_bus_ops = {
     .write = amiga_open_bus_write,
     .endianness = DEVICE_BIG_ENDIAN,
 };
+
+void amiga_gayle_init(AmigaMachineState *ams)
+{
+    DeviceState *gayle = qdev_new(TYPE_GAYLE_IDE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(gayle);
+    int i;
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, GAYLE_IDE_ATA_BASE);
+    sysbus_mmio_map(sbd, 1, GAYLE_IDE_CTRL_BASE);
+    sysbus_mmio_map(sbd, 2, GAYLE_IDE_ID_BASE);
+    /* the IDE interrupt is on INT2 */
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in_named(ams->custom, "ports-irq", 0));
+    gayle_ide_init_drives(gayle, drive_get(IF_IDE, 0, 0),
+                          drive_get(IF_IDE, 0, 1));
+
+    for (i = 0; i < AMIGA_RSTO_DEVS; i++) {
+        if (!ams->rsto_dev[i]) {
+            ams->rsto_dev[i] = gayle;
+            break;
+        }
+    }
+}
 
 static void amiga_machine_init(MachineState *machine)
 {

@@ -12,10 +12,11 @@
  * 1MB steps and must not bus-error) and the Zorro III config scan
  * (0xff reads mean "no board").
  *
- * Gayle, the IDE port and PCMCIA are not modelled yet, so their
- * register space reads open bus and Kickstart's probes see nothing.
- * There is no fast RAM on the motherboard; trapdoor expansions carry
- * their own autoconfig logic and are not modelled either.
+ * Gayle's IDE interface is modelled (hw/ide/gayle.c), so hard disks
+ * attach with -drive if=ide; PCMCIA is not, and its card status
+ * lines read "no card".  There is no fast RAM on the motherboard;
+ * trapdoor expansions carry their own autoconfig logic and are not
+ * modelled either.
  *
  * As on the A4000, the AGA display renders through the ECS-compatible
  * path plus the 8-bitplane/256-colour support in amiga_custom.
@@ -24,7 +25,9 @@
  *   0x00000000  chip RAM (2MB)
  *   0x00bfd000  CIA-B
  *   0x00bfe000  CIA-A
- *   0x00da0000  Gayle IDE (unmodelled, open bus)
+ *   0x00da0000  Gayle IDE ATA registers
+ *   0x00da8000  Gayle interrupt status/change/enable/config
+ *   0x00de1000  Gayle ID (bit-serial read)
  *   0x00dff000  custom chips
  *   0x00f80000  Kickstart ROM (512KB)
  *
@@ -50,6 +53,7 @@ static void a1200_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "Commodore Amiga 1200 (68EC020, AGA)";
     /* QEMU has no EC020 variant; the 020 core stands in for it */
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68020");
+    mc->block_default_type = IF_IDE;
 
     amc->rom_base = A1200_ROM_BASE;
     amc->rom_size = 512 * KiB;
@@ -59,6 +63,7 @@ static void a1200_machine_class_init(ObjectClass *oc, const void *data)
     /* AGA: 2MB Alice reports VPOSR id 0x23, Lisa reports Denise id 0xf8 */
     amc->agnus_id = 0x23;
     amc->denise_id = 0xf8;
+    amc->board_init = amiga_gayle_init;
 }
 
 static const TypeInfo a1200_machine_types[] = {

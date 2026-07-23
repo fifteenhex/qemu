@@ -5,15 +5,18 @@
  * 2MB ECS Agnus (8375) and ECS Denise (8373), 1MB chip RAM on board
  * with a trapdoor extending chip RAM to 2MB - in a smaller case with
  * no numeric keypad, plus the Gayle gate array providing IDE and
- * PCMCIA.  Gayle, the IDE port and PCMCIA are not modelled yet, so
- * accesses to their register space read open bus and Kickstart's
- * probes see nothing.  Shipped with Kickstart 2.05.
+ * PCMCIA.  Gayle's IDE interface is modelled (hw/ide/gayle.c), so
+ * hard disks attach with -drive if=ide; PCMCIA is not, and its card
+ * status lines read "no card".  Shipped with Kickstart 2.05; IDE
+ * needs a scsi.device that knows Gayle, i.e. 2.05 r37.300+ or 3.1.
  *
  * Memory map (motherboard):
  *   0x00000000  chip RAM (1MB, trapdoor continues at 0x100000)
  *   0x00bfd000  CIA-B
  *   0x00bfe000  CIA-A
- *   0x00da0000  Gayle IDE (unmodelled, open bus)
+ *   0x00da0000  Gayle IDE ATA registers
+ *   0x00da8000  Gayle interrupt status/change/enable/config
+ *   0x00de1000  Gayle ID (bit-serial read)
  *   0x00dff000  custom chips
  *   0x00f80000  Kickstart ROM (512KB)
  *
@@ -49,6 +52,8 @@ static void a600_board_init(AmigaMachineState *ams)
     if (machine->ram_size) {
         memory_region_add_subregion(sysmem, A600_TRAPDOOR_BASE, machine->ram);
     }
+
+    amiga_gayle_init(ams);
 }
 
 static void a600_machine_class_init(ObjectClass *oc, const void *data)
@@ -60,6 +65,7 @@ static void a600_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68000");
     mc->default_ram_size = A600_TRAPDOOR_MAX;
     mc->default_ram_id = "amiga.chipram-exp";
+    mc->block_default_type = IF_IDE;
 
     amc->rom_base = A600_ROM_BASE;
     amc->rom_size = 512 * KiB;
