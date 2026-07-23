@@ -12,7 +12,8 @@
 OBJECT_DECLARE_SIMPLE_TYPE(DragonBallGPIOState, DRAGONBALL_GPIO)
 
 #define DRAGONBALL_GPIO_NGPIOPERPORT 8
-#define DRAGONBALL_GPIO_PORTS        7
+/* the EZ has ports A-G; the VZ adds J, K and M at 0x38/0x40/0x48 */
+#define DRAGONBALL_GPIO_PORTS        10
 #define DRAGONBALL_GPIO_NGPIO        (DRAGONBALL_GPIO_NGPIOPERPORT * DRAGONBALL_GPIO_PORTS)
 #define DRAGONBALL_GPIO_PORTD        3
 
@@ -31,6 +32,9 @@ struct DragonBallGPIOState {
     MemoryRegion mmio;
 
     qemu_irq output[DRAGONBALL_GPIO_NGPIO];
+
+    /* how many ports this chip variant has (7 on EZ, 10 on VZ) */
+    uint8_t num_ports;
 
     struct DragonBallGPIOPort ports[DRAGONBALL_GPIO_PORTS];
 };
