@@ -1143,23 +1143,6 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                                    address, access_type, &page_size)
         : get_physical_address(env, &physical, &prot,
                                address, access_type, &page_size);
-    if (is_030 && ret != 0) {
-        qemu_log_mask(CPU_LOG_MMU,
-                      "030 walk fail: addr=%08x type=%d pc=%08x a0=%08x "
-                      "a1=%08x tc=%08x crp=%08x/%08x\n",
-                      (uint32_t)address, access_type, env->pc,
-                      env->aregs[0], env->aregs[1], env->mmu.tc030,
-                      env->mmu.crp030[0], env->mmu.crp030[1]);
-    }
-    if (is_030 && ret == 0 && (uint32_t)address < 0x2000
-        && (uint32_t)address != (uint32_t)physical) {
-        qemu_log_mask(CPU_LOG_MMU,
-                      "030 lowmem remap: addr=%08x -> phys=%08x pc=%08x "
-                      "tc=%08x crp=%08x/%08x\n",
-                      (uint32_t)address, (uint32_t)physical, env->pc,
-                      env->mmu.tc030, env->mmu.crp030[0],
-                      env->mmu.crp030[1]);
-    }
     if (likely(ret == 0)) {
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      physical & TARGET_PAGE_MASK, prot, mmu_idx, page_size);
