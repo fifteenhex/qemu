@@ -117,6 +117,10 @@ static void m68k_cpu_reset_hold(Object *obj, ResetType type)
 #else
     cpu_m68k_set_sr(env, SR_S | SR_I);
 #endif
+    if (m68k_feature(env, M68K_FEATURE_M68060)) {
+        /* identification 0x0430, revision 1, EDEBUG/dFP/ESS clear */
+        env->pcr = 0x04300100;
+    }
     /*
      * M68000 FAMILY PROGRAMMER'S REFERENCE MANUAL
      * 3.4 FLOATING-POINT INSTRUCTION DETAILS
@@ -561,6 +565,25 @@ static bool cpu_68040_spregs_needed(void *opaque)
     return m68k_feature(&s->env, M68K_FEATURE_M68040);
 }
 
+static bool cpu_68060_spregs_needed(void *opaque)
+{
+    M68kCPU *s = opaque;
+
+    return m68k_feature(&s->env, M68K_FEATURE_M68060);
+}
+
+const VMStateDescription vmstate_68060_spregs = {
+    .name = "cpu/68060_spregs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cpu_68060_spregs_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.pcr, M68kCPU),
+        VMSTATE_UINT32(env.buscr, M68kCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_68040_spregs = {
     .name = "cpu/68040_spregs",
     .version_id = 1,
@@ -601,6 +624,7 @@ static const VMStateDescription vmstate_m68k_cpu = {
         &vmstate_cf_spregs,
         &vmstate_68040_mmu,
         &vmstate_68040_spregs,
+        &vmstate_68060_spregs,
         NULL
     },
 };

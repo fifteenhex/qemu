@@ -255,30 +255,34 @@ void HELPER(m68k_movec_to)(CPUM68KState *env, uint32_t reg, uint32_t val)
             return;
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_ITT0: /* MC68EC040 only: M68K_CR_IACR0 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             env->mmu.ttr[M68K_ITTR0] = val;
             return;
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_ITT1: /* MC68EC040 only: M68K_CR_IACR1 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             env->mmu.ttr[M68K_ITTR1] = val;
             return;
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_DTT0: /* MC68EC040 only: M68K_CR_DACR0 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             env->mmu.ttr[M68K_DTTR0] = val;
             return;
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_DTT1: /* MC68EC040 only: M68K_CR_DACR1 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             env->mmu.ttr[M68K_DTTR1] = val;
             return;
         }
@@ -291,13 +295,19 @@ void HELPER(m68k_movec_to)(CPUM68KState *env, uint32_t reg, uint32_t val)
             return;
         }
         break;
-    /* MC68060 only, unimplemented */
+    /* MC68060 */
     case M68K_CR_PCR:
+        if (m68k_feature(env, M68K_FEATURE_M68060)) {
+            /* identification/revision are fixed; EDEBUG, dFP, ESS stick */
+            env->pcr = (env->pcr & 0xffffff00) | (val & 0x83);
+            return;
+        }
+        break;
+    /* MC68060 */
     case M68K_CR_BUSCR:
         if (m68k_feature(env, M68K_FEATURE_M68060)) {
-            cpu_abort(env_cpu(env),
-                      "Unimplemented control register write 0x%x = 0x%x\n",
-                      reg, val);
+            env->buscr = val;
+            return;
         }
         break;
     }
@@ -373,27 +383,31 @@ uint32_t HELPER(m68k_movec_from)(CPUM68KState *env, uint32_t reg)
             return env->sp[M68K_ISP];
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_ITT0: /* MC68EC040 only: M68K_CR_IACR0 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             return env->mmu.ttr[M68K_ITTR0];
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_ITT1: /* MC68EC040 only: M68K_CR_IACR1 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             return env->mmu.ttr[M68K_ITTR1];
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_DTT0: /* MC68EC040 only: M68K_CR_DACR0 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             return env->mmu.ttr[M68K_DTTR0];
         }
         break;
-    /* MC68040/MC68LC040 */
+    /* MC680[46]0 */
     case M68K_CR_DTT1: /* MC68EC040 only: M68K_CR_DACR1 */
-        if (m68k_feature(env, M68K_FEATURE_M68040)) {
+        if (m68k_feature(env, M68K_FEATURE_M68040)
+         || m68k_feature(env, M68K_FEATURE_M68060)) {
             return env->mmu.ttr[M68K_DTTR1];
         }
         break;
@@ -404,12 +418,16 @@ uint32_t HELPER(m68k_movec_from)(CPUM68KState *env, uint32_t reg)
             return env->caar;
         }
 	break;
-    /* MC68060 only, unimplemented */
+    /* MC68060 */
     case M68K_CR_PCR:
+        if (m68k_feature(env, M68K_FEATURE_M68060)) {
+            return env->pcr;
+        }
+        break;
+    /* MC68060 */
     case M68K_CR_BUSCR:
         if (m68k_feature(env, M68K_FEATURE_M68060)) {
-            cpu_abort(env_cpu(env),
-                      "Unimplemented control register read 0x%x\n", reg);
+            return env->buscr;
         }
         break;
     }

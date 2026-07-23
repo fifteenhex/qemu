@@ -6247,7 +6247,11 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(cpushl,    f428, ff38, CF_ISA_A);
     INSN(cpush,     f420, ff20, M68040);
     INSN(cinv,      f400, ff20, M68040);
+    /* the 68060 keeps CINV/CPUSH and PFLUSH, but drops PTEST */
+    INSN(cpush,     f420, ff20, M68060);
+    INSN(cinv,      f400, ff20, M68060);
     INSN(pflush,    f500, ffe0, M68040);
+    INSN(pflush,    f500, ffe0, M68060);
     INSN(ptest,     f548, ffd8, M68040);
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
