@@ -268,12 +268,16 @@ static const MStarRegDefault mstarv7_disp_cfg8_defaults[] = {
 static const MStarRegDefault mstarv7_disp_cfg12_defaults[] = {
     { 0x000, 0x1000 },              /* 0x1f2a4a00, mipi/dsi analog */
 };
+static const MStarRegDefault mstarv7_disp_cfg14_defaults[] = {
+    { 0x140, 0x8002 },              /* 0x1f2a4f40, mipi/dsi analog */
+};
 static const struct {
     const MStarRegDefault *defaults;
     unsigned num;
 } mstarv7_disp_cfg_defaults[MSTARV7_NUM_DISP_CFG] = {
     [8]  = { mstarv7_disp_cfg8_defaults, ARRAY_SIZE(mstarv7_disp_cfg8_defaults) },
     [12] = { mstarv7_disp_cfg12_defaults, ARRAY_SIZE(mstarv7_disp_cfg12_defaults) },
+    [14] = { mstarv7_disp_cfg14_defaults, ARRAY_SIZE(mstarv7_disp_cfg14_defaults) },
 };
 
 /*
