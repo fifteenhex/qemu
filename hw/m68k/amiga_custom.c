@@ -644,6 +644,14 @@ static void amiga_sprite_load_ctl(AmigaSpriteChan *c, unsigned beam)
     c->dead = true;
 }
 
+static int amiga_fetch_words(uint16_t ddfstrt, uint16_t ddfstop, bool hires)
+{
+    if (hires) {
+        return ((ddfstop - ddfstrt) >> 2) + 2;
+    }
+    return ((ddfstop - ddfstrt) >> 3) + 1;
+}
+
 #define DREG(r)     (dregs[(r) >> 1])
 #define DPTR(r)     (((uint32_t)dregs[(r) >> 1] << 16) | dregs[((r) >> 1) + 1])
 
@@ -660,7 +668,7 @@ static bool amiga_custom_gfx_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     uint16_t dregs[0x100];
     uint16_t bplcon0, ddfstrt, ddfstop, diwstrt, diwstop;
-    bool hires;
+    bool hires, surf_hires = false;
     uint32_t palette[64];
     bool pal_dirty = true;
     uint32_t bplpt[MAX_PLANES];
@@ -685,17 +693,51 @@ static bool amiga_custom_gfx_update(void *opaque)
     vstart = diwstrt >> 8;
     vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
     height = vstop - vstart;
-    if (hires) {
-        words = ((ddfstop - ddfstrt) >> 2) + 2;
-    } else {
-        words = ((ddfstop - ddfstrt) >> 3) + 1;
+
+    /*
+     * Frames can mix modes (a lowres playfield above a hires status
+     * panel is a popular split).  Scan the journal for every fetch
+     * geometry the frame uses: if any part is hires the surface works
+     * in hires pixels and lowres rows are doubled.
+     */
+    {
+        uint16_t c_strt = ddfstrt, c_stop = ddfstop, c_con0 = bplcon0;
+        int wl = 0, wh = 0;
+        unsigned i;
+
+        for (i = 0; i <= s->journal_len; i++) {
+            if (c_con0 & BPLCON0_HIRES) {
+                surf_hires = true;
+                wh = MAX(wh, amiga_fetch_words(c_strt, c_stop, true));
+            } else {
+                wl = MAX(wl, amiga_fetch_words(c_strt, c_stop, false));
+            }
+            if (i == s->journal_len) {
+                break;
+            }
+            switch (s->journal[i].reg) {
+            case REG_DDFSTRT:
+                c_strt = s->journal[i].val & 0xfc;
+                break;
+            case REG_DDFSTOP:
+                c_stop = s->journal[i].val & 0xfc;
+                break;
+            case REG_BPLCON0:
+                c_con0 = s->journal[i].val;
+                break;
+            }
+        }
+        if (surf_hires) {
+            width = MAX(wh * 16, wl * 32);
+        } else {
+            width = wl * 16;
+        }
     }
-    width = words * 16;
     /* clip the fetch overrun to the display window width */
     {
         int hstart = diwstrt & 0xff;
         int hstop = (diwstop & 0xff) | 0x100;
-        int diw_width = (hstop - hstart) << (hires ? 1 : 0);
+        int diw_width = (hstop - hstart) << (surf_hires ? 1 : 0);
 
         if (diw_width > 0 && diw_width < width) {
             width = diw_width;
@@ -776,6 +818,10 @@ static bool amiga_custom_gfx_update(void *opaque)
         if (planes > MAX_PLANES) {
             planes = MAX_PLANES;
         }
+        hires = bplcon0 & BPLCON0_HIRES;
+        words = amiga_fetch_words(DREG(REG_DDFSTRT) & 0xfc,
+                                  DREG(REG_DDFSTOP) & 0xfc, hires);
+        words = MIN(MAX(words, 0), (int)sizeof(rowbuf[0]) / 2);
 
         for (p = 0; p < planes; p++) {
             int16_t mod = DREG((p & 1) ? REG_BPL2MOD : REG_BPL1MOD);
@@ -784,18 +830,25 @@ static bool amiga_custom_gfx_update(void *opaque)
                             rowbuf[p], words * 2, MEMTXATTRS_UNSPECIFIED);
             bplpt[p] += words * 2 + mod;
         }
-        for (x = 0; x < width; x++) {
+        for (x = 0; x < words * 16; x++) {
+            int scale = (surf_hires && !hires) ? 2 : 1;
             int idx = 0;
 
             for (p = 0; p < planes; p++) {
                 idx |= ((rowbuf[p][x >> 3] >> (7 - (x & 7))) & 1) << p;
             }
-            *dst++ = palette[idx];
+            while (scale-- > 0 && dst < row + width) {
+                *dst++ = palette[idx];
+            }
+        }
+        /* a row narrower than the surface shows the background */
+        while (dst < row + width) {
+            *dst++ = palette[0];
         }
 
         /* overlay the DMA sprites, lowest number in front */
         if (s->dmacon & DMACON_SPREN) {
-            int px = (DREG(REG_BPLCON0) & BPLCON0_HIRES) ? 2 : 1;
+            int px = surf_hires ? 2 : 1;
 
             for (p = MAX_SPRITES - 1; p >= 0; p--) {
                 AmigaSpriteChan *c = &spr[p];
