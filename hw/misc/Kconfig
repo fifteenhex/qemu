@@ -269,4 +269,8 @@ config MVME147_PCC
 config MVME147_VMECHIP
     bool
 
+config E17_SYSC
+    bool
+    select PS2
+
 source macio/Kconfig

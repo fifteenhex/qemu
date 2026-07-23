@@ -132,6 +132,9 @@ config ATI_VGA
     select BITBANG_I2C
     select DDC
 
+config E17_VID
+    bool
+
 config MACFB
     bool
     select FRAMEBUFFER

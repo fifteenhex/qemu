@@ -1,0 +1,90 @@
+
+***> 
+--- load CPU2 payload ---
+
+>>> sload 1 0
+sload 1 0
+ Waiting  
+ Transfer complete
+***>
+--- release CPU2 (reset + run via 0xfec58000) ---
+
+>>> mb fec58000 0
+mb fec58000 0
+fec58000 :  00
+***>
+>>> .
+.
+### Command not defined.
+***> 
+>>> mb fec58000 20
+mb fec58000 20
+fec58000 :  20
+***>
+>>> .
+.
+### Command not defined.
+***>
+--- heartbeat (should advance if CPU2 is running) ---
+
+>>> dl 10108 1
+dl 10108 1
+00010108 : 0015dc20                                            ... 
+***>
+>>> dl 10108 1
+dl 10108 1
+00010108 : 002c1fa4                                            .,..
+***>
+>>> dl 10108 1
+dl 10108 1
+00010108 : 00458597                                            .E..
+***>
+>>> dl 10108 1
+dl 10108 1
+00010108 : 005e556b                                            .^Uk
+***>
+--- mailbox round trip: write cmd, read response(=~cmd) ---
+
+>>> ml 10100 12345678
+ml 10100 12345678
+00010100 :  12345678
+***>
+>>> .
+.
+### Command not defined.
+***> 
+>>> dl 10100 4
+dl 10100 4
+00010100 : 12345678  edcba987  009238ca  00000000              .4Vx......8.....
+***>
+>>> ml 10100 a5a5a5a5
+ml 10100 a5a5a5a5
+00010100 :  a5a5a5a5
+***>
+>>> .
+.
+### Command not defined.
+***>
+>>> dl 10100 4
+dl 10100 4
+00010100 : a5a5a5a5  5a5a5a5a  00be269a  00000000              ....ZZZZ..&.....
+***> 
+--- park CPU2 (quit flag) ---
+
+>>> ml 1010c 1
+ml 1010c 1
+0001010c :  00000001
+***>
+>>> .
+.
+### Command not defined.
+***>
+>>> dl 10108 1
+dl 10108 1
+00010108 : 00cbf467                                            ...g
+***> 
+>>> dl 10108 1
+dl 10108 1
+00010108 : 00cbf467                                            ...g
+***>
+DONE

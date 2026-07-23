@@ -1,0 +1,159 @@
+# e17probe 20260721-124852 target=shiro
+>>> 
+
+***> 
+===== version: $   (RMON version / build) =====
+>>> $
+
+
+
+         **********   RMON   **********
+
+               Version : 3.1.3 (27) for the Eurocom 17 - 68040
+         Creation date : 02apr97
+
+Copyright (c) 1994-96 by ELTEC Elektronik GmbH, Mainz
+
+        Board Revision : 1.M
+         Serial Number : 187562
+         RAM available : 32 MBytes
+         Secondary CPU : Installed
+
+Extended slave address : 0x80000000  256 MByte
+          ICF1 address : 0x8000
+
+      Ethernet address : 00:00:5B:00:49:62
+
+***>
+===== csunit: dl fec70000 2c   (chip-select + memory controller regs) =====
+>>> dl fec70000 2c
+ 
+***> dl fec70000 2c
+fec70000 : fec00000  00000f30  00000b84  00000b83              .......0........
+fec70010 : 00000b84  00001bc3  00000b81  00000b81              ................
+fec70020 : 00000b84  00000b82  00001b82  00000f30              ...............0
+fec70030 : 00000f30  0
+===== vic068a: dl fec01000 20   (VIC068A regs (value = byte lane 3 of each long)) =====
+>>> dl fec01000 20
+0000830  00000b80  fec00b80              ...0...0........
+fec70040 : fe800000  fff00000  00000a03  fff00a03              ................
+fec70050 : fea00000  fff00000  00000a04  fff00a04              ................
+fec70060 : 00000b82  00000b82  fff00a04  fff00a04              ................
+fec70070 : fff00a04  fff00a04  fff00a04  fff00a04              ................
+fec70080 : fff00a04  fff00a04  00000b82  00000b82              ................
+fec70090 : 00000b82  00000b82  00000b82  00000b82              ................
+fec700a0 : 00000000  f0000000  0000528b  00000000              ..........R.....
+***>
+===== asic_dramc: dl fec080f0 2   (ASIC/DRAM timing regs) =====
+>>> dl fec080f0 2
+ dl fec01000 20
+fec01000 : 080808f8  080808f9  080808fa  080808fb              ................
+fec01010 : 080808fc  080808fd  080808fe  080808ff              ................
+fec01020 : 080808f8  08080888  08080837  08080888              ...........7....
+fec01030 : 08080888  08080888  08080888  08080888              ................
+fec01040 : 080808f8  0808087f  080808f0  0808080f              ................
+fec01050 : 0808081f  08080840  08080808  08080800              .......@........
+fec01060 : 08080800  08080800  08080800  08080800              ................
+fec01070 : 08080800  080808fc  0808087f  08080880              ................
+***>
+===== cputype: db fec5e000 4   (CPU-type latch (1=040, 4=060)) =====
+>>> db fec5e000 4
+ dl fec080f0 2
+fec080f0 : 080808ff  080808ff                                  ........
+***> db fec5e000 4
+fec5e000 : 40 ff ff ff                                         @...
+***> 
+===== misc_5c: db fec5c000 4   (misc / "slave select") =====
+>>> db fec5c000 4
+db fec5c000 4
+fec5c000 : 80 ff ff ff                                         ....
+***> 
+===== status_ack: db fec50000 4   (status/ack (mild read side effect)) =====
+>>> db fec50000 4
+db fec50000 4
+fec50000 : 40 ff ff 80                                         @...
+***> 
+===== i2c_ipin: db fec54000 4   (I2C IPIN EEPROM port) =====
+>>> db fec54000 4
+### Watchdog Reset
+
+
+         **********   RMON   **********
+
+               Version : 3.1.3 (27) for the Eurocom 17 - 68040
+         Creation date : 02apr97
+
+Copyright (c) 1994-96 by ELTEC Elektronik GmbH, Mainz
+
+        Board Revision : 1.M
+         Serial Number : 187562
+         RAM available : 32 MBytes
+         Secondary CPU : Installed
+
+Extended slave address : 0x80000000  256 MByte
+          ICF1 address : 0x8000
+
+      Ethernet address : 00:00:5B:00:49:62
+
+***>
+===== ramdac: db fec40000 8   (RAMDAC; +2 should read 0x3a) =====
+>>> db fec40000 8
+ db fec40000 8
+fec40000 : 10 00 ff 80 ff 07 ff ff                             ........
+***> 
+===== crtc: dl fec48000 8   (CRTC direct regs) =====
+>>> dl fec48000 8
+dl fec48000 8
+fec48000 : 75757575  ffffffff  ffffffff  ffffffff              uuuu............
+fec48010 : ffffffff  ffffffff  ffffffff  ffffffff              ................
+***> 
+===== macprom: db fec69d00 88   (LANCE station-address PROM area) =====
+>>> db fec69d00 88
+db fec69d00 88
+fec69d00 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d10 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d20 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d30 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d40 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d50 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d60 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d70 : 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 01     ................
+fec69d80 : 00 00 00 00 00 00 00 01                             ........
+***>
+===== nvram_hdr: db fec20000 20   (NVRAM config header) =====
+>>> db fec20000 20
+ db fec20000 20
+fec20000 : 00 ab f0 af 60 b3 40 57 10 a7 46 a3 00 b7 12 c3     ....`.@W..F.....
+fec20010 : 82 c7 16 cb 82 cf 00 d3 00 d7 00 db 00 df 80 7f     ................
+***> 
+===== nvram_boardid: db fec20460 40   (board ID block (+0x468): MAC/serial source) =====
+>>> db fec20460 40
+db fec20460 40
+fec20460 : ff ff ff ff ff ff ff ff 31 4d 41 35 34 37 30 30     ........1MA54700
+fec20470 : 31 38 37 35 36 32 02 fc 56 2d 45 31 37 2e 2d 41     187562..V-E17.-A
+fec20480 : 35 34 37 00 00 00 00 00 00 00 5b 00 49 62 1b ff     547.......[.Ib..
+fec20490 : fe 80 00 00 02 ff 00 20 10 00 00 00 ff ff ff ff     ....... ........
+***>
+===== nvram_cksum: db fec205e0 20   (config checksum (last bytes at 5fd-5ff)) =====
+>>> db fec205e0 20
+ db fec205e0 20
+fec205e0 : 80 80 80 00 0f 0f 00 00 ff ff ff ff ff ff ff ff     ................
+fec205f0 : ff ff ff ff ff ff ff ff ff ff ff ff ff fb b1 93     ................
+***> 
+===== nvram_bootstrap: db fec20700 20   (OS-9 bootstrap param block (+0x700)) =====
+>>> db fec20700 20
+db fec20700 20
+fec20700 : 45 45 45 45 45 45 45 45 45 45 45 45 45 45 45 45     EEEEEEEEEEEEEEEE
+fec20710 : 45 45 45 45 45 45 45 45 45 45 45 45 45 45 45 45     EEEEEEEEEEEEEEEE
+***> 
+===== rtc: db fec207f8 8   (M48T02 clock: ctl,sec,min,hr,dow,date,mon,yr (BCD)) =====
+>>> db fec207f8 8
+db fec207f8 8
+fec207f8 : 00 38 40 12 03 21 07 26                             .8@..!.&
+***> 
+===== scsi: scsi   (SCSI bus scan (real targets/LUNs)) =====
+>>> scsi
+scsi
+Scanning controllers and luns on SCSI bus
+Controller: LUN0 LUN1 LUN2 LUN3   Identification
+     0    :

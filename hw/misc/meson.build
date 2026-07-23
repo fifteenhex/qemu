@@ -176,3 +176,6 @@ system_ss.add(when: 'CONFIG_DRAGONBALL_SCR', if_true: files('dragonball_scr.c'))
 # MVME147
 system_ss.add(when: 'CONFIG_MVME147_PCC', if_true: files('mvme147_pcc.c'))
 system_ss.add(when: 'CONFIG_MVME147_VMECHIP', if_true: files('mvme147_vmechip.c'))
+
+# ELTEC Eurocom E17
+system_ss.add(when: 'CONFIG_E17_SYSC', if_true: files('e17_sysc.c'))

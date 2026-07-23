@@ -226,3 +226,8 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# e17_vid.c
+e17_vid_dac_write(uint64_t reg, uint64_t val) "DAC +%" PRIu64 " = 0x%02" PRIx64
+e17_vid_crtc_write(uint64_t reg, uint64_t val) "CRTC +%" PRIu64 " = 0x%02" PRIx64
+e17_vid_crtc_reg(uint8_t idx, uint16_t val) "CRTC timing reg %d = 0x%04x"

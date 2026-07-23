@@ -5,6 +5,7 @@ m68k_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-kbd.c', 'next-cube.c')
 m68k_ss.add(when: 'CONFIG_Q800', if_true: files('q800.c', 'q800-glue.c'))
 m68k_ss.add(when: 'CONFIG_M68K_VIRT', if_true: files('virt.c'))
 m68k_ss.add(when: 'CONFIG_MVME147', if_true: files('mvme147.c'))
+m68k_ss.add(when: 'CONFIG_ELTEC_E17', if_true: files('e17.c'))
 m68k_ss.add(when: 'CONFIG_AMIGA', if_true: files('amiga.c', 'a1000.c',
                                                  'a1200.c',
                                                  'a2000.c',
