@@ -32,13 +32,26 @@ Libraries".  SuperKickstart (disk-loaded) images are not supported.
     # optional disk: -drive if=scsi,file=hd.img,format=raw
     # serial (Paula):  -serial stdio
 
-## Current state (2026-07-19)
+## Current state (2026-07-19, evening)
 
 Kickstart 3.1 boots all the way to the insert-floppy screen with the
 animation running (560x145 hires, 3 planes, purple background; the
 disk animates into the drive).  Chip RAM (2MB) and fast RAM (-m, up
 to 16MB below 0x08000000) are detected correctly; exec multitasks;
 scsi.device initialises and probes the bus.
+
+Floppy boot works: `-drive if=floppy,file=x.adf,format=raw` gives a
+DF0 (hw/m68k/amiga_fdc.c) that encodes ADF tracks to AmigaDOS MFM on
+the fly for Paula disk DMA, and decodes writes back.  Lemmings (cr
+Skid Row) boots through cracktro, Psygnosis/DMA logos and title to
+the playable intro; both trackdisk.device and the game's own
+trackloader work.  The copper is now line-granular (display writes
+journalled by WAIT line, replayed by the renderer), so per-line
+palettes and split screens render.  A mouse is wired to gameport 0.
+Watch out: guest *byte* accesses to custom registers needed impl
+min_access_size 1 with the split done in the device — a trackloader
+polled INTREQR's low byte and QEMU's widening returned the wrong
+half.
 
 Structure: abstract `amiga-common` machine class (hw/m68k/amiga.c)
 holds everything all classic Amigas share — chip RAM, Kickstart +
@@ -69,12 +82,12 @@ callbacks run inside the timer's transaction).
   has mos8520_sdr_input() for injection.  Needs the handshake
   protocol and a QEMU keyboard event handler wiring scancodes.
 - Display gaps: sprites (mouse pointer is a sprite!), HAM, dual
-  playfield.  The copper is frame-atomic, so beam-synchronous raster
-  tricks won't render; fine for OS screens.
-- Not modelled: audio, floppy (trackdisk probes the drive-ID via the
-  CIA ports and gets "drive present" from the pull-ups; a real floppy
-  model would hang off CIA-B PRB + DSKLEN/DSKPT DMA), battery clock
-  (RP5C01 at 0xdc0000, currently open bus), Zorro slots.
+  playfield.  The copper is line-granular; effects keyed to the
+  horizontal beam position won't render.
+- Not modelled: audio, keyboard (CIA-A SDR handshake), battery clock
+  (RP5C01 at 0xdc0000, currently open bus), Zorro slots.  Floppy: no
+  disk change/eject at runtime yet (fixed media), only DF0, only
+  880KB DD ADFs.
 - mvme147_pcc has the same latent `dc->legacy_reset =` bug that bit
   the Amiga devices; its reset has never actually run.
 
