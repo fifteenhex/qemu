@@ -1,7 +1,8 @@
-Commodore Amiga (``a500``, ``a500plus``, ``a600``, ``a1000``, ``a1200``, ``a2000``, ``a3000``, ``a4000``)
-=========================================================================================================
+Commodore Amiga (``a500``, ``a500plus``, ``a600``, ``a1000``, ``a1200``, ``a2000``, ``a3000``, ``a4000``, ``cd32``)
+===================================================================================================================
 
-QEMU emulates eight classic Commodore Amiga models.  They share a
+QEMU emulates eight classic Commodore Amiga models and the CD32
+console.  They share a
 common core (``hw/m68k/amiga.c``) — chip RAM, the Kickstart ROM with
 its reset-time overlay at address 0, the two MOS 8520 CIAs and the
 custom chip register block — and each board adds its own CPU, memory
@@ -64,6 +65,12 @@ layout and I/O:
      - 2MB
      - motherboard fast RAM, max 16MB (8MB)
      - 3.1 (A4000)
+   * - ``cd32``
+     - 68020 [2]_
+     - AGA
+     - 2MB
+     - none
+     - 3.1 (CD32) + extended ROM
 
 .. [1] The plain A500 machine inherits the shared base's ECS chipset
    IDs, modelling an A500 fitted with the ECS chip upgrade.
@@ -109,6 +116,13 @@ Emulated hardware
 * On the A3000: the WD33C93A SCSI controller behind the SuperDMAC
   (``-drive if=scsi``), and the Ramsey/Fat Gary glue shared with the
   A4000.
+* On the A600 and A1200: Gayle's IDE interface (``-drive if=ide``,
+  master and slave), with the interrupt latching and the bit-serial
+  Gayle ID register Kickstart's scsi.device probes for.
+* On the CD32: the Akiko chip - identification, the chunky-to-planar
+  conversion port and the battery-backed I2C NVRAM.  The CD drive
+  itself is not modelled yet, so the console behaves as if no disc is
+  inserted.
 * Zorro II autoconfig with the Commodore A2065 Ethernet card (Am7990
   LANCE) as an autoconfigured board.
 
@@ -147,11 +161,23 @@ machines were developed and tested against:
    * - 3.1 r40.068 (A4000)
      - ``a4000``
      - 9bdedde6a4f33555b4a270c8ca53297d
+   * - 3.1 r40.060 (CD32)
+     - ``cd32``
+     - 5f8924d013dd57a89cf349f4cdedc6b1
+   * - CD32 extended ROM r40.60
+     - ``cd32``
+     - bb72565701b1b6faece07d68ea5da639
 
 The machines expect a plain ROM image.  "SuperKickstart" setups,
 where a bonus ROM loads the real Kickstart from disk, are not
 supported.  The 256KB Kickstart 1.x images are mirrored across the
 512KB ROM window on the machines whose real socket decode does that.
+
+The CD32 needs both ROMs: the Kickstart via ``-bios`` and the
+extended ROM (cd.device and the boot user interface), which is
+loaded from the file named by the ``extrom`` machine property
+(default ``cd32_ext.rom``, looked up like ``-bios`` is, so ``-L`` is
+the easiest way to point at a directory holding both).
 
 Booting
 -------
@@ -169,13 +195,31 @@ factory setup default to SCSI unit 6, so
 place for a hard disk.  A bootable RDB partition boots without a
 floppy present.
 
+On the A600 and A1200, hard disks attach to Gayle's IDE port::
+
+   qemu-system-m68k -M a1200 -bios kick31_a1200.rom \
+       -drive if=ide,file=hd.img,format=raw
+
+The first ``-drive if=ide`` is the master, a second the slave.
+Kickstart 3.1 (and 2.05 r37.300+ on the A600) boot-scans the RDB and
+boots a Workbench installation from the disk with no floppy present;
+Kickstart 2.05 r37.299 and older predate IDE support and ignore the
+drive.
+
+The CD32 boots to its animated "insert disc" startup screen::
+
+   qemu-system-m68k -M cd32 -L /path/to/roms -bios kick31_cd32.rom
+
 What works
 ----------
 
 * Workbench 3.1 boots to the desktop from floppy on ``a500``,
-  ``a600``, ``a1200``, ``a2000``, ``a3000`` and ``a4000``; Kickstart
-  1.3 on ``a1000``/``a2000`` and 2.04/2.05 on ``a500plus``/``a600``
-  reach their insert-disk screens.
+  ``a600``, ``a1200``, ``a2000``, ``a3000`` and ``a4000``, and from
+  an IDE hard disk on ``a600`` and ``a1200``; Kickstart 1.3 on
+  ``a1000``/``a2000`` and 2.04/2.05 on ``a500plus``/``a600`` reach
+  their insert-disk screens.
+* The CD32 runs its boot chime and startup animation from the
+  extended ROM, rendering through Akiko's chunky-to-planar port.
 * Games run from ADF: Lemmings and The Secret of Monkey Island are
   playable, and Deluxe Galaga (AGA) runs in 256 colours on the
   ``a4000``.
@@ -195,9 +239,9 @@ Known limitations
   render.
 * The battery-backed clock is not modelled, and Zorro III cards are
   not supported (the config space reads open bus).
-* Gayle, IDE and PCMCIA on the ``a600``/``a1200`` (and the A4000's
-  onboard IDE) are not modelled: those machines have no hard disk
-  yet.
+* PCMCIA on the ``a600``/``a1200`` and the A4000's onboard IDE are
+  not modelled, and the CD32 has no CD drive yet (the console runs
+  its "no disc" startup screen).
 * Floppies are 880KB double-density ADFs only.
 * Joystick directions in gameport 1 are not wired (only the fire
   button is).

@@ -342,3 +342,88 @@ callbacks run inside the timer's transaction).
   (drivers/scsi/a3000.h etc.) were the main reference sources; the
   scsi.device ISR confirmed the SDMAC register quirks (SASR mirror
   read at 0x49, ISTR INT_P gate).
+
+## Session 2026-07-23: Gayle IDE (A600/A1200 hard disk boot) + CD32
+
+New hardware this session: hw/ide/gayle.c (the Gayle gate array's IDE
+interface, on QEMU's IDE core) and hw/m68k/cd32.c + cd32_akiko.c (the
+CD32 console with Akiko).  Milestones hit: a1200 and a600 boot
+Workbench 3.1 from an IDE hard disk to the desktop with no floppy;
+`-M cd32` boots to the animated startup screen (spinning disc over the
+starfield).  All verified by screendump.
+
+- Gayle IDE layout (per Linux pata_gayle.c/amigayle.h and the Gayle
+  spec): ATA block at 0xda0000 (data word at +0, task file byte regs
+  at +2 + reg*4, control/altstatus +0x101a, bits 0x2020 undecoded so
+  scsi.device's 0xda2000 accesses are mirrors), IRQ regs at
+  0xda8000 (live status)/0xda9000 (change latch, write-0-to-clear,
+  bits 1:0 store)/0xdaa000 (enable)/0xdab000 (config), Gayle ID at
+  0xde1000 (serial read, one bit per read on D7 after any write
+  resets the pointer; 0xd0).  IDE INTRQ latches into 0xda9000 bit 7
+  and drives INT2 when enabled.  KS3.1 A1200/A500-A600 scsi.device
+  found the disk with no fuss on the first try; KS2.05 r37.299
+  (pre-A600HD) ignores it, as on real hardware.  Data port is a
+  little-endian region: memory core swaps per 16-bit word for the BE
+  guest = the straight D15..D0 wiring.
+- Workbench HD image WITHOUT a guest install pass: amitools' xdftool
+  (venv at /workspace/home/dev/amitools-venv) understands RDB images
+  with `open part=<name>`.  Recipe: cp hd-golden.img (RDB, two FFS
+  partitions, guest-formatted, empty), `xdftool img open part=WB_2.x
+  + delete Disk.info + write <each top-level entry of the unpacked
+  wb31_workbench.adf>`.  The FFS the guest formatted stays intact, so
+  Kickstart mounts and boots it.  Saved as
+  _amiga_assets/hd-wb31-golden.img; boots on a600/a1200 IDE and (via
+  if=scsi,unit=6) presumably a3000.  Use snapshot=on for tests.
+- CD32 board: a1200 clone + extended ROM 512KB at 0xe00000 (machine
+  prop "extrom", qemu_find_file so -L works) + Akiko at 0xb80000.  No
+  Gayle.  Akiko: ID 0xc0cacafe, C2P port at +0x38 (8 longword FIFO,
+  WinUAE-equivalent bit permutation, used by the boot animation),
+  NVRAM I2C at +0x30/+0x32 (SCL bit7/SDA bit6, level vs direction
+  regs) bit-banged into 4x at24c-eeprom (a 24C08's four banks on i2c
+  addresses 0x50..0x53), CD controller regs stored-only (no drive =
+  "no disc": exactly the boot-animation behaviour).  Kickstart does
+  word writes to 0x30/0x32, so the odd bytes 0x31/0x33 land in the
+  UNIMP log - harmless.  KS also probes the (absent) Gayle ID at
+  0xde1000, reads open bus 0xff, moves on.
+- CD32 debugging saga, in order:
+  1. Boot hung in audio.device (PC 0xfbc1e2, polling its channel
+     struct).  audio.device starts EVERY DMA playback by hand-feeding
+     one word to AUDxDAT and letting the AUDx interrupt handler
+     (is_Code, switched to the "DMA start" routine 0xfbb874) set
+     DMACON - Paula's manual (non-DMA) audio mode.  Implemented: DAT
+     write with the channel DMA off schedules INT_AUDx after 2
+     periods (QEMUTimer per channel).
+  2. Then the chime crawled: the boot jingle plays a period-8 sweep
+     (443kHz!), and the mixer clamped periods to Paula's fetch floor
+     (124), stretching a 0.3s buffer to ~40s.  Clamp removed: a
+     starved Paula repeats words but drains at the programmed rate,
+     and the guest just sleeps until the buffer-done interrupt.
+  3. Then CDUITask GURU'd (Line-F at PC 0xff000000): graphics'
+     SetChipRev derives the Lisa REVISION from ~DENISEID >> 8 & 3.
+     Real Lisa drives all 16 bits (DENISEID = 0x00f8); our 0xff00|id
+     made rev = 0 = pre-production, and the CD32 UI jumped through a
+     vector that revision leaves unset.  DENISEID now returns 0x00f8
+     when denise-id is 0xf8 (AGA), 0xff00|id otherwise.
+  4. With the revision right, KS programs REAL AGA fetch: hires WB
+     screen = FMODE 3, DDF 0x38..0xd8 = 11 4-word bursts = 44 words
+     (88 bytes) fetched per row, BPLxMOD 0x48, interleaved 80-byte
+     rows, plane pointers pre-decremented 2 bytes for the early
+     DDFSTRT.  Our renderer used the frame-start FMODE (0 -> 42
+     words) and sheared the whole screen 4 bytes/row.  FMODE is now
+     journalled and tracked per line like DDF/BPLCON0.  (Debug trick
+     that cracked it: pmemsave the bitplanes and re-render them
+     host-side with PIL - the guest's framebuffer was pixel-perfect,
+     which pinned the bug on the renderer.)
+- Boot timing: CD32 takes ~90-100s to the animation (real-time chime
+  + C2P decompression on the emulated 020); a transient garbage frame
+  around 75-85s is the animation decompressing into the visible
+  buffer.  Works with no -audiodev (default backend drains); wav
+  backend captures the chime (nice for regression: silence = broken).
+- exec Alert debugging recipe: alert code lands in D6/at 0x100
+  (0x8000000b = dead-end Line-F), crashed task from SysBase; a
+  5-line temporary hook in do_interrupt_all() printing pc/sp/regs +
+  stack top on EXCP_LINEF beats gdbstub for this (register reads via
+  gdb come back byte-swapped, monitor xp does not).
+- Gayle/board reset: AmigaMachineState gained rsto_dev[], board
+  devices the RESET instruction cold-resets along with the shared
+  chips (gayle on a600/a1200, akiko on cd32).
