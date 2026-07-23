@@ -308,13 +308,43 @@ everything — beware, the idle loop makes that huge — or the targeted
   not SCRIPTS, so a phase-engine model in the style of the other
   QEMU SCSI HBAs should be enough to boot OS-9 from a disk image.
   THIS IS THE HIGHEST-PAYOFF NEXT TASK.
-- `boot` with device=Ethernet: no output, sits in the console getc
-  loop (PC fe81dc7e/fe81dca0) polling only VIC LICR6 + the CD2401 —
-  it never touches the LANCE.  NOT a timer problem (a 0.3s runtime
-  trace of the hang shows zero CIO accesses; enable tracing at
-  runtime with an HMP monitor socket and "trace-event NAME on").
-  Perhaps it waits for the ethernet address from the IPIN EEPROM
-  (our I2C stub reads 0xff) — investigate when doing the LANCE.
+- Beware when scripting the setup menus: exiting setup after changes
+  raises a strict "Save parameters (y/n)?" prompt that eats any
+  other keystrokes — the earlier "netboot hangs silently" was this
+  prompt swallowing the "boot" command (found by walking the a5
+  frame chain from the getc loop back to the y/n comparison at
+  fe80ad42).
+- `boot` with device=Ethernet (after answering the prompt) runs
+  "Network bootstrap V1.3": prints its configuration (local/server
+  internet address from NVRAM, boot file name, "Booting via
+  TFTPBOOT") and then programs the LANCE exactly per the datasheet:
+  CSR1/CSR2 = init block at phys 0x8000, CSR3 = 0x0002 (ACON), a
+  CSR4 write 0x45 (ILACC probe? plain LANCE has CSR0-3 only), then
+  CSR0 = INIT and endless CSR0 polling for IDON.  With 0.0.0.0
+  addresses it will BOOTP first ("Received BOOTP response" string).
+
+## Netboot plan (for loading u-boot or other payloads)
+
+1. Wire QEMU's existing LANCE model (hw/net/lance.c, as mvme147
+   does) at 0xfec68000 with the E17 lane arrangement: RDP at +2,
+   RAP at +6 (16-bit regs in the low half of 32-bit words) — two
+   2-byte memory region aliases onto the lance's RDP/RAP.  DMA byte
+   order should match the mvme147 ledma swap (same 16-bit LANCE on
+   big-endian 68k bus; the tree's lance already routes through
+   those hooks).
+2. Station address: RMON reads the MAC from a PROM around LANCE
+   +0x1d01/+0x1d81 (odd byte lanes, low nibbles) — model as a small
+   ROM region, or rely on the EPROM-default address (banner shows
+   00:00:5B:00:49:62 without it).
+3. Use slirp's built-in BOOTP+TFTP: -netdev user,tftp=DIR,
+   bootfile=FILE; the bootstrap does BOOTP then TFTP.
+4. Payload format: unknown yet — "boot file cpu type mismatch"
+   string implies a header check on the loaded image (OS-9 module
+   header? ELTEC wrapper?).  RE the TFTP-done path once transfers
+   work to learn the expected format and entry convention; then a
+   u-boot binary can be wrapped accordingly.
+   (Alternative payload path that needs no network: `sload`
+   S-record download over serial + `gm` start user module.)
 - Session hygiene: other Claude sessions also run QEMU here — always
   use unique names (socket paths under ~/e17-re, odd gdb ports, kill
   only via stored pids, never pkill by generic pattern).
