@@ -29,6 +29,9 @@
 #include "hw/m68k/amiga.h"
 #include "hw/m68k/a3000_sdmac.h"
 #include "hw/scsi/wd33c93.h"
+#include "hw/core/or-irq.h"
+#include "hw/m68k/amiga_a2065.h"
+#include "net/net.h"
 #include "target/m68k/cpu.h"
 
 #define A3000_SUPERDMAC_BASE    0xdd0000
@@ -119,7 +122,8 @@ static void a3000_board_init(AmigaMachineState *ams)
     A3000MachineState *s = A3000_MACHINE(ams);
     MachineState *machine = MACHINE(ams);
     MemoryRegion *sysmem = get_system_memory();
-    DeviceState *sbic_dev, *sdmac_dev;
+    DeviceState *sbic_dev, *sdmac_dev, *a2065_dev, *int2_dev;
+    NICInfo *nd;
 
     /* motherboard fast RAM sits below 0x08000000, sized by Kickstart */
     if (machine->ram_size > 16 * MiB) {
@@ -144,9 +148,28 @@ static void a3000_board_init(AmigaMachineState *ams)
                              &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(sdmac_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(sdmac_dev), 0, A3000_SUPERDMAC_BASE);
+    /*
+     * The SuperDMAC and the A2065 both raise INT2, so OR them onto the
+     * custom chip's single ports-irq (INT2) input.
+     */
+    int2_dev = qdev_new(TYPE_OR_IRQ);
+    qdev_prop_set_uint16(int2_dev, "num-lines", 2);
+    qdev_realize_and_unref(int2_dev, NULL, &error_fatal);
+    qdev_connect_gpio_out(int2_dev, 0,
+                          qdev_get_gpio_in_named(ams->custom, "ports-irq", 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(sdmac_dev), 0,
-                       qdev_get_gpio_in_named(ams->custom, "ports-irq", 0));
+                       qdev_get_gpio_in(int2_dev, 0));
     scsi_bus_legacy_handle_cmdline(&WD33C93(sbic_dev)->bus);
+
+    /* A2065 Ethernet: a Zorro II card, autoconfigured by the OS */
+    a2065_dev = qdev_new(TYPE_AMIGA_A2065);
+    nd = qemu_find_nic_info(TYPE_AMIGA_A2065, true, NULL);
+    if (nd) {
+        qdev_set_nic_properties(a2065_dev, nd);
+    }
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(a2065_dev), &error_fatal);
+    sysbus_connect_irq(SYS_BUS_DEVICE(a2065_dev), 0,
+                       qdev_get_gpio_in(int2_dev, 1));
 
     /*
      * Zorro III configuration space: with no boards present,

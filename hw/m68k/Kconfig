@@ -79,6 +79,8 @@ config AMIGA
     depends on M68K
     select PTIMER
     select SPLIT_IRQ
+    select OR_IRQ
+    select PCNET_COMMON
     select WD33C93
 
 config MEGADRIVE
