@@ -9,8 +9,38 @@
 #include "qemu/error-report.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "hw/misc/mvme147_pcc.h"
 #include "migration/vmstate.h"
+
+/*
+ * Recompute the interrupt request towards the CPU: the highest level
+ * among pending+enabled sources wins and supplies its vector, formed
+ * from the high nibble of the vector base register and the source id.
+ */
+static void mvme147_pcc_update_irq(MVME147PCCState *s)
+{
+    int level = 0;
+    uint8_t vector = 0;
+    static const uint8_t timer_vec[2] = {
+        MVME147_PCC_VEC_TIMER1, MVME147_PCC_VEC_TIMER2
+    };
+    int i;
+
+    if (s->gen_purpose_control & MVME147_PCC_GEN_PURPOSE_CTRL_MINTEN) {
+        for (i = 0; i < 2; i++) {
+            int l = s->timerN_int_ctrl[i] & MVME147_PCC_INT_CTRL_LEVEL_MASK;
+
+            if (s->timerN_int[i] &&
+                (s->timerN_int_ctrl[i] & MVME147_PCC_INT_CTRL_IEN) &&
+                l > level) {
+                level = l;
+                vector = (s->int_vector_base & 0xf0) | timer_vec[i];
+            }
+        }
+    }
+    qemu_set_irq(s->irq, (level << 8) | vector);
+}
 
 static uint16_t mvme147_pcc_timer_get_count(MVME147PCCState *s, unsigned int which)
 {
@@ -45,11 +75,13 @@ static uint64_t mvme147_pcc_read(void *opaque, hwaddr addr, unsigned size)
     case MVME147_PCC_TIMER2_COUNT:
 		return mvme147_pcc_timer_get_count(s, 1);
     case MVME147_PCC_TIMER1_INT_CTRL:
-    	return s->timerN_int_ctrl[0];
+    	return s->timerN_int_ctrl[0] |
+    	       (s->timerN_int[0] ? MVME147_PCC_TIMERN_INT_CTRL_INTSTAT : 0);
     case MVME147_PCC_TIMER1_CTRL:
     	return s->timerN_ctrl[0];
     case MVME147_PCC_TIMER2_INT_CTRL:
-    	return s->timerN_int_ctrl[1];
+    	return s->timerN_int_ctrl[1] |
+    	       (s->timerN_int[1] ? MVME147_PCC_TIMERN_INT_CTRL_INTSTAT : 0);
     case MVME147_PCC_TIMER2_CTRL:
     	return s->timerN_ctrl[1];
     case MVME147_PCC_WDOG_TIMER_CTRL:
@@ -71,6 +103,8 @@ static uint64_t mvme147_pcc_read(void *opaque, hwaddr addr, unsigned size)
     	return s->gen_purpose_control;
     case MVME147_PCC_GEN_PURPOSE_STAT:
     	return s->gen_purpose_stat;
+    case MVME147_PCC_INT_VECTOR_BASE:
+    	return s->int_vector_base;
     case MVME147_PCC_SLAVE_BASE_ADDR:
 		return 0;
     default:
@@ -133,16 +167,24 @@ static void mvme147_pcc_write(void *opaque, hwaddr addr, uint64_t value,
     	s->timerN_preload[1] = value;
     	break;
     case MVME147_PCC_TIMER1_INT_CTRL:
-    	s->timerN_int_ctrl[0] = value;
+    	if (value & MVME147_PCC_TIMERN_INT_CTRL_INTSTAT) {
+    		s->timerN_int[0] = false;
+    	}
+    	s->timerN_int_ctrl[0] = value & ~MVME147_PCC_TIMERN_INT_CTRL_INTSTAT;
     	mvme147_pcc_timer_update(s, 0);
+    	mvme147_pcc_update_irq(s);
     	break;
     case MVME147_PCC_TIMER1_CTRL:
     	s->timerN_ctrl[0] = value;
     	mvme147_pcc_timer_update(s, 0);
     	break;
     case MVME147_PCC_TIMER2_INT_CTRL:
-    	s->timerN_int_ctrl[1] = value;
+    	if (value & MVME147_PCC_TIMERN_INT_CTRL_INTSTAT) {
+    		s->timerN_int[1] = false;
+    	}
+    	s->timerN_int_ctrl[1] = value & ~MVME147_PCC_TIMERN_INT_CTRL_INTSTAT;
     	mvme147_pcc_timer_update(s, 1);
+    	mvme147_pcc_update_irq(s);
     	break;
     case MVME147_PCC_TIMER2_CTRL:
     	s->timerN_ctrl[1] = value;
@@ -177,6 +219,7 @@ static void mvme147_pcc_write(void *opaque, hwaddr addr, uint64_t value,
     	break;
     case MVME147_PCC_GEN_PURPOSE_CTRL:
     	s->gen_purpose_control = value;
+    	mvme147_pcc_update_irq(s);
     	break;
     case MVME147_PCC_LAN_INT_CTRL:
     	break;
@@ -195,6 +238,8 @@ static void mvme147_pcc_write(void *opaque, hwaddr addr, uint64_t value,
     case MVME147_PCC_SW_INT1_CTRL:
     	break;
     case MVME147_PCC_INT_VECTOR_BASE:
+    	s->int_vector_base = value;
+    	mvme147_pcc_update_irq(s);
     	break;
     case MVME147_PCC_SW_INT2_CTRL:
     	break;
@@ -223,6 +268,7 @@ static void mvme147_pcc_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->mmio, OBJECT(dev), &mvme147_pcc_ops, s, TYPE_MVME147_PCC, 0x30);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 }
 
 static const VMStateDescription vmstate_mvme147_pcc = {
@@ -244,6 +290,9 @@ static void mvme147_pcc_timer_overflow(MVME147PCCState *s, unsigned int which)
                               MVME147_PCC_TIMERN_CTRL_OVF_MASK;
 	s->timerN_ctrl[which] &= ~(MVME147_PCC_TIMERN_CTRL_OVF_MASK << MVME147_PCC_TIMERN_CTRL_OVF_SHIFT);
 	s->timerN_ctrl[which] |= ((overflows + 1) & MVME147_PCC_TIMERN_CTRL_OVF_MASK) << MVME147_PCC_TIMERN_CTRL_OVF_SHIFT;
+
+	s->timerN_int[which] = true;
+	mvme147_pcc_update_irq(s);
 }
 
 

@@ -23,6 +23,9 @@ struct MVME147PCCState {
 
     ptimer_state *timers[2];
 
+    /* encodes (level << 8) | vector towards the board */
+    qemu_irq irq;
+
     uint32_t table_address;
     uint32_t data_address;
     uint32_t link;
@@ -30,6 +33,8 @@ struct MVME147PCCState {
     uint16_t timerN_preload[2];
     uint8_t timerN_int_ctrl[2];
     uint8_t timerN_ctrl[2];
+    bool timerN_int[2];
+    uint8_t int_vector_base;
     uint8_t gen_purpose_control;
     uint8_t gen_purpose_stat;
 };
@@ -46,6 +51,11 @@ struct MVME147PCCState {
 /* 8 bit registers */
 #define MVME147_PCC_TIMER1_INT_CTRL          0x18
 #define MVME147_PCC_TIMERN_INT_CTRL_INTSTAT	 (1 << 7)
+#define MVME147_PCC_INT_CTRL_IEN             (1 << 3)
+#define MVME147_PCC_INT_CTRL_LEVEL_MASK      0x7
+/* interrupt vector numbers ORed into the vector base high nibble */
+#define MVME147_PCC_VEC_TIMER1               8
+#define MVME147_PCC_VEC_TIMER2               9
 #define MVME147_PCC_TIMER1_CTRL              0x19
 #define MVME147_PCC_TIMERN_CTRL_ENABLE       (1 << 0)
 #define MVME147_PCC_TIMERN_CTRL_ENACNT       (1 << 1)
