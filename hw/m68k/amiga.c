@@ -208,6 +208,7 @@ static void amiga_machine_init(MachineState *machine)
         qdev_prop_set_string(ams->custom, "audiodev", machine->audiodev);
     }
     qdev_prop_set_uint32(ams->custom, "agnus-id", amc->agnus_id);
+    qdev_prop_set_uint32(ams->custom, "denise-id", amc->denise_id);
     object_property_set_link(OBJECT(ams->custom), "fdc0",
                              OBJECT(ams->fdc[0]), &error_abort);
     object_property_set_link(OBJECT(ams->custom), "fdc1",
@@ -310,6 +311,7 @@ static void amiga_machine_class_init(ObjectClass *oc, const void *data)
     /* PAL defaults */
     amc->cia_clock_hz = 709379;     /* E clock: 7.09MHz / 10 */
     amc->agnus_id = 0x22;           /* ECS 2MB Agnus */
+    amc->denise_id = 0xfc;          /* ECS Denise */
 }
 
 static const TypeInfo amiga_machine_types[] = {

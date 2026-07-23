@@ -59,6 +59,7 @@ struct AmigaMachineClass {
     uint32_t chipram_size;
     uint32_t cia_clock_hz;
     uint32_t agnus_id;
+    uint32_t denise_id;
     /*
      * Size of the region (from address 0) where the glue logic always
      * terminates bus cycles, so accesses to unpopulated addresses read
