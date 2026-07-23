@@ -257,6 +257,22 @@ static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
 };
 
 /*
+ * Reset defaults for the display/analog readback banks, captured from a real
+ * SSD202D (Miyoo Mini) via contrib/mstarpoker - the non-zero values these
+ * banks power up holding, which the vendor IPL reads back. Indices match
+ * mstarv7_disp_cfg_base[]; banks not listed reset to 0.
+ */
+static const MStarRegDefault mstarv7_disp_cfg8_defaults[] = {
+    { 0x000, 0x11b2 },              /* 0x1f283e00, read during USB-PHY bring-up */
+};
+static const struct {
+    const MStarRegDefault *defaults;
+    unsigned num;
+} mstarv7_disp_cfg_defaults[MSTARV7_NUM_DISP_CFG] = {
+    [8] = { mstarv7_disp_cfg8_defaults, ARRAY_SIZE(mstarv7_disp_cfg8_defaults) },
+};
+
+/*
  * Reset defaults for the readback banks, captured from a real SSD202D
  * (Miyoo Mini) via contrib/mstarpoker - the values these banks power up
  * holding, which the vendor code reads back. See VALIDATION.md; only the
@@ -403,6 +419,10 @@ static void mstarv7_soc_init(Object *obj)
     for (i = 0; i < MSTARV7_NUM_DISP_CFG; i++) {
         object_initialize_child(obj, "disp-cfg[*]", &s->disp_cfg[i],
                                 TYPE_MSTAR_REGBANK);
+        s->disp_cfg[i].defaults = mstarv7_disp_cfg_defaults[i].defaults;
+        s->disp_cfg[i].num_defaults = mstarv7_disp_cfg_defaults[i].num;
+        s->disp_cfg[i].base = mstarv7_disp_cfg_base[i];
+        s->disp_cfg[i].bankname = "disp_cfg";
     }
     object_initialize_child(obj, "cpupll", &s->cpupll, TYPE_MSTAR_CPUPLL);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSTAR_PWM);
