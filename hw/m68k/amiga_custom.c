@@ -221,6 +221,110 @@ static uint16_t blit_fill(uint16_t d, bool exclusive, bool *fc)
     return out;
 }
 
+#define BLTCON1_SIGN    (1 << 6)
+#define BLTCON1_SUD     (1 << 4)
+#define BLTCON1_SUL     (1 << 3)
+#define BLTCON1_AUL     (1 << 2)
+#define BLTCON1_SING    (1 << 1)
+
+/*
+ * Line mode: a Bresenham stepper.  BLTAPT is the error accumulator,
+ * BLTAMOD/BLTBMOD the two increments, BLTCON1 carries the octant and
+ * the initial sign, and C/D point at the word containing the first
+ * pixel with the start bit in ASH.  One pixel is drawn per "row" of
+ * the blit; with SING set only the first pixel on each raster line
+ * lands, which is what area fill outlines need.
+ */
+static void amiga_custom_do_line(AmigaCustomState *s, int len)
+{
+    uint16_t con0 = amiga_custom_reg(s, REG_BLTCON0);
+    uint16_t con1 = amiga_custom_reg(s, REG_BLTCON1);
+    uint16_t adat = amiga_custom_reg(s, REG_BLTADAT);
+    uint16_t afwm = amiga_custom_reg(s, REG_BLTAFWM);
+    uint16_t bdat = amiga_custom_reg(s, REG_BLTBDAT);
+    int16_t amod = amiga_custom_reg(s, REG_BLTAMOD);
+    int16_t bmod = amiga_custom_reg(s, REG_BLTBMOD);
+    int16_t cmod = amiga_custom_reg(s, REG_BLTCMOD);
+    uint32_t cpt = amiga_custom_ptr(s, REG_BLTCPT);
+    int16_t acc = amiga_custom_ptr(s, REG_BLTAPT);
+    int ash = con0 >> 12, bsh = con1 >> 12;
+    uint8_t lf = con0;
+    bool sign = con1 & BLTCON1_SIGN;
+    bool sud = con1 & BLTCON1_SUD;
+    bool sul = con1 & BLTCON1_SUL;
+    bool aul = con1 & BLTCON1_AUL;
+    bool dot = false;
+    bool zero = true;
+    int i;
+
+    for (i = 0; i < len; i++) {
+        bool tex = (bdat >> (15 - ((bsh + i) & 15))) & 1;
+        uint16_t a = (adat & afwm) >> ash;
+        uint16_t b = tex ? 0xffff : 0;
+        uint16_t c = chip_read16(cpt);
+        uint16_t d = blit_minterm(lf, a, b, c);
+
+        if (!(con1 & BLTCON1_SING) || !dot) {
+            if (con0 & BLTCON0_USED) {
+                chip_write16(cpt, d);
+            }
+            dot = true;
+        }
+        if (d) {
+            zero = false;
+        }
+
+        /*
+         * The minor ("sometimes") axis moves only while the sign is
+         * clear, in the SUL direction; the major axis moves every
+         * pixel in the AUL direction.  SUD selects which axis is
+         * which: set means Y is the minor axis and X the major one.
+         */
+        acc += sign ? bmod : amod;
+        if (!sign) {
+            if (sud) {
+                cpt += sul ? -cmod : cmod;
+                dot = false;
+            } else {
+                if (sul) {
+                    if (ash-- == 0) {
+                        ash = 15;
+                        cpt -= 2;
+                    }
+                } else {
+                    if (++ash == 16) {
+                        ash = 0;
+                        cpt += 2;
+                    }
+                }
+            }
+        }
+        if (sud) {
+            if (aul) {
+                if (ash-- == 0) {
+                    ash = 15;
+                    cpt -= 2;
+                }
+            } else {
+                if (++ash == 16) {
+                    ash = 0;
+                    cpt += 2;
+                }
+            }
+        } else {
+            cpt += aul ? -cmod : cmod;
+            dot = false;
+        }
+        sign = acc < 0;
+    }
+
+    amiga_custom_set_ptr(s, REG_BLTCPT, cpt);
+    amiga_custom_set_ptr(s, REG_BLTDPT, cpt);
+    s->regs[REG_BLTCON0 >> 1] = (ash << 12) | (con0 & 0x0fff);
+    s->blit_zero = zero;
+    amiga_custom_post_int(s, INT_BLIT);
+}
+
 static void amiga_custom_do_blit(AmigaCustomState *s, int width, int height)
 {
     uint16_t con0 = amiga_custom_reg(s, REG_BLTCON0);
@@ -248,8 +352,7 @@ static void amiga_custom_do_blit(AmigaCustomState *s, int width, int height)
     int x, y;
 
     if (con1 & BLTCON1_LINE) {
-        qemu_log_mask(LOG_UNIMP, "amiga-custom: blitter line mode\n");
-        amiga_custom_post_int(s, INT_BLIT);
+        amiga_custom_do_line(s, height);
         return;
     }
 
