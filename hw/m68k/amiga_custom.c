@@ -506,14 +506,12 @@ static bool amiga_custom_display_reg(unsigned reg)
 static void amiga_custom_run_copper(AmigaCustomState *s, uint32_t pc)
 {
     int budget = 20000;
-    uint32_t line, hpos;
+    uint32_t line = 0;          /* the copper restarts at the frame top */
 
     if ((s->dmacon & (DMACON_DMAEN | DMACON_COPEN)) !=
         (DMACON_DMAEN | DMACON_COPEN)) {
         return;
     }
-
-    amiga_custom_beam_pos(s, &line, &hpos);
 
     while (budget-- > 0) {
         uint16_t ir1 = chip_read16(pc);
@@ -583,14 +581,6 @@ static void amiga_custom_vblank(void *opaque)
 
     s->frame_origin_ns += FRAME_NS;
     timer_mod(&s->vblank_timer, s->frame_origin_ns + FRAME_NS);
-    /*
-     * Snapshot the display state the frame starts with, then let the
-     * copper journal its per-line changes on top; the copper restarts
-     * from the top of its list every frame.
-     */
-    memcpy(s->frame_regs, s->regs, sizeof(s->frame_regs));
-    s->journal_len = 0;
-    amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
     amiga_custom_post_int(s, INT_VERTB);
 }
 
@@ -688,6 +678,19 @@ static bool amiga_custom_gfx_update(void *opaque)
     if (!s->con || !surface) {
         return true;
     }
+
+    /*
+     * Execute the copper for this frame now, at render time, not at the
+     * vertical blank.  The guest's vblank interrupt handler rebuilds and
+     * swaps its double-buffered copper lists; running the copper before
+     * that handler ran could catch a half-updated COP2LC and lose the
+     * frame's bitplane setup (a flickering Workbench).  Snapshot the
+     * frame-start registers, then let the copper journal its per-line
+     * writes on top.
+     */
+    memcpy(s->frame_regs, s->regs, sizeof(s->frame_regs));
+    s->journal_len = 0;
+    amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
 
     memcpy(dregs, s->frame_regs, sizeof(dregs));
     bplcon0 = DREG(REG_BPLCON0);
