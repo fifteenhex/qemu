@@ -873,32 +873,62 @@ static void maciisi_egret_process(MacIIsiMachineState *m)
     }
 }
 
+static void maciisi_egret_feed_byte(MOS6522MacIIsiState *v1s)
+{
+    MacIIsiMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    if (m->egret_resp_idx < m->egret_resp_len) {
+        s->sr = m->egret_resp[m->egret_resp_idx++];
+        /* /TREQ deasserts along with the final byte's interrupt */
+        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx < m->egret_resp_len);
+        maciisi_egret_schedule_int(m);
+        qemu_log_mask(LOG_UNIMP, "maciisi egret: feed 0x%02x (#%d/%d)\n",
+                      s->sr, m->egret_resp_idx, m->egret_resp_len);
+    }
+}
+
 static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
 {
     MacIIsiMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
     bool sys = !(s->b & EGRET_SYS_SESSION);
+    uint8_t hs_change = (s->b ^ v1s->last_b) & (EGRET_SYS_SESSION |
+                                                EGRET_VIA_FULL);
 
     if (sys && !m->egret_session) {
         m->egret_session = true;
         m->egret_cmd_len = 0;
         m->egret_resp_len = 0;
-        maciisi_egret_set_xcvr(v1s, true);
+        m->egret_resp_idx = 0;
         /* the ROM preloads the first byte before asserting the session */
         if (s->acr & SR_OUT) {
             maciisi_egret_sr_written(v1s);
         }
-    } else if (!sys && m->egret_session) {
+        return;
+    }
+
+    /*
+     * TIP/TACK toggles during the receive phase acknowledge the byte
+     * in SR and clock the next one; /TIP alternates as part of the ack
+     * so it does not signify session end while a response is flowing.
+     */
+    if (m->egret_session && !(s->acr & SR_OUT) && hs_change
+        && m->egret_resp_idx < m->egret_resp_len) {
+        maciisi_egret_feed_byte(v1s);
+        return;
+    }
+
+    if (!sys && m->egret_session) {
+        bool had_resp = m->egret_resp_len > 0;
+
         m->egret_session = false;
-        maciisi_egret_process(m);
-        if (m->egret_resp_len > 0) {
-            /* Egret turns around and streams the response */
-            maciisi_egret_set_xcvr(v1s, true);
-            s->sr = m->egret_resp[0];
-            m->egret_resp_idx = 1;
+        m->egret_resp_len = 0;
+        m->egret_resp_idx = 0;
+        maciisi_egret_set_xcvr(v1s, false);
+        if (had_resp) {
+            /* closing edge: one final shift-complete interrupt */
             maciisi_egret_schedule_int(m);
-        } else {
-            maciisi_egret_set_xcvr(v1s, false);
         }
     }
 }
@@ -926,19 +956,16 @@ static void maciisi_egret_acr_changed(MOS6522MacIIsiState *v1s)
 
     /*
      * The host turns the shifter around to receive while still holding
-     * the session: treat the bytes collected so far as the command and
-     * start streaming the response.
+     * the session: treat the bytes collected so far as the command,
+     * build the response and raise /TREQ; the host's following TACK
+     * toggle clocks the first byte out.
      */
     if (m->egret_session && !(s->acr & SR_OUT) && m->egret_resp_len == 0
         && m->egret_cmd_len > 0) {
         maciisi_egret_process(m);
         m->egret_cmd_len = 0;
         if (m->egret_resp_len > 0) {
-            s->sr = m->egret_resp[0];
-            m->egret_resp_idx = 1;
-            /* TREQ low = more bytes follow the one now in SR */
-            maciisi_egret_set_xcvr(v1s, m->egret_resp_len > 1);
-            maciisi_egret_schedule_int(m);
+            maciisi_egret_set_xcvr(v1s, true);
         }
     }
 }
@@ -953,17 +980,6 @@ static void maciisi_egret_sr_read(MOS6522MacIIsiState *v1s)
     }
     qemu_log_mask(LOG_UNIMP, "maciisi egret: -> 0x%02x (#%d/%d)\n", s->sr,
                   m->egret_resp_idx, m->egret_resp_len);
-    if (m->egret_resp_idx < m->egret_resp_len) {
-        s->sr = m->egret_resp[m->egret_resp_idx++];
-        /* deassert TREQ along with the final byte */
-        maciisi_egret_set_xcvr(v1s, m->egret_resp_idx < m->egret_resp_len);
-        maciisi_egret_schedule_int(m);
-    } else {
-        /* response fully consumed */
-        m->egret_resp_len = 0;
-        m->egret_resp_idx = 0;
-        maciisi_egret_set_xcvr(v1s, false);
-    }
 }
 
 /*
