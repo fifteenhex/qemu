@@ -116,6 +116,7 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_CHIPVER_BASE    (MSTARV7_RIU_BASE + 0x3c00)
 #define MSTARV7_CHIPVER_REG     0x19c
 #define MSTARV7_CHIPVER_VALUE   0x0100
+#define MSTARV7_CHIPVER_ID      0x00f0  /* +0x00: chip ID byte (0xf0 = SSD20XD) */
 /*
  * The efuse / OTP config-readback bank (RIU bank 0x20, 0x1f004000). The boot
  * ROM and vendor IPL read it (read_config_word) for the DDR/PHY calibration and

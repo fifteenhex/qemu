@@ -353,8 +353,13 @@ static const MStarRegDefault mstarv7_chiptop_defaults[] = {
     { 0x1f0, 0xffff }, { 0x1f4, 0x0003 }, { 0x1f8, 0x000f },
 };
 
-/* The chip-version bank: only +0x19c (0x1f003d9c) is known. */
+/*
+ * The chip-version bank. +0x00 is the chip ID byte the mstar u-boot / linux
+ * chiptype detection reads (0xf0 = SSD20XD family); +0x19c is the revision the
+ * vendor GOP code reads. Both captured from a real SSD202D.
+ */
 static const MStarRegDefault mstarv7_chipver_defaults[] = {
+    { 0x000, MSTARV7_CHIPVER_ID },
     { MSTARV7_CHIPVER_REG, MSTARV7_CHIPVER_VALUE },
 };
 
