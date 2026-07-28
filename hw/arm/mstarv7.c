@@ -502,6 +502,17 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         object_property_set_int(cpu, "reset-cbar", MSTARV7_PERIPHBASE,
                                 &error_abort);
         /*
+         * The generic timer runs at 6MHz on this SoC, not QEMU's
+         * cortex-a7 back-compat default of 62.5MHz. The vendor device
+         * tree hard-codes this (arm,armv7-timer clock-frequency =
+         * <6000000>) and the kernel scales the counter by it, so if the
+         * model advanced the counter at 62.5MHz the guest's notion of
+         * time - and everything derived from it, e.g. the 60Hz display
+         * vsync waits - would run ~10x too fast and time out.
+         */
+        object_property_set_int(cpu, "cntfrq", MSTARV7_CNTFRQ_HZ,
+                                &error_abort);
+        /*
          * On hardware every core runs the mask ROM and the
          * secondaries park in its smpctrl wait loop; the model keeps
          * them powered off until the mailbox posts an entry address.

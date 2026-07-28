@@ -57,6 +57,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_PERIPHBASE      0x16000000
 /* SCU/GIC/timer private region size, from the Cortex-A7 MPCore TRM */
 #define MSTARV7_PERIPHBASE_SIZE 0x8000
+/*
+ * ARM generic timer frequency. The vendor device tree pins the
+ * arm,armv7-timer at 6MHz (mstar-v7.dtsi: clock-frequency = <6000000>),
+ * which is what the kernel uses to convert counter ticks to time. The
+ * model must advance the counter at the same rate.
+ */
+#define MSTARV7_CNTFRQ_HZ       6000000
 /* GIC-400 SPI count, from the previous branch */
 #define MSTARV7_GIC_NUM_SPI     128
 /* IMI SRAM; the size varies between SoCs */
