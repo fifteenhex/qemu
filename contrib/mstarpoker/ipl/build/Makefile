@@ -17,7 +17,8 @@ all: flash.bin
 
 start.o: start.S ; $(CC) $(CFLAGS) -c $< -o $@
 ipl.o:   ipl.c rt.h ; $(CC) $(CFLAGS) -c $< -o $@
-ipl.elf: start.o ipl.o link.ld ; $(LD) $(LDFLAGS) start.o ipl.o -o $@
+rodata.o: rodata.S ipl_rodata.bin ; $(CC) $(CFLAGS) -c $< -o $@
+ipl.elf: start.o ipl.o rodata.o link.ld ; $(LD) $(LDFLAGS) start.o ipl.o rodata.o -o $@
 ipl.bin: ipl.elf ; $(OBJCOPY) -O binary $< $@
 ipl.ipl: ipl.bin ; $(PYTHON) $(POKER)/mkipl.py ipl.bin ipl.ipl
 flash.bin: ipl.ipl ; cp $(FIRMWARE) $@ && dd if=ipl.ipl of=$@ conv=notrunc status=none
