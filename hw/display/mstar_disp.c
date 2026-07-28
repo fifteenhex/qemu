@@ -423,6 +423,13 @@ static void mstar_disp_reset(DeviceState *dev)
     memset(s->gopregs, 0, sizeof(s->gopregs));
     memset(s->topregs, 0, sizeof(s->topregs));
     memset(s->mopregs, 0, sizeof(s->mopregs));
+    /*
+     * The vsync interrupt starts masked (VSYNC_MASK bit3 = 1). The driver
+     * unmasks it once it has set up its regmap fields; latching it from
+     * reset makes mstar_top_probe's request_irq fire the handler before the
+     * fields exist, which NULL-derefs in regmap_field_force_write.
+     */
+    s->topregs[TOP_VSYNC_MASK / 4] = TOP_VSYNC_BIT;
     s->invalidate = true;
 }
 
