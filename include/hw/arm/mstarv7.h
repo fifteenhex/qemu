@@ -162,6 +162,7 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_DISP_MOP_BASE   (MSTARV7_RIU_BASE + 0x280a00)
 #define MSTARV7_DISP_TOP_INTC_IRQ 50
 #define MSTARV7_DISP_GOP_INTC_IRQ 20
+#define MSTARV7_GE_INTC_IRQ 25
 /*
  * The GE 2D graphics engine. MI_GFX/MainUI composites the on-screen UI
  * through it; its bitblts must run for anything to appear on the panel.

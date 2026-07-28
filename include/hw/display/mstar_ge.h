@@ -24,6 +24,7 @@ struct MStarGeState {
     /*< public >*/
 
     MemoryRegion iomem;
+    qemu_irq irq;               /* job-done interrupt */
     /* Physical base of DRAM; the GE's surface addresses are MIU offsets */
     uint32_t dram_base;
 

@@ -19,6 +19,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "hw/display/mstar_ge.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 
@@ -62,6 +63,44 @@
 
 #define GE_ROTATE_180   2
 #define GE_MAX_DIM      4096
+
+/*
+ * The kernel GE driver (drivers/gpu/drm/mstar/mstar_ge.c) selects the
+ * primitive with prim_type in CMD bits[6:4] (LINE=1, RECTFILL=3, BITBLT=4),
+ * rather than the single bit MI_GFX pokes for a blit. The first vertex is in
+ * GE_DST_X0/Y0, the second in GE_X1/Y1; the fill/line colour is the "start
+ * colour" in BG_ST/RA_ST; and drawing is clipped to the clip window.
+ *
+ * NOTE: the line/rectfill executors below are a best-effort model to be aligned
+ * against real silicon later - the fractional line walk and the exact rectfill
+ * edge/clip semantics are guesses.
+ */
+#define GE_CMD_PRIMTYPE(v)  (((v) >> 4) & 0x7)
+#define GE_PRIM_LINE        1
+#define GE_PRIM_RECTFILL    3
+#define GE_PRIM_BITBLT      4
+
+/* Second vertex (line end / rectfill bottom-right); first is GE_DST_X0/Y0. */
+#define GE_X1           0x1a8
+#define GE_Y1           0x1ac
+/* Start colour: BG_ST = b | (g << 8), RA_ST = r | (a << 8). */
+#define GE_BG_ST        0x1c0
+#define GE_RA_ST        0x1c4
+/* Clip window, inclusive. */
+#define GE_CLIP_LEFT    0x154
+#define GE_CLIP_RIGHT   0x158
+#define GE_CLIP_TOP     0x15c
+#define GE_CLIP_BOTTOM  0x160
+
+/*
+ * Job-done interrupt (REG_IRQ, 0x78): the kernel driver waits for a completion
+ * IRQ per job (wait_event on ge->inflight). status is bits[13:12], and the
+ * handler clears it by setting the clear bits[11:10]. Fire one IRQ per kicked
+ * primitive; hold the (level) line until the driver clears it.
+ */
+#define GE_IRQ_REG      0x78
+#define GE_IRQ_STATUS   (0x3 << 12)
+#define GE_IRQ_CLR      (0x3 << 10)
 
 static unsigned ge_bpp(unsigned fmt)
 {
@@ -177,6 +216,107 @@ static void mstar_ge_bitblt(MStarGeState *s)
      */
 }
 
+/* The fill/line start colour, as 0xAARRGGBB. */
+static uint32_t ge_start_argb(MStarGeState *s)
+{
+    const uint16_t *r = s->regs;
+    unsigned b = r[GE_BG_ST / 4] & 0xff, g = (r[GE_BG_ST / 4] >> 8) & 0xff;
+    unsigned rr = r[GE_RA_ST / 4] & 0xff, a = (r[GE_RA_ST / 4] >> 8) & 0xff;
+
+    return (a << 24) | (rr << 16) | (g << 8) | b;
+}
+
+/*
+ * Write one destination pixel, encoded to the destination format and clipped
+ * to the clip window (only when the driver has actually programmed one, i.e.
+ * right > left / bottom > top).
+ */
+static void ge_put_pixel(MStarGeState *s, int x, int y, uint32_t argb)
+{
+    const uint16_t *r = s->regs;
+    uint32_t dst = s->dram_base +
+                   (((uint32_t)r[GE_DST_ADDR_H / 4] << 16) | r[GE_DST_ADDR_L / 4]);
+    unsigned dpit = r[GE_DST_PITCH / 4];
+    unsigned dfmt = (r[GE_FMT / 4] >> 8) & 0xf;
+    unsigned dbpp = ge_bpp(dfmt);
+    int cl = r[GE_CLIP_LEFT / 4], cr = r[GE_CLIP_RIGHT / 4];
+    int ct = r[GE_CLIP_TOP / 4], cb = r[GE_CLIP_BOTTOM / 4];
+    uint32_t px = ge_from_argb(dfmt, argb);
+    uint8_t buf[4];
+
+    if (x < 0 || y < 0) {
+        return;
+    }
+    if (cr > cl && (x < cl || x > cr)) {
+        return;
+    }
+    if (cb > ct && (y < ct || y > cb)) {
+        return;
+    }
+    if (dbpp == 4) {
+        stl_le_p(buf, px);
+    } else {
+        stw_le_p(buf, px);
+    }
+    address_space_write(&address_space_memory,
+                        dst + (unsigned)y * dpit + (unsigned)x * dbpp,
+                        MEMTXATTRS_UNSPECIFIED, buf, dbpp);
+}
+
+/*
+ * RECTFILL: the driver puts the top-left corner in (X0,Y0) and the bottom-right
+ * in (X1,Y1) and fills the rectangle with the start colour. Treated as
+ * inclusive of both corners - to confirm on hardware.
+ */
+static void mstar_ge_rectfill(MStarGeState *s)
+{
+    const uint16_t *r = s->regs;
+    int x0 = r[GE_DST_X0 / 4] & 0xfff, y0 = r[GE_DST_Y0 / 4] & 0xfff;
+    int x1 = r[GE_X1 / 4] & 0xfff, y1 = r[GE_Y1 / 4] & 0xfff;
+    uint32_t argb = ge_start_argb(s);
+    int x, y;
+
+    for (y = y0; y <= y1; y++) {
+        for (x = x0; x <= x1; x++) {
+            ge_put_pixel(s, x, y, argb);
+        }
+    }
+}
+
+/*
+ * LINE: draw from (X0,Y0) to (X1,Y1) in the start colour. The hardware walks
+ * the line with the fractional line_delta/line_major registers; a plain
+ * Bresenham raster is close enough to eyeball and will be aligned with silicon.
+ */
+static void mstar_ge_line(MStarGeState *s)
+{
+    const uint16_t *r = s->regs;
+    int x0 = r[GE_DST_X0 / 4] & 0xfff, y0 = r[GE_DST_Y0 / 4] & 0xfff;
+    int x1 = r[GE_X1 / 4] & 0xfff, y1 = r[GE_Y1 / 4] & 0xfff;
+    uint32_t argb = ge_start_argb(s);
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        int e2;
+
+        ge_put_pixel(s, x0, y0, argb);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 static uint64_t mstar_ge_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarGeState *s = MSTAR_GE(opaque);
@@ -194,8 +334,34 @@ static void mstar_ge_write(void *opaque, hwaddr addr, uint64_t val,
 
     s->regs[addr / 4] = val;
 
-    if (addr == GE_CMD && (val & GE_CMD_BITBLT)) {
-        mstar_ge_bitblt(s);
+    /* The driver clears the job-done IRQ by setting the clear bits. */
+    if (addr == GE_IRQ_REG && (val & GE_IRQ_CLR)) {
+        s->regs[GE_IRQ_REG / 4] &= ~GE_IRQ_STATUS;
+        qemu_set_irq(s->irq, 0);
+    }
+
+    if (addr == GE_CMD) {
+        bool done = true;
+
+        switch (GE_CMD_PRIMTYPE(val)) {
+        case GE_PRIM_LINE:
+            mstar_ge_line(s);
+            break;
+        case GE_PRIM_RECTFILL:
+            mstar_ge_rectfill(s);
+            break;
+        case GE_PRIM_BITBLT:
+            mstar_ge_bitblt(s);
+            break;
+        default:
+            done = false;
+            break;
+        }
+        if (done) {
+            /* Raise the job-done interrupt (level; held until cleared). */
+            s->regs[GE_IRQ_REG / 4] |= GE_IRQ_STATUS;
+            qemu_set_irq(s->irq, 1);
+        }
     }
 }
 
@@ -221,6 +387,7 @@ static void mstar_ge_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &mstar_ge_ops, s,
                           "mstar-ge", MSTAR_GE_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
 static const Property mstar_ge_properties[] = {

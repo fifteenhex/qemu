@@ -703,6 +703,9 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->ge), 0, MSTARV7_DISP_GE_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ge), 0,
+                       qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                        MSTARV7_GE_INTC_IRQ));
 
     object_property_set_uint(OBJECT(&s->bach), "dram-base", MSTARV7_MIU0_BASE,
                              &error_abort);
