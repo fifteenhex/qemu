@@ -115,10 +115,13 @@ static bool mstar_disp_draw_mop(MStarDispState *s, uint32_t *dst,
     uint32_t h = (s->mopregs[MOP_REG(MOP_WIN_SRCH)] & 0xfff) + 1;
     uint32_t pitch = (s->mopregs[MOP_REG(MOP_WIN_PITCH)] & 0x1fff)
                      << MOP_ADDR_SHIFT;
+    /* Mask to the MIU0 window as for the GOP plane (see mstar_disp_draw_gop). */
     hwaddr yaddr = MSTARV7_MIU0_BASE +
-                   (((hwaddr)((yh << 16) | yl)) << MOP_ADDR_SHIFT);
+                   ((((hwaddr)((yh << 16) | yl)) << MOP_ADDR_SHIFT)
+                    & (MSTARV7_MIU0_WINDOW - 1));
     hwaddr caddr = MSTARV7_MIU0_BASE +
-                   (((hwaddr)((ch << 16) | cl)) << MOP_ADDR_SHIFT);
+                   ((((hwaddr)((ch << 16) | cl)) << MOP_ADDR_SHIFT)
+                    & (MSTARV7_MIU0_WINDOW - 1));
     g_autofree uint8_t *yplane = NULL;
     g_autofree uint8_t *cplane = NULL;
     uint32_t x, y;
@@ -168,8 +171,17 @@ static void mstar_disp_draw_gop(MStarDispState *s, uint32_t *dst,
     uint32_t fmt = GOP_WIN0_FMT(win0);
     uint32_t addrl = s->gopregs[GOP_WIN0_ADDRL / 4];
     uint32_t addrh = s->gopregs[GOP_WIN0_ADDRH / 4] & 0xfff;
+    /*
+     * The address register holds the driver's DMA address >> GOP_ADDR_SHIFT.
+     * With no dma-ranges the mainline DRM driver's dma_addr is the full CPU
+     * physical address (MIU0 base included); the MIU0 window only decodes
+     * MSTARV7_MIU0_WINDOW, so those high base bits are not wired and wrap.
+     * Mask to the window before adding the base back, so a full-physical
+     * address (mainline) and a MIU-relative one (vendor) resolve alike.
+     */
     hwaddr fbaddr = MSTARV7_MIU0_BASE +
-                    (((hwaddr)((addrh << 16) | addrl)) << GOP_ADDR_SHIFT);
+                    ((((hwaddr)((addrh << 16) | addrl)) << GOP_ADDR_SHIFT)
+                     & (MSTARV7_MIU0_WINDOW - 1));
     bool is32 = (fmt == GOP_FMT_ARGB8888 || fmt == GOP_FMT_ABGR8888);
     bool bgr = (fmt == GOP_FMT_ABGR8888);
     uint32_t bpp = is32 ? 4 : 2;
