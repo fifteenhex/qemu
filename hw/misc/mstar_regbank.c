@@ -30,10 +30,26 @@ static const char *mstar_regbank_regname(MStarRegbankState *s, hwaddr off)
     return "?";
 }
 
+/*
+ * Registers are 16 bits wide on a 4-byte stride: within each slot bytes 0/1
+ * are the register (low/high byte) and bytes 2/3 are padding. Accesses can be
+ * byte, half-word or word wide - the vendor code writes some of these
+ * registers a byte at a time (e.g. the USB UTMI PHY power-up), so a byte write
+ * to the high byte must merge into the stored value, not replace it.
+ */
 static uint64_t mstar_regbank_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarRegbankState *s = MSTAR_REGBANK(opaque);
-    uint64_t val = s->regs[addr / 4];
+    unsigned boff = addr & 3;
+    uint64_t val;
+
+    if (boff >= 2) {
+        val = 0;                                /* padding half-word */
+    } else if (size == 1) {
+        val = (s->regs[addr / 4] >> (boff * 8)) & 0xff;
+    } else {
+        val = s->regs[addr / 4];                /* 16-bit register */
+    }
 
     if (trace_event_get_state_backends(TRACE_MSTAR_REGBANK_READ)) {
         trace_mstar_regbank_read(s->bankname ?: "regbank", s->base + addr,
@@ -46,12 +62,23 @@ static void mstar_regbank_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
     MStarRegbankState *s = MSTAR_REGBANK(opaque);
+    unsigned boff = addr & 3;
 
     if (trace_event_get_state_backends(TRACE_MSTAR_REGBANK_WRITE)) {
         trace_mstar_regbank_write(s->bankname ?: "regbank", s->base + addr,
                                   mstar_regbank_regname(s, addr), val, size);
     }
-    s->regs[addr / 4] = val;
+
+    if (boff >= 2) {
+        return;                                 /* padding half-word */
+    }
+    if (size == 1) {
+        unsigned shift = boff * 8;
+        s->regs[addr / 4] = (s->regs[addr / 4] & ~(0xff << shift)) |
+                            ((val & 0xff) << shift);
+    } else {
+        s->regs[addr / 4] = val;                /* 16-bit (or 32-bit low half) */
+    }
 }
 
 static const MemoryRegionOps mstar_regbank_ops = {
