@@ -211,12 +211,11 @@ static void miyoomini_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_SSD202D_SOC);
 
-    /* The SPI NOR image (-drive if=mtd) appears in the XIP window */
-    dinfo = drive_get(IF_MTD, 0, 0);
-    if (dinfo) {
-        qdev_prop_set_drive_err(DEVICE(&MSTARV7_SOC(&s->soc)->fsp), "drive",
-                                blk_by_legacy_dinfo(dinfo), &error_fatal);
-    }
+    /*
+     * The SPI NOR image (-drive if=mtd) is picked up by the SoC's FSP/ISP
+     * controller itself: it attaches the flash to its SSI bus and mirrors it
+     * into the XIP window (see hw/ssi/mstar_fsp.c).
+     */
 
     /*
      * The panel is board specific: it hangs off the SoC's DSI

@@ -575,6 +575,7 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->fsp), 0, MSTARV7_FSP_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->fsp), 1, MSTARV7_ISP_XIP_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->fsp), 2, MSTARV7_ISP_BASE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sar), errp)) {
         return;

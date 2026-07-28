@@ -203,6 +203,7 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
  * memory mapped XIP read window the flash contents appear in.
  */
 #define MSTARV7_FSP_BASE        (MSTARV7_RIU_BASE + 0x2c00)
+#define MSTARV7_ISP_BASE        (MSTARV7_RIU_BASE + 0x1000)
 #define MSTARV7_ISP_XIP_BASE    0x14000000
 /* The BDMA engine; the boot ROM DMAs the IPL from flash into IMI */
 #define MSTARV7_BDMA_BASE       (MSTARV7_RIU_BASE + 0x200400)
