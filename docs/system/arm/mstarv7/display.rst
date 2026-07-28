@@ -140,9 +140,11 @@ panel-enable routine at ``0xc02f0d80`` (``obs``).
    * MOP (video) at ``0x1f280a00`` with up to four overlay windows at
      ``0x1f281a00`` (each window a ``{pos 0x820, size 0xa01f,
      blend 0x801}`` triple, ``0x40`` apart).
-   * The scaler/colour planes at ``0x1f284200`` / ``0x1f284a00`` /
-     ``0x1f285200`` - three identical blocks the kernel enables by
-     writing ``0xffc4`` to ``reg0`` and ``0x80`` to ``reg4``.
+   * Not part of the display pipe: the blocks at ``0x1f283e00`` and
+     ``0x1f284200`` / ``0x1f284a00`` / ``0x1f285200`` (formerly listed
+     here as "scaler/colour planes") are the USB PLL and the three USB
+     UTMI PHYs. The vendor IPL powers them up; see the mstarpoker USB PHY
+     test (``contrib/mstarpoker/scripts/ssd20x/mstar_usbphy.py``).
 
 4. **MIPI DSI output.** Bring up the DSI controller and its D-PHY
    (:doc:`dsi`) and the analog trim at ``0x1f2a4a00``-``0x1f2a4e00``
@@ -192,12 +194,15 @@ with a plain readback bank (``mstarv7_disp_cfg_base[]`` in
      - MOP overlay windows (x4)
      - per-window ``{0x820, 0xa01f, 0x801}`` at ``+0x48`` stride
        ``0x40``
-   * - ``0x1f283e00``
-     - scaler front
-     - ``reg0`` (read)
+   * - ``0x1f283e00`` / ``0x1f284000``
+     - USB PLL / clock gate (not display)
+     - reset ``0x11b2``
    * - ``0x1f284200`` / ``0x1f284a00`` / ``0x1f285200``
-     - scaler / colour planes (x3, identical)
-     - ``reg0`` enable (``0xffc4``), ``reg4`` (``0x80``)
+     - USB UTMI PHYs (x3, identical; not display)
+     - ``pwrctrl`` reset ``0xff05`` -> ``0x7f03`` powered up
+   * - ``0x1f284600`` / ``0x1f284e00`` / ``0x1f286200``
+     - USB USBC controllers (x3)
+     - ``reg0`` reset ``0x0200`` -> ``0x0228``
    * - ``0x1f2a4a00`` / ``0x1f2a4c00`` / ``0x1f2a4e00``
      - mipi/dsi analog trim
      - ``0x2a4c00`` ``reg0`` (``0x105b``), ``reg8`` (``0xffff``);

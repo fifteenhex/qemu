@@ -235,8 +235,12 @@ static const MemoryRegionOps mstarv7_chiptop_ops = {
 };
 
 /*
- * Bases of the display-pipeline config/timing banks, with the role
- * each was traced to (see display.rst). All plain readback banks.
+ * Bases of the display-pipeline config/timing banks, with the role each was
+ * traced to (see display.rst), followed by the USB UTMI PHY banks. The
+ * 0x283e00-0x286200 range was formerly mislabelled as display "scalers"; it is
+ * in fact the three USB UTMI PHYs (matching the Linux DT: utmi@284a00,
+ * usbc@284e00), which the vendor IPL powers up and calibrates. All plain
+ * readback banks.
  */
 static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
     MSTARV7_RIU_BASE + 0x224c00,    /* disp front: mux/enable, clip windows */
@@ -247,37 +251,64 @@ static const hwaddr mstarv7_disp_cfg_base[MSTARV7_NUM_DISP_CFG] = {
     MSTARV7_RIU_BASE + 0x246400,    /* GOP plane 1 config */
     MSTARV7_RIU_BASE + 0x281000,    /* GE front / display mux */
     MSTARV7_RIU_BASE + 0x281a00,    /* MOP overlay windows */
-    MSTARV7_RIU_BASE + 0x283e00,    /* scaler front */
-    MSTARV7_RIU_BASE + 0x284200,    /* scaler / colour plane 0 */
-    MSTARV7_RIU_BASE + 0x284a00,    /* scaler / colour plane 1 */
-    MSTARV7_RIU_BASE + 0x285200,    /* scaler / colour plane 2 */
+    MSTARV7_RIU_BASE + 0x283e00,    /* USB PLL (upll) */
+    MSTARV7_RIU_BASE + 0x284000,    /* USB clock gate */
+    MSTARV7_RIU_BASE + 0x284200,    /* USB0 UTMI PHY */
+    MSTARV7_RIU_BASE + 0x284600,    /* USB0 USBC controller */
+    MSTARV7_RIU_BASE + 0x284a00,    /* USB1 UTMI PHY */
+    MSTARV7_RIU_BASE + 0x284e00,    /* USB1 USBC controller */
+    MSTARV7_RIU_BASE + 0x285200,    /* USB2 UTMI PHY */
+    MSTARV7_RIU_BASE + 0x286200,    /* USB2 USBC controller */
     MSTARV7_RIU_BASE + 0x2a4a00,    /* mipi/dsi analog */
     MSTARV7_RIU_BASE + 0x2a4c00,    /* mipi/dsi analog */
     MSTARV7_RIU_BASE + 0x2a4e00,    /* mipi/dsi analog */
 };
 
 /*
- * Reset defaults for the display/analog readback banks, captured from a real
- * SSD202D (Miyoo Mini) via contrib/mstarpoker - the non-zero values these
+ * Reset defaults for the display/analog/USB readback banks, captured from a
+ * real SSD202D (Miyoo Mini) via contrib/mstarpoker - the non-zero values these
  * banks power up holding, which the vendor IPL reads back. Indices match
  * mstarv7_disp_cfg_base[]; banks not listed reset to 0.
+ *
+ * The USB defaults are the powered-down reset state (utmi pwrctrl 0xff05); the
+ * usb_phy_test.py bring-up walks them to the powered-up state (0x7f03).
  */
-static const MStarRegDefault mstarv7_disp_cfg8_defaults[] = {
-    { 0x000, 0x11b2 },              /* 0x1f283e00, read during USB-PHY bring-up */
+static const MStarRegDefault mstarv7_usb_pll_defaults[] = {
+    { 0x000, 0x11b2 },              /* 0x1f283e00 USB PLL */
 };
-static const MStarRegDefault mstarv7_disp_cfg12_defaults[] = {
+static const MStarRegDefault mstarv7_usb_clkgate_defaults[] = {
+    { 0x000, 0x11b2 },              /* 0x1f284000 USB clock gate */
+};
+static const MStarRegDefault mstarv7_usb_utmi_defaults[] = {
+    { 0x000, 0xff05 },              /* pwrctrl: all rails powered down at reset */
+    { 0x004, 0x9080 },              /* config */
+    { 0x010, 0x04af },              /* clkctrl */
+};
+static const MStarRegDefault mstarv7_usb_usbc_defaults[] = {
+    { 0x000, 0x0200 },              /* USBC reset control */
+};
+static const MStarRegDefault mstarv7_disp_mipi_analog0_defaults[] = {
     { 0x000, 0x1000 },              /* 0x1f2a4a00, mipi/dsi analog */
 };
-static const MStarRegDefault mstarv7_disp_cfg14_defaults[] = {
+static const MStarRegDefault mstarv7_disp_mipi_analog2_defaults[] = {
     { 0x140, 0x8002 },              /* 0x1f2a4f40, mipi/dsi analog */
 };
 static const struct {
     const MStarRegDefault *defaults;
     unsigned num;
 } mstarv7_disp_cfg_defaults[MSTARV7_NUM_DISP_CFG] = {
-    [8]  = { mstarv7_disp_cfg8_defaults, ARRAY_SIZE(mstarv7_disp_cfg8_defaults) },
-    [12] = { mstarv7_disp_cfg12_defaults, ARRAY_SIZE(mstarv7_disp_cfg12_defaults) },
-    [14] = { mstarv7_disp_cfg14_defaults, ARRAY_SIZE(mstarv7_disp_cfg14_defaults) },
+    [8]  = { mstarv7_usb_pll_defaults,     ARRAY_SIZE(mstarv7_usb_pll_defaults) },
+    [9]  = { mstarv7_usb_clkgate_defaults, ARRAY_SIZE(mstarv7_usb_clkgate_defaults) },
+    [10] = { mstarv7_usb_utmi_defaults,    ARRAY_SIZE(mstarv7_usb_utmi_defaults) },
+    [11] = { mstarv7_usb_usbc_defaults,    ARRAY_SIZE(mstarv7_usb_usbc_defaults) },
+    [12] = { mstarv7_usb_utmi_defaults,    ARRAY_SIZE(mstarv7_usb_utmi_defaults) },
+    [13] = { mstarv7_usb_usbc_defaults,    ARRAY_SIZE(mstarv7_usb_usbc_defaults) },
+    [14] = { mstarv7_usb_utmi_defaults,    ARRAY_SIZE(mstarv7_usb_utmi_defaults) },
+    [15] = { mstarv7_usb_usbc_defaults,    ARRAY_SIZE(mstarv7_usb_usbc_defaults) },
+    [16] = { mstarv7_disp_mipi_analog0_defaults,
+             ARRAY_SIZE(mstarv7_disp_mipi_analog0_defaults) },
+    [18] = { mstarv7_disp_mipi_analog2_defaults,
+             ARRAY_SIZE(mstarv7_disp_mipi_analog2_defaults) },
 };
 
 /*

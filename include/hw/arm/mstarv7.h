@@ -170,11 +170,13 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 /*
  * Display-pipeline configuration/timing banks that the panel bring-up
  * programs and reads back but which do not feed the functional scanout
- * (the disp model reads the framebuffer state directly). Modelled as
- * plain readback banks; see docs/system/arm/mstarv7/display.rst for the
+ * (the disp model reads the framebuffer state directly), plus the USB
+ * UTMI PHY banks (0x283e00-0x286200) that the vendor IPL powers up and
+ * that were formerly mislabelled display "scalers". Modelled as plain
+ * readback banks; see docs/system/arm/mstarv7/display.rst for the
  * per-bank register maps. The base of each is in mstarv7_disp_cfg_base[].
  */
-#define MSTARV7_NUM_DISP_CFG    15
+#define MSTARV7_NUM_DISP_CFG    19
 /*
  * The "bach" audio controller and its "audiotop" codec syscon. The
  * vendor MI_AO audio path (the chime the boot flow plays, MainUI's
