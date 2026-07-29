@@ -35,6 +35,14 @@
 /* Command register: bit6 kicks a bitblt */
 #define GE_CMD          0x180
 #define GE_CMD_BITBLT   (1 << 6)
+/*
+ * Blit direction bits: the driver flips the destination (and optionally the
+ * source) rather than using the rotation register for the cheap 90/180 cases.
+ * A 180 degree blit comes through as H+V destination flip.
+ */
+#define GE_CMD_SRC_VFLIP (1 << 8)   /* pri_s_y_dir */
+#define GE_CMD_DST_HFLIP (1 << 9)   /* pri_x_dir */
+#define GE_CMD_DST_VFLIP (1 << 10)  /* pri_y_dir */
 
 /* Source/destination surface base addresses (MIU offsets), low/high halves */
 #define GE_SRC_ADDR_L   0x80
@@ -175,6 +183,14 @@ static void mstar_ge_bitblt(MStarGeState *s)
     unsigned sfmt = r[GE_FMT / 4] & 0xf, dfmt = (r[GE_FMT / 4] >> 8) & 0xf;
     unsigned w = r[GE_WIDTH / 4], h = r[GE_HEIGHT / 4];
     unsigned rot = r[GE_ROTATE / 4] & 3;
+    unsigned cmd = r[GE_CMD / 4];
+    /*
+     * A 180 degree blit reaches us either via the rotation register or, more
+     * commonly, as an H+V destination flip. Treat both the same. (The source
+     * V-flip bit isn't needed for the rotation path and isn't modelled.)
+     */
+    bool hflip = rot == GE_ROTATE_180 || (cmd & GE_CMD_DST_HFLIP);
+    bool vflip = rot == GE_ROTATE_180 || (cmd & GE_CMD_DST_VFLIP);
     unsigned sbpp = ge_bpp(sfmt), dbpp = ge_bpp(dfmt);
     int dx = (int)r[GE_DST_X0 / 4] - (int)w + 1;
     int dy = (int)r[GE_DST_Y0 / 4] - (int)h + 1;
@@ -186,7 +202,7 @@ static void mstar_ge_bitblt(MStarGeState *s)
 
     for (row = 0; row < h; row++) {
         uint8_t sbuf[GE_MAX_DIM * 4], dbuf[GE_MAX_DIM * 4];
-        unsigned orow = rot == GE_ROTATE_180 ? h - 1 - row : row;
+        unsigned orow = vflip ? h - 1 - row : row;
         uint32_t srow = src + row * spit;
         uint32_t drow = dst + (dy + orow) * dpit + dx * dbpp;
 
@@ -199,7 +215,7 @@ static void mstar_ge_bitblt(MStarGeState *s)
             uint32_t px = sbpp == 4 ? ldl_le_p(sbuf + col * 4)
                                     : lduw_le_p(sbuf + col * 2);
             uint32_t out = ge_from_argb(dfmt, ge_to_argb(sfmt, px));
-            unsigned ocol = rot == GE_ROTATE_180 ? w - 1 - col : col;
+            unsigned ocol = hflip ? w - 1 - col : col;
 
             if (dbpp == 4) {
                 stl_le_p(dbuf + ocol * 4, out);
