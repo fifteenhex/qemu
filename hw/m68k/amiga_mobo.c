@@ -17,6 +17,7 @@
 #include "hw/m68k/amiga_mobo.h"
 #include "migration/vmstate.h"
 
+#define GARY_TIMEOUT            0x0000
 #define RAMSEY_CTRL             0x0003
 #define RAMSEY_VERSION          0x0043
 #define GARY_TOENB              0x1000
@@ -30,6 +31,9 @@ static uint64_t amiga_mobo_read(void *opaque, hwaddr addr, unsigned size)
     AmigaMoboState *s = opaque;
 
     switch (addr) {
+    case GARY_TIMEOUT:
+        /* bit 7: a watched bus access timed out since the last write */
+        return (s->gary_timeout ? 0x80 : 0) | (s->gary_timeout_ctrl & 0x7f);
     case RAMSEY_CTRL:
         return s->ramsey_ctrl;
     case RAMSEY_VERSION:
@@ -52,6 +56,15 @@ static void amiga_mobo_write(void *opaque, hwaddr addr, uint64_t val,
     AmigaMoboState *s = opaque;
 
     switch (addr) {
+    case GARY_TIMEOUT:
+        /*
+         * Writing configures the timeout response (bit 7 enables the
+         * bus-error machine; scsi.device writes 0 to probe silently)
+         * and clears the latch for the next watched access.
+         */
+        s->gary_timeout_ctrl = val;
+        s->gary_timeout = false;
+        break;
     case RAMSEY_CTRL:
         s->ramsey_ctrl = val;
         break;
@@ -83,6 +96,32 @@ static const MemoryRegionOps amiga_mobo_ops = {
     },
 };
 
+/*
+ * A vacant, Gary-watched slot: nothing answers, so the access times
+ * out, the latch sets and the data bus floats (open bus reads).
+ */
+static uint64_t amiga_mobo_slot_read(void *opaque, hwaddr addr, unsigned size)
+{
+    AmigaMoboState *s = opaque;
+
+    s->gary_timeout = true;
+    return (uint64_t)-1;
+}
+
+static void amiga_mobo_slot_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    AmigaMoboState *s = opaque;
+
+    s->gary_timeout = true;
+}
+
+static const MemoryRegionOps amiga_mobo_slot_ops = {
+    .read = amiga_mobo_slot_read,
+    .write = amiga_mobo_slot_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
 static void amiga_mobo_realize(DeviceState *dev, Error **errp)
 {
     AmigaMoboState *s = AMIGA_MOBO(dev);
@@ -90,6 +129,10 @@ static void amiga_mobo_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &amiga_mobo_ops, s,
                           "amiga.mobo", AMIGA_MOBO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    memory_region_init_io(&s->timeout_slot, OBJECT(s), &amiga_mobo_slot_ops,
+                          s, "amiga.mobo.timeout-slot",
+                          AMIGA_MOBO_TIMEOUT_SLOT_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->timeout_slot);
 }
 
 static const VMStateDescription vmstate_amiga_mobo = {
@@ -99,6 +142,8 @@ static const VMStateDescription vmstate_amiga_mobo = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(ramsey_ctrl, AmigaMoboState),
         VMSTATE_UINT8_ARRAY(gary, AmigaMoboState, 3),
+        VMSTATE_UINT8(gary_timeout_ctrl, AmigaMoboState),
+        VMSTATE_BOOL(gary_timeout, AmigaMoboState),
         VMSTATE_END_OF_LIST()
     }
 };

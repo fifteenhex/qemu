@@ -39,6 +39,11 @@ config IDE_MMIO
     select IDE_BUS
     select IDE_DEV
 
+config IDE_GAYLE
+    bool
+    select IDE_BUS
+    select IDE_DEV
+
 config IDE_VIA
     bool
     select IDE_PCI

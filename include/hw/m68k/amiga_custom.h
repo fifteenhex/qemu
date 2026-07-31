@@ -81,6 +81,8 @@ struct AmigaCustomState {
         uint8_t bytepos;        /* which byte of it is playing */
         int8_t sample;
     } aud[4];
+    /* pending "next word please" interrupts of hand-fed (non-DMA) audio */
+    QEMUTimer aud_dat_timer[4];
     /*
      * INT2/INT6 are open-drain lines shared by the CIAs (bit 0) and
      * board hardware (bit 1); INTREQ re-latches while any source holds
@@ -111,6 +113,8 @@ struct AmigaCustomState {
     uint32_t aga_color[256];
 
     bool blit_zero;             /* last blit produced only zeroes */
+    /* DIWHIGH written and not invalidated by a DIWSTRT/DIWSTOP write */
+    bool diwhigh_valid;
 
     int64_t frame_origin_ns;
     QEMUTimer vblank_timer;

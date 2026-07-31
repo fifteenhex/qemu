@@ -17,11 +17,18 @@
 #include "hw/core/boards.h"
 #include "hw/m68k/amiga.h"
 #include "hw/m68k/amiga_mobo.h"
+#include "hw/m68k/zorro3.h"
+#include "hw/core/sysbus.h"
+#include "standard-headers/asm-m68k/bootinfo.h"
+#include "standard-headers/asm-m68k/bootinfo-amiga.h"
 #include "target/m68k/cpu.h"
 
 #define A4000_FASTRAM_BASE      0x07000000
+#define A4000_CPUSLOT_RAM_BASE  0x08000000
 #define A4000_RAMSEY_BASE       0xde0000
 #define A4000_ROM_BASE          0xf80000
+/* A4000T: the (vacant) onboard NCR 53C710 slot page */
+#define A4000T_NCR_SLOT_BASE    0xdd0000
 
 #define TYPE_A4000_MACHINE MACHINE_TYPE_NAME("a4000")
 OBJECT_DECLARE_SIMPLE_TYPE(A4000MachineState, A4000_MACHINE)
@@ -30,6 +37,7 @@ struct A4000MachineState {
     AmigaMachineState parent_obj;
 
     MemoryRegion z3_open_bus;
+    DeviceState *mobo;
 };
 
 static void a4000_board_init(AmigaMachineState *ams)
@@ -39,19 +47,27 @@ static void a4000_board_init(AmigaMachineState *ams)
     MemoryRegion *sysmem = get_system_memory();
     DeviceState *mobo_dev;
 
-    /* 68040 local-bus fast RAM at 0x07000000 (the SIMM sockets) */
-    if (machine->ram_size > 16 * MiB) {
-        error_report("a4000: motherboard fast RAM is limited to 16MB");
+    /*
+     * 68040 local-bus fast RAM: up to 16MB in the motherboard SIMM
+     * sockets at 0x07000000; more than that models a processor-slot
+     * accelerator's local RAM (CyberStorm/Warp Engine class), which
+     * decodes the contiguous space from 0x08000000 upward.
+     */
+    if (machine->ram_size > 128 * MiB) {
+        error_report("a4000: at most 128MB of processor-slot RAM");
         exit(1);
     }
     if (machine->ram_size) {
-        memory_region_add_subregion(sysmem, A4000_FASTRAM_BASE, machine->ram);
+        ams->fastram_base = machine->ram_size > 16 * MiB ?
+            A4000_CPUSLOT_RAM_BASE : A4000_FASTRAM_BASE;
+        memory_region_add_subregion(sysmem, ams->fastram_base, machine->ram);
     }
 
     /* Ramsey memory controller and Fat Gary bus glue */
     mobo_dev = qdev_new(TYPE_AMIGA_MOBO);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mobo_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(mobo_dev), 0, A4000_RAMSEY_BASE);
+    s->mobo = mobo_dev;
 
     /*
      * Zorro III configuration space reads open bus so the OS's config
@@ -60,6 +76,26 @@ static void a4000_board_init(AmigaMachineState *ams)
     memory_region_init_io(&s->z3_open_bus, OBJECT(s), &amiga_open_bus_ops,
                           NULL, "a4000.z3-config-open-bus", 0x01000000);
     memory_region_add_subregion(sysmem, 0xff000000, &s->z3_open_bus);
+
+    /*
+     * The Zorro III expansion bus.  The AutoConfig space sits over the
+     * open-bus filler: with no unconfigured board left it reads open
+     * bus itself, which is what ends the OS's config chain scan.
+     * Boards attach with -device (e.g. -device mediator4000).
+     */
+    ams->zorro = qdev_new(TYPE_ZORRO3_BRIDGE);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->zorro), &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, ZORRO3_CONFIG_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(ams->zorro), 0), 1);
+    /* the bus's open-collector /INT2 joins the PORTS interrupt */
+    sysbus_connect_irq(SYS_BUS_DEVICE(ams->zorro), 0,
+                       qdev_get_gpio_in_named(ams->custom, "ports-irq", 0));
+    for (int i = 0; i < AMIGA_RSTO_DEVS; i++) {
+        if (!ams->rsto_dev[i]) {
+            ams->rsto_dev[i] = ams->zorro;
+            break;
+        }
+    }
 }
 
 static void a4000_machine_class_init(ObjectClass *oc, const void *data)
@@ -79,7 +115,43 @@ static void a4000_machine_class_init(ObjectClass *oc, const void *data)
     /* AGA: 2MB Alice reports VPOSR id 0x23, Lisa reports Denise id 0xf8 */
     amc->agnus_id = 0x23;
     amc->denise_id = 0xf8;
+    /* Linux direct-boot identity */
+    amc->amiga_model = AMI_4000;
+    amc->chipset = CS_AGA;
     amc->board_init = a4000_board_init;
+}
+
+#define TYPE_A4000T_MACHINE MACHINE_TYPE_NAME("a4000t")
+
+static void a4000t_board_init(AmigaMachineState *ams)
+{
+    A4000MachineState *s = A4000_MACHINE(ams);
+
+    a4000_board_init(ams);
+
+    /*
+     * The onboard NCR 53C710 is not modelled.  Kickstart 3.1
+     * r40.070's scsi.device probes for it by touching its register
+     * space under Fat Gary's bus-timeout watch, so the vacant slot
+     * must latch a Gary timeout - plain open bus would read as a
+     * present chip and hang the boot in the SCSI handler task.
+     */
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->mobo), 1, A4000T_NCR_SLOT_BASE);
+}
+
+static void a4000t_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    AmigaMachineClass *amc = AMIGA_MACHINE_CLASS(oc);
+
+    /*
+     * The tower variant: the A4000 desktop's chipset with Kickstart
+     * 3.1 r40.070.  The onboard NCR 53C710 SCSI is absent (and its
+     * absence detected, see above), so it boots from floppy only.
+     */
+    mc->desc = "Commodore Amiga 4000T (68040, AGA)";
+    amc->amiga_model = AMI_4000T;
+    amc->board_init = a4000t_board_init;
 }
 
 static const TypeInfo a4000_machine_types[] = {
@@ -88,6 +160,12 @@ static const TypeInfo a4000_machine_types[] = {
         .parent        = TYPE_AMIGA_MACHINE,
         .instance_size = sizeof(A4000MachineState),
         .class_init    = a4000_machine_class_init,
+    },
+    {
+        .name          = TYPE_A4000T_MACHINE,
+        .parent        = TYPE_A4000_MACHINE,
+        .instance_size = sizeof(A4000MachineState),
+        .class_init    = a4000t_machine_class_init,
     },
 };
 

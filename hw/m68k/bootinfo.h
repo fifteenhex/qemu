@@ -30,6 +30,40 @@
         base += 4; \
     } while (0)
 
+/*
+ * A record holding a single byte (e.g. BI_AMIGA_VBLANK), padded so the
+ * next record stays 4-byte aligned.
+ */
+#define BOOTINFOBYTE(base, id, value) \
+    do { \
+        stw_be_p(base, id); \
+        base += 2; \
+        stw_be_p(base, sizeof(struct bi_record) + 4); \
+        base += 2; \
+        stb_p(base, value); \
+        base += 1; \
+        stb_p(base, 0); \
+        base += 1; \
+        stw_be_p(base, 0); \
+        base += 2; \
+    } while (0)
+
+/*
+ * A record holding a single 16-bit word (e.g. BI_AMIGA_SERPER), padded
+ * so the next record stays 4-byte aligned.
+ */
+#define BOOTINFOWORD(base, id, value) \
+    do { \
+        stw_be_p(base, id); \
+        base += 2; \
+        stw_be_p(base, sizeof(struct bi_record) + 4); \
+        base += 2; \
+        stw_be_p(base, value); \
+        base += 2; \
+        stw_be_p(base, 0); \
+        base += 2; \
+    } while (0)
+
 #define BOOTINFO2(base, id, value1, value2) \
     do { \
         stw_be_p(base, id); \

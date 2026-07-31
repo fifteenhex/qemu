@@ -1,0 +1,13 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# zorro3.c
+zorro3_config_read(uint64_t addr, unsigned size, uint64_t val) "addr 0x%03" PRIx64 " size %u -> 0x%02" PRIx64
+zorro3_config_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%03" PRIx64 " size %u <- 0x%" PRIx64
+zorro3_configure(uint8_t product, uint64_t base) "product 0x%02x configured at 0x%08" PRIx64
+zorro3_shutup(uint8_t product) "product 0x%02x shut up"
+
+# mediator4000.c
+mediator4000_window(unsigned msb) "window base msb 0x%x"
+mediator4000_irq(uint8_t status, uint8_t mask, int level) "intx status 0x%x mask 0x%02x -> int2 %d"
+mediator4000_conf_read(unsigned slot, unsigned func, unsigned where, unsigned size, uint64_t val) "%02u.%u reg 0x%02x size %u -> 0x%" PRIx64
+mediator4000_conf_write(unsigned slot, unsigned func, unsigned where, unsigned size, uint64_t val) "%02u.%u reg 0x%02x size %u <- 0x%" PRIx64

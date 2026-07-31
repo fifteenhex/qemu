@@ -18,6 +18,9 @@
 #define TYPE_AMIGA_MACHINE MACHINE_TYPE_NAME("amiga-common")
 OBJECT_DECLARE_TYPE(AmigaMachineState, AmigaMachineClass, AMIGA_MACHINE)
 
+/* board devices that also listen to the CPU's /RSTO line */
+#define AMIGA_RSTO_DEVS 4
+
 /* the open-collector lines the floppy drives share */
 enum {
     FLOPPY_LINE_CHNG,
@@ -32,6 +35,21 @@ struct AmigaMachineState {
     MachineState parent_obj;
 
     M68kCPU *cpu;
+    /*
+     * Base of the fast RAM bank backing machine->ram, recorded by the
+     * board_init hook; a direct-boot Linux kernel is loaded here.
+     */
+    hwaddr fastram_base;
+    /* -kernel boot: entry point the CPU reset routes to instead of ROM */
+    bool linux_boot;
+    hwaddr kernel_entry;
+    /*
+     * The Zorro III bridge, on machines with an expansion bus; the
+     * kernel is loaded from a machine-done notifier so that boards
+     * added with -device are described in the bootinfo.
+     */
+    DeviceState *zorro;
+    Notifier machine_done;
     MemoryRegion chipram;
     MemoryRegion rom;
     MemoryRegion rom_overlay;
@@ -40,6 +58,12 @@ struct AmigaMachineState {
     DeviceState *custom;
     DeviceState *kbd;
     DeviceState *fdc[AMIGA_FLOPPY_DRIVES];
+    /*
+     * Board-specific chips on /RSTO: boards deposit devices here from
+     * their board_init hook and the RESET instruction cold-resets them
+     * along with the shared chips.
+     */
+    DeviceState *rsto_dev[AMIGA_RSTO_DEVS];
 
     /*
      * The floppy status lines are open collector and shared by all
@@ -61,6 +85,13 @@ struct AmigaMachineClass {
     uint32_t agnus_id;
     uint32_t denise_id;
     /*
+     * Linux bootinfo identity (BI_AMIGA_MODEL / BI_AMIGA_CHIPSET from
+     * standard-headers/asm-m68k/bootinfo-amiga.h).  Machines that leave
+     * amiga_model at AMI_UNKNOWN do not support direct kernel boot.
+     */
+    uint32_t amiga_model;
+    uint32_t chipset;
+    /*
      * Size of the region (from address 0) where the glue logic always
      * terminates bus cycles, so accesses to unpopulated addresses read
      * open bus instead of faulting.
@@ -76,5 +107,12 @@ struct AmigaMachineClass {
  * relies on this to see 0xff ("no board") in empty config space.
  */
 extern const MemoryRegionOps amiga_open_bus_ops;
+
+/*
+ * The Gayle IDE interface at its A600/A1200 addresses, interrupting
+ * on INT2, with the IF_IDE drives attached; for the board_init hook
+ * of the machines built around Gayle.
+ */
+void amiga_gayle_init(AmigaMachineState *ams);
 
 #endif

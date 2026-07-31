@@ -32,6 +32,8 @@
 #include "hw/core/or-irq.h"
 #include "hw/m68k/amiga_a2065.h"
 #include "net/net.h"
+#include "standard-headers/asm-m68k/bootinfo.h"
+#include "standard-headers/asm-m68k/bootinfo-amiga.h"
 #include "target/m68k/cpu.h"
 
 #define A3000_SUPERDMAC_BASE    0xdd0000
@@ -61,9 +63,8 @@ static void a3000_board_init(AmigaMachineState *ams)
         exit(1);
     }
     if (machine->ram_size) {
-        memory_region_add_subregion(sysmem,
-                                    A3000_FASTRAM_TOP - machine->ram_size,
-                                    machine->ram);
+        ams->fastram_base = A3000_FASTRAM_TOP - machine->ram_size;
+        memory_region_add_subregion(sysmem, ams->fastram_base, machine->ram);
     }
 
     /* Ramsey memory controller and Fat Gary bus glue */
@@ -126,6 +127,9 @@ static void a3000_machine_class_init(ObjectClass *oc, const void *data)
     amc->rom_base = 0xf80000;
     amc->rom_size = 512 * KiB;
     amc->chipram_size = 2 * MiB;
+    /* Linux direct-boot identity */
+    amc->amiga_model = AMI_3000;
+    amc->chipset = CS_ECS;
     /* Ramsey/Gary answer every cycle below the Zorro III space */
     amc->open_bus_size = 0x10000000;
     amc->board_init = a3000_board_init;

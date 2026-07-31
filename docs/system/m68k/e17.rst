@@ -1,0 +1,86 @@
+ELTEC Eurocom E17 (``e17``)
+===========================
+
+The ``e17`` machine models the ELTEC Eurocom 17, a German VMEbus
+68040 single-board computer, reconstructed by reverse engineering its
+RMON monitor firmware (the full register-level notes live in
+``E17-NOTES.md`` in the source tree).
+
+Emulated hardware
+-----------------
+
+* 68040 CPU (``-cpu m68060`` selects the board's 68060 factory
+  option), with an optional second CPU: the board is dual-processor
+  and ``-smp 1`` removes the secondary ("Secondary CPU : Not
+  installed").
+* DRAM at 0 (``-m``, default 16MB, must be a power of two — the
+  firmware sizes memory by mirror detection), 1MB battery-backed SRAM
+  at 0xfea00000, the 1MB EPROM window at 0xfe800000.
+* The 0xfec00000 I/O complex (``hw/misc/e17_sysc.c``): chip-select
+  controller, two Zilog Z8536 CIOs (POST-code display, DIP switches,
+  the VxWorks timebase counter), VIC068A interrupt plumbing, CPU-type
+  and secondary-CPU control registers, and an AT keyboard interface.
+* Cirrus CD2401 four-channel serial controller (``hw/char/cd2401.c``,
+  a new model) — RMON's serial console is channel 0 (``-serial``).
+* M48T02 timekeeper NVRAM/RTC, persistent via
+  ``-drive if=mtd,format=raw,file=nvram.img`` (2KB raw file).
+* Am79C900 ILACC (32-bit LANCE) Ethernet with the board's byte-lane
+  arrangement; RMON's network bootstrap (RARP + TFTP) works end to
+  end against a suitable server.
+* NCR 53C720 SCSI (``hw/scsi/ncr53c720.c``, a new model implementing
+  the low-level mode RMON bit-bangs); disks attach with
+  ``-device scsi-hd`` / ``-drive if=scsi``.
+* Onboard video: an 800x600 8bpp framebuffer console with the RAMDAC
+  and CRTC the firmware programs (``hw/display/e17_vid.c``).  The
+  machine option ``video=off`` removes it, and RMON then falls back
+  to the serial console on both directions.
+
+Firmware
+--------
+
+The RMON 3.1.3 monitor ROM, passed with ``-bios``.  A dump is on
+bitsavers under ``pdf/eltec/EUROCOM-27/rmon.bin`` (1MB file, the
+256KB EPROM content mirrored four times; both the 1MB dump and a bare
+256KB image work), md5 ``863805ee1f03abf0c90979877f3b4263``.  The
+same ROM serves the Eurocom 17 and 27.
+
+Running
+-------
+
+::
+
+   qemu-system-m68k -M e17 -bios rmon.bin
+
+brings up RMON as a fully interactive monitor in the QEMU display
+window (framebuffer console plus AT keyboard), or on the first serial
+port with ``-M e17,video=off -serial stdio``.  ``-kernel`` loads an
+ELF image (used for the u-boot port; RMON still supplies the reset
+vectors).
+
+What works
+----------
+
+RMON 3.1.3 runs its power-on self test clean and boots to the
+interactive monitor prompt; the setup menus, memory display, SCSI bus
+scan and the embedded OS-9 bootstrap all function.  Netboot works end
+to end (RARP, TFTP, image header validation, execution).  The model
+has been cross-checked against a real Eurocom 17 board with a
+read-only probe script (``e17-tools/e17probe.py``); a u-boot port
+boots to its prompt via ``-kernel``, and the secondary CPU can be
+released and talked to through shared memory exactly as on hardware.
+
+Known limitations
+-----------------
+
+* No full OS has been booted yet: OS-9 lacks a disk image, and the
+  VxWorks 5.3.1 boot ROM boots its kernel but dies in a driver
+  callout about a second in.
+* The SCSI model implements only the register-level low-level mode
+  RMON uses; SCRIPTS, DMA and interrupts are absent (an OS driver may
+  need them).
+* The exact video RAMDAC/CRTC chips are unidentified; the model
+  implements the modes the firmware programs.
+* The VMEbus itself is not modelled (the VIC068A registers are
+  storage plus the interrupt paths the firmware exercises), the 1MB
+  battery SRAM does not persist, and the I2C "IPIN" board-ID EEPROM
+  is not populated.

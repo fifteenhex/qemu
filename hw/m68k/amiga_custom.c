@@ -54,6 +54,7 @@
 #define AUD_LEN         0x004
 #define AUD_PER         0x006
 #define AUD_VOL         0x008
+#define AUD_DAT         0x00a
 #define REG_SERDAT      0x030
 #define REG_SERPER      0x032
 #define REG_POTGO       0x034
@@ -90,7 +91,14 @@
 #define REG_BPL2MOD     0x10a
 #define REG_BPLCON4     0x10c       /* AGA: sprite/bitplane colour offsets */
 #define REG_COLOR00     0x180
+#define REG_DIWHIGH     0x1e4       /* ECS: display window high bits */
 #define REG_FMODE       0x1fc       /* AGA: bitplane/sprite fetch width */
+
+/* DIWHIGH fields: high bits of the four display window positions */
+#define DIWHIGH_VSTRT_HIGH(v)   (((v) & 0x0007) << 8)
+#define DIWHIGH_VSTOP_HIGH(v)   ((v) & 0x0700)
+#define DIWHIGH_HSTRT_H8(v)     (((v) & 0x0020) ? 0x100 : 0)
+#define DIWHIGH_HSTOP_H8(v)     (((v) & 0x2000) ? 0x100 : 0)
 
 #define BPLCON3_BANK(x) (((x) >> 13) & 7)
 #define BPLCON3_LOCT    (1 << 9)
@@ -497,6 +505,8 @@ static bool amiga_custom_display_reg(unsigned reg)
            (reg >= REG_BPL1PT && reg < REG_BPL1PT + MAX_PLANES * 4) ||
            (reg >= REG_SPR0PTH && reg < REG_SPR0PTH + MAX_SPRITES * 4) ||
            (reg >= REG_BPLCON0 && reg <= REG_BPL2MOD) ||
+           reg == REG_DIWHIGH ||
+           reg == REG_FMODE ||
            (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64);
 }
 
@@ -553,10 +563,20 @@ static void amiga_custom_run_copper(AmigaCustomState *s, uint32_t pc)
             if (vp == 0xff && (ir1 & 0xfe) == 0xfe) {
                 break;
             }
-            /* the vertical compare wraps once past line 255 */
-            if (vp < (line & 0xff)) {
+            /*
+             * The compare is beam >= position on the 8-bit line
+             * counter.  A wait that parked on line 255 leaves the
+             * next wait to complete in the following 256-line block
+             * once the counter wraps - the standard idiom for
+             * crossing line 256 (amifb's tall virtual screens).  A
+             * wait for a line the beam already passed is satisfied
+             * immediately (amifb re-enters its display list "at line
+             * 10" from a wait that parked just before the display
+             * window opens).
+             */
+            if ((line & 0xff) == 0xff) {
                 line = (line & ~0xff) + 0x100 + vp;
-            } else {
+            } else if (vp > (line & 0xff)) {
                 line = (line & ~0xff) | vp;
             }
         } else {
@@ -725,6 +745,31 @@ static int amiga_fetch_words(uint16_t ddfstrt, uint16_t ddfstop, bool hires,
 #define DPTR(r)     (((uint32_t)dregs[(r) >> 1] << 16) | dregs[((r) >> 1) + 1])
 
 /*
+ * Decode the display window.  When ECS/AGA's DIWHIGH has been written
+ * (and not invalidated by a later DIWSTRT/DIWSTOP write) it supplies
+ * the high bits of all four positions; otherwise the OCS rules apply:
+ * vertical stop bit 8 is the complement of bit 7 and horizontal stop
+ * lies in the right half of the line.  Linux's amifb needs DIWHIGH -
+ * its windows sit where the OCS decode cannot express them.
+ */
+static void amiga_diw_decode(uint16_t diwstrt, uint16_t diwstop,
+                             uint16_t diwhigh, bool diwhigh_valid,
+                             int *vstart, int *vstop, int *hstart, int *hstop)
+{
+    if (diwhigh_valid) {
+        *vstart = (diwstrt >> 8) | DIWHIGH_VSTRT_HIGH(diwhigh);
+        *vstop = (diwstop >> 8) | DIWHIGH_VSTOP_HIGH(diwhigh);
+        *hstart = (diwstrt & 0xff) | DIWHIGH_HSTRT_H8(diwhigh);
+        *hstop = (diwstop & 0xff) | DIWHIGH_HSTOP_H8(diwhigh);
+    } else {
+        *vstart = diwstrt >> 8;
+        *vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
+        *hstart = diwstrt & 0xff;
+        *hstop = (diwstop & 0xff) | 0x100;
+    }
+}
+
+/*
  * Render the current frame: start from the register state the frame
  * began with and replay the copper's journalled writes line by line,
  * which is what makes screen splits and per-line palettes come out.
@@ -737,13 +782,13 @@ static bool amiga_custom_gfx_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     uint16_t dregs[0x100];
     uint16_t bplcon0, ddfstrt, ddfstop, diwstrt, diwstop;
-    bool hires, surf_hires = false;
+    bool hires, surf_hires = false, frame_diwhigh_valid;
     uint32_t pal[256];
     uint32_t bplpt[MAX_PLANES];
     uint8_t rowbuf[MAX_PLANES][1024 / 8];
     AmigaSpriteChan spr[MAX_SPRITES] = { 0 };
     unsigned ji = 0;
-    int words, width, height, vstart, vstop, fmode;
+    int words, width, height, vstart, vstop, hstart, hstop, fmode;
     int p, x, y;
 
     if (!s->con || !surface) {
@@ -767,6 +812,7 @@ static bool amiga_custom_gfx_update(void *opaque)
      * writes on top.
      */
     memcpy(s->frame_regs, s->regs, sizeof(s->frame_regs));
+    frame_diwhigh_valid = s->diwhigh_valid;
     s->journal_len = 0;
     amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP1LC));
 
@@ -779,8 +825,8 @@ static bool amiga_custom_gfx_update(void *opaque)
     hires = bplcon0 & BPLCON0_HIRES;
     fmode = DREG(REG_FMODE) & 3;
 
-    vstart = diwstrt >> 8;
-    vstop = (diwstop >> 8) | ((diwstop & 0x8000) ? 0 : 0x100);
+    amiga_diw_decode(diwstrt, diwstop, DREG(REG_DIWHIGH), frame_diwhigh_valid,
+                     &vstart, &vstop, &hstart, &hstop);
     height = vstop - vstart;
 
     /*
@@ -792,6 +838,10 @@ static bool amiga_custom_gfx_update(void *opaque)
     {
         uint16_t c_strt = ddfstrt, c_stop = ddfstop, c_con0 = bplcon0;
         uint16_t c_diwstrt = diwstrt, c_diwstop = diwstop;
+        uint16_t c_diwhigh = DREG(REG_DIWHIGH);
+        bool c_diwhigh_valid = frame_diwhigh_valid;
+        int c_vstart, c_vstop, c_hstart, c_hstop;
+        int c_fmode = fmode;
         int wl = 0, wh = 0, dw = 0;
         bool diw_from_copper = false;
         unsigned i;
@@ -799,9 +849,10 @@ static bool amiga_custom_gfx_update(void *opaque)
         for (i = 0; i <= s->journal_len; i++) {
             if (c_con0 & BPLCON0_HIRES) {
                 surf_hires = true;
-                wh = MAX(wh, amiga_fetch_words(c_strt, c_stop, true, fmode));
+                wh = MAX(wh, amiga_fetch_words(c_strt, c_stop, true, c_fmode));
             } else {
-                wl = MAX(wl, amiga_fetch_words(c_strt, c_stop, false, fmode));
+                wl = MAX(wl, amiga_fetch_words(c_strt, c_stop, false,
+                                               c_fmode));
             }
             if (i == s->journal_len) {
                 break;
@@ -816,17 +867,36 @@ static bool amiga_custom_gfx_update(void *opaque)
             case REG_BPLCON0:
                 c_con0 = s->journal[i].val;
                 break;
+            case REG_FMODE:
+                c_fmode = s->journal[i].val & 3;
+                break;
             case REG_DIWSTRT:
                 c_diwstrt = s->journal[i].val;
+                c_diwhigh_valid = false;
                 break;
             case REG_DIWSTOP:
                 /*
                  * DIWSTOP is written after DIWSTRT, so sample the window
                  * here where both halves are current; a copper split
-                 * updates the pair for each section.
+                 * updates the pair for each section.  An ECS guest
+                 * follows up with DIWHIGH, which resamples with the
+                 * high bits in place.
                  */
                 c_diwstop = s->journal[i].val;
-                dw = MAX(dw, ((c_diwstop & 0xff) | 0x100) - (c_diwstrt & 0xff));
+                c_diwhigh_valid = false;
+                amiga_diw_decode(c_diwstrt, c_diwstop, c_diwhigh,
+                                 c_diwhigh_valid, &c_vstart, &c_vstop,
+                                 &c_hstart, &c_hstop);
+                dw = MAX(dw, c_hstop - c_hstart);
+                diw_from_copper = true;
+                break;
+            case REG_DIWHIGH:
+                c_diwhigh = s->journal[i].val;
+                c_diwhigh_valid = true;
+                amiga_diw_decode(c_diwstrt, c_diwstop, c_diwhigh,
+                                 c_diwhigh_valid, &c_vstart, &c_vstop,
+                                 &c_hstart, &c_hstop);
+                dw = MAX(dw, c_hstop - c_hstart);
                 diw_from_copper = true;
                 break;
             }
@@ -844,7 +914,7 @@ static bool amiga_custom_gfx_update(void *opaque)
          * stale once a copper list drives the display.
          */
         if (!diw_from_copper) {
-            dw = ((diwstop & 0xff) | 0x100) - (diwstrt & 0xff);
+            dw = hstop - hstart;
         }
         dw <<= surf_hires ? 1 : 0;
         if (dw > 0 && dw < width) {
@@ -928,6 +998,8 @@ static bool amiga_custom_gfx_update(void *opaque)
         ham = bplcon0 & BPLCON0_HAM;
         ehb = !ham && planes == 6;      /* extra-half-brite */
         hires = bplcon0 & BPLCON0_HIRES;
+        /* AGA copper lists set FMODE per screen section */
+        fmode = DREG(REG_FMODE) & 3;
         words = amiga_fetch_words(DREG(REG_DDFSTRT) & 0xfc,
                                   DREG(REG_DDFSTOP) & 0xfc, hires, fmode);
         words = MIN(MAX(words, 0), (int)sizeof(rowbuf[0]) / 2);
@@ -1023,8 +1095,6 @@ static const GraphicHwOps amiga_custom_gfx_ops = {
 /* PAL colour clock; a sample lasts AUDxPER of its ticks */
 #define PAULA_COLOR_HZ      3546895
 #define PAULA_OUT_HZ        44100
-/* Paula can't fetch faster than one word per two scanlines */
-#define PAULA_MIN_PERIOD    124
 #define PAULA_MIX_FRAMES    256
 
 static void amiga_audio_reload(AmigaCustomState *s, int ch)
@@ -1083,9 +1153,18 @@ static void amiga_audio_callback(void *opaque, int avail)
                     (DMACON_DMAEN | (DMACON_AUD0EN << ch))) {
                     continue;
                 }
+                /*
+                 * Honour the period as programmed, without the DMA
+                 * fetch-rate floor real Paula has (~124 ticks/word):
+                 * a starved channel repeats words but its buffer
+                 * still drains at the programmed rate, and guests
+                 * (the CD32 boot chime, period 8) do use tiny periods
+                 * and wait for the buffer-done interrupt.  A period
+                 * of 0 reloads the counter as a full 65536.
+                 */
                 period = amiga_custom_reg(s, base + AUD_PER);
-                if (period < PAULA_MIN_PERIOD) {
-                    period = PAULA_MIN_PERIOD;
+                if (period == 0) {
+                    period = 0x10000;
                 }
                 s->aud[ch].frac += step;
                 while (s->aud[ch].frac >= period << 16) {
@@ -1123,8 +1202,58 @@ static void amiga_custom_audio_dmacon(AmigaCustomState *s, uint16_t old)
         if ((s->dmacon & bit) && !(old & bit)) {
             amiga_audio_reload(s, ch);
             s->aud[ch].frac = 0;
+            /* DMA takes the channel over from any hand-fed word */
+            timer_del(&s->aud_dat_timer[ch]);
         }
     }
+}
+
+/*
+ * Manual (non-DMA) audio: a CPU write to AUDxDAT plays that word
+ * directly, and Paula raises the channel interrupt when it wants the
+ * next word, two sample periods later.  audio.device relies on this
+ * to start DMA race-free: it hand-feeds one word and the AUDx
+ * interrupt handler it installed switches the channel's DMA on (the
+ * CD32 boot chime hangs without it).
+ */
+static void amiga_audio_dat_write(AmigaCustomState *s, int ch)
+{
+    unsigned period = amiga_custom_reg(s, REG_AUD0LC + ch * AUD_CH_SIZE
+                                          + AUD_PER);
+    /* the period counter reloads 0 as a full 65536 ticks */
+    int64_t ticks = 2 * (int64_t)(period ? period : 0x10000);
+
+    timer_mod(&s->aud_dat_timer[ch],
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              ticks * NANOSECONDS_PER_SECOND / PAULA_COLOR_HZ);
+}
+
+static void amiga_audio_dat_done(AmigaCustomState *s, int ch)
+{
+    /* only the hand-fed mode interrupts here; DMA has its own path */
+    if (!(s->dmacon & (DMACON_AUD0EN << ch))) {
+        amiga_custom_post_int(s, INT_AUD0 << ch);
+    }
+}
+
+static void amiga_audio_dat_done0(void *opaque)
+{
+    amiga_audio_dat_done(opaque, 0);
+}
+
+static void amiga_audio_dat_done1(void *opaque)
+{
+    amiga_audio_dat_done(opaque, 1);
+}
+
+static void amiga_audio_dat_done2(void *opaque)
+{
+    amiga_audio_dat_done(opaque, 2);
+}
+
+static void amiga_audio_dat_done3(void *opaque)
+{
+    amiga_audio_dat_done(opaque, 3);
 }
 
 /* --- mouse --- */
@@ -1319,6 +1448,17 @@ static uint16_t amiga_custom_reg_read(AmigaCustomState *s, unsigned reg)
     case REG_INTREQR:
         return s->intreq;
     case REG_DENISEID:
+        /*
+         * Lisa (AGA, id 0xf8) drives all 16 data lines, so the high
+         * byte reads 0; the earlier Denises only drive D7-D0 and the
+         * open bus floats the top byte high.  graphics.library reads
+         * the AGA chip revision out of the inverted high bits, so the
+         * distinction matters (0xfff8 would make Kickstart see a
+         * pre-production Lisa).
+         */
+        if (s->denise_id == 0xf8) {
+            return s->denise_id;
+        }
         return 0xff00 | s->denise_id;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -1362,6 +1502,18 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
     uint8_t ch;
 
     switch (reg) {
+    case REG_AUD0LC + AUD_DAT:
+    case REG_AUD0LC + AUD_CH_SIZE + AUD_DAT:
+    case REG_AUD0LC + 2 * AUD_CH_SIZE + AUD_DAT:
+    case REG_AUD0LC + 3 * AUD_CH_SIZE + AUD_DAT: {
+        int ach = (reg - REG_AUD0LC) / AUD_CH_SIZE;
+
+        s->regs[reg >> 1] = val;
+        if (!(s->dmacon & (DMACON_AUD0EN << ach))) {
+            amiga_audio_dat_write(s, ach);
+        }
+        break;
+    }
     case REG_SERDAT:
         ch = val & 0xff;
         qemu_chr_fe_write_all(&s->chr, &ch, 1);
@@ -1425,6 +1577,16 @@ static void amiga_custom_reg_write(AmigaCustomState *s, unsigned reg,
         break;
     case REG_COPJMP2:
         amiga_custom_run_copper(s, amiga_custom_ptr(s, REG_COP2LC));
+        break;
+    /* writing either window register invalidates DIWHIGH, per ECS */
+    case REG_DIWSTRT:
+    case REG_DIWSTOP:
+        s->diwhigh_valid = false;
+        s->regs[reg >> 1] = val;
+        break;
+    case REG_DIWHIGH:
+        s->diwhigh_valid = true;
+        s->regs[reg >> 1] = val;
         break;
     default:
         if (reg >= REG_COLOR00 && reg < REG_COLOR00 + 64) {
@@ -1506,9 +1668,13 @@ static void amiga_custom_reset(DeviceState *dev)
     s->ports_levels = 0;
     s->exter_levels = 0;
     s->blit_zero = false;
+    s->diwhigh_valid = false;
     s->dsklen = 0;
     s->dsklen_armed = false;
     timer_del(&s->disk_timer);
+    for (int i = 0; i < 4; i++) {
+        timer_del(&s->aud_dat_timer[i]);
+    }
     memset(s->aud, 0, sizeof(s->aud));
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->aga_color, 0, sizeof(s->aga_color));
@@ -1538,6 +1704,14 @@ static void amiga_custom_realize(DeviceState *dev, Error **errp)
                   amiga_custom_vblank, s);
     timer_init_ns(&s->disk_timer, QEMU_CLOCK_VIRTUAL,
                   amiga_custom_disk_done, s);
+    timer_init_ns(&s->aud_dat_timer[0], QEMU_CLOCK_VIRTUAL,
+                  amiga_audio_dat_done0, s);
+    timer_init_ns(&s->aud_dat_timer[1], QEMU_CLOCK_VIRTUAL,
+                  amiga_audio_dat_done1, s);
+    timer_init_ns(&s->aud_dat_timer[2], QEMU_CLOCK_VIRTUAL,
+                  amiga_audio_dat_done2, s);
+    timer_init_ns(&s->aud_dat_timer[3], QEMU_CLOCK_VIRTUAL,
+                  amiga_audio_dat_done3, s);
     qemu_chr_fe_set_handlers(&s->chr, amiga_custom_serial_can_receive,
                              amiga_custom_serial_receive, NULL, NULL,
                              s, NULL, true);
@@ -1566,8 +1740,8 @@ static void amiga_custom_init(Object *obj)
 
 static const VMStateDescription vmstate_amiga_custom = {
     .name = "amiga-custom",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(dsklen, AmigaCustomState),
         VMSTATE_BOOL(dsklen_armed, AmigaCustomState),
@@ -1595,8 +1769,10 @@ static const VMStateDescription vmstate_amiga_custom = {
         VMSTATE_UINT16_ARRAY(regs, AmigaCustomState, 0x100),
         VMSTATE_UINT32_ARRAY(aga_color, AmigaCustomState, 256),
         VMSTATE_BOOL(blit_zero, AmigaCustomState),
+        VMSTATE_BOOL(diwhigh_valid, AmigaCustomState),
         VMSTATE_INT64(frame_origin_ns, AmigaCustomState),
         VMSTATE_TIMER(vblank_timer, AmigaCustomState),
+        VMSTATE_TIMER_ARRAY(aud_dat_timer, AmigaCustomState, 4),
         VMSTATE_END_OF_LIST()
     }
 };
