@@ -74,6 +74,7 @@ config M68K_VIRT
 config MC68EZ328
     bool
     default y
+    depends on M68K
     select M68K_IRQC
     select DRAGONBALL_PLL
     select DRAGONBALL_GPIO
@@ -119,6 +120,7 @@ config SUN3
 config MVME147
     bool
     default y
+    depends on M68K
     select M68K_IRQC
     select MVME147_PCC
     select MVME147_VMECHIP
@@ -162,6 +164,7 @@ config ATARIST
 config MEGADRIVE
     bool
     default y
+    depends on M68K
     select M68K_IRQC
     select MEGADRIVE_VDP
     select MEGADRIVE_EVERDRIVE
