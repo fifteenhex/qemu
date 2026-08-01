@@ -63,6 +63,13 @@ config VMWARE_VGA
     depends on PCI
     select VGA
 
+config GEFORCE6200
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select I2C
+    select DDC
+
 config BOCHS_DISPLAY
     bool
     default y if PCI_DEVICES
