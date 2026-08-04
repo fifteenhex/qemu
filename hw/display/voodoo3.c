@@ -1383,7 +1383,18 @@ static void voodoo3_fetch_texel(Voodoo3State *s, unsigned tmu, uint32_t base,
             break;
         case V3_TFMT_P8:
         case V3_TFMT_P8_RGBA: {
-            /* palette lookup (P8_RGBA's 6666 alpha isn't downloaded -> 255) */
+            /*
+             * palette lookup (P8_RGBA's 6666 alpha isn't downloaded -> 255)
+             *
+             * TODO: P8_RGBA does NOT match silicon here.  On real hardware a
+             * P8_RGBA texture drawn against the same tex_palette download that
+             * P8/AP88 use produces different colours (validated with the
+             * smoltdfx texfmt scene: AP88 and P8 are bit-exact, P8_RGBA is
+             * not), so P8_RGBA evidently sources its palette from a separate
+             * RGBA table / download path this model does not implement.  Needs
+             * a probe to characterise before it can be modelled; treated as P8
+             * for now.
+             */
             uint32_t c = s->tex_palette[px];
             *r = (c >> 16) & 0xff;
             *g = (c >> 8) & 0xff;
@@ -2025,16 +2036,52 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
             l0 = e0 / area;
             l1 = e1 / area;
             l2 = e2 / area;
+            /*
+             * TODO: match silicon's fixed-point setup/rasterisation.
+             * Two float-vs-fixed-point gaps versus real hardware:
+             *  - iterated params (colour/z/w/s/t) are interpolated in
+             *    float and rounded on store, off by +-1 LSB from the SST
+             *    12.12/etc. math (smoltdfx Gouraud test: ~1/4 of samples
+             *    high by +1, mostly green); and
+             *  - edge coverage: the edge functions (e0/e1/e2) and area
+             *    are float here, so triangle-edge pixels land slightly
+             *    differently than the hardware's fixed-point edge walk
+             *    (smoltdfx cubes: the 8x6 sample grid matches exactly but
+             *    the whole-frame checksum differs on cube edges).
+             * Replicate the hardware's fixed-point gradient accumulation
+             * and edge stepping/rounding for bit-exact output.
+             */
 
-            /* stipple mask: skip pixels whose pattern bit is clear (4x4 by
-             * (x,y), else an absolute-x line pattern - rotate mode is
-             * span-relative on hw and only approximated here) */
+            /* stipple mask: skip pixels whose pattern bit is clear.  In
+             * pattern mode the register is an 8-wide x 4-tall pattern -
+             * one byte per row (byte y&3, low byte = row 0), MSB-first
+             * across x (verified with smoltdfx tdfx_stipple: 0xff000000
+             * lights the bottom row of the cell, 0xaa55aa55 is a checker).
+             * Non-pattern (rotate/line) mode is span-relative on hardware
+             * and only approximated here as an absolute-x pattern.
+             *
+             * TODO: hardware (tdfx_stipple dump_line) does NOT match this.
+             * It is a rotating stipple: consecutive scanlines flip the bit
+             * order (even rows index LSB-first bit(x&31), odd rows MSB-first
+             * bit(31-(x&31)) at x0=0), and the phase depends on the span
+             * start (a quad drawn at x0=5 shifts to a non-period-8 spacing),
+             * i.e. the pattern advances/rotates along each span the way a
+             * dashed line consumes it.  Needs a line-drawing probe to pin
+             * the rotate step before it can be modelled; absolute-x for now. */
             if (fbz & V3_FBZ_ENSTIPPLE) {
                 uint32_t stip = s->d3_regs[V3_3D_STIPPLE / 4];
-                unsigned sbit = (fbz & V3_FBZ_ENSTIPPLEPATTERN)
-                                ? (dy & 3) * 4 + (x & 3) : (unsigned)(x & 31);
-                if (!((stip >> (31 - sbit)) & 1)) {
-                    continue;
+                unsigned sbit;
+
+                if (fbz & V3_FBZ_ENSTIPPLEPATTERN) {
+                    sbit = (dy & 3) * 8 + (7 - (x & 7));
+                    if (!((stip >> sbit) & 1)) {
+                        continue;
+                    }
+                } else {
+                    sbit = x & 31;
+                    if (!((stip >> (31 - sbit)) & 1)) {
+                        continue;
+                    }
                 }
             }
 
@@ -2068,21 +2115,33 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 float ia = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255) / 255.0f;
                 float tr = 0, tg = 0, tb = 0, ta = 0, fr, fg, fb, fa;
 
-                /* TMU chain: TMU1 (if active) feeds its colour into TMU0's
-                 * combine as "other"; TMU0's colour goes to the fbz stage */
+                /* TMU chain: TMU1 is the downstream combiner on silicon (the
+                 * smoltdfx tdfx_mtex probe showed TMU0's combine is ignored
+                 * and TMU1's result reaches the FBI).  So TMU0 (if TMU1 is
+                 * active) feeds its colour into TMU1's combine as "other" and
+                 * TMU1's colour goes to the fbz stage; a lone TMU0 goes there
+                 * directly. */
                 if (texen) {
-                    float c1r = 0, c1g = 0, c1b = 0, c1a = 0;
                     if (tmu1_en) {
-                        voodoo3_tmu_stage(s, V3_3D_TMU1, v0, v1, v2,
+                        float c0r = 0, c0g = 0, c0b = 0, c0a = 0;
+
+                        voodoo3_tmu_stage(s, 0, v0, v1, v2,
                                           l0, l1, l2, e0, e1, e2,
                                           de0dx, de0dy, de1dx, de1dy,
                                           de2dx, de2dy, area, 0, 0, 0, 0,
-                                          &c1r, &c1g, &c1b, &c1a);
+                                          &c0r, &c0g, &c0b, &c0a);
+                        voodoo3_tmu_stage(s, V3_3D_TMU1, v0, v1, v2,
+                                          l0, l1, l2, e0, e1, e2,
+                                          de0dx, de0dy, de1dx, de1dy,
+                                          de2dx, de2dy, area, c0r, c0g, c0b, c0a,
+                                          &tr, &tg, &tb, &ta);
+                    } else {
+                        voodoo3_tmu_stage(s, 0, v0, v1, v2,
+                                          l0, l1, l2, e0, e1, e2,
+                                          de0dx, de0dy, de1dx, de1dy,
+                                          de2dx, de2dy, area, 0, 0, 0, 0,
+                                          &tr, &tg, &tb, &ta);
                     }
-                    voodoo3_tmu_stage(s, 0, v0, v1, v2, l0, l1, l2, e0, e1, e2,
-                                      de0dx, de0dy, de1dx, de1dy,
-                                      de2dx, de2dy, area, c1r, c1g, c1b, c1a,
-                                      &tr, &tg, &tb, &ta);
                 }
 
                 /* fbzColorPath combine -> final pixel colour, 0..255 */
@@ -2228,12 +2287,19 @@ static void voodoo3_setup_vertex(Voodoo3State *s, V3Vertex *v)
     v->tow1 = v3_reg_f(s, V3_3D_STOW1);
 }
 
-/* Setup unit: accumulate a vertex and emit triangles (strip or fan). */
+/*
+ * Setup unit: accumulate a vertex and emit triangles.  A continuous
+ * sBeginTri + sDrawTri... stream is assembled as a triangle STRIP -
+ * (v0,v1,v2), (v1,v2,v3), ... - regardless of the sSetupMode STRIP bit.
+ * This matches silicon: the smoltdfx test drew a 4-vertex quad
+ * TL,TR,BR,BL and hardware left the left wedge unfilled, i.e.
+ * (TL,TR,BR)+(TR,BR,BL), which is the strip assembly (an earlier "fan"
+ * path that anchored on v0 drew the wrong second triangle).  A single
+ * triangle is still just its three vertices, so callers wanting
+ * independent triangles issue a fresh sBeginTri per triangle.
+ */
 static void voodoo3_setup_tri(Voodoo3State *s, bool begin)
 {
-    uint32_t mode = s->d3_regs[V3_3D_SSETUPMODE / 4];
-    bool strip = mode & V3_SSETUP_STRIP_MODE;
-
     if (begin) {
         voodoo3_setup_vertex(s, &s->svtx[0]);
         s->snvert = 1;
@@ -2241,11 +2307,8 @@ static void voodoo3_setup_tri(Voodoo3State *s, bool begin)
     }
     if (s->snvert < 3) {
         voodoo3_setup_vertex(s, &s->svtx[s->snvert++]);
-    } else if (strip) {
+    } else {
         s->svtx[0] = s->svtx[1];
-        s->svtx[1] = s->svtx[2];
-        voodoo3_setup_vertex(s, &s->svtx[2]);
-    } else { /* fan: keep svtx[0] as the anchor */
         s->svtx[1] = s->svtx[2];
         voodoo3_setup_vertex(s, &s->svtx[2]);
     }
