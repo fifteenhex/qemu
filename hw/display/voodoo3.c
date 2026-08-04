@@ -295,6 +295,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_INTR_VSYNC_ENABLE    BIT(0)  /* raise PCI IRQ on vertical blank */
 #define V3_INTR_VSYNC_CLEAR     BIT(1)  /* write 1 to acknowledge the IRQ */
 #define V3_INTR_VSYNC_PENDING   BIT(6)  /* read: a vblank IRQ is pending */
+#define V3_INTR_IDLE_ENABLE     BIT(2)  /* arm: raise PCI IRQ when 3D idle */
+#define V3_INTR_IDLE_CLEAR      BIT(3)  /* write 1 to acknowledge the IRQ */
+#define V3_INTR_IDLE_PENDING    BIT(7)  /* read: a 3D-idle IRQ is pending */
 
 /* fbzMode bits */
 #define V3_FBZ_ENCLIP           BIT(0)
@@ -510,6 +513,22 @@ struct Voodoo3State {
     uint32_t swap_buf;          /* vram offset queued for display */
     uint32_t swap_interval;     /* vblanks to wait before the queued swap */
     bool vsync_irq;             /* vsync interrupt asserted (status[31]) */
+    bool idle_irq;              /* 3D-idle interrupt asserted */
+
+    /*
+     * First-order engine-timing model.  Rasterisation is synchronous (pixels
+     * are produced inside the command's register write), but real hardware
+     * takes time proportional to the pixels touched.  We charge that time to a
+     * virtual "busy until" clock so STATUS_BUSY and the idle interrupt behave
+     * like hardware (the guest actually sleeps for a realistic interval)
+     * instead of everything appearing instant.  Pixel output is unaffected.
+     */
+    QEMUTimer idle_timer;       /* fires the idle IRQ when busy_until passes */
+    int64_t busy_until;         /* virtual time (ns) the engine stays busy */
+    int64_t ns_per_pixel;       /* fill cost per pixel (fill-rate model, 0=off) */
+    int64_t tri_setup_ns;       /* per-triangle setup cost */
+    int64_t max_busy_ns;        /* cap on queued virtual debt (FIFO backpressure) */
+    int64_t fifo_ns;            /* backlog that reads as a full command FIFO */
 
     bool draminit0_written;
     bool draminit1_written;
@@ -560,6 +579,9 @@ static bool voodoo3_mem_ok(Voodoo3State *s)
     return f >= 50000 && f <= 250000 &&
            s->draminit0_written && s->draminit1_written && s->dram_mode_set;
 }
+
+static void voodoo3_engine_busy(Voodoo3State *s, int64_t ns);
+static int voodoo3_fifo_free(Voodoo3State *s, int64_t now);
 
 static bool voodoo3_2d_ok(Voodoo3State *s)
 {
@@ -913,6 +935,7 @@ static void voodoo3_2d_rectfill(Voodoo3State *s, uint32_t xy)
     }
     voodoo3_2d_dirty(s, base + dy * stride,
                      base + (dy + h) * stride + 4 * (dx + w));
+    voodoo3_engine_busy(s, (int64_t)w * h * s->ns_per_pixel);
 }
 
 static void voodoo3_2d_s2s_blt(Voodoo3State *s, uint32_t srcxy)
@@ -967,6 +990,7 @@ static void voodoo3_2d_s2s_blt(Voodoo3State *s, uint32_t srcxy)
         voodoo3_2d_dirty(s, dstbase + (dy - (int)h + 1) * dstride,
                          dstbase + (dy + 1) * dstride + 4 * (dx + 1));
     }
+    voodoo3_engine_busy(s, (int64_t)w * h * s->ns_per_pixel);
 }
 
 /*
@@ -1193,9 +1217,12 @@ static uint64_t voodoo3_reg_read(Voodoo3State *s, hwaddr addr, unsigned size)
     case V3_STATUS:
     {
         uint32_t visible, line = voodoo3_scanline(s, &visible);
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-        /* command FIFO always has room, engine never busy */
-        val = 0x1f;
+        val = voodoo3_fifo_free(s, now);        /* command-FIFO free slots */
+        if (now < s->busy_until) {
+            val |= V3_STATUS_BUSY;
+        }
         if (line >= visible) {
             val |= BIT(6); /* vertical retrace */
         }
@@ -2362,6 +2389,18 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     }
 
     s->d3_regs[0x25c / 4]++;  /* fbiTrianglesOut */
+
+    /* charge fill time: ~half the bounding box, doubled for dual-TMU */
+    {
+        int64_t px = (int64_t)(ix1 - ix0) * (iy1 - iy0) / 2;
+
+        if (px > 0) {
+            voodoo3_engine_busy(s, s->tri_setup_ns +
+                                px * s->ns_per_pixel * (tmu1_en ? 2 : 1));
+        } else {
+            voodoo3_engine_busy(s, s->tri_setup_ns);
+        }
+    }
     if (yflip) {
         /* drawn device rows are yorg-iy1 .. yorg-iy0 after the swap */
         int dtop = yorg - (iy1 - 1);
@@ -2807,6 +2846,7 @@ static void voodoo3_3d_fastfill(Voodoo3State *s)
         }
     }
     memory_region_set_dirty(&s->vga.vram, cbase, cstride * (y1 - y0 + 1));
+    voodoo3_engine_busy(s, (int64_t)(x1 - x0) * (y1 - y0) * s->ns_per_pixel);
 }
 
 /* Point the video scanout at a buffer and refresh the display. */
@@ -2846,6 +2886,79 @@ static void voodoo3_3d_swapbuffer(Voodoo3State *s, uint32_t cmd)
     }
 }
 
+/* Drive the shared PCI interrupt line from the vsync + idle pending flags. */
+static void voodoo3_update_irq(Voodoo3State *s)
+{
+    pci_set_irq(&s->dev, (s->vsync_irq || s->idle_irq) ? 1 : 0);
+}
+
+/*
+ * Command-FIFO free slots (STATUS[4:0], 0..31) derived from the virtual
+ * backlog: full (0 free) once the engine is fifo_ns of work behind, recovering
+ * as it drains.  When timing is disabled it always reads free, as before.
+ */
+static int voodoo3_fifo_free(Voodoo3State *s, int64_t now)
+{
+    int64_t backlog;
+
+    if (s->ns_per_pixel <= 0 || s->fifo_ns <= 0) {
+        return 0x1f;
+    }
+    backlog = s->busy_until - now;
+    if (backlog <= 0) {
+        return 0x1f;
+    }
+    if (backlog >= s->fifo_ns) {
+        return 0;
+    }
+    return 0x1f - (int)((int64_t)0x1f * backlog / s->fifo_ns);
+}
+
+/* The idle interrupt fires here, when the engine's virtual busy time elapses. */
+static void voodoo3_idle_timer(void *opaque)
+{
+    Voodoo3State *s = opaque;
+
+    if (s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_IDLE_ENABLE) {
+        s->d3_regs[V3_3D_INTRCTRL / 4] &= ~V3_INTR_IDLE_ENABLE;  /* one-shot */
+        s->idle_irq = true;
+        voodoo3_update_irq(s);
+    }
+}
+
+/*
+ * Charge the engine `ns` of virtual busy time (serial FIFO model: work queues
+ * behind whatever is already outstanding).  If a WAIT_IDLE is armed and still
+ * pending, push its wakeup out so it fires once this work would have drained.
+ */
+static void voodoo3_engine_busy(Voodoo3State *s, int64_t ns)
+{
+    int64_t now;
+
+    if (s->ns_per_pixel <= 0) {          /* timing disabled -> stay instant */
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->busy_until < now) {
+        s->busy_until = now;
+    }
+    s->busy_until += ns;
+    /*
+     * Backpressure: on real hardware the guest stalls once the command FIFO
+     * fills, so the engine is never more than roughly a frame of work behind.
+     * We can't stall a synchronous MMIO write, so instead cap the virtual debt
+     * -- otherwise a long burst of commands with no intervening wait would make
+     * the next wait_idle sleep for the entire accumulated (possibly multi-
+     * second) backlog.
+     */
+    if (s->busy_until > now + s->max_busy_ns) {
+        s->busy_until = now + s->max_busy_ns;
+    }
+    if ((s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_IDLE_ENABLE) && !s->idle_irq) {
+        timer_mod(&s->idle_timer, s->busy_until);
+    }
+}
+
 /* Vertical-blank: perform any queued swap and raise the vsync IRQ. */
 static void voodoo3_vblank(void *opaque)
 {
@@ -2865,7 +2978,7 @@ static void voodoo3_vblank(void *opaque)
 
     if (s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_VSYNC_ENABLE) {
         s->vsync_irq = true;
-        pci_set_irq(&s->dev, 1);
+        voodoo3_update_irq(s);
     }
 
     timer_mod(&s->vblank_timer, now + NANOSECONDS_PER_SECOND / 60);
@@ -2882,20 +2995,29 @@ static uint64_t voodoo3_3d_read(Voodoo3State *s, hwaddr addr, unsigned size)
     case V3_STATUS:
     {
         uint32_t vis, line = voodoo3_scanline(s, &vis);
-        val = 0x1f;                                 /* FIFO free */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        val = voodoo3_fifo_free(s, now);            /* command-FIFO free slots */
+        if (now < s->busy_until) {
+            val |= V3_STATUS_BUSY;
+        }
         if (line >= vis) {
             val |= V3_STATUS_VRETRACE;
         }
         val |= (s->swap_pending & 7) << V3_STATUS_SWAP_SHIFT;
-        if (s->vsync_irq) {
+        if (s->vsync_irq || s->idle_irq) {
             val |= V3_STATUS_PCIINT;
         }
         break;
     }
     case V3_3D_INTRCTRL:
-        val = s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_VSYNC_ENABLE;
+        val = s->d3_regs[V3_3D_INTRCTRL / 4] &
+              (V3_INTR_VSYNC_ENABLE | V3_INTR_IDLE_ENABLE);
         if (s->vsync_irq) {
             val |= V3_INTR_VSYNC_PENDING;
+        }
+        if (s->idle_irq) {
+            val |= V3_INTR_IDLE_PENDING;
         }
         break;
     default:
@@ -2960,9 +3082,29 @@ static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
     case V3_3D_INTRCTRL:
         if (data & V3_INTR_VSYNC_CLEAR) {
             s->vsync_irq = false;
-            pci_set_irq(&s->dev, 0);
         }
-        s->d3_regs[V3_3D_INTRCTRL / 4] = data & V3_INTR_VSYNC_ENABLE;
+        if (data & V3_INTR_IDLE_CLEAR) {
+            s->idle_irq = false;
+        }
+        s->d3_regs[V3_3D_INTRCTRL / 4] =
+            data & (V3_INTR_VSYNC_ENABLE | V3_INTR_IDLE_ENABLE);
+        /*
+         * Arming the idle interrupt fires it when the engine's virtual busy
+         * time (charged per command by voodoo3_engine_busy) has elapsed: if the
+         * engine is already idle, signal now; otherwise schedule the wakeup for
+         * when it would drain, so the guest sleeps for a realistic interval.
+         */
+        if (data & V3_INTR_IDLE_ENABLE) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+            if (now >= s->busy_until) {          /* already idle: fire now */
+                s->d3_regs[V3_3D_INTRCTRL / 4] &= ~V3_INTR_IDLE_ENABLE;
+                s->idle_irq = true;
+            } else {
+                timer_mod(&s->idle_timer, s->busy_until);
+            }
+        }
+        voodoo3_update_irq(s);
         break;
     case V3_3D_NOPCMD:
         break;
@@ -3208,6 +3350,43 @@ static void voodoo3_realize(PCIDevice *dev, Error **errp)
     timer_mod(&s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
+
+    /*
+     * Engine-timing model.  Voodoo3 3000: ~333 Mpixel/s single-textured fill
+     * (166 MHz x 2 pipelines) -> ~3 ns/pixel; ~200 ns triangle setup.  These
+     * are deliberately first-order; V3_NS_PER_PIXEL / V3_TRI_SETUP_NS override
+     * them for calibration against real hardware.
+     */
+    timer_init_ns(&s->idle_timer, QEMU_CLOCK_VIRTUAL, voodoo3_idle_timer, s);
+    s->busy_until = 0;
+    /*
+     * Fill-timing model OFF by default.  It faithfully rate-limits to the
+     * Voodoo3's fill rate (and makes the idle interrupt fire on a realistic
+     * delay), but under QEMU the extra per-frame sync (each wait_idle is a
+     * vCPU halt + IRQ round-trip) roughly halves interactive frame rate and
+     * slows startup, which is not worth it for day-to-day development.  Set
+     * V3_NS_PER_PIXEL=3 (~333 Mpixel/s) to enable it for HW-timing validation.
+     */
+    s->ns_per_pixel = 0;
+    s->tri_setup_ns = 200;
+    s->max_busy_ns = 33 * 1000 * 1000;   /* hard cap on queued virtual debt */
+    s->fifo_ns = 2 * 1000 * 1000;        /* FIFO reads full at ~2 ms of backlog */
+    {
+        const char *e;
+
+        if ((e = getenv("V3_NS_PER_PIXEL"))) {   /* 0 disables engine timing */
+            s->ns_per_pixel = atoi(e);
+        }
+        if ((e = getenv("V3_TRI_SETUP_NS"))) {
+            s->tri_setup_ns = atoi(e);
+        }
+        if ((e = getenv("V3_MAX_BUSY_NS"))) {
+            s->max_busy_ns = atoll(e);
+        }
+        if ((e = getenv("V3_FIFO_NS"))) {
+            s->fifo_ns = atoll(e);
+        }
+    }
 }
 
 static void voodoo3_reset(DeviceState *dev)
@@ -3219,6 +3398,8 @@ static void voodoo3_reset(DeviceState *dev)
     s->swap_pending = 0;
     s->swap_interval = 0;
     s->vsync_irq = false;
+    s->idle_irq = false;
+    s->busy_until = 0;
     pci_set_irq(&s->dev, 0);
 
     memset(s->io_regs, 0, sizeof(s->io_regs));
@@ -3247,6 +3428,7 @@ static void voodoo3_exit(PCIDevice *dev)
 
     voodoo3_pool_teardown(s);
     timer_del(&s->vblank_timer);
+    timer_del(&s->idle_timer);
     qemu_graphic_console_close(s->vga.con);
     cursor_unref(s->cursor);
 }
