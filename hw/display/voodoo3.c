@@ -375,6 +375,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_TEX_TCA_ADD_CLOCAL   BIT(27)  /* TMU alpha: add local texel */
 #define V3_TEX_TCA_ADD_ALOCAL   BIT(28)
 #define V3_TEX_TCA_INVERT_OUTPUT BIT(29)
+#define V3_TEX_TRILINEAR        BIT(30)  /* LOD blend (dual-TMU); else nearest-mip */
 /* texture formats (textureMode[11:8]) - values per the Avenger spec */
 #define V3_TFMT_RGB332          0        /* 8bpp 3-3-2 */
 #define V3_TFMT_YIQ             1        /* 8bpp NCC (table 0) */
@@ -1530,63 +1531,31 @@ static uint32_t voodoo3_tiled_lod_offset(unsigned lod, unsigned bpt,
     return a;
 }
 
-/* sample TMU `tmu` (byte offset 0 or V3_3D_TMU1) at (sc,tc) */
-static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
-                          float sc, float tc, float lodval,
-                          float *r, float *g, float *b, float *a)
+/*
+ * Rescale a replication-decoded (0..255) channel to the left-shift decode the
+ * bilinear filter uses (raw << (8-bits), so an N-bit channel maxes at
+ * ((1<<N)-1)<<(8-N)).  factor = that_max / 255.  Palette/NCC/8-bit channels are
+ * already full-range -> factor 1.
+ */
+static void voodoo3_bilerp_scale(unsigned fmt, float *sr, float *sg, float *sb)
 {
-    uint32_t tmode = s->d3_regs[(V3_3D_TEXTUREMODE + tmu) / 4];
-    uint32_t texbase = s->d3_regs[(V3_3D_TEXBASEADDR + tmu) / 4];
-    uint32_t base = texbase & 0xfffff0;   /* [23:4] byte address, 16-byte units */
-    bool tiled = texbase & 1;             /* [0] SST_TEXTURE_IS_TILED */
-    unsigned stride_tiles = (texbase >> 25) & 0x7f;  /* [31:25] tile stride */
-    uint32_t lod = s->d3_regs[(V3_3D_TLOD + tmu) / 4];
-    unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
-    unsigned lodmin = (lod & 0x3f) >> 2;      /* tLOD lodmin, 4.2 -> integer */
-    unsigned lodmax = ((lod >> 6) & 0x3f) >> 2;
-    int lodbias_raw = (lod >> 12) & 0x3f;     /* 4.2 signed */
-    float lodbias, scale;
-    unsigned dim, level;
-    bool minifying;
-    bool clamps = tmode & V3_TEX_CLAMPS;
-    bool clampt = tmode & V3_TEX_CLAMPT;
-    bool bilinear;
-
-    lodmin = MIN(lodmin, 8);
-    lodmax = MIN(lodmax, 8);
-    lodmax = MAX(lodmax, lodmin);
-    lodbias = ((lodbias_raw & 0x20) ? lodbias_raw - 0x40 : lodbias_raw) / 4.0f;
-
-    /*
-     * Pick the mip level from the screen-space LOD (nearest level, no
-     * trilinear yet). lodval is log2(texels/pixel) relative to lodmin, so it
-     * is <=0 under magnification (stay at lodmin) and grows under
-     * minification. sc/tc are in lodmin-level texel units, so scale them
-     * down for the coarser level. Non-mipmapped textures have
-     * lodmin == lodmax and fall through unchanged.
-     */
-    {
-        float eff = lodval + lodbias;
-        int lev = (int)lodmin + (eff > 0 ? (int)(eff + 0.5f) : 0);
-        level = (unsigned)MIN(MAX(lev, (int)lodmin), (int)lodmax);
+    switch (fmt) {
+    case V3_TFMT_RGB565:   *sr = 248/255.0f; *sg = 252/255.0f; *sb = 248/255.0f; break;
+    case V3_TFMT_ARGB1555: *sr = *sg = *sb = 248/255.0f; break;   /* 5-5-5 */
+    case V3_TFMT_ARGB4444: *sr = *sg = *sb = 240/255.0f; break;   /* 4-4-4 */
+    case V3_TFMT_RGB332:
+    case V3_TFMT_ARGB8332: *sr = 224/255.0f; *sg = 224/255.0f; *sb = 192/255.0f; break;
+    default:               *sr = *sg = *sb = 1.0f; break;         /* 8-bit / palette */
     }
-    minifying = level > lodmin;
-    dim = 256 >> level;
-    scale = (float)(1u << (level - lodmin));
-    sc /= scale;
-    tc /= scale;
+}
 
-    /* add the per-level offset (linear verified with tdfx_texlod; tiled ports
-     * Glide's fractal mip packing) so sub-256 / mip levels sample correctly */
-    if (tiled) {
-        base += voodoo3_tiled_lod_offset(level, voodoo3_tfmt_bpt(fmt),
-                                         stride_tiles);
-    } else {
-        base += voodoo3_lod_offset(level, voodoo3_tfmt_bpt(fmt));
-    }
-    /* minfilter minifies, magfilter magnifies */
-    bilinear = tmode & (minifying ? V3_TEX_MINFILTER : V3_TEX_MAGFILTER);
-
+/* sample one mip level (point or bilinear) at (sc,tc), dim x dim texels */
+static void voodoo3_sample_level(Voodoo3State *s, unsigned tmu, uint32_t base,
+                                 unsigned fmt, unsigned dim, bool tiled,
+                                 unsigned stride_tiles, float sc, float tc,
+                                 bool bilinear, bool clamps, bool clampt,
+                                 float *r, float *g, float *b, float *a)
+{
     if (!bilinear) {
         int u = voodoo3_wrap((int)floorf(sc), dim, clamps);
         int v = voodoo3_wrap((int)floorf(tc), dim, clampt);
@@ -1614,12 +1583,115 @@ static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
                             ua, vb, &r01, &g01, &b01, &a01);
         voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             ub, vb, &r11, &g11, &b11, &a11);
-        /* hardware rounds the bilinear result to nearest (a 4-texel average
-         * of e.g. 127.5 lands on 128, not 127) */
-        *r = floorf(r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11 + 0.5f);
-        *g = floorf(g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11 + 0.5f);
-        *b = floorf(b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11 + 0.5f);
-        *a = floorf(a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11 + 0.5f);
+        *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+        *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
+        *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;
+        *a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
+        /*
+         * The bilinear filter interpolates texel channels decoded by a plain
+         * left-shift (zero fill), not the bit-replication the point/combine
+         * path uses -- so a 5-bit channel maxes at 248, a 6-bit at 252, etc.
+         * (hwprobe SUBTEX: the ramp is floor(31*frac), not floor(31.875*frac)).
+         * fetch_texel returned replication-decoded 0..255; rescale to the
+         * shift-decode range per this format's channel widths.
+         */
+        {
+            float scr, scg, scb;
+            voodoo3_bilerp_scale(fmt, &scr, &scg, &scb);
+            *r *= scr; *g *= scg; *b *= scb;
+        }
+    }
+}
+
+/* sample TMU `tmu` (byte offset 0 or V3_3D_TMU1) at (sc,tc) */
+static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
+                          float sc, float tc, float lodval,
+                          float *r, float *g, float *b, float *a)
+{
+    uint32_t tmode = s->d3_regs[(V3_3D_TEXTUREMODE + tmu) / 4];
+    uint32_t texbase = s->d3_regs[(V3_3D_TEXBASEADDR + tmu) / 4];
+    uint32_t base = texbase & 0xfffff0;   /* [23:4] byte address, 16-byte units */
+    bool tiled = texbase & 1;             /* [0] SST_TEXTURE_IS_TILED */
+    unsigned stride_tiles = (texbase >> 25) & 0x7f;  /* [31:25] tile stride */
+    uint32_t lod = s->d3_regs[(V3_3D_TLOD + tmu) / 4];
+    unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
+    unsigned lodmin = (lod & 0x3f) >> 2;      /* tLOD lodmin, 4.2 -> integer */
+    unsigned lodmax = ((lod >> 6) & 0x3f) >> 2;
+    int lodbias_raw = (lod >> 12) & 0x3f;     /* 4.2 signed */
+    float lodbias;
+    unsigned level;
+    bool minifying;
+    bool clamps = tmode & V3_TEX_CLAMPS;
+    bool clampt = tmode & V3_TEX_CLAMPT;
+    bool bilinear;
+
+    lodmin = MIN(lodmin, 8);
+    lodmax = MIN(lodmax, 8);
+    lodmax = MAX(lodmax, lodmin);
+    lodbias = ((lodbias_raw & 0x20) ? lodbias_raw - 0x40 : lodbias_raw) / 4.0f;
+
+    /*
+     * Pick the mip level from the screen-space LOD.  The Voodoo3 default is
+     * NEAREST-mip with a floor()/truncated LOD: level = floor(LOD), fractional
+     * LOD stays on the finer level (confirmed on real hardware with
+     * smoltdfx/lodprobe: LOD 0.5->L0, 1.5->L1, 2.5->L2).  Trilinear ("LOD
+     * blend", textureMode[30]) additionally blends the next-coarser level in
+     * by the LOD fraction -- a dual-TMU feature, off by default.  lodval is
+     * log2(texels/pixel) relative to lodmin (<=0 under magnification, grows
+     * under minification); sc/tc are in lodmin-level texel units.
+     */
+    {
+        /* +1e-3 snaps a LOD that lands a float-epsilon under an integer back
+         * to it, so exact power-of-two minification floors to the same level
+         * as the hardware (lodprobe: rx=2 -> L1, not L0). */
+        float eff = lodval + lodbias;
+        int lev = (int)lodmin + (eff > 0 ? (int)(eff + 1e-3f) : 0);
+        level = (unsigned)MIN(MAX(lev, (int)lodmin), (int)lodmax);
+    }
+    minifying = level > lodmin;
+    /* minfilter minifies, magfilter magnifies */
+    bilinear = tmode & (minifying ? V3_TEX_MINFILTER : V3_TEX_MAGFILTER);
+
+    {
+        unsigned bpt = voodoo3_tfmt_bpt(fmt);
+        unsigned dim0 = 256 >> level;
+        float inv0 = 1.0f / (float)(1u << (level - lodmin));
+        uint32_t base0 = base + (tiled
+            ? voodoo3_tiled_lod_offset(level, bpt, stride_tiles)
+            : voodoo3_lod_offset(level, bpt));
+
+        voodoo3_sample_level(s, tmu, base0, fmt, dim0, tiled, stride_tiles,
+                             sc * inv0, tc * inv0, bilinear, clamps, clampt,
+                             r, g, b, a);
+
+        /* trilinear (textureMode[30] LOD blend): blend toward the next coarser
+         * level by the LOD fraction.  Off by default -> nearest-mip, matching
+         * real Voodoo3 (lodprobe: fractional-LOD bands are a pure single
+         * level, not an inter-level average). */
+        if ((tmode & V3_TEX_TRILINEAR) && minifying && level < lodmax) {
+            float eff = lodval + lodbias;
+            float frac = eff - floorf(eff);
+
+            if (frac > 0.001f) {
+                unsigned l1 = level + 1, dim1 = 256 >> l1;
+                float inv1 = 1.0f / (float)(1u << (l1 - lodmin));
+                uint32_t base1 = base + (tiled
+                    ? voodoo3_tiled_lod_offset(l1, bpt, stride_tiles)
+                    : voodoo3_lod_offset(l1, bpt));
+                float cr, cg, cb, ca;
+
+                voodoo3_sample_level(s, tmu, base1, fmt, dim1, tiled,
+                                     stride_tiles, sc * inv1, tc * inv1,
+                                     bilinear, clamps, clampt,
+                                     &cr, &cg, &cb, &ca);
+                *r += (cr - *r) * frac;
+                *g += (cg - *g) * frac;
+                *b += (cb - *b) * frac;
+                *a += (ca - *a) * frac;
+            }
+        }
+        *r = floorf(*r + 0.5f); *g = floorf(*g + 0.5f);
+        *b = floorf(*b + 0.5f); *a = floorf(*a + 0.5f);
     }
 }
 
@@ -1788,11 +1860,28 @@ static void voodoo3_tmu_stage(Voodoo3State *s, unsigned tmu,
     float dsx, dtx, dsy, dty, g2, lodval, xr, xg, xb, xa;
     uint32_t tmode = s->d3_regs[(V3_3D_TEXTUREMODE + tmu) / 4];
 
-    if (oow != 0) { sc /= oow; tc /= oow; }
-    if (ow_x != 0) { sc_x /= ow_x; tc_x /= ow_x; }
-    if (ow_y != 0) { sc_y /= ow_y; tc_y /= ow_y; }
-    dsx = sc_x - sc; dtx = tc_x - tc;
-    dsy = sc_y - sc; dty = tc_y - tc;
+    /*
+     * Screen-space texcoord derivatives for the LOD.  sc/tc/oow here are the
+     * raw perspective interpolants (s/w, t/w, 1/w), linear in screen space, so
+     * their forward differences are well conditioned.  Compute d(s)/dx via the
+     * quotient rule from those raw gradients rather than differencing the
+     * already-divided coords: at grazing/far angles oow is tiny and s = (s/w)/
+     * (1/w) is huge, so sc_x - sc cancels catastrophically and underestimates
+     * the LOD (surfaces stay at the finest level and alias).
+     */
+    {
+        float invw = oow != 0 ? 1.0f / oow : 0.0f;
+        float invw2 = invw * invw;
+        float dSx = sc_x - sc, dTx = tc_x - tc, dWx = ow_x - oow;
+        float dSy = sc_y - sc, dTy = tc_y - tc, dWy = ow_y - oow;
+
+        dsx = (dSx * oow - sc * dWx) * invw2;
+        dtx = (dTx * oow - tc * dWx) * invw2;
+        dsy = (dSy * oow - sc * dWy) * invw2;
+        dty = (dTy * oow - tc * dWy) * invw2;
+        sc *= invw;
+        tc *= invw;
+    }
     g2 = MAX(dsx * dsx + dtx * dtx, dsy * dsy + dty * dty);
     lodval = g2 > 1e-12f ? 0.5f * log2f(g2) : 0.0f;
     /* LOD factor sources for the combine (MLOD / MLODFRAC), best-effort */
@@ -1868,10 +1957,10 @@ static const uint8_t v3_dither_4x4[16] = {
     15,  7, 13,  5,
 };
 static const uint8_t v3_dither_2x2[16] = {
-     8, 10,  8, 10,
-    11,  9, 11,  9,
-     8, 10,  8, 10,
-    11,  9, 11,  9,
+     0,  8,  0,  8,
+    12,  4, 12,  4,
+     0,  8,  0,  8,
+    12,  4, 12,  4,
 };
 
 /*
@@ -1990,6 +2079,22 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     float de2dx = -(v1->y - v0->y), de2dy = (v1->x - v0->x);
 
     /*
+     * Top-left fill rule.  A sample lying exactly on an edge (e==0) must be
+     * covered by only ONE of the two triangles sharing that edge, else a
+     * read-modify-write op (alpha blend) applies twice on the shared diagonal
+     * (hwprobe: a diagonal blend sample came out double-applied vs hardware).
+     * An edge is top-left iff its vector points up (dy<0) or is horizontal and
+     * points left (dy==0 && dx<0); the sense flips for CW triangles (area<0).
+     */
+    int a_pos = area > 0;
+#define V3_TL(dx, dy) (a_pos ? ((dy) < 0 || ((dy) == 0 && (dx) < 0)) \
+                             : ((dy) > 0 || ((dy) == 0 && (dx) > 0)))
+    int tl0 = V3_TL(v2->x - v1->x, v2->y - v1->y);
+    int tl1 = V3_TL(v0->x - v2->x, v0->y - v2->y);
+    int tl2 = V3_TL(v1->x - v0->x, v1->y - v0->y);
+#undef V3_TL
+
+    /*
      * Clip rectangle (left/right, top/bottom in packed form) - only
      * applied when fbzMode enables clipping, otherwise the whole buffer
      * is drawable, like the hardware.
@@ -2025,12 +2130,16 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
             uint16_t pix;
             int dy = yflip ? yorg - y : y;  /* device row after Y-origin swap */
 
-            /* inside test, winding-agnostic */
-            if (area > 0) {
+            /* inside test, winding-agnostic, with the top-left rule on shared
+             * edges (e==0 covered only by the top-left-owning triangle) */
+            if (a_pos) {
                 if (e0 < 0 || e1 < 0 || e2 < 0) {
                     continue;
                 }
             } else if (e0 > 0 || e1 > 0 || e2 > 0) {
+                continue;
+            }
+            if ((e0 == 0 && !tl0) || (e1 == 0 && !tl1) || (e2 == 0 && !tl2)) {
                 continue;
             }
             l0 = e0 / area;
@@ -2201,10 +2310,15 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                         float ow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
                         af = voodoo3_fog_factor(s, ow > 1e-9f ? 1.0f / ow : 1e9f);
                     }
-                    af = v3_clampf(af, 0, 1);
-                    sr = v3_clampf(af * ar + (1 - af) * cr, 0, 255);
-                    sg = v3_clampf(af * ag + (1 - af) * cg, 0, 255);
-                    sb = v3_clampf(af * ab + (1 - af) * cb, 0, 255);
+                    /* fog blend = (f8*fogcolor + (255-f8)*pixel + 128) >> 8:
+                     * an 8-bit factor, /256 (not /255) with round-to-nearest.
+                     * hwprobe FOGR: no-fog red reads f000 (=248*255/256 rounded
+                     * -> 247 -> R5 30), and the green add is +1 vs a bare /256. */
+                    float f8 = floorf(v3_clampf(af, 0, 1) * 255.0f + 0.5f);
+                    float k = 256.0f / 255.0f;    /* fog-colour term is /255, pixel /256 */
+                    sr = v3_clampf(floorf((f8*ar*k + (255.0f-f8)*cr + 128.0f)/256.0f), 0, 255);
+                    sg = v3_clampf(floorf((f8*ag*k + (255.0f-f8)*cg + 128.0f)/256.0f), 0, 255);
+                    sb = v3_clampf(floorf((f8*ab*k + (255.0f-f8)*cb + 128.0f)/256.0f), 0, 255);
                 }
             }
 
@@ -2220,12 +2334,19 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 float db = (d & 0x1f) * 255.0f / 31;
                 float da = 255.0f;
 
-                sr = sr * voodoo3_blend_factor(sblend, sa, da, sr) +
-                     dr * voodoo3_blend_factor(dblend, sa, da, dr);
-                sg = sg * voodoo3_blend_factor(sblend, sa, da, sg) +
-                     dg * voodoo3_blend_factor(dblend, sa, da, dg);
-                sb = sb * voodoo3_blend_factor(sblend, sa, da, sb) +
-                     db * voodoo3_blend_factor(dblend, sa, da, db);
+                /*
+                 * The COLOR/OM_COLOR blend factors are cross-referenced on the
+                 * SST: the SOURCE term scaled by "colour" uses the DESTINATION
+                 * colour and vice-versa (hwprobe: DST_COLOR/ZERO gives src*dst,
+                 * not src*src).  So pass the dst channel as the src-factor comp
+                 * and the src channel as the dst-factor comp.
+                 */
+                sr = sr * voodoo3_blend_factor(sblend, sa, da, dr) +
+                     dr * voodoo3_blend_factor(dblend, sa, da, sr);
+                sg = sg * voodoo3_blend_factor(sblend, sa, da, dg) +
+                     dg * voodoo3_blend_factor(dblend, sa, da, sg);
+                sb = sb * voodoo3_blend_factor(sblend, sa, da, db) +
+                     db * voodoo3_blend_factor(dblend, sa, da, sb);
                 sr = v3_clampf(sr, 0, 255);
                 sg = v3_clampf(sg, 0, 255);
                 sb = v3_clampf(sb, 0, 255);
