@@ -59,6 +59,25 @@
 #include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/thread.h"
+#if defined(__x86_64__) || defined(__i386__)
+/* SSE control word (MXCSR): FTZ/DAZ/rounding affect denormal-sensitive float
+ * results.  Worker threads inherit the default word, not the submitter's, so
+ * the same pixel could round differently depending on which thread computed
+ * it (seen on grazing/perspective floors where 1/w underflows).  Sync it. */
+static inline unsigned int v3_get_mxcsr(void) { return __builtin_ia32_stmxcsr(); }
+static inline void v3_set_mxcsr(unsigned int v) { __builtin_ia32_ldmxcsr(v); }
+static inline unsigned short v3_get_x87cw(void)
+{ unsigned short cw; __asm__ __volatile__("fnstcw %0" : "=m"(cw)); return cw; }
+static inline void v3_set_x87cw(unsigned short cw)
+{ __asm__ __volatile__("fldcw %0" : : "m"(cw)); }
+#define V3_HAS_MXCSR 1
+#else
+static inline unsigned int v3_get_mxcsr(void) { return 0; }
+static inline void v3_set_mxcsr(unsigned int v) { (void)v; }
+static inline unsigned short v3_get_x87cw(void) { return 0; }
+static inline void v3_set_x87cw(unsigned short cw) { (void)cw; }
+#endif
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
@@ -430,9 +449,39 @@ typedef struct V3Vertex {
     float sow1, tow1;   /* TMU1 s/w, t/w */
 } V3Vertex;
 
+/*
+ * Rasteriser worker pool.  Triangle rasterisation is the pixel-pipeline hot
+ * path; each pixel is independent given the (read-only during a draw)
+ * triangle setup and register state, and different scanlines write disjoint
+ * framebuffer/depth rows.  So a triangle's scanline range is split into
+ * chunks farmed out to a persistent worker pool -- bit-identical to the
+ * serial result (workers run the same per-pixel code over disjoint rows), so
+ * digest-level hardware validation is preserved.  The submitting thread also
+ * processes chunks and then barriers on the workers before the draw returns.
+ */
+struct V3RasterCtx;
+typedef struct V3Pool {
+    QemuThread *threads;
+    QemuMutex lock;
+    QemuCond cond_work;         /* workers wait for a job */
+    QemuCond cond_done;         /* submitter waits for workers to drain */
+    const struct V3RasterCtx *ctx;   /* current triangle (NULL when idle) */
+    int chunk_next;             /* next unclaimed row-chunk (atomic) */
+    int nchunks;                /* row-chunks in the current job */
+    int chunk;                  /* rows per chunk (debug-tunable) */
+    int active;                 /* workers still processing the job */
+    int nworkers;               /* 0 => rasterise serially */
+    uint64_t gen;               /* job generation (each handled once/worker) */
+    unsigned int mxcsr;         /* submitter SSE control word for workers */
+    unsigned short x87cw;       /* submitter x87 control word for workers */
+    bool shutdown;
+    bool inited;
+} V3Pool;
+
 struct Voodoo3State {
     PCIDevice dev;
     VGACommonState vga;
+    V3Pool pool;
 
     MemoryRegion mmio;      /* BAR 0: 32 MB register space */
     MemoryRegion lfb;       /* BAR 1: 32 MB linear framebuffer window */
@@ -2022,6 +2071,170 @@ static uint16_t voodoo3_pack565(int r, int g, int b, int x, int y,
     return (r5 << 11) | (g6 << 5) | b5;
 }
 
+/* Per-triangle raster state shared (read-only) with the worker pool. */
+typedef struct V3RasterCtx {
+    Voodoo3State *s;
+    const V3Vertex *v0, *v1, *v2;
+    float area;
+    int a_pos;
+    float de0dx, de0dy, de1dx, de1dy, de2dx, de2dy;
+    int tl0, tl1, tl2;
+    int ix0, ix1, iy0, iy1;
+    int yflip, yorg;
+    uint32_t fbz, cpath, alpham, fogm, fogc, ckey, crange;
+    unsigned zfunc, afunc, sblend, dblend, aref;
+    bool texen, tmu1_en;
+    uint32_t cbase, cstride, zbase, zstride;
+} V3RasterCtx;
+
+#define V3_RASTER_CHUNK    8    /* scanlines per work-stealing chunk */
+#define V3_RASTER_MIN_ROWS 24   /* fewer rows -> rasterise serially */
+
+static void voodoo3_raster_span(const V3RasterCtx *c, int ry0, int ry1);
+
+/* Claim and render row-chunks until the job is drained (submitter + workers). */
+static void voodoo3_pool_claim(V3Pool *p, const V3RasterCtx *ctx)
+{
+    for (;;) {
+        int c = qatomic_fetch_inc(&p->chunk_next);
+        int y0, y1;
+
+        if (c >= p->nchunks) {
+            break;
+        }
+        y0 = ctx->iy0 + c * p->chunk;
+        y1 = y0 + p->chunk;
+        if (y1 > ctx->iy1) {
+            y1 = ctx->iy1;
+        }
+        voodoo3_raster_span(ctx, y0, y1);
+    }
+}
+
+static void *voodoo3_raster_worker(void *opaque)
+{
+    V3Pool *p = opaque;
+    uint64_t seen = 0;
+
+    for (;;) {
+        const V3RasterCtx *ctx;
+
+        qemu_mutex_lock(&p->lock);
+        while (p->gen == seen && !p->shutdown) {
+            qemu_cond_wait(&p->cond_work, &p->lock);
+        }
+        if (p->shutdown) {
+            qemu_mutex_unlock(&p->lock);
+            break;
+        }
+        seen = p->gen;
+        ctx = p->ctx;
+        v3_set_mxcsr(p->mxcsr);
+        v3_set_x87cw(p->x87cw);
+        qemu_mutex_unlock(&p->lock);
+
+        voodoo3_pool_claim(p, ctx);
+
+        qemu_mutex_lock(&p->lock);
+        if (--p->active == 0) {
+            qemu_cond_signal(&p->cond_done);
+        }
+        qemu_mutex_unlock(&p->lock);
+    }
+    return NULL;
+}
+
+/* Rasterise [iy0,iy1) across the worker pool (serial for small triangles). */
+static void voodoo3_raster_dispatch(const V3RasterCtx *ctx)
+{
+    V3Pool *p = &ctx->s->pool;
+    int rows = ctx->iy1 - ctx->iy0;
+
+    if (rows <= 0) {
+        return;
+    }
+    int chunk = V3_RASTER_CHUNK;
+    const char *ce = getenv("V3_RASTER_CHUNKROWS");
+
+    if (ce) chunk = atoi(ce);
+    if (p->nworkers == 0 || rows < V3_RASTER_MIN_ROWS) {
+        voodoo3_raster_span(ctx, ctx->iy0, ctx->iy1);
+        return;
+    }
+    qemu_mutex_lock(&p->lock);
+    p->ctx = ctx;
+    p->mxcsr = v3_get_mxcsr();
+    p->x87cw = v3_get_x87cw();
+    p->chunk = chunk;
+    p->nchunks = (rows + chunk - 1) / chunk;
+    qatomic_set(&p->chunk_next, 0);
+    p->active = p->nworkers;
+    p->gen++;
+    qemu_cond_broadcast(&p->cond_work);
+    qemu_mutex_unlock(&p->lock);
+
+    voodoo3_pool_claim(p, ctx);              /* the submitter helps too */
+
+    qemu_mutex_lock(&p->lock);
+    while (p->active > 0) {
+        qemu_cond_wait(&p->cond_done, &p->lock);
+    }
+    p->ctx = NULL;
+    qemu_mutex_unlock(&p->lock);
+}
+
+static void voodoo3_pool_init(Voodoo3State *s)
+{
+    V3Pool *p = &s->pool;
+    int n = g_get_num_processors();
+    int i;
+
+    p->nworkers = n > 1 ? MIN(n - 1, 15) : 0;
+    if (getenv("V3_RASTER_THREADS"))
+        p->nworkers = atoi(getenv("V3_RASTER_THREADS"));
+    if (getenv("V3_RASTER_SERIAL")) {   /* validation: force serial rasterise */
+        p->nworkers = 0;
+    }
+    qemu_mutex_init(&p->lock);
+    qemu_cond_init(&p->cond_work);
+    qemu_cond_init(&p->cond_done);
+    p->ctx = NULL;
+    p->gen = 0;
+    p->shutdown = false;
+    p->inited = true;
+    if (p->nworkers > 0) {
+        p->threads = g_new0(QemuThread, p->nworkers);
+        for (i = 0; i < p->nworkers; i++) {
+            qemu_thread_create(&p->threads[i], "voodoo3-raster",
+                               voodoo3_raster_worker, p, QEMU_THREAD_JOINABLE);
+        }
+    }
+}
+
+static void voodoo3_pool_teardown(Voodoo3State *s)
+{
+    V3Pool *p = &s->pool;
+    int i;
+
+    if (!p->inited) {
+        return;
+    }
+    qemu_mutex_lock(&p->lock);
+    p->shutdown = true;
+    p->gen++;
+    qemu_cond_broadcast(&p->cond_work);
+    qemu_mutex_unlock(&p->lock);
+    for (i = 0; i < p->nworkers; i++) {
+        qemu_thread_join(&p->threads[i]);
+    }
+    g_free(p->threads);
+    p->threads = NULL;
+    qemu_cond_destroy(&p->cond_work);
+    qemu_cond_destroy(&p->cond_done);
+    qemu_mutex_destroy(&p->lock);
+    p->inited = false;
+}
+
 /*
  * Rasterise one triangle through the pixel pipeline: Gouraud colour or
  * texture, depth test/write, chroma-key, alpha test, fog and alpha
@@ -2056,7 +2269,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     bool tmu1_en = texen && (tmode1 & 0x3ffff000u);
     int clx0, clx1, cly0, cly1;
     float area, minx, maxx, miny, maxy;
-    int ix0, ix1, iy0, iy1, x, y;
+    int ix0, ix1, iy0, iy1;
     /* Y-origin swap (fbzMode YORIGIN): the device flips the vertical axis so
      * (0,0) is bottom-left.  The swap pivot lives in miscInit0[29:18], loaded
      * with screenHeight-1 by the driver. */
@@ -2118,8 +2331,73 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     ix1 = MIN((int)ceilf(maxx), clx1);
     iy0 = MAX((int)floorf(miny), cly0);
     iy1 = MIN((int)ceilf(maxy), cly1);
+    /*
+     * Clamp X to the colour buffer's pixel width: a pixel drawn past the row
+     * (x >= cstride/bpp) wraps into the next scanline, corrupting an on-screen
+     * pixel there -- deterministic under serial rasterisation (row order) but a
+     * write race between threads under the parallel path.  The physical surface
+     * is stride-bounded, so off-row pixels are never written on hardware.
+     */
+    if (cstride && ix1 > (int)(cstride / 2)) {
+        ix1 = cstride / 2;
+    }
+    if (ix0 < 0) {
+        ix0 = 0;
+    }
 
-    for (y = iy0; y < iy1; y++) {
+    {
+        V3RasterCtx ctx = {
+            .s = s, .v0 = v0, .v1 = v1, .v2 = v2, .area = area,
+            .a_pos = a_pos, .de0dx = de0dx, .de0dy = de0dy, .de1dx = de1dx,
+            .de1dy = de1dy, .de2dx = de2dx, .de2dy = de2dy,
+            .tl0 = tl0, .tl1 = tl1, .tl2 = tl2, .ix0 = ix0, .ix1 = ix1,
+            .iy0 = iy0, .iy1 = iy1, .yflip = yflip, .yorg = yorg,
+            .fbz = fbz, .cpath = cpath, .alpham = alpham, .fogm = fogm,
+            .fogc = fogc, .ckey = ckey, .crange = crange, .zfunc = zfunc,
+            .afunc = afunc, .sblend = sblend, .dblend = dblend, .aref = aref,
+            .texen = texen, .tmu1_en = tmu1_en, .cbase = cbase,
+            .cstride = cstride, .zbase = zbase, .zstride = zstride,
+        };
+        voodoo3_raster_dispatch(&ctx);
+    }
+
+    s->d3_regs[0x25c / 4]++;  /* fbiTrianglesOut */
+    if (yflip) {
+        /* drawn device rows are yorg-iy1 .. yorg-iy0 after the swap */
+        int dtop = yorg - (iy1 - 1);
+        if (dtop < 0) {
+            dtop = 0;
+        }
+        memory_region_set_dirty(&s->vga.vram, cbase + dtop * cstride,
+                                cstride * (iy1 - iy0 + 1));
+    } else {
+        memory_region_set_dirty(&s->vga.vram, cbase, cstride * (iy1 - iy0 + 1));
+    }
+}
+
+/* Rasterise scanlines [ry0, ry1) of one triangle (the pixel pipeline). */
+static void voodoo3_raster_span(const V3RasterCtx *c, int ry0, int ry1)
+{
+    Voodoo3State *s = c->s;
+    const V3Vertex *v0 = c->v0, *v1 = c->v1, *v2 = c->v2;
+    float area = c->area;
+    int a_pos = c->a_pos;
+    float de0dx = c->de0dx, de0dy = c->de0dy, de1dx = c->de1dx;
+    float de1dy = c->de1dy, de2dx = c->de2dx, de2dy = c->de2dy;
+    int tl0 = c->tl0, tl1 = c->tl1, tl2 = c->tl2;
+    int ix0 = c->ix0, ix1 = c->ix1;
+    int yflip = c->yflip, yorg = c->yorg;
+    uint32_t fbz = c->fbz, cpath = c->cpath, alpham = c->alpham;
+    uint32_t fogm = c->fogm, fogc = c->fogc, ckey = c->ckey;
+    uint32_t crange = c->crange;
+    unsigned zfunc = c->zfunc, afunc = c->afunc, sblend = c->sblend;
+    unsigned dblend = c->dblend, aref = c->aref;
+    bool texen = c->texen, tmu1_en = c->tmu1_en;
+    uint32_t cbase = c->cbase, cstride = c->cstride;
+    uint32_t zbase = c->zbase, zstride = c->zstride;
+    int x, y;
+
+    for (y = ry0; y < ry1; y++) {
         for (x = ix0; x < ix1; x++) {
             float px = x + 0.5f, py = y + 0.5f;
             float e0 = v3_edge(v1, v2, px, py);
@@ -2364,19 +2642,6 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 stw_le_p(s->vga.vram_ptr + zoff, srcz);
             }
         }
-    }
-
-    s->d3_regs[0x25c / 4]++;  /* fbiTrianglesOut */
-    if (yflip) {
-        /* drawn device rows are yorg-iy1 .. yorg-iy0 after the swap */
-        int dtop = yorg - (iy1 - 1);
-        if (dtop < 0) {
-            dtop = 0;
-        }
-        memory_region_set_dirty(&s->vga.vram, cbase + dtop * cstride,
-                                cstride * (iy1 - iy0 + 1));
-    } else {
-        memory_region_set_dirty(&s->vga.vram, cbase, cstride * (iy1 - iy0 + 1));
     }
 }
 
@@ -2937,6 +3202,8 @@ static void voodoo3_realize(PCIDevice *dev, Error **errp)
 
     dev->config[PCI_INTERRUPT_PIN] = 1;
 
+    voodoo3_pool_init(s);
+
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, voodoo3_vblank, s);
     timer_mod(&s->vblank_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -2978,6 +3245,7 @@ static void voodoo3_exit(PCIDevice *dev)
 {
     Voodoo3State *s = VOODOO3(dev);
 
+    voodoo3_pool_teardown(s);
     timer_del(&s->vblank_timer);
     qemu_graphic_console_close(s->vga.con);
     cursor_unref(s->cursor);
