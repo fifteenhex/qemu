@@ -19,10 +19,20 @@
  * processor or the VGA core are set up; otherwise the display is black,
  * like a monitor with no sync.
  *
+ * The 3D (SST/Avenger) core models the common pixel pipeline: both
+ * triangle paths (direct and the setup unit, fan/strip), Gouraud and
+ * point/bilinear perspective-correct texturing in every non-palette
+ * format, depth test/write, chroma-key, alpha test, fog (iterated
+ * alpha/Z, and the fog table), alpha blend, fastfill and swapbuffer,
+ * over a 565 colour and 16bpp depth buffer.
+ *
  * Simplifications: memory is always 16 MB (dramInit sizing bits are
  * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
  * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
- * (miscInit0 30/31) is unimplemented.
+ * (miscInit0 30/31) is unimplemented. The colour path uses the
+ * rgb/aselect mux rather than the full fbzColorPath/textureMode combine
+ * units; palette/NCC textures, mipmap LOD selection, a second TMU, and
+ * pixel-pipeline LFB writes are not modelled yet.
  */
 
 #include "qemu/osdep.h"
@@ -278,16 +288,45 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_CP_RGBSELECT_MASK    0x3     /* 0=iterated, 1=texture, 2=color1 */
 #define V3_CP_ASELECT_SHIFT     2
 #define V3_CP_ASELECT_MASK      (0x3 << V3_CP_ASELECT_SHIFT)
+#define V3_CP_TEXTURE_EN        BIT(27) /* enable texture mapping (TREX->FBI) */
 
-/* textureMode bits (subset) */
-#define V3_TEX_ENABLE           BIT(0)
+/* textureMode bits */
+#define V3_TEX_ENABLE           BIT(0)   /* perspective/enable (tpersp) */
+#define V3_TEX_MINFILTER        BIT(1)   /* 1 = bilinear minification */
+#define V3_TEX_MAGFILTER        BIT(2)   /* 1 = bilinear magnification */
+#define V3_TEX_CLAMPS           BIT(6)   /* 1 = clamp S (else wrap) */
+#define V3_TEX_CLAMPT           BIT(7)   /* 1 = clamp T (else wrap) */
 #define V3_TEX_TFORMAT_SHIFT    8
 #define V3_TEX_TFORMAT_MASK     (0xf << V3_TEX_TFORMAT_SHIFT)
-#define V3_TFMT_RGB332          0
-#define V3_TFMT_ARGB1555        5
-#define V3_TFMT_RGB565          10
-#define V3_TFMT_ARGB4444        14
-#define V3_TFMT_ARGB8332        6
+#define V3_TEX_TC_ADD_CLOCAL    BIT(18)  /* TMU RGB: add local texel */
+#define V3_TEX_TCA_ADD_CLOCAL   BIT(27)  /* TMU alpha: add local texel */
+/* texture formats (textureMode[11:8]) - values per the Avenger spec */
+#define V3_TFMT_RGB332          0        /* 8bpp 3-3-2 */
+#define V3_TFMT_YIQ             1        /* 8bpp NCC (table 0) */
+#define V3_TFMT_A8              2        /* 8bpp alpha */
+#define V3_TFMT_I8              3        /* 8bpp intensity */
+#define V3_TFMT_AI44            4        /* 8bpp alpha(4) intensity(4) */
+#define V3_TFMT_P8              5        /* 8bpp palette -> RGB */
+#define V3_TFMT_P8_RGBA         6        /* 8bpp palette -> RGBA */
+#define V3_TFMT_ARGB8332        8        /* 16bpp 8-3-3-2 */
+#define V3_TFMT_AYIQ            9        /* 16bpp 8-4-2-2 NCC */
+#define V3_TFMT_RGB565          10       /* 16bpp 5-6-5 */
+#define V3_TFMT_ARGB1555        11       /* 16bpp 1-5-5-5 */
+#define V3_TFMT_ARGB4444        12       /* 16bpp 4-4-4-4 */
+#define V3_TFMT_AI88            13       /* 16bpp alpha(8) intensity(8) */
+#define V3_TFMT_AP88            14       /* 16bpp alpha(8) palette(8) */
+
+/* fogMode bits */
+#define V3_FOG_ENABLE           BIT(0)
+#define V3_FOG_ADD              BIT(1)   /* 0=fogColor, 1=zero */
+#define V3_FOG_MULT             BIT(2)   /* 0=CCU rgb, 1=zero */
+#define V3_FOG_ALPHA            BIT(3)   /* fog factor = iterated alpha */
+#define V3_FOG_Z                BIT(4)   /* fog factor = iterated Z msb */
+#define V3_FOG_CONSTANT         BIT(5)   /* add fogColor constant */
+
+/* fog table: 32 32-bit words (64 entries), 3D reg index 0x60 */
+#define V3_3D_FOGTABLE          0x180
+#define V3_3D_FOGTABLE_NB       32
 
 /* sSetupMode: which per-vertex params are valid */
 #define V3_SSETUP_RGB           BIT(0)
@@ -1132,6 +1171,96 @@ static float voodoo3_blend_factor(unsigned f, float sa, float da, float comp)
 }
 
 /* Sample TMU0 (point sampled). Returns colour in r/g/b/a (0..255). */
+/* bytes per texel for a texture format (fmt 0..6 = 8bpp, 8..14 = 16bpp) */
+static unsigned voodoo3_tfmt_bpt(unsigned fmt)
+{
+    return fmt <= V3_TFMT_P8_RGBA ? 1 : 2;
+}
+
+/* fetch and decode one texel at integer (u,v) into 0..255 RGBA floats */
+static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
+                                unsigned dim, int u, int v,
+                                float *r, float *g, float *b, float *a)
+{
+    unsigned bpt = voodoo3_tfmt_bpt(fmt);
+    uint32_t off = base + (unsigned)(v * (int)dim + u) * bpt;
+    uint32_t t;
+
+    *a = 255.0f;
+    *r = *g = *b = 0.0f;
+    if (off + bpt > s->vga.vram_size) {
+        return;
+    }
+    if (bpt == 1) {
+        uint8_t px = s->vga.vram_ptr[off];
+        switch (fmt) {
+        case V3_TFMT_RGB332:
+            *r = ((px >> 5) & 7) * 255 / 7;
+            *g = ((px >> 2) & 7) * 255 / 7;
+            *b = (px & 3) * 255 / 3;
+            break;
+        case V3_TFMT_A8:
+            *a = px; *r = *g = *b = px;
+            break;
+        case V3_TFMT_I8:
+            *r = *g = *b = px;
+            break;
+        case V3_TFMT_AI44:
+            *a = (px >> 4) * 255 / 15;
+            *r = *g = *b = (px & 0xf) * 255 / 15;
+            break;
+        default: /* P8/P8_RGBA/YIQ: palette+NCC not modelled -> intensity */
+            *r = *g = *b = px;
+            break;
+        }
+        return;
+    }
+    t = lduw_le_p(s->vga.vram_ptr + off);
+    switch (fmt) {
+    case V3_TFMT_RGB565:
+        *r = ((t >> 11) & 0x1f) * 255 / 31;
+        *g = ((t >> 5) & 0x3f) * 255 / 63;
+        *b = (t & 0x1f) * 255 / 31;
+        break;
+    case V3_TFMT_ARGB1555:
+        *a = (t & 0x8000) ? 255 : 0;
+        *r = ((t >> 10) & 0x1f) * 255 / 31;
+        *g = ((t >> 5) & 0x1f) * 255 / 31;
+        *b = (t & 0x1f) * 255 / 31;
+        break;
+    case V3_TFMT_ARGB4444:
+        *a = ((t >> 12) & 0xf) * 255 / 15;
+        *r = ((t >> 8) & 0xf) * 255 / 15;
+        *g = ((t >> 4) & 0xf) * 255 / 15;
+        *b = (t & 0xf) * 255 / 15;
+        break;
+    case V3_TFMT_ARGB8332:
+        *a = (t >> 8) & 0xff;
+        *r = ((t >> 5) & 7) * 255 / 7;
+        *g = ((t >> 2) & 7) * 255 / 7;
+        *b = (t & 3) * 255 / 3;
+        break;
+    case V3_TFMT_AI88:
+        *a = (t >> 8) & 0xff;
+        *r = *g = *b = t & 0xff;
+        break;
+    default: /* AYIQ/AP88: palette+NCC not modelled -> alpha+intensity */
+        *a = (t >> 8) & 0xff;
+        *r = *g = *b = t & 0xff;
+        break;
+    }
+}
+
+/* wrap or clamp an integer texel coordinate to [0, dim) */
+static int voodoo3_wrap(int c, unsigned dim, bool clamp)
+{
+    if (clamp) {
+        return c < 0 ? 0 : c >= (int)dim ? (int)dim - 1 : c;
+    }
+    return c & (int)(dim - 1);
+}
+
+/* sample the texture at (sc,tc); point-sampled or bilinear per textureMode */
 static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
                           float *r, float *g, float *b, float *a)
 {
@@ -1139,51 +1268,39 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
     uint32_t base = s->d3_regs[V3_3D_TEXBASEADDR / 4] & 0xffffff;
     uint32_t lod = s->d3_regs[V3_3D_TLOD / 4];
     unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
-    /* tLOD "lodmin" gives the base LOD; texture is (256>>lodmin) square */
-    unsigned lodmin = (lod >> 2) & 0xf;
+    unsigned lodmin = (lod & 0x3f) >> 2;  /* tLOD lodmin, 4.2 -> integer LOD */
     unsigned dim = 256 >> (lodmin > 8 ? 8 : lodmin);
-    unsigned bpt = (fmt == V3_TFMT_RGB332 || fmt == V3_TFMT_ARGB8332) ? 1 : 2;
-    int u = (int)sc & (dim - 1);
-    int v = (int)tc & (dim - 1);
-    uint32_t off = base + (v * dim + u) * bpt;
-    uint32_t texel;
+    bool clamps = tmode & V3_TEX_CLAMPS;
+    bool clampt = tmode & V3_TEX_CLAMPT;
+    /* no LOD gradient here, so use the magnification filter selector */
+    bool bilinear = tmode & V3_TEX_MAGFILTER;
 
-    *a = 255.0f;
-    if (off + bpt > s->vga.vram_size) {
-        *r = *g = *b = 0;
+    if (!bilinear) {
+        int u = voodoo3_wrap((int)floorf(sc), dim, clamps);
+        int v = voodoo3_wrap((int)floorf(tc), dim, clampt);
+        voodoo3_fetch_texel(s, base, fmt, dim, u, v, r, g, b, a);
         return;
-    }
-    if (bpt == 1) {
-        texel = s->vga.vram_ptr[off];
-        *r = ((texel >> 5) & 7) * 255 / 7;
-        *g = ((texel >> 2) & 7) * 255 / 7;
-        *b = (texel & 3) * 255 / 3;
-        return;
-    }
-    texel = lduw_le_p(s->vga.vram_ptr + off);
-    switch (fmt) {
-    case V3_TFMT_RGB565:
-        *r = ((texel >> 11) & 0x1f) * 255 / 31;
-        *g = ((texel >> 5) & 0x3f) * 255 / 63;
-        *b = (texel & 0x1f) * 255 / 31;
-        break;
-    case V3_TFMT_ARGB1555:
-        *a = (texel & 0x8000) ? 255 : 0;
-        *r = ((texel >> 10) & 0x1f) * 255 / 31;
-        *g = ((texel >> 5) & 0x1f) * 255 / 31;
-        *b = (texel & 0x1f) * 255 / 31;
-        break;
-    case V3_TFMT_ARGB4444:
-        *a = ((texel >> 12) & 0xf) * 255 / 15;
-        *r = ((texel >> 8) & 0xf) * 255 / 15;
-        *g = ((texel >> 4) & 0xf) * 255 / 15;
-        *b = (texel & 0xf) * 255 / 15;
-        break;
-    default:
-        *r = ((texel >> 11) & 0x1f) * 255 / 31;
-        *g = ((texel >> 5) & 0x3f) * 255 / 63;
-        *b = (texel & 0x1f) * 255 / 31;
-        break;
+    } else {
+        float fs = sc - 0.5f, ft = tc - 0.5f;
+        int u0 = (int)floorf(fs), v0 = (int)floorf(ft);
+        float du = fs - u0, dv = ft - v0;
+        float w00 = (1 - du) * (1 - dv), w10 = du * (1 - dv);
+        float w01 = (1 - du) * dv,       w11 = du * dv;
+        int ua = voodoo3_wrap(u0, dim, clamps);
+        int ub = voodoo3_wrap(u0 + 1, dim, clamps);
+        int va = voodoo3_wrap(v0, dim, clampt);
+        int vb = voodoo3_wrap(v0 + 1, dim, clampt);
+        float r00, g00, b00, a00, r10, g10, b10, a10;
+        float r01, g01, b01, a01, r11, g11, b11, a11;
+
+        voodoo3_fetch_texel(s, base, fmt, dim, ua, va, &r00, &g00, &b00, &a00);
+        voodoo3_fetch_texel(s, base, fmt, dim, ub, va, &r10, &g10, &b10, &a10);
+        voodoo3_fetch_texel(s, base, fmt, dim, ua, vb, &r01, &g01, &b01, &a01);
+        voodoo3_fetch_texel(s, base, fmt, dim, ub, vb, &r11, &g11, &b11, &a11);
+        *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+        *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
+        *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;
+        *a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
     }
 }
 
@@ -1194,10 +1311,33 @@ static inline float v3_edge(const V3Vertex *a, const V3Vertex *b,
 }
 
 /*
+ * Fog blending factor from the 64-entry fog table. The hardware indexes
+ * it with the MSBs of a normalised float(1/w); lacking that here we index
+ * by the iterated Z and interpolate with the low bits - good enough to
+ * exercise the table, exact indexing to be confirmed on real hardware.
+ */
+static float voodoo3_fog_factor(Voodoo3State *s, uint32_t srcz)
+{
+    unsigned idx = (srcz >> 10) & 0x3f;
+    unsigned frac = (srcz >> 2) & 0xff;
+    uint32_t word = s->d3_regs[(V3_3D_FOGTABLE / 4) + (idx >> 1)];
+    unsigned factor, delta;
+
+    if (idx & 1) {
+        factor = (word >> 24) & 0xff;
+        delta = (word >> 16) & 0xff;
+    } else {
+        factor = (word >> 8) & 0xff;
+        delta = word & 0xff;
+    }
+    return v3_clampf((factor + delta * frac / 256.0f) / 255.0f, 0, 1);
+}
+
+/*
  * Rasterise one triangle through the pixel pipeline: Gouraud colour or
- * texture, depth test/write, alpha test and alpha blending, honouring
- * fbzMode/alphaMode/fbzColorPath/textureMode. 16bpp 565 colour buffer
- * and 16bpp depth buffer (the classic Voodoo3 3D configuration).
+ * texture, depth test/write, chroma-key, alpha test, fog and alpha
+ * blending, honouring fbzMode/alphaMode/fbzColorPath/textureMode/fogMode.
+ * 16bpp 565 colour buffer and 16bpp depth buffer.
  */
 static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                                 const V3Vertex *v1, const V3Vertex *v2)
@@ -1206,6 +1346,9 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     uint32_t alpham = s->d3_regs[V3_3D_ALPHAMODE / 4];
     uint32_t cpath = s->d3_regs[V3_3D_FBZCOLORPATH / 4];
     uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
+    uint32_t fogm = s->d3_regs[V3_3D_FOGMODE / 4];
+    uint32_t fogc = s->d3_regs[V3_3D_FOGCOLOR / 4];
+    uint32_t ckey = s->d3_regs[V3_3D_CHROMAKEY / 4] & 0xffffff;
     uint32_t cbase = s->d3_regs[V3_3D_COLBUFFERADDR / 4] & 0xffffff;
     uint32_t cstride = s->d3_regs[V3_3D_COLBUFFERSTRIDE / 4] & 0xffff;
     uint32_t zbase = s->d3_regs[V3_3D_AUXBUFFERADDR / 4] & 0xffffff;
@@ -1218,7 +1361,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     unsigned sblend = (alpham >> V3_ALPHA_SRCFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
     unsigned dblend = (alpham >> V3_ALPHA_DSTFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
     unsigned aref = (alpham >> V3_ALPHA_REF_SHIFT) & 0xff;
-    bool texen = (rgbsel == 1) && (tmode & V3_TEX_ENABLE);
+    bool texen = (rgbsel == 1) && (cpath & V3_CP_TEXTURE_EN);
     int clx0, clx1, cly0, cly1;
     float area, minx, maxx, miny, maxy;
     int ix0, ix1, iy0, iy1, x, y;
@@ -1232,18 +1375,20 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
         return; /* degenerate */
     }
 
-    /* clip rectangle: left/right and top/bottom in (6)10 packed form */
-    clx0 = (clr >> 16) & 0x3ff;
-    clx1 = clr & 0x3ff;
-    cly0 = (cbt >> 16) & 0x3ff;
-    cly1 = cbt & 0x3ff;
-    if (clx1 <= clx0) {
-        clx0 = 0;
-        clx1 = 2048;
-    }
-    if (cly1 <= cly0) {
-        cly0 = 0;
-        cly1 = 2048;
+    /*
+     * Clip rectangle (left/right, top/bottom in packed form) - only
+     * applied when fbzMode enables clipping, otherwise the whole buffer
+     * is drawable, like the hardware.
+     */
+    clx0 = 0;
+    clx1 = 2048;
+    cly0 = 0;
+    cly1 = 2048;
+    if (fbz & V3_FBZ_ENCLIP) {
+        clx0 = (clr >> 16) & 0x3ff;
+        clx1 = clr & 0x3ff;
+        cly0 = (cbt >> 16) & 0x3ff;
+        cly1 = cbt & 0x3ff;
     }
 
     minx = MIN(v0->x, MIN(v1->x, v2->x));
@@ -1298,6 +1443,18 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                     tc /= oow;
                 }
                 voodoo3_texel(s, sc, tc, &sr, &sg, &sb, &sa);
+                /*
+                 * Single-TMU combine: the texel reaches the TMU output
+                 * only when textureMode adds the local texel; with the
+                 * combine at reset the TMU emits zero (so a texture needs
+                 * the combine set up, unlike plain iterated colour).
+                 */
+                if (!(tmode & V3_TEX_TC_ADD_CLOCAL)) {
+                    sr = sg = sb = 0;
+                }
+                if (!(tmode & V3_TEX_TCA_ADD_CLOCAL)) {
+                    sa = 0;
+                }
             } else if (rgbsel == 2) {
                 uint32_t c1 = s->d3_regs[V3_3D_C1 / 4];
                 sr = (c1 >> 16) & 0xff;
@@ -1311,6 +1468,15 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 sa = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255);
             }
 
+            /* chroma-key: discard pixels whose colour matches chromaKey */
+            if (fbz & V3_FBZ_ENCHROMAKEY) {
+                if (((ckey >> 16) & 0xff) == (unsigned)sr &&
+                    ((ckey >> 8) & 0xff) == (unsigned)sg &&
+                    (ckey & 0xff) == (unsigned)sb) {
+                    continue;
+                }
+            }
+
             /* alpha test */
             if (alpham & V3_ALPHA_ENTEST) {
                 unsigned av = (unsigned)sa;
@@ -1318,6 +1484,39 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                       ((afunc & V3_ZF_EQ) && av == aref) ||
                       ((afunc & V3_ZF_GT) && av > aref))) {
                     continue;
+                }
+            }
+
+            /* fog */
+            if (fogm & V3_FOG_ENABLE) {
+                float fr = (fogc >> 16) & 0xff;
+                float fg = (fogc >> 8) & 0xff;
+                float fb = fogc & 0xff;
+
+                if (fogm & V3_FOG_CONSTANT) {
+                    sr = v3_clampf(sr + fr, 0, 255);
+                    sg = v3_clampf(sg + fg, 0, 255);
+                    sb = v3_clampf(sb + fb, 0, 255);
+                } else {
+                    float af;
+                    float cr = (fogm & V3_FOG_MULT) ? 0.0f : sr;
+                    float cg = (fogm & V3_FOG_MULT) ? 0.0f : sg;
+                    float cb = (fogm & V3_FOG_MULT) ? 0.0f : sb;
+                    float ar = (fogm & V3_FOG_ADD) ? 0.0f : fr;
+                    float ag = (fogm & V3_FOG_ADD) ? 0.0f : fg;
+                    float ab = (fogm & V3_FOG_ADD) ? 0.0f : fb;
+
+                    if (fogm & V3_FOG_Z) {
+                        af = (srcz >> 8) / 255.0f;
+                    } else if (fogm & V3_FOG_ALPHA) {
+                        af = sa / 255.0f;
+                    } else {
+                        af = voodoo3_fog_factor(s, srcz);
+                    }
+                    af = v3_clampf(af, 0, 1);
+                    sr = v3_clampf(af * ar + (1 - af) * cr, 0, 255);
+                    sg = v3_clampf(af * ag + (1 - af) * cg, 0, 255);
+                    sb = v3_clampf(af * ab + (1 - af) * cb, 0, 255);
                 }
             }
 
@@ -1347,7 +1546,9 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
             pix = (((uint16_t)sr >> 3) << 11) |
                   (((uint16_t)sg >> 2) << 5) |
                   ((uint16_t)sb >> 3);
-            stw_le_p(s->vga.vram_ptr + coff, pix);
+            if (fbz & V3_FBZ_RGBWRMASK) {
+                stw_le_p(s->vga.vram_ptr + coff, pix);
+            }
 
             if ((fbz & V3_FBZ_ENDEPTH) && (fbz & V3_FBZ_DEPTHWRMASK) &&
                 zstride && zoff + 2 <= s->vga.vram_size) {
@@ -1504,10 +1705,10 @@ static void voodoo3_3d_fastfill(Voodoo3State *s)
     for (y = y0; y < y1; y++) {
         for (x = x0; x < x1; x++) {
             uint32_t coff = cbase + y * cstride + x * 2;
-            if (coff + 2 <= s->vga.vram_size) {
+            if ((fbz & V3_FBZ_RGBWRMASK) && coff + 2 <= s->vga.vram_size) {
                 stw_le_p(s->vga.vram_ptr + coff, col);
             }
-            if ((fbz & V3_FBZ_ENDEPTH) && zstride) {
+            if ((fbz & V3_FBZ_DEPTHWRMASK) && zstride) {
                 uint32_t zoff = zbase + y * zstride + x * 2;
                 if (zoff + 2 <= s->vga.vram_size) {
                     stw_le_p(s->vga.vram_ptr + zoff, zval);

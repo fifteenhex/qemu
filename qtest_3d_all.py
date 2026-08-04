@@ -54,9 +54,13 @@ class QT:
 
 # 3D register offsets (relative to D3)
 FBZMODE, FBZCOLORPATH, ALPHAMODE = 0x110, 0x104, 0x10c
+RGBWRMASK = 1 << 9      # fbzMode: enable colour-buffer writes
+ENCLIP = 1 << 0        # fbzMode: enable clip rectangle
+TC = (1<<12)|(1<<18)|(1<<21)|(1<<27)   # textureMode: pass the texel
 CLIPLR, CLIPBT = 0x118, 0x11c
 COLBUF, COLSTRIDE, AUXBUF, AUXSTRIDE = 0x1ec, 0x1f0, 0x1f4, 0x1f8
 ZACOLOR, C1, CHROMAKEY = 0x130, 0x148, 0x134
+FOGMODE, FOGCOLOR = 0x108, 0x12c
 FASTFILL, SWAPBUF, NOP, INTRCTRL = 0x124, 0x128, 0x120, 0x004
 STATUS = 0x000
 # direct int
@@ -103,11 +107,11 @@ def setup(q):
     q.wl(D3 + AUXBUF, W * H * 2); q.wl(D3 + AUXSTRIDE, W * 2)
     q.wl(D3 + CLIPLR, W); q.wl(D3 + CLIPBT, H)
     q.wl(D3 + ALPHAMODE, 0); q.wl(D3 + FBZCOLORPATH, 0)
-    q.wl(D3 + FBZMODE, 7 << 5)   # zfunc = ALWAYS, depth off
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)   # zfunc = ALWAYS, depth off
 
 
 def clear(q, col565=0):
-    q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, 0xffff); q.wl(D3 + FBZMODE, (7 << 5))
+    q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, 0xffff); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
     # C1 is ARGB; encode background as ARGB from a 565-ish value: just use black/blue
     q.wl(D3 + C1, col565)
     q.wl(D3 + FASTFILL, 1)
@@ -129,9 +133,16 @@ def run():
     q.wl(D3 + C1, 0x00204060); q.wl(D3 + FASTFILL, 1)
     check("fastfill", near(pix(q, 10, 10), 0x20, 0x40, 0x60), hex(pix(q, 10, 10)))
 
+    # 1b. RGB write mask: a fill with RGBWRMASK clear must leave colour alone
+    q.wl(D3 + C1, 0x00ff0000); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+    q.wl(D3 + FASTFILL, 1)                                  # red, mask on
+    q.wl(D3 + C1, 0x000000ff); q.wl(D3 + FBZMODE, 7 << 5)   # blue, mask OFF
+    q.wl(D3 + FASTFILL, 1)
+    check("rgb write mask", near(pix(q, 10, 10), 255, 0, 0), hex(pix(q, 10, 10)))
+
     # 2. direct integer triangleCMD (flat green, gradients 0)
     q.wl(D3 + C1, 0); q.wl(D3 + FASTFILL, 1)
-    q.wl(D3 + FBZMODE, 7 << 5)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
     q.wl(D3 + FBZCOLORPATH, 0)
     q.wl(D3 + VA, (30 << 4)); q.wl(D3 + VA + 4, (30 << 4))
     q.wl(D3 + VB, (300 << 4)); q.wl(D3 + VB + 4, (40 << 4))
@@ -175,9 +186,9 @@ def run():
 
     # 6. all 8 depth-compare functions
     def depth_case(func, srcz, dstz, expect_draw):
-        q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, dstz & 0xffff); q.wl(D3 + FBZMODE, 7 << 5)
-        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (7 << 5)); q.wl(D3 + FASTFILL, 1)  # clear depth=dstz
-        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (func << 5))  # depth on, this func
+        q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, dstz & 0xffff); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)  # clear depth=dstz
+        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (func << 5) | RGBWRMASK)  # depth on, this func
         q.wl(D3 + FBZCOLORPATH, 0)
         q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
         svert(q, 40, 40, 0xff00ffff, z=float(srcz), first=True)
@@ -204,7 +215,7 @@ def run():
 
     # 7. alpha test: ref=128, GREATER -> alpha 200 passes, 60 fails
     def alpha_test_case(alpha, expect):
-        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
         q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + ALPHAMODE,
              1 | (4 << 1) | (128 << 24))   # entest, func=GT(bit2->value4), ref=128
         q.wl(D3 + SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
@@ -217,7 +228,7 @@ def run():
     check("alpha test", alpha_test_case(200, True) and alpha_test_case(60, False))
 
     # 8. alpha blend: 50% white over blue -> light blue
-    q.wl(D3 + C1, 0x000000ff); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)  # blue bg
+    q.wl(D3 + C1, 0x000000ff); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)  # blue bg
     q.wl(D3 + FBZCOLORPATH, 0)
     q.wl(D3 + ALPHAMODE, (1 << 4) | (1 << 8) | (5 << 12))  # blend: src*srcA + dst*(1-srcA)
     q.wl(D3 + SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
@@ -233,10 +244,10 @@ def run():
         toff = W * H * 2 + W * H * 2   # after colour+depth
         for k, byteval in enumerate(texel_bytes):
             q.cmd("writeb 0x%x 0x%x" % (BAR1 + toff + k, byteval))
-        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
         q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, (8 << 2))   # 1x1 texture (lodmin=8)
-        q.wl(D3 + TEXMODE, 1 | (fmt << 8))
-        q.wl(D3 + FBZCOLORPATH, 1)  # rgb from texture
+        q.wl(D3 + TEXMODE, (fmt << 8) | TC)             # point sample + pass texel
+        q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))  # rgbselect=texture + texture enable
         q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
         svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
         svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
@@ -250,15 +261,61 @@ def run():
     r4444 = struct.pack("<H", 0xf000 | (0xf << 8))  # a=f,red
     ok565, d565 = tex_case(10, r565, (255, 0, 0))
     ok332, d332 = tex_case(0, r332, (255, 0, 0))
-    ok1555, d1 = tex_case(5, r1555, (255, 0, 0))
-    ok4444, d4 = tex_case(14, r4444, (255, 0, 0))
+    ok1555, d1 = tex_case(11, r1555, (255, 0, 0))
+    ok4444, d4 = tex_case(12, r4444, (255, 0, 0))
     check("texture RGB565", ok565, d565)
     check("texture RGB332", ok332, d332)
     check("texture ARGB1555", ok1555, d1)
     check("texture ARGB4444", ok4444, d4)
 
+    # 9e. bilinear filtering: 2x2 texture, sample the centre -> 4-texel average
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    toff = W * H * 2 * 3
+    for k, texv in enumerate([rgb565(255, 0, 0), rgb565(0, 255, 0),
+                              rgb565(0, 0, 255), rgb565(255, 255, 255)]):
+        q.ww(BAR1 + toff + k * 2, texv)
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 7 << 2)      # 2x2 (lodmin=7)
+    q.wl(D3 + TEXMODE, (10 << 8) | (1 << 2) | TC)          # RGB565 + magfilter + pass texel
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=1.0, t=1.0)
+    svert(q, 40, 200, 0xffffffff, s=1.0, t=1.0)
+    svert(q, 280, 120, 0xffffffff, s=1.0, t=1.0)
+    v = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("bilinear filter", near(v, 127, 127, 127, tol=40), hex(v))
+
+    # 9f. chroma-key: matching colour discarded, non-matching drawn
+    q.wl(D3 + C1, 0x000000ff)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)   # blue bg
+    q.wl(D3 + CHROMAKEY, 0x00ff00ff)                                   # key = magenta
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK | (1 << 1))                # enable chroma-key
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    svert(q, 40, 40, 0xffff00ff, first=True); svert(q, 40, 200, 0xffff00ff)
+    svert(q, 280, 120, 0xffff00ff)
+    keyed = pix(q, 100, 110)                                           # discarded -> blue
+    svert(q, 40, 40, 0xff00ff00, first=True); svert(q, 40, 200, 0xff00ff00)
+    svert(q, 280, 120, 0xff00ff00)
+    nonkey = pix(q, 100, 110)                                          # green drawn
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+    check("chroma-key", near(keyed, 0, 0, 255) and near(nonkey, 0, 255, 0),
+          "keyed=%s non=%s" % (hex(keyed), hex(nonkey)))
+
+    # 9g. fog (iterated alpha): Cout = Afog*fogColor + (1-Afog)*Cin
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + FOGCOLOR, 0x000000ff)                 # fog blue
+    q.wl(D3 + FOGMODE, 1 | (1 << 3))                # enable + fog_alpha
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
+    svert(q, 40, 40, 0x80ff0000, first=True); svert(q, 40, 200, 0x80ff0000)
+    svert(q, 280, 120, 0x80ff0000)                  # red, alpha=128
+    v = pix(q, 100, 110)
+    q.wl(D3 + FOGMODE, 0)
+    check("fog (alpha)", near(v, 127, 0, 127, tol=30), hex(v))
+
     # 10. constant colour (fbzColorPath rgbselect=2 -> color1)
-    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
     q.wl(D3 + C1, 0x00ff8800)   # ARGB const
     q.wl(D3 + FBZCOLORPATH, 2)
     q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
@@ -268,8 +325,9 @@ def run():
     check("constant colour (color1)", near(v, 0xff, 0x88, 0x00, 20), hex(v))
 
     # 11. clip rectangle: restrict to a box, draw full-screen tri, outside stays bg
-    q.wl(D3 + C1, 0x00202020); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + C1, 0x00202020); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
     q.wl(D3 + CLIPLR, (100 << 16) | 200); q.wl(D3 + CLIPBT, (80 << 16) | 160)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK | ENCLIP)
     q.wl(D3 + FBZCOLORPATH, 0)
     q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
     svert(q, 0, 0, 0xffff00ff, first=True); svert(q, 319, 0, 0xffff00ff)
@@ -286,7 +344,7 @@ def run():
     # render into a back buffer then queue a wait-on-vsync swap
     backoff = 0x300000
     q.wl(D3 + COLBUF, backoff); q.wl(D3 + COLSTRIDE, W * 2)
-    q.wl(D3 + C1, 0x0000ff00); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + C1, 0x0000ff00); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
     q.wl(D3 + SWAPBUF, 1)                  # wait-on-vsync swap
     st_before = q.rl(D3 + STATUS)
     pend = (st_before >> 28) & 7
