@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -155,10 +156,163 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_ROP_XOR              0x66
 #define V3_ROP_INVERT           0x55
 
+/*
+ * 3D ("SST"/Avenger) register space at BAR0 + 0x200000.
+ * Offsets and formats from the 3dfx Glide3 h3regs.h / sst.h spec.
+ */
+#define V3_3D_VA                0x008   /* vertex A: x,y at 0x08,0x0c (12.4) */
+#define V3_3D_VB                0x010
+#define V3_3D_VC                0x018
+#define V3_3D_STARTR            0x020   /* iterated params at vertex A */
+#define V3_3D_STARTG            0x024
+#define V3_3D_STARTB            0x028
+#define V3_3D_STARTZ            0x02c
+#define V3_3D_STARTA            0x030
+#define V3_3D_STARTS            0x034
+#define V3_3D_STARTT            0x038
+#define V3_3D_STARTW            0x03c
+#define V3_3D_DPDX              0x040   /* 8 x/dx gradients 0x40..0x5c */
+#define V3_3D_DPDY              0x060   /* 8 y/dy gradients 0x60..0x7c */
+#define V3_3D_TRIANGLECMD       0x080
+#define V3_3D_FVA               0x088   /* float vertex A */
+#define V3_3D_FVB               0x090
+#define V3_3D_FVC               0x098
+#define V3_3D_FSTARTR           0x0a0
+#define V3_3D_FDPDX             0x0c0
+#define V3_3D_FDPDY             0x0e0
+#define V3_3D_FTRIANGLECMD      0x100
+#define V3_3D_FBZCOLORPATH      0x104
+#define V3_3D_FOGMODE           0x108
+#define V3_3D_ALPHAMODE         0x10c
+#define V3_3D_FBZMODE           0x110
+#define V3_3D_LFBMODE           0x114
+#define V3_3D_CLIPLEFTRIGHT     0x118
+#define V3_3D_CLIPBOTTOMTOP     0x11c
+#define V3_3D_NOPCMD            0x120
+#define V3_3D_FASTFILLCMD       0x124
+#define V3_3D_SWAPBUFFERCMD     0x128
+#define V3_3D_FOGCOLOR          0x12c
+#define V3_3D_ZACOLOR           0x130
+#define V3_3D_CHROMAKEY         0x134
+#define V3_3D_C0                0x144
+#define V3_3D_C1                0x148
+#define V3_3D_RENDERMODE        0x1e0
+#define V3_3D_COLBUFFERADDR     0x1ec
+#define V3_3D_COLBUFFERSTRIDE   0x1f0
+#define V3_3D_AUXBUFFERADDR     0x1f4
+#define V3_3D_AUXBUFFERSTRIDE   0x1f8
+#define V3_3D_SSETUPMODE        0x260
+#define V3_3D_SVX               0x264
+#define V3_3D_SVY               0x268
+#define V3_3D_SARGB             0x26c
+#define V3_3D_SRED              0x270
+#define V3_3D_SGREEN            0x274
+#define V3_3D_SBLUE             0x278
+#define V3_3D_SALPHA            0x27c
+#define V3_3D_SVZ               0x280
+#define V3_3D_SWOOWFBI          0x284
+#define V3_3D_SOOW0             0x288
+#define V3_3D_SSOW0             0x28c
+#define V3_3D_STOW0             0x290
+#define V3_3D_SDRAWTRICMD       0x2a0
+#define V3_3D_SBEGINTRICMD      0x2a4
+#define V3_3D_TEXTUREMODE       0x300
+#define V3_3D_TLOD              0x304
+#define V3_3D_TEXBASEADDR       0x30c
+
+#define V3_3D_INTRCTRL          0x004   /* interrupt control */
+
+#define V3_3D_REG_NB            (0x400 / 4)
+
+/* status register bits (BAR0 + 0x200000) */
+#define V3_STATUS_VRETRACE      BIT(6)
+#define V3_STATUS_BUSY          BIT(9)
+#define V3_STATUS_SWAP_SHIFT    28      /* [30:28] pending swapbuffers */
+#define V3_STATUS_PCIINT        BIT(31)
+
+/* intrCtrl bits (our vsync-interrupt contract, see include/uapi tdfx3d.h) */
+#define V3_INTR_VSYNC_ENABLE    BIT(0)  /* raise PCI IRQ on vertical blank */
+#define V3_INTR_VSYNC_CLEAR     BIT(1)  /* write 1 to acknowledge the IRQ */
+#define V3_INTR_VSYNC_PENDING   BIT(6)  /* read: a vblank IRQ is pending */
+
+/* fbzMode bits */
+#define V3_FBZ_ENCLIP           BIT(0)
+#define V3_FBZ_ENCHROMAKEY      BIT(1)
+#define V3_FBZ_ENDEPTH          BIT(4)
+#define V3_FBZ_ZFUNC_SHIFT      5
+#define V3_FBZ_ZFUNC_MASK       (0x7 << V3_FBZ_ZFUNC_SHIFT)
+#define V3_FBZ_ENDITHER         BIT(8)
+#define V3_FBZ_RGBWRMASK        BIT(9)
+#define V3_FBZ_DEPTHWRMASK      BIT(10)
+#define V3_FBZ_DRAWBUFFER_SHIFT 14
+#define V3_FBZ_DRAWBUFFER_MASK  (0x3 << V3_FBZ_DRAWBUFFER_SHIFT)
+#define V3_FBZ_ENWBUFFER        BIT(20)
+#define V3_FBZ_YORIGIN          BIT(17)
+
+/* zfunc sub-bits (LT/EQ/GT), test passes if (src REL dst) matches enabled set */
+#define V3_ZF_LT                BIT(0)
+#define V3_ZF_EQ                BIT(1)
+#define V3_ZF_GT                BIT(2)
+
+/* alphaMode bits */
+#define V3_ALPHA_ENTEST         BIT(0)
+#define V3_ALPHA_FUNC_SHIFT     1
+#define V3_ALPHA_FUNC_MASK      (0x7 << V3_ALPHA_FUNC_SHIFT)
+#define V3_ALPHA_ENBLEND        BIT(4)
+#define V3_ALPHA_SRCFUNC_SHIFT  8
+#define V3_ALPHA_DSTFUNC_SHIFT  12
+#define V3_ALPHA_BLENDFUNC_MASK 0xf
+#define V3_ALPHA_REF_SHIFT      24
+
+/* alpha blend function codes */
+#define V3_BLEND_ZERO           0x0
+#define V3_BLEND_SRCALPHA       0x1
+#define V3_BLEND_COLOR          0x2
+#define V3_BLEND_DSTALPHA       0x3
+#define V3_BLEND_ONE            0x4
+#define V3_BLEND_OMSRCALPHA     0x5
+#define V3_BLEND_OMCOLOR        0x6
+#define V3_BLEND_OMDSTALPHA     0x7
+
+/* fbzColorPath bits (subset) */
+#define V3_CP_RGBSELECT_MASK    0x3     /* 0=iterated, 1=texture, 2=color1 */
+#define V3_CP_ASELECT_SHIFT     2
+#define V3_CP_ASELECT_MASK      (0x3 << V3_CP_ASELECT_SHIFT)
+
+/* textureMode bits (subset) */
+#define V3_TEX_ENABLE           BIT(0)
+#define V3_TEX_TFORMAT_SHIFT    8
+#define V3_TEX_TFORMAT_MASK     (0xf << V3_TEX_TFORMAT_SHIFT)
+#define V3_TFMT_RGB332          0
+#define V3_TFMT_ARGB1555        5
+#define V3_TFMT_RGB565          10
+#define V3_TFMT_ARGB4444        14
+#define V3_TFMT_ARGB8332        6
+
+/* sSetupMode: which per-vertex params are valid */
+#define V3_SSETUP_RGB           BIT(0)
+#define V3_SSETUP_ALPHA         BIT(1)
+#define V3_SSETUP_Z             BIT(2)
+#define V3_SSETUP_WFBI          BIT(3)
+#define V3_SSETUP_W0            BIT(4)
+#define V3_SSETUP_ST0           BIT(5)
+#define V3_SSETUP_CULLING_EN    BIT(16)
+#define V3_SSETUP_CULL_SIGN     BIT(17)
+#define V3_SSETUP_STRIP_MODE    BIT(18)
+
 /* PLL reference clock, kHz */
 #define V3_PLL_REF_KHZ          14318
 
 enum { V3_MODE_BLANK, V3_MODE_VGA, V3_MODE_DESKTOP };
+
+/* A rasteriser vertex, in screen space with iterated parameters. */
+typedef struct V3Vertex {
+    float x, y;         /* screen position (pixels, sub-pixel ok) */
+    float z;            /* depth, 0..65535 */
+    float oow;          /* 1/w for perspective-correct texturing */
+    float r, g, b, a;   /* colour components, 0..255 */
+    float sow, tow;     /* s/w, t/w */
+} V3Vertex;
 
 struct Voodoo3State {
     PCIDevice dev;
@@ -171,6 +325,23 @@ struct Voodoo3State {
 
     uint32_t io_regs[V3_IO_REG_NB];
     uint32_t d2_regs[V3_2D_REG_NB];
+    uint32_t d3_regs[V3_3D_REG_NB];
+
+    /*
+     * Strip/fan setup-unit vertex accumulator. The Avenger setup unit
+     * takes one vertex per sDrawTriCMD and emits a triangle once three
+     * vertices are available (fan/strip per sSetupMode).
+     */
+    V3Vertex svtx[3];   /* setup-unit vertex window (strip/fan) */
+    int snvert;         /* vertices accumulated since last Begin */
+
+    /* vertical-blank / buffer-swap emulation */
+    QEMUTimer vblank_timer;
+    uint32_t vblank_count;      /* frames elapsed (also drives retrace) */
+    uint32_t swap_pending;      /* queued swapbufferCMDs (status[30:28]) */
+    uint32_t swap_buf;          /* vram offset queued for display */
+    uint32_t swap_interval;     /* vblanks to wait before the queued swap */
+    bool vsync_irq;             /* vsync interrupt asserted (status[31]) */
 
     bool draminit0_written;
     bool draminit1_written;
@@ -912,6 +1083,583 @@ static void voodoo3_reg_write(Voodoo3State *s, hwaddr addr, uint64_t data,
 }
 
 /* ---------------------------------------------------------------- */
+/* 3D engine (Avenger/SST core at BAR0 + 0x200000)                  */
+/*                                                                  */
+/* The SST rasteriser is fed a triangle either directly (vertices + */
+/* per-parameter screen-space gradients, via [F]triangleCMD) or     */
+/* through the on-chip setup unit (per-vertex data + sDrawTriCMD,    */
+/* which is what Glide3/Mesa use). Both feed the same span walker.   */
+
+static float v3_reg_f(Voodoo3State *s, unsigned off)
+{
+    uint32_t u = s->d3_regs[off / 4];
+    float f;
+
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static float v3_reg_fx(Voodoo3State *s, unsigned off, int frac)
+{
+    return (float)(int32_t)s->d3_regs[off / 4] / (float)(1 << frac);
+}
+
+static inline float v3_clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static bool voodoo3_zfunc_pass(unsigned func, uint32_t src, uint32_t dst)
+{
+    return ((func & V3_ZF_LT) && src < dst) ||
+           ((func & V3_ZF_EQ) && src == dst) ||
+           ((func & V3_ZF_GT) && src > dst);
+}
+
+static float voodoo3_blend_factor(unsigned f, float sa, float da, float comp)
+{
+    switch (f) {
+    case V3_BLEND_ZERO:       return 0.0f;
+    case V3_BLEND_ONE:        return 1.0f;
+    case V3_BLEND_SRCALPHA:   return sa / 255.0f;
+    case V3_BLEND_OMSRCALPHA: return 1.0f - sa / 255.0f;
+    case V3_BLEND_DSTALPHA:   return da / 255.0f;
+    case V3_BLEND_OMDSTALPHA: return 1.0f - da / 255.0f;
+    case V3_BLEND_COLOR:      return comp / 255.0f;
+    case V3_BLEND_OMCOLOR:    return 1.0f - comp / 255.0f;
+    default:                  return 1.0f;
+    }
+}
+
+/* Sample TMU0 (point sampled). Returns colour in r/g/b/a (0..255). */
+static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
+                          float *r, float *g, float *b, float *a)
+{
+    uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
+    uint32_t base = s->d3_regs[V3_3D_TEXBASEADDR / 4] & 0xffffff;
+    uint32_t lod = s->d3_regs[V3_3D_TLOD / 4];
+    unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
+    /* tLOD "lodmin" gives the base LOD; texture is (256>>lodmin) square */
+    unsigned lodmin = (lod >> 2) & 0xf;
+    unsigned dim = 256 >> (lodmin > 8 ? 8 : lodmin);
+    unsigned bpt = (fmt == V3_TFMT_RGB332 || fmt == V3_TFMT_ARGB8332) ? 1 : 2;
+    int u = (int)sc & (dim - 1);
+    int v = (int)tc & (dim - 1);
+    uint32_t off = base + (v * dim + u) * bpt;
+    uint32_t texel;
+
+    *a = 255.0f;
+    if (off + bpt > s->vga.vram_size) {
+        *r = *g = *b = 0;
+        return;
+    }
+    if (bpt == 1) {
+        texel = s->vga.vram_ptr[off];
+        *r = ((texel >> 5) & 7) * 255 / 7;
+        *g = ((texel >> 2) & 7) * 255 / 7;
+        *b = (texel & 3) * 255 / 3;
+        return;
+    }
+    texel = lduw_le_p(s->vga.vram_ptr + off);
+    switch (fmt) {
+    case V3_TFMT_RGB565:
+        *r = ((texel >> 11) & 0x1f) * 255 / 31;
+        *g = ((texel >> 5) & 0x3f) * 255 / 63;
+        *b = (texel & 0x1f) * 255 / 31;
+        break;
+    case V3_TFMT_ARGB1555:
+        *a = (texel & 0x8000) ? 255 : 0;
+        *r = ((texel >> 10) & 0x1f) * 255 / 31;
+        *g = ((texel >> 5) & 0x1f) * 255 / 31;
+        *b = (texel & 0x1f) * 255 / 31;
+        break;
+    case V3_TFMT_ARGB4444:
+        *a = ((texel >> 12) & 0xf) * 255 / 15;
+        *r = ((texel >> 8) & 0xf) * 255 / 15;
+        *g = ((texel >> 4) & 0xf) * 255 / 15;
+        *b = (texel & 0xf) * 255 / 15;
+        break;
+    default:
+        *r = ((texel >> 11) & 0x1f) * 255 / 31;
+        *g = ((texel >> 5) & 0x3f) * 255 / 63;
+        *b = (texel & 0x1f) * 255 / 31;
+        break;
+    }
+}
+
+static inline float v3_edge(const V3Vertex *a, const V3Vertex *b,
+                            float px, float py)
+{
+    return (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+}
+
+/*
+ * Rasterise one triangle through the pixel pipeline: Gouraud colour or
+ * texture, depth test/write, alpha test and alpha blending, honouring
+ * fbzMode/alphaMode/fbzColorPath/textureMode. 16bpp 565 colour buffer
+ * and 16bpp depth buffer (the classic Voodoo3 3D configuration).
+ */
+static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
+                                const V3Vertex *v1, const V3Vertex *v2)
+{
+    uint32_t fbz = s->d3_regs[V3_3D_FBZMODE / 4];
+    uint32_t alpham = s->d3_regs[V3_3D_ALPHAMODE / 4];
+    uint32_t cpath = s->d3_regs[V3_3D_FBZCOLORPATH / 4];
+    uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
+    uint32_t cbase = s->d3_regs[V3_3D_COLBUFFERADDR / 4] & 0xffffff;
+    uint32_t cstride = s->d3_regs[V3_3D_COLBUFFERSTRIDE / 4] & 0xffff;
+    uint32_t zbase = s->d3_regs[V3_3D_AUXBUFFERADDR / 4] & 0xffffff;
+    uint32_t zstride = s->d3_regs[V3_3D_AUXBUFFERSTRIDE / 4] & 0xffff;
+    uint32_t clr = s->d3_regs[V3_3D_CLIPLEFTRIGHT / 4];
+    uint32_t cbt = s->d3_regs[V3_3D_CLIPBOTTOMTOP / 4];
+    unsigned zfunc = (fbz & V3_FBZ_ZFUNC_MASK) >> V3_FBZ_ZFUNC_SHIFT;
+    unsigned rgbsel = cpath & V3_CP_RGBSELECT_MASK;
+    unsigned afunc = (alpham & V3_ALPHA_FUNC_MASK) >> V3_ALPHA_FUNC_SHIFT;
+    unsigned sblend = (alpham >> V3_ALPHA_SRCFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
+    unsigned dblend = (alpham >> V3_ALPHA_DSTFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
+    unsigned aref = (alpham >> V3_ALPHA_REF_SHIFT) & 0xff;
+    bool texen = (rgbsel == 1) && (tmode & V3_TEX_ENABLE);
+    int clx0, clx1, cly0, cly1;
+    float area, minx, maxx, miny, maxy;
+    int ix0, ix1, iy0, iy1, x, y;
+
+    if (!voodoo3_2d_ok(s) || !cstride) {
+        return;
+    }
+
+    area = v3_edge(v0, v1, v2->x, v2->y);
+    if (area == 0.0f) {
+        return; /* degenerate */
+    }
+
+    /* clip rectangle: left/right and top/bottom in (6)10 packed form */
+    clx0 = (clr >> 16) & 0x3ff;
+    clx1 = clr & 0x3ff;
+    cly0 = (cbt >> 16) & 0x3ff;
+    cly1 = cbt & 0x3ff;
+    if (clx1 <= clx0) {
+        clx0 = 0;
+        clx1 = 2048;
+    }
+    if (cly1 <= cly0) {
+        cly0 = 0;
+        cly1 = 2048;
+    }
+
+    minx = MIN(v0->x, MIN(v1->x, v2->x));
+    maxx = MAX(v0->x, MAX(v1->x, v2->x));
+    miny = MIN(v0->y, MIN(v1->y, v2->y));
+    maxy = MAX(v0->y, MAX(v1->y, v2->y));
+    ix0 = MAX((int)floorf(minx), clx0);
+    ix1 = MIN((int)ceilf(maxx), clx1);
+    iy0 = MAX((int)floorf(miny), cly0);
+    iy1 = MIN((int)ceilf(maxy), cly1);
+
+    for (y = iy0; y < iy1; y++) {
+        for (x = ix0; x < ix1; x++) {
+            float px = x + 0.5f, py = y + 0.5f;
+            float e0 = v3_edge(v1, v2, px, py);
+            float e1 = v3_edge(v2, v0, px, py);
+            float e2 = v3_edge(v0, v1, px, py);
+            float l0, l1, l2, sr, sg, sb, sa, zf;
+            uint32_t coff, zoff, srcz;
+            uint16_t pix;
+
+            /* inside test, winding-agnostic */
+            if (area > 0) {
+                if (e0 < 0 || e1 < 0 || e2 < 0) {
+                    continue;
+                }
+            } else if (e0 > 0 || e1 > 0 || e2 > 0) {
+                continue;
+            }
+            l0 = e0 / area;
+            l1 = e1 / area;
+            l2 = e2 / area;
+
+            zf = l0 * v0->z + l1 * v1->z + l2 * v2->z;
+            srcz = (uint32_t)v3_clampf(zf, 0, 65535);
+
+            zoff = zbase + y * zstride + x * 2;
+            if ((fbz & V3_FBZ_ENDEPTH) && zstride &&
+                zoff + 2 <= s->vga.vram_size) {
+                uint32_t dstz = lduw_le_p(s->vga.vram_ptr + zoff);
+                if (!voodoo3_zfunc_pass(zfunc, srcz, dstz)) {
+                    continue;
+                }
+            }
+
+            if (texen) {
+                float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
+                float sc = (l0 * v0->sow + l1 * v1->sow + l2 * v2->sow);
+                float tc = (l0 * v0->tow + l1 * v1->tow + l2 * v2->tow);
+                if (oow != 0) {
+                    sc /= oow;
+                    tc /= oow;
+                }
+                voodoo3_texel(s, sc, tc, &sr, &sg, &sb, &sa);
+            } else if (rgbsel == 2) {
+                uint32_t c1 = s->d3_regs[V3_3D_C1 / 4];
+                sr = (c1 >> 16) & 0xff;
+                sg = (c1 >> 8) & 0xff;
+                sb = c1 & 0xff;
+                sa = (c1 >> 24) & 0xff;
+            } else {
+                sr = v3_clampf(l0 * v0->r + l1 * v1->r + l2 * v2->r, 0, 255);
+                sg = v3_clampf(l0 * v0->g + l1 * v1->g + l2 * v2->g, 0, 255);
+                sb = v3_clampf(l0 * v0->b + l1 * v1->b + l2 * v2->b, 0, 255);
+                sa = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255);
+            }
+
+            /* alpha test */
+            if (alpham & V3_ALPHA_ENTEST) {
+                unsigned av = (unsigned)sa;
+                if (!(((afunc & V3_ZF_LT) && av < aref) ||
+                      ((afunc & V3_ZF_EQ) && av == aref) ||
+                      ((afunc & V3_ZF_GT) && av > aref))) {
+                    continue;
+                }
+            }
+
+            coff = cbase + y * cstride + x * 2;
+            if (coff + 2 > s->vga.vram_size) {
+                continue;
+            }
+
+            if (alpham & V3_ALPHA_ENBLEND) {
+                uint16_t d = lduw_le_p(s->vga.vram_ptr + coff);
+                float dr = ((d >> 11) & 0x1f) * 255.0f / 31;
+                float dg = ((d >> 5) & 0x3f) * 255.0f / 63;
+                float db = (d & 0x1f) * 255.0f / 31;
+                float da = 255.0f;
+
+                sr = sr * voodoo3_blend_factor(sblend, sa, da, sr) +
+                     dr * voodoo3_blend_factor(dblend, sa, da, dr);
+                sg = sg * voodoo3_blend_factor(sblend, sa, da, sg) +
+                     dg * voodoo3_blend_factor(dblend, sa, da, dg);
+                sb = sb * voodoo3_blend_factor(sblend, sa, da, sb) +
+                     db * voodoo3_blend_factor(dblend, sa, da, db);
+                sr = v3_clampf(sr, 0, 255);
+                sg = v3_clampf(sg, 0, 255);
+                sb = v3_clampf(sb, 0, 255);
+            }
+
+            pix = (((uint16_t)sr >> 3) << 11) |
+                  (((uint16_t)sg >> 2) << 5) |
+                  ((uint16_t)sb >> 3);
+            stw_le_p(s->vga.vram_ptr + coff, pix);
+
+            if ((fbz & V3_FBZ_ENDEPTH) && (fbz & V3_FBZ_DEPTHWRMASK) &&
+                zstride && zoff + 2 <= s->vga.vram_size) {
+                stw_le_p(s->vga.vram_ptr + zoff, srcz);
+            }
+        }
+    }
+
+    s->d3_regs[0x25c / 4]++;  /* fbiTrianglesOut */
+    memory_region_set_dirty(&s->vga.vram, cbase, cstride * (iy1 - iy0 + 1));
+}
+
+/* Build a vertex from the setup-unit (s*) registers. */
+static void voodoo3_setup_vertex(Voodoo3State *s, V3Vertex *v)
+{
+    uint32_t mode = s->d3_regs[V3_3D_SSETUPMODE / 4];
+    uint32_t argb = s->d3_regs[V3_3D_SARGB / 4];
+
+    v->x = v3_reg_f(s, V3_3D_SVX);
+    v->y = v3_reg_f(s, V3_3D_SVY);
+    v->z = v3_reg_f(s, V3_3D_SVZ);
+    v->oow = v3_reg_f(s, V3_3D_SWOOWFBI);
+    if (mode & V3_SSETUP_RGB) {
+        /* packed ARGB is the common Glide layout */
+        v->a = (argb >> 24) & 0xff;
+        v->r = (argb >> 16) & 0xff;
+        v->g = (argb >> 8) & 0xff;
+        v->b = argb & 0xff;
+    } else {
+        v->r = v3_reg_f(s, V3_3D_SRED);
+        v->g = v3_reg_f(s, V3_3D_SGREEN);
+        v->b = v3_reg_f(s, V3_3D_SBLUE);
+        v->a = v3_reg_f(s, V3_3D_SALPHA);
+    }
+    v->sow = v3_reg_f(s, V3_3D_SSOW0);
+    v->tow = v3_reg_f(s, V3_3D_STOW0);
+}
+
+/* Setup unit: accumulate a vertex and emit triangles (strip or fan). */
+static void voodoo3_setup_tri(Voodoo3State *s, bool begin)
+{
+    uint32_t mode = s->d3_regs[V3_3D_SSETUPMODE / 4];
+    bool strip = mode & V3_SSETUP_STRIP_MODE;
+
+    if (begin) {
+        voodoo3_setup_vertex(s, &s->svtx[0]);
+        s->snvert = 1;
+        return;
+    }
+    if (s->snvert < 3) {
+        voodoo3_setup_vertex(s, &s->svtx[s->snvert++]);
+    } else if (strip) {
+        s->svtx[0] = s->svtx[1];
+        s->svtx[1] = s->svtx[2];
+        voodoo3_setup_vertex(s, &s->svtx[2]);
+    } else { /* fan: keep svtx[0] as the anchor */
+        s->svtx[1] = s->svtx[2];
+        voodoo3_setup_vertex(s, &s->svtx[2]);
+    }
+    if (s->snvert == 3) {
+        voodoo3_3d_triangle(s, &s->svtx[0], &s->svtx[1], &s->svtx[2]);
+    }
+}
+
+/*
+ * Direct triangle: the driver has written the three vertices and the
+ * per-parameter screen-space gradients; the value of each parameter at
+ * pixel (x,y) is (value at vertex A) + dpdx*(x-Ax) + dpdy*(y-Ay). We
+ * reconstruct per-vertex values from A + gradients and reuse the span
+ * walker.
+ */
+/* fixed-point fraction bits for the iterated params: r,g,b,z,a,s,t,w */
+static const int voodoo3_param_fracs[8] = { 12, 12, 12, 12, 12, 18, 18, 30 };
+
+static void voodoo3_direct_tri(Voodoo3State *s, bool is_float)
+{
+    V3Vertex v[3];
+    float ax, ay;
+    float pA[8], dx[8], dy[8];   /* r,g,b,z,a,s,t,w */
+    int i;
+
+    if (is_float) {
+        v[0].x = v3_reg_f(s, V3_3D_FVA);
+        v[0].y = v3_reg_f(s, V3_3D_FVA + 4);
+        v[1].x = v3_reg_f(s, V3_3D_FVB);
+        v[1].y = v3_reg_f(s, V3_3D_FVB + 4);
+        v[2].x = v3_reg_f(s, V3_3D_FVC);
+        v[2].y = v3_reg_f(s, V3_3D_FVC + 4);
+        for (i = 0; i < 8; i++) {
+            pA[i] = v3_reg_f(s, V3_3D_FSTARTR + i * 4);
+            dx[i] = v3_reg_f(s, V3_3D_FDPDX + i * 4);
+            dy[i] = v3_reg_f(s, V3_3D_FDPDY + i * 4);
+        }
+    } else {
+        v[0].x = v3_reg_fx(s, V3_3D_VA, 4);
+        v[0].y = v3_reg_fx(s, V3_3D_VA + 4, 4);
+        v[1].x = v3_reg_fx(s, V3_3D_VB, 4);
+        v[1].y = v3_reg_fx(s, V3_3D_VB + 4, 4);
+        v[2].x = v3_reg_fx(s, V3_3D_VC, 4);
+        v[2].y = v3_reg_fx(s, V3_3D_VC + 4, 4);
+        /* r,g,b,a: 12.12 ; z: 20.12 ; s,t: 14.18 ; w: 2.30 */
+        for (i = 0; i < 8; i++) {
+            int f = voodoo3_param_fracs[i];
+            pA[i] = v3_reg_fx(s, V3_3D_STARTR + i * 4, f);
+            dx[i] = v3_reg_fx(s, V3_3D_DPDX + i * 4, f);
+            dy[i] = v3_reg_fx(s, V3_3D_DPDY + i * 4, f);
+        }
+    }
+
+    ax = v[0].x;
+    ay = v[0].y;
+    for (i = 0; i < 3; i++) {
+        float ox = v[i].x - ax, oy = v[i].y - ay;
+        float p[8];
+        int k;
+
+        for (k = 0; k < 8; k++) {
+            p[k] = pA[k] + dx[k] * ox + dy[k] * oy;
+        }
+        v[i].r = p[0];
+        v[i].g = p[1];
+        v[i].b = p[2];
+        v[i].z = p[3];
+        v[i].a = p[4];
+        v[i].sow = p[5];
+        v[i].tow = p[6];
+        v[i].oow = p[7];
+    }
+    voodoo3_3d_triangle(s, &v[0], &v[1], &v[2]);
+}
+
+static void voodoo3_3d_fastfill(Voodoo3State *s)
+{
+    uint32_t fbz = s->d3_regs[V3_3D_FBZMODE / 4];
+    uint32_t c1 = s->d3_regs[V3_3D_C1 / 4];
+    uint32_t za = s->d3_regs[V3_3D_ZACOLOR / 4];
+    uint32_t cbase = s->d3_regs[V3_3D_COLBUFFERADDR / 4] & 0xffffff;
+    uint32_t cstride = s->d3_regs[V3_3D_COLBUFFERSTRIDE / 4] & 0xffff;
+    uint32_t zbase = s->d3_regs[V3_3D_AUXBUFFERADDR / 4] & 0xffffff;
+    uint32_t zstride = s->d3_regs[V3_3D_AUXBUFFERSTRIDE / 4] & 0xffff;
+    uint32_t clr = s->d3_regs[V3_3D_CLIPLEFTRIGHT / 4];
+    uint32_t cbt = s->d3_regs[V3_3D_CLIPBOTTOMTOP / 4];
+    int x0 = (clr >> 16) & 0x3ff, x1 = clr & 0x3ff;
+    int y0 = (cbt >> 16) & 0x3ff, y1 = cbt & 0x3ff;
+    uint16_t col = ((((c1 >> 16) & 0xff) >> 3) << 11) |
+                   ((((c1 >> 8) & 0xff) >> 2) << 5) |
+                   ((c1 & 0xff) >> 3);
+    uint16_t zval = za & 0xffff;
+    int x, y;
+
+    if (!voodoo3_2d_ok(s) || !cstride || x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    for (y = y0; y < y1; y++) {
+        for (x = x0; x < x1; x++) {
+            uint32_t coff = cbase + y * cstride + x * 2;
+            if (coff + 2 <= s->vga.vram_size) {
+                stw_le_p(s->vga.vram_ptr + coff, col);
+            }
+            if ((fbz & V3_FBZ_ENDEPTH) && zstride) {
+                uint32_t zoff = zbase + y * zstride + x * 2;
+                if (zoff + 2 <= s->vga.vram_size) {
+                    stw_le_p(s->vga.vram_ptr + zoff, zval);
+                }
+            }
+        }
+    }
+    memory_region_set_dirty(&s->vga.vram, cbase, cstride * (y1 - y0 + 1));
+}
+
+/* Point the video scanout at a buffer and refresh the display. */
+static void voodoo3_present(Voodoo3State *s, uint32_t addr)
+{
+    s->io_regs[V3_VIDDESKSTART / 4] = addr;
+    if (s->mode == V3_MODE_DESKTOP) {
+        voodoo3_set_scanout_offset(s, addr);
+    } else {
+        voodoo3_update_mode(s);
+    }
+    s->need_blank = false;
+    qemu_console_hw_invalidate(s->vga.con);
+    qemu_console_update_full(s->vga.con);
+}
+
+/*
+ * swapbufferCMD: make colBufferAddr the displayed buffer. If the
+ * command requests it (SST_SWAP_EN_WAIT_ON_VSYNC, bit 0), the swap is
+ * deferred to the vertical-blank timer and reflected in the pending
+ * count (status[30:28]); otherwise it happens immediately. cmd[8:1] is
+ * the swap interval in vblanks.
+ */
+static void voodoo3_3d_swapbuffer(Voodoo3State *s, uint32_t cmd)
+{
+    uint32_t cbase = s->d3_regs[V3_3D_COLBUFFERADDR / 4] & 0xffffff;
+
+    s->d3_regs[0x258 / 4]++;   /* fbiSwapHistory */
+    if (cmd & 1) {
+        s->swap_buf = cbase;
+        s->swap_interval = (cmd >> 1) & 0xff;
+        if (s->swap_pending < 7) {
+            s->swap_pending++;
+        }
+    } else {
+        voodoo3_present(s, cbase);
+    }
+}
+
+/* Vertical-blank: perform any queued swap and raise the vsync IRQ. */
+static void voodoo3_vblank(void *opaque)
+{
+    Voodoo3State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->vblank_count++;
+
+    if (s->swap_pending) {
+        if (s->swap_interval) {
+            s->swap_interval--;
+        } else {
+            voodoo3_present(s, s->swap_buf);
+            s->swap_pending--;
+        }
+    }
+
+    if (s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_VSYNC_ENABLE) {
+        s->vsync_irq = true;
+        pci_set_irq(&s->dev, 1);
+    }
+
+    timer_mod(&s->vblank_timer, now + NANOSECONDS_PER_SECOND / 60);
+}
+
+static uint64_t voodoo3_3d_read(Voodoo3State *s, hwaddr addr, unsigned size)
+{
+    uint32_t val;
+
+    if (addr >= 0x400) {
+        return 0;
+    }
+    switch (addr & ~3) {
+    case V3_STATUS:
+    {
+        uint32_t vis, line = voodoo3_scanline(s, &vis);
+        val = 0x1f;                                 /* FIFO free */
+        if (line >= vis) {
+            val |= V3_STATUS_VRETRACE;
+        }
+        val |= (s->swap_pending & 7) << V3_STATUS_SWAP_SHIFT;
+        if (s->vsync_irq) {
+            val |= V3_STATUS_PCIINT;
+        }
+        break;
+    }
+    case V3_3D_INTRCTRL:
+        val = s->d3_regs[V3_3D_INTRCTRL / 4] & V3_INTR_VSYNC_ENABLE;
+        if (s->vsync_irq) {
+            val |= V3_INTR_VSYNC_PENDING;
+        }
+        break;
+    default:
+        val = s->d3_regs[(addr & ~3) / 4];
+        break;
+    }
+    return extract32(val, (addr & 3) * 8, size * 8);
+}
+
+static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
+                             unsigned size)
+{
+    unsigned reg;
+
+    if (addr >= 0x400) {
+        return;
+    }
+    reg = (addr & ~3);
+    s->d3_regs[reg / 4] = deposit32(s->d3_regs[reg / 4], (addr & 3) * 8,
+                                    size * 8, data);
+
+    switch (reg) {
+    case V3_3D_TRIANGLECMD:
+        voodoo3_direct_tri(s, false);
+        break;
+    case V3_3D_FTRIANGLECMD:
+        voodoo3_direct_tri(s, true);
+        break;
+    case V3_3D_SBEGINTRICMD:
+        voodoo3_setup_tri(s, true);
+        break;
+    case V3_3D_SDRAWTRICMD:
+        voodoo3_setup_tri(s, false);
+        break;
+    case V3_3D_FASTFILLCMD:
+        voodoo3_3d_fastfill(s);
+        break;
+    case V3_3D_SWAPBUFFERCMD:
+        voodoo3_3d_swapbuffer(s, data);
+        break;
+    case V3_3D_INTRCTRL:
+        if (data & V3_INTR_VSYNC_CLEAR) {
+            s->vsync_irq = false;
+            pci_set_irq(&s->dev, 0);
+        }
+        s->d3_regs[V3_3D_INTRCTRL / 4] = data & V3_INTR_VSYNC_ENABLE;
+        break;
+    case V3_3D_NOPCMD:
+        break;
+    default:
+        break;
+    }
+}
+
+/* ---------------------------------------------------------------- */
 /* memory regions                                                   */
 
 static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -923,6 +1671,9 @@ static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
     }
     if (addr >= 0x100000 && addr < 0x200000) {
         return voodoo3_2d_read(s, addr - 0x100000, size);
+    }
+    if (addr >= 0x200000 && addr < 0x600000) {
+        return voodoo3_3d_read(s, addr - 0x200000, size);
     }
     return 0;
 }
@@ -937,13 +1688,7 @@ static void voodoo3_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     } else if (addr >= 0x100000 && addr < 0x200000) {
         voodoo3_2d_write(s, addr - 0x100000, data, size);
     } else if (addr >= 0x200000 && addr < 0x600000) {
-        /* 3D engine: accept and ignore NOPs, tdfxfb uses it for sync */
-        if ((addr & 0xfffff) != 0x120 || (data & 0xff) != 0) {
-            qemu_log_mask(LOG_UNIMP,
-                          "voodoo3: 3D engine not implemented "
-                          "(write 0x%" PRIx64 " @ 0x%" HWADDR_PRIx ")\n",
-                          data, addr);
-        }
+        voodoo3_3d_write(s, addr - 0x200000, data, size);
     }
 }
 
@@ -1065,6 +1810,11 @@ static void voodoo3_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
 
     dev->config[PCI_INTERRUPT_PIN] = 1;
+
+    timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, voodoo3_vblank, s);
+    timer_mod(&s->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 60);
 }
 
 static void voodoo3_reset(DeviceState *dev)
@@ -1073,8 +1823,15 @@ static void voodoo3_reset(DeviceState *dev)
 
     vga_common_reset(&s->vga);
 
+    s->swap_pending = 0;
+    s->swap_interval = 0;
+    s->vsync_irq = false;
+    pci_set_irq(&s->dev, 0);
+
     memset(s->io_regs, 0, sizeof(s->io_regs));
     memset(s->d2_regs, 0, sizeof(s->d2_regs));
+    memset(s->d3_regs, 0, sizeof(s->d3_regs));
+    s->snvert = 0;
     /*
      * Cold power-on state: PLLs unlocked, DRAM controller
      * unconfigured. The VGA BIOS (or a driver doing its job) has to
@@ -1094,6 +1851,7 @@ static void voodoo3_exit(PCIDevice *dev)
 {
     Voodoo3State *s = VOODOO3(dev);
 
+    timer_del(&s->vblank_timer);
     qemu_graphic_console_close(s->vga.con);
     cursor_unref(s->cursor);
 }
@@ -1120,6 +1878,7 @@ static const VMStateDescription vmstate_voodoo3 = {
                        VGACommonState),
         VMSTATE_UINT32_ARRAY(io_regs, Voodoo3State, V3_IO_REG_NB),
         VMSTATE_UINT32_ARRAY(d2_regs, Voodoo3State, V3_2D_REG_NB),
+        VMSTATE_UINT32_ARRAY(d3_regs, Voodoo3State, V3_3D_REG_NB),
         VMSTATE_BOOL(draminit0_written, Voodoo3State),
         VMSTATE_BOOL(draminit1_written, Voodoo3State),
         VMSTATE_BOOL(dram_mode_set, Voodoo3State),

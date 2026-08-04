@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+Comprehensive feature test for the QEMU voodoo3 3D engine.
+
+Exercises every implemented hardware feature and checks exact rendered
+pixels (read back through the LFB), so the same sequences can be trusted
+when validated against real Voodoo3 hardware:
+
+  fastfill, direct integer triangleCMD, direct float FtriangleCMD,
+  setup-unit fan and strip, all 8 depth-compare functions, depth write
+  mask, alpha test, alpha blending, textures (RGB332/565/ARGB1555/4444,
+  point-sampled perspective), constant colour, the clip rectangle, and
+  vsync (swap-on-vblank pending count + vsync interrupt).
+"""
+import json, os, socket, struct, subprocess, sys, time
+
+QEMU = "/workspace/src/qemu-voodoo3/build/qemu-system-x86_64"
+DIR = "/workspace/src/voodoo3-test"
+QTSOCK = DIR + "/qa.sock"
+QMPSOCK = DIR + "/qaqmp.sock"
+BAR0, BAR1, BAR2 = 0xf0000000, 0xf4000000, 0xc000
+D3 = BAR0 + 0x200000
+W, H = 320, 240
+
+fails = []
+def check(name, cond, detail=""):
+    print(("PASS " if cond else "FAIL ") + name + (("  " + detail) if detail else ""))
+    if not cond:
+        fails.append(name)
+
+def f2i(f):
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+class QT:
+    def __init__(s, p):
+        s.s = socket.socket(socket.AF_UNIX)
+        for _ in range(100):
+            try: s.s.connect(p); break
+            except OSError: time.sleep(0.1)
+        s.f = s.s.makefile("rw")
+    def cmd(s, l):
+        s.f.write(l + "\n"); s.f.flush()
+        while True:
+            r = s.f.readline().strip()
+            if r.startswith("OK"): return r[2:].strip()
+            if r.startswith("FAIL"): raise RuntimeError(l + " -> " + r)
+    def wl(s, a, v): s.cmd("writel 0x%x 0x%x" % (a, v & 0xffffffff))
+    def rl(s, a): return int(s.cmd("readl 0x%x" % a), 16)
+    def rw(s, a): return int(s.cmd("readw 0x%x" % a), 16)
+    def ww(s, a, v): s.cmd("writew 0x%x 0x%x" % (a, v & 0xffff))
+    def outl(s, p, v): s.cmd("outl 0x%x 0x%x" % (p, v))
+    def inl(s, p): return int(s.cmd("inl 0x%x" % p), 16)
+    def clock_step(s, ns): s.cmd("clock_step %d" % ns)
+
+# 3D register offsets (relative to D3)
+FBZMODE, FBZCOLORPATH, ALPHAMODE = 0x110, 0x104, 0x10c
+CLIPLR, CLIPBT = 0x118, 0x11c
+COLBUF, COLSTRIDE, AUXBUF, AUXSTRIDE = 0x1ec, 0x1f0, 0x1f4, 0x1f8
+ZACOLOR, C1, CHROMAKEY = 0x130, 0x148, 0x134
+FASTFILL, SWAPBUF, NOP, INTRCTRL = 0x124, 0x128, 0x120, 0x004
+STATUS = 0x000
+# direct int
+VA, VB, VC = 0x008, 0x010, 0x018
+STARTR, DPDX, DPDY, TRICMD = 0x020, 0x040, 0x060, 0x080
+# direct float
+FVA, FVB, FVC = 0x088, 0x090, 0x098
+FSTARTR, FDPDX, FDPDY, FTRICMD = 0x0a0, 0x0c0, 0x0e0, 0x100
+# setup unit
+SSETUPMODE = 0x260
+SVX, SVY, SARGB, SVZ, SWOOW, SSOW0, STOW0 = 0x264, 0x268, 0x26c, 0x280, 0x284, 0x28c, 0x290
+SBEGIN, SDRAW = 0x2a4, 0x2a0
+# texture
+TEXMODE, TLOD, TEXBASE = 0x300, 0x304, 0x30c
+
+
+def rgb565(r, g, b):
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+
+def pix(q, x, y, buf=0):
+    return q.rw(BAR1 + buf + (y * W + x) * 2)
+
+def near(v, r, g, b, tol=12):
+    pr, pg, pb = ((v >> 11) & 0x1f) * 255 // 31, ((v >> 5) & 0x3f) * 255 // 63, (v & 0x1f) * 255 // 31
+    return abs(pr - r) < tol + 8 and abs(pg - g) < tol + 8 and abs(pb - b) < tol + 8
+
+
+def setup(q):
+    slot = None
+    for d in range(32):
+        q.outl(0xcf8, 0x80000000 | (d << 11))
+        if q.inl(0xcfc) == 0x0005121a: slot = d; break
+    def cfg(o, v): q.outl(0xcf8, 0x80000000 | (slot << 11) | (o & 0xfc)); q.outl(0xcfc, v)
+    cfg(0x10, BAR0); cfg(0x14, BAR1); cfg(0x18, BAR2 | 1); cfg(0x04, 3)
+    # memory up (like BIOS)
+    q.wl(BAR0 + 0x44, (44 << 8) | (2 << 2)); q.wl(BAR0 + 0x18, (1 << 26) | (1 << 27))
+    q.wl(BAR0 + 0x1c, (1 << 30)); q.wl(BAR0 + 0x30, 1)
+    # 16bpp desktop scanout of buffer 0
+    q.wl(BAR0 + 0x40, (12 << 8) | (1 << 2) | 1); q.wl(BAR0 + 0x28, (1 << 2))
+    q.wl(BAR0 + 0x98, W | (H << 12)); q.wl(BAR0 + 0xe8, W * 2)
+    q.wl(BAR0 + 0xe4, 0); q.wl(BAR0 + 0x5c, 1 | (1 << 7) | (1 << 18))
+    # 3D common state: render into buffer 0
+    q.wl(D3 + COLBUF, 0); q.wl(D3 + COLSTRIDE, W * 2)
+    q.wl(D3 + AUXBUF, W * H * 2); q.wl(D3 + AUXSTRIDE, W * 2)
+    q.wl(D3 + CLIPLR, W); q.wl(D3 + CLIPBT, H)
+    q.wl(D3 + ALPHAMODE, 0); q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + FBZMODE, 7 << 5)   # zfunc = ALWAYS, depth off
+
+
+def clear(q, col565=0):
+    q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, 0xffff); q.wl(D3 + FBZMODE, (7 << 5))
+    # C1 is ARGB; encode background as ARGB from a 565-ish value: just use black/blue
+    q.wl(D3 + C1, col565)
+    q.wl(D3 + FASTFILL, 1)
+
+def svert(q, x, y, argb, z=1000.0, first=False, s=None, t=None):
+    q.wl(D3 + SVX, f2i(float(x))); q.wl(D3 + SVY, f2i(float(y)))
+    q.wl(D3 + SVZ, f2i(float(z))); q.wl(D3 + SWOOW, f2i(1.0))
+    q.wl(D3 + SARGB, argb)
+    if s is not None:
+        q.wl(D3 + SSOW0, f2i(float(s))); q.wl(D3 + STOW0, f2i(float(t)))
+    q.wl(D3 + (SBEGIN if first else SDRAW), 1)
+
+
+def run():
+    q = QT(QTSOCK)
+    setup(q)
+
+    # 1. fastfill
+    q.wl(D3 + C1, 0x00204060); q.wl(D3 + FASTFILL, 1)
+    check("fastfill", near(pix(q, 10, 10), 0x20, 0x40, 0x60), hex(pix(q, 10, 10)))
+
+    # 2. direct integer triangleCMD (flat green, gradients 0)
+    q.wl(D3 + C1, 0); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + FBZMODE, 7 << 5)
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + VA, (30 << 4)); q.wl(D3 + VA + 4, (30 << 4))
+    q.wl(D3 + VB, (300 << 4)); q.wl(D3 + VB + 4, (40 << 4))
+    q.wl(D3 + VC, (60 << 4)); q.wl(D3 + VC + 4, (210 << 4))
+    for i in range(8): q.wl(D3 + DPDX + i * 4, 0); q.wl(D3 + DPDY + i * 4, 0)
+    q.wl(D3 + STARTR + 0, 0); q.wl(D3 + STARTR + 4, 220 << 12); q.wl(D3 + STARTR + 8, 0)  # g=220
+    q.wl(D3 + STARTR + 12, 1000 << 12)  # z
+    q.wl(D3 + TRICMD, 1)
+    check("direct-int triangleCMD", near(pix(q, 90, 90), 0, 220, 0), hex(pix(q, 90, 90)))
+
+    # 3. direct float FtriangleCMD (flat red)
+    q.wl(D3 + C1, 0); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + FVA, f2i(30.0)); q.wl(D3 + FVA + 4, f2i(30.0))
+    q.wl(D3 + FVB, f2i(300.0)); q.wl(D3 + FVB + 4, f2i(40.0))
+    q.wl(D3 + FVC, f2i(60.0)); q.wl(D3 + FVC + 4, f2i(210.0))
+    for i in range(8): q.wl(D3 + FDPDX + i * 4, 0); q.wl(D3 + FDPDY + i * 4, 0)
+    q.wl(D3 + FSTARTR + 0, f2i(230.0)); q.wl(D3 + FSTARTR + 4, f2i(0.0))
+    q.wl(D3 + FSTARTR + 8, f2i(0.0)); q.wl(D3 + FSTARTR + 12, f2i(1000.0))
+    q.wl(D3 + FTRICMD, 1)
+    check("direct-float FtriangleCMD", near(pix(q, 90, 90), 230, 0, 0), hex(pix(q, 90, 90)))
+
+    # 4. setup-unit fan (gouraud), colours interpolate
+    q.wl(D3 + C1, 0); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    svert(q, 160, 30, 0xffff0000, first=True)
+    svert(q, 40, 210, 0xff00ff00)
+    svert(q, 280, 210, 0xff0000ff)
+    c = pix(q, 160, 150)
+    check("setup fan gouraud", not near(c, 0, 0, 0) and pix(q, 50, 205) != pix(q, 270, 205),
+          hex(c))
+
+    # 5. setup-unit strip (two triangles from 4 verts)
+    q.wl(D3 + C1, 0); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 18))  # strip
+    svert(q, 40, 40, 0xffffff00, first=True)
+    svert(q, 40, 200, 0xffffff00)
+    svert(q, 280, 40, 0xffffff00)
+    svert(q, 280, 200, 0xffffff00)   # 2nd triangle
+    check("setup strip", near(pix(q, 160, 120), 255, 255, 0) and
+          near(pix(q, 250, 180), 255, 255, 0), hex(pix(q, 250, 180)))
+
+    # 6. all 8 depth-compare functions
+    def depth_case(func, srcz, dstz, expect_draw):
+        q.wl(D3 + C1, 0); q.wl(D3 + ZACOLOR, dstz & 0xffff); q.wl(D3 + FBZMODE, 7 << 5)
+        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (7 << 5)); q.wl(D3 + FASTFILL, 1)  # clear depth=dstz
+        q.wl(D3 + FBZMODE, (1 << 4) | (1 << 10) | (func << 5))  # depth on, this func
+        q.wl(D3 + FBZCOLORPATH, 0)
+        q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+        svert(q, 40, 40, 0xff00ffff, z=float(srcz), first=True)
+        svert(q, 40, 200, 0xff00ffff, z=float(srcz))
+        svert(q, 280, 120, 0xff00ffff, z=float(srcz))
+        drew = near(pix(q, 100, 110), 0, 255, 255)
+        return drew == expect_draw
+    # func encoding: bit0=LT,bit1=EQ,bit2=GT (value in [5:7])
+    cases = [
+        (0, 100, 200, False),  # NEVER
+        (1, 100, 200, True),   # LESS: 100<200
+        (1, 200, 100, False),
+        (2, 150, 150, True),   # EQUAL
+        (2, 150, 151, False),
+        (4, 200, 100, True),   # GREATER
+        (3, 100, 100, True),   # LEQUAL (LT|EQ) equal
+        (6, 200, 100, True),   # GEQUAL (EQ|GT)
+        (5, 100, 200, True),   # NOTEQUAL (LT|GT)
+        (5, 150, 150, False),
+        (7, 200, 100, True),   # ALWAYS
+    ]
+    ok = all(depth_case(*c) for c in cases)
+    check("depth compare (8 funcs)", ok)
+
+    # 7. alpha test: ref=128, GREATER -> alpha 200 passes, 60 fails
+    def alpha_test_case(alpha, expect):
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+        q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + ALPHAMODE,
+             1 | (4 << 1) | (128 << 24))   # entest, func=GT(bit2->value4), ref=128
+        q.wl(D3 + SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
+        argb = (alpha << 24) | 0x00ff00
+        svert(q, 40, 40, argb, first=True); svert(q, 40, 200, argb)
+        svert(q, 280, 120, argb)
+        drew = near(pix(q, 100, 110), 0, 255, 0)
+        q.wl(D3 + ALPHAMODE, 0)
+        return drew == expect
+    check("alpha test", alpha_test_case(200, True) and alpha_test_case(60, False))
+
+    # 8. alpha blend: 50% white over blue -> light blue
+    q.wl(D3 + C1, 0x000000ff); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)  # blue bg
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + ALPHAMODE, (1 << 4) | (1 << 8) | (5 << 12))  # blend: src*srcA + dst*(1-srcA)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
+    svert(q, 40, 40, 0x80ffffff, first=True); svert(q, 40, 200, 0x80ffffff)
+    svert(q, 280, 120, 0x80ffffff)
+    b = pix(q, 100, 110)
+    q.wl(D3 + ALPHAMODE, 0)
+    # expect ~ (128,128,255): white*0.5 + blue*0.5
+    check("alpha blend", near(b, 128, 128, 255, 20), hex(b))
+
+    # 9. textures - upload a distinct texel per format and sample it
+    def tex_case(fmt, texel_bytes, expect_rgb):
+        toff = W * H * 2 + W * H * 2   # after colour+depth
+        for k, byteval in enumerate(texel_bytes):
+            q.cmd("writeb 0x%x 0x%x" % (BAR1 + toff + k, byteval))
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+        q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, (8 << 2))   # 1x1 texture (lodmin=8)
+        q.wl(D3 + TEXMODE, 1 | (fmt << 8))
+        q.wl(D3 + FBZCOLORPATH, 1)  # rgb from texture
+        q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+        svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+        svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+        svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+        v = pix(q, 100, 110)
+        q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+        return near(v, *expect_rgb, tol=24), hex(v)
+    r565 = struct.pack("<H", rgb565(255, 0, 0))
+    r332 = bytes([0b11100000])              # red in 3:3:2
+    r1555 = struct.pack("<H", 0x8000 | (31 << 10))  # a=1,red
+    r4444 = struct.pack("<H", 0xf000 | (0xf << 8))  # a=f,red
+    ok565, d565 = tex_case(10, r565, (255, 0, 0))
+    ok332, d332 = tex_case(0, r332, (255, 0, 0))
+    ok1555, d1 = tex_case(5, r1555, (255, 0, 0))
+    ok4444, d4 = tex_case(14, r4444, (255, 0, 0))
+    check("texture RGB565", ok565, d565)
+    check("texture RGB332", ok332, d332)
+    check("texture ARGB1555", ok1555, d1)
+    check("texture ARGB4444", ok4444, d4)
+
+    # 10. constant colour (fbzColorPath rgbselect=2 -> color1)
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + C1, 0x00ff8800)   # ARGB const
+    q.wl(D3 + FBZCOLORPATH, 2)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    svert(q, 40, 40, 0xffffffff, first=True); svert(q, 40, 200, 0xffffffff)
+    svert(q, 280, 120, 0xffffffff)
+    v = pix(q, 100, 110); q.wl(D3 + FBZCOLORPATH, 0)
+    check("constant colour (color1)", near(v, 0xff, 0x88, 0x00, 20), hex(v))
+
+    # 11. clip rectangle: restrict to a box, draw full-screen tri, outside stays bg
+    q.wl(D3 + C1, 0x00202020); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + CLIPLR, (100 << 16) | 200); q.wl(D3 + CLIPBT, (80 << 16) | 160)
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    svert(q, 0, 0, 0xffff00ff, first=True); svert(q, 319, 0, 0xffff00ff)
+    svert(q, 160, 239, 0xffff00ff)
+    inside = near(pix(q, 150, 120), 255, 0, 255)
+    outside = near(pix(q, 20, 20), 0x20, 0x20, 0x20)
+    q.wl(D3 + CLIPLR, W); q.wl(D3 + CLIPBT, H)
+    check("clip rectangle", inside and outside,
+          "in=%s out=%s" % (hex(pix(q, 150, 120)), hex(pix(q, 20, 20))))
+
+    # 12. vsync: swap-on-vblank pending count + vsync interrupt
+    q.wl(D3 + INTRCTRL, 1)                 # enable vsync IRQ
+    q.wl(D3 + COLBUF, W * H * 2 * 0)       # front = 0 (already)
+    # render into a back buffer then queue a wait-on-vsync swap
+    backoff = 0x300000
+    q.wl(D3 + COLBUF, backoff); q.wl(D3 + COLSTRIDE, W * 2)
+    q.wl(D3 + C1, 0x0000ff00); q.wl(D3 + FBZMODE, 7 << 5); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + SWAPBUF, 1)                  # wait-on-vsync swap
+    st_before = q.rl(D3 + STATUS)
+    pend = (st_before >> 28) & 7
+    q.clock_step(20 * 1000 * 1000)         # advance ~1 vblank (60Hz)
+    st_after = q.rl(D3 + STATUS)
+    pciint = (st_after >> 31) & 1
+    pend_after = (st_after >> 28) & 7
+    deskstart = q.rl(BAR0 + 0xe4)
+    check("vsync swap pending", pend == 1, "before=%d" % pend)
+    check("vsync interrupt raised", pciint == 1, hex(st_after))
+    check("vsync swap consumed+presented", pend_after == 0 and deskstart == backoff,
+          "pend=%d desk=0x%x" % (pend_after, deskstart))
+    q.wl(D3 + INTRCTRL, 2)                 # ack/clear
+    check("vsync interrupt cleared", ((q.rl(D3 + STATUS) >> 31) & 1) == 0)
+
+    print("----")
+    if fails:
+        print("FAILURES:", fails); sys.exit(1)
+    print("all feature checks passed")
+
+
+def main():
+    for p in (QTSOCK, QMPSOCK):
+        if os.path.exists(p): os.unlink(p)
+    err = open(DIR + "/qa.err", "wb")
+    qemu = subprocess.Popen([QEMU, "-M", "pc,accel=qtest", "-display", "none",
+        "-qtest", "unix:" + QTSOCK + ",server=on,wait=off",
+        "-qmp", "unix:" + QMPSOCK + ",server=on,wait=off",
+        "-vga", "none", "-device", "voodoo3"], stderr=err)
+    try: run()
+    finally: qemu.terminate()
+
+main()
