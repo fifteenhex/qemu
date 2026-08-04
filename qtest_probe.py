@@ -24,10 +24,13 @@ VA, VB, VC, STARTR, DPDX, DPDY, TRICMD = 0x008, 0x010, 0x018, 0x020, 0x040, 0x06
 FVA, FVB, FVC, FSTARTR, FDPDX, FDPDY, FTRICMD = 0x088, 0x090, 0x098, 0x0a0, 0x0c0, 0x0e0, 0x100
 SSETUPMODE, SVX, SVY, SARGB, SVZ, SWOOW, SSOW0, STOW0 = 0x260, 0x264, 0x268, 0x26c, 0x280, 0x284, 0x28c, 0x290
 SDRAW, SBEGIN = 0x2a0, 0x2a4
-TEXMODE, TLOD, TEXBASE = 0x300, 0x304, 0x30c
+TEXMODE, TLOD, TEXBASE, NCCTABLE0 = 0x300, 0x304, 0x30c, 0x324
+C0 = 0x144
 RGBW = 1 << 9
 ENCLIP = 1 << 0
 TC = (1<<12)|(1<<18)|(1<<21)|(1<<27)
+TEXEN = 1 << 27
+CC_MCLOCAL, CC_REVERSE, CC_ADD_CLOCAL = 1 << 10, 1 << 13, 1 << 14
 
 
 def f2i(f):
@@ -206,6 +209,77 @@ def run():
     inp = pix(t, 150, 120); out = pix(t, 20, 20)
     w3(t, CLIPLR, W); w3(t, CLIPBT, H)
     line("clip-rect", "in=0x%04x out=0x%04x" % (inp, out))
+
+    D2 = BAR0 + 0x100000
+    def w2(off, v): t.wl(D2 + off, v)
+    def flat_tex(argb=0xffffffff, s=0.0, tt=0.0):
+        w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+        vert(t, 40, 40, argb, 1, s=s, tt=tt)
+        vert(t, 40, 200, argb, 0, s=s, tt=tt)
+        vert(t, 280, 120, argb, 0, s=s, tt=tt)
+
+    # 12. more combine modes
+    clear(t, 0); t.ww(BAR1 + toff, 0xffff)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN | CC_MCLOCAL | CC_REVERSE)
+    flat_tex(0xff808080)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("combine-modulate-grey", "0x%04x" % pix(t, 100, 110))
+
+    clear(t, 0); t.ww(BAR1 + toff, 0xf800)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN | CC_ADD_CLOCAL)
+    flat_tex(0xff00ff00)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("combine-add", "0x%04x" % pix(t, 100, 110))
+
+    # 13. palette (P8) texture
+    clear(t, 0)
+    w3(t, NCCTABLE0 + 16 + (5 & 7) * 4, 0x80000000 | ((5 & 0xfe) << 23) | 0xff0000)
+    t.cmd("writeb 0x%x 0x5" % (BAR1 + toff))
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (5 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN); flat_tex()
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("tex-P8-palette", "0x%04x" % pix(t, 100, 110))
+
+    # 14. tiled texture, texel (64,0)
+    clear(t, 0); t.ww(BAR1 + toff + 4096, 0x07e0)
+    w3(t, TEXBASE, toff | 1 | (4 << 25)); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN); flat_tex(s=64.0, tt=0.0)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("tiled-uv-64-0", "0x%04x" % pix(t, 100, 110))
+
+    # 15. sub-256 LOD: 128x128 texture
+    clear(t, 0); t.ww(BAR1 + toff + ((256 * 256 * 2) & ~0xf), 0x001f)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 1 << 2); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN); flat_tex()
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("tex-128-lod1", "0x%04x" % pix(t, 100, 110))
+
+    # 16. mipmap LOD: L0 red, L1 green, minified 2x -> L1
+    clear(t, 0)
+    l1 = (256 * 256 * 2) & ~0xf
+    for yy in range(4):
+        for xx in range(4):
+            t.ww(BAR1 + toff + (yy * 256 + xx) * 2, 0xf800)
+            t.ww(BAR1 + toff + l1 + (yy * 128 + xx) * 2, 0x07e0)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0x100); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN)
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    vert(t, 10, 10, 0xffffffff, 1, s=0.0, tt=0.0)
+    vert(t, 138, 10, 0xffffffff, 0, s=256.0, tt=0.0)
+    vert(t, 10, 138, 0xffffffff, 0, s=0.0, tt=256.0)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("mipmap-lod", "0x%04x" % pix(t, 12, 12))
+
+    # 17. colour-source 2D host-to-screen blt
+    clear(t, 0)
+    w2(0x08, 0); w2(0x0c, 0x0fff0fff)
+    w2(0x10, 0); w2(0x14, (W * 2) | (3 << 16))
+    w2(0x54, 3 << 16); w2(0x68, 2 | (1 << 16)); w2(0x6c, 10 | (20 << 16))
+    w2(0x70, 0x03 | (0xcc << 24))
+    w2(0x80, 0xf800 | (0x07e0 << 16))
+    line("hostblt-color", "px0=0x%04x px1=0x%04x" % (pix(t, 10, 20), pix(t, 11, 20)))
 
 
 if __name__ == "__main__":

@@ -34,9 +34,10 @@
  * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
  * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
  * (miscInit0 30/31) is unimplemented. A second TMU, NCC (YIQ) textures,
- * mipmap LOD selection, the combine's LOD/Z/W factor sources, and
- * pixel-pipeline LFB writes are not modelled yet. Palette textures
- * (P8/P8_RGBA/AP88) are, via the nccTable0 CLUT download.
+ * trilinear mip blending (LOD picks the nearest level only), the combine's
+ * LOD/Z/W factor sources, and pixel-pipeline LFB writes are not modelled
+ * yet. Palette textures (P8/P8_RGBA/AP88) work via the nccTable0 CLUT
+ * download; the mip level is chosen from the screen-space LOD gradient.
  *
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
@@ -438,6 +439,8 @@ struct Voodoo3State {
     struct {
         bool active;
         uint32_t x, y;
+        uint32_t acc;       /* partial colour-source pixel accumulator */
+        uint32_t accn;      /* bytes accumulated in acc */
     } h2s;
 
     uint8_t mode;
@@ -885,9 +888,11 @@ static void voodoo3_2d_s2s_blt(Voodoo3State *s, uint32_t srcxy)
 }
 
 /*
- * Host-to-screen blt: the host streams data into the launch area.
- * Only monochrome expansion (source format 0) is implemented; rows
- * are consumed byte aligned which matches how tdfxfb packs them.
+ * Host-to-screen blt: the host streams data into the launch area. Source
+ * format 0 is a 1bpp monochrome expansion (fore/back colours), consumed
+ * byte aligned per row which matches how tdfxfb packs its text. The colour
+ * source formats (8/16/24/32bpp) stream packed pixels, each row padded to
+ * a 32-bit boundary.
  */
 static void voodoo3_2d_h2s_data(Voodoo3State *s, uint32_t data)
 {
@@ -901,15 +906,10 @@ static void voodoo3_2d_h2s_data(Voodoo3State *s, uint32_t data)
     uint32_t back = s->d2_regs[V3_2D_COLORBACK / 4];
     uint32_t dstbase = s->d2_regs[V3_2D_DSTBASE / 4] & 0xffffff;
     uint32_t dstride = s->d2_regs[V3_2D_DSTFORMAT / 4] & 0x3fff;
+    unsigned srcmode = (srcfmt >> 16) & 7;
     uint8_t rop = cmd >> 24;
     unsigned int byte, bit;
 
-    if (((srcfmt >> 16) & 7) != 0) {
-        qemu_log_mask(LOG_UNIMP,
-                      "voodoo3: only monochrome host blts implemented\n");
-        s->h2s.active = false;
-        return;
-    }
     if (!s->h2s.active) {
         if (!w || !h) {
             return;
@@ -917,7 +917,43 @@ static void voodoo3_2d_h2s_data(Voodoo3State *s, uint32_t data)
         s->h2s.active = true;
         s->h2s.x = 0;
         s->h2s.y = 0;
+        s->h2s.acc = 0;
+        s->h2s.accn = 0;
     }
+
+    if (srcmode != 0) {
+        /* colour source: accumulate bytes into pixels, dword-align rows */
+        unsigned sbpp = voodoo3_2d_bpp(srcfmt);
+
+        if (!sbpp) {
+            s->h2s.active = false;
+            return;
+        }
+        for (byte = 0; byte < 4 && s->h2s.active; byte++) {
+            s->h2s.acc |= (uint32_t)((data >> (byte * 8)) & 0xff)
+                          << (s->h2s.accn * 8);
+            if (++s->h2s.accn < sbpp) {
+                continue;
+            }
+            voodoo3_2d_plot(s, dx + s->h2s.x, dy + s->h2s.y, s->h2s.acc, rop);
+            s->h2s.acc = 0;
+            s->h2s.accn = 0;
+            if (++s->h2s.x >= w) {
+                s->h2s.x = 0;
+                s->h2s.acc = 0;
+                s->h2s.accn = 0;   /* drop rest of the word: dword row align */
+                if (++s->h2s.y >= h) {
+                    s->h2s.active = false;
+                    voodoo3_2d_dirty(s, dstbase + dy * dstride,
+                                     dstbase + (dy + h) * dstride +
+                                     4 * (dx + w));
+                }
+                break;
+            }
+        }
+        return;
+    }
+
     for (byte = 0; byte < 4 && s->h2s.active; byte++) {
         uint8_t b = data >> (byte * 8);
 
@@ -1371,7 +1407,7 @@ static uint32_t voodoo3_lod_offset(unsigned lod, unsigned bpt)
 }
 
 /* sample the texture at (sc,tc); point-sampled or bilinear per textureMode */
-static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
+static void voodoo3_texel(Voodoo3State *s, float sc, float tc, float lodval,
                           float *r, float *g, float *b, float *a)
 {
     uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
@@ -1381,8 +1417,39 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
     unsigned stride_tiles = (texbase >> 25) & 0x7f;  /* [31:25] tile stride */
     uint32_t lod = s->d3_regs[V3_3D_TLOD / 4];
     unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
-    unsigned lodmin = (lod & 0x3f) >> 2;  /* tLOD lodmin, 4.2 -> integer LOD */
-    unsigned dim = 256 >> (lodmin > 8 ? 8 : lodmin);
+    unsigned lodmin = (lod & 0x3f) >> 2;      /* tLOD lodmin, 4.2 -> integer */
+    unsigned lodmax = ((lod >> 6) & 0x3f) >> 2;
+    int lodbias_raw = (lod >> 12) & 0x3f;     /* 4.2 signed */
+    float lodbias, scale;
+    unsigned dim, level;
+    bool minifying;
+    bool clamps = tmode & V3_TEX_CLAMPS;
+    bool clampt = tmode & V3_TEX_CLAMPT;
+    bool bilinear;
+
+    lodmin = MIN(lodmin, 8);
+    lodmax = MIN(lodmax, 8);
+    lodmax = MAX(lodmax, lodmin);
+    lodbias = ((lodbias_raw & 0x20) ? lodbias_raw - 0x40 : lodbias_raw) / 4.0f;
+
+    /*
+     * Pick the mip level from the screen-space LOD (nearest level, no
+     * trilinear yet). lodval is log2(texels/pixel) relative to lodmin, so it
+     * is <=0 under magnification (stay at lodmin) and grows under
+     * minification. sc/tc are in lodmin-level texel units, so scale them
+     * down for the coarser level. Non-mipmapped textures have
+     * lodmin == lodmax and fall through unchanged.
+     */
+    {
+        float eff = lodval + lodbias;
+        int lev = (int)lodmin + (eff > 0 ? (int)(eff + 0.5f) : 0);
+        level = (unsigned)MIN(MAX(lev, (int)lodmin), (int)lodmax);
+    }
+    minifying = level > lodmin;
+    dim = 256 >> level;
+    scale = (float)(1u << (level - lodmin));
+    sc /= scale;
+    tc /= scale;
 
     /*
      * Add the per-level offset for the linear layout (verified with
@@ -1391,13 +1458,10 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
      * are still addressed from base.
      */
     if (!tiled) {
-        base += voodoo3_lod_offset(lodmin > 8 ? 8 : lodmin,
-                                   voodoo3_tfmt_bpt(fmt));
+        base += voodoo3_lod_offset(level, voodoo3_tfmt_bpt(fmt));
     }
-    bool clamps = tmode & V3_TEX_CLAMPS;
-    bool clampt = tmode & V3_TEX_CLAMPT;
-    /* no LOD gradient here, so use the magnification filter selector */
-    bool bilinear = tmode & V3_TEX_MAGFILTER;
+    /* minfilter minifies, magfilter magnifies */
+    bilinear = tmode & (minifying ? V3_TEX_MINFILTER : V3_TEX_MAGFILTER);
 
     if (!bilinear) {
         int u = voodoo3_wrap((int)floorf(sc), dim, clamps);
@@ -1426,10 +1490,12 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
                             ua, vb, &r01, &g01, &b01, &a01);
         voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
                             ub, vb, &r11, &g11, &b11, &a11);
-        *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
-        *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
-        *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;
-        *a = a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11;
+        /* hardware rounds the bilinear result to nearest (a 4-texel average
+         * of e.g. 127.5 lands on 128, not 127) */
+        *r = floorf(r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11 + 0.5f);
+        *g = floorf(g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11 + 0.5f);
+        *b = floorf(b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11 + 0.5f);
+        *a = floorf(a00 * w00 + a10 * w10 + a01 * w01 + a11 * w11 + 0.5f);
     }
 }
 
@@ -1633,6 +1699,12 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
         return; /* degenerate */
     }
 
+    /* screen-space derivatives of the edge functions (constant across the
+     * triangle), used to sample texcoords one pixel over for the mip LOD */
+    float de0dx = -(v2->y - v1->y), de0dy = (v2->x - v1->x);
+    float de1dx = -(v0->y - v2->y), de1dy = (v0->x - v2->x);
+    float de2dx = -(v1->y - v0->y), de2dy = (v1->x - v0->x);
+
     /*
      * Clip rectangle (left/right, top/bottom in packed form) - only
      * applied when fbzMode enables clipping, otherwise the whole buffer
@@ -1706,12 +1778,30 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                     float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
                     float sc = (l0 * v0->sow + l1 * v1->sow + l2 * v2->sow);
                     float tc = (l0 * v0->tow + l1 * v1->tow + l2 * v2->tow);
-                    float xr, xg, xb, xa;
+                    float xr, xg, xb, xa, lodval;
+                    /* texcoords one pixel over in x and y for the LOD */
+                    float l0x = (e0 + de0dx) / area, l1x = (e1 + de1dx) / area;
+                    float l2x = (e2 + de2dx) / area;
+                    float l0y = (e0 + de0dy) / area, l1y = (e1 + de1dy) / area;
+                    float l2y = (e2 + de2dy) / area;
+                    float ow_x = l0x * v0->oow + l1x * v1->oow + l2x * v2->oow;
+                    float sc_x = l0x * v0->sow + l1x * v1->sow + l2x * v2->sow;
+                    float tc_x = l0x * v0->tow + l1x * v1->tow + l2x * v2->tow;
+                    float ow_y = l0y * v0->oow + l1y * v1->oow + l2y * v2->oow;
+                    float sc_y = l0y * v0->sow + l1y * v1->sow + l2y * v2->sow;
+                    float tc_y = l0y * v0->tow + l1y * v1->tow + l2y * v2->tow;
+                    float dsx, dtx, dsy, dty, g2;
                     if (oow != 0) {
                         sc /= oow;
                         tc /= oow;
                     }
-                    voodoo3_texel(s, sc, tc, &xr, &xg, &xb, &xa);
+                    if (ow_x != 0) { sc_x /= ow_x; tc_x /= ow_x; }
+                    if (ow_y != 0) { sc_y /= ow_y; tc_y /= ow_y; }
+                    dsx = sc_x - sc; dtx = tc_x - tc;
+                    dsy = sc_y - sc; dty = tc_y - tc;
+                    g2 = MAX(dsx * dsx + dtx * dtx, dsy * dsy + dty * dty);
+                    lodval = g2 > 1e-12f ? 0.5f * log2f(g2) : 0.0f;
+                    voodoo3_texel(s, sc, tc, lodval, &xr, &xg, &xb, &xa);
                     voodoo3_tmu_combine(tmode, xr / 255.0f, xg / 255.0f,
                                         xb / 255.0f, xa / 255.0f,
                                         &tr, &tg, &tb, &ta);
@@ -2442,6 +2532,8 @@ static const VMStateDescription vmstate_voodoo3 = {
         VMSTATE_UINT32(h2s.y, Voodoo3State),
         VMSTATE_UINT8(mode, Voodoo3State),
         VMSTATE_UINT32_ARRAY_V(tex_palette, Voodoo3State, 256, 2),
+        VMSTATE_UINT32_V(h2s.acc, Voodoo3State, 2),
+        VMSTATE_UINT32_V(h2s.accn, Voodoo3State, 2),
         VMSTATE_END_OF_LIST()
     }
 };

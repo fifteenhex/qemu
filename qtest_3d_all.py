@@ -382,6 +382,43 @@ def run():
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
     check("P8 palette texture", near(v, 255, 0, 0, tol=24), hex(v))
 
+    # 9j. colour-source 2D host-to-screen blt: stream two 16bpp pixels into the
+    # launch area and check they land at the destination (red then green).
+    D2 = BAR0 + 0x100000
+    def w2(off, val): q.wl(D2 + off, val)
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    w2(0x08, 0); w2(0x0c, 0x0fff0fff)         # clip0 min/max
+    w2(0x10, 0); w2(0x14, (W * 2) | (3 << 16))  # dstbase, dstformat stride|16bpp
+    w2(0x54, 3 << 16)                          # srcformat: 16bpp colour source
+    w2(0x68, 2 | (1 << 16))                    # dstsize 2x1
+    w2(0x6c, 10 | (20 << 16))                  # dstxy (10,20)
+    w2(0x70, 0x03 | (0xcc << 24))              # command: H2S blt, ROP=SRCCOPY
+    w2(0x80, rgb565(255, 0, 0) | (rgb565(0, 255, 0) << 16))
+    hb0, hb1 = pix(q, 10, 20), pix(q, 11, 20)
+    check("host blt colour px0", near(hb0, 255, 0, 0, tol=24), hex(hb0))
+    check("host blt colour px1", near(hb1, 0, 255, 0, tol=24), hex(hb1))
+
+    # 9k. mipmap LOD selection: 2-level texture (L0 red, L1 green) mapped so
+    # the texture is minified 2x (256 texels over 128 px -> 2 texels/pixel ->
+    # LOD 1), so the sampled texel comes from L1 (green), not L0 (red).
+    toff = W * H * 2 * 8
+    l1off = (256 * 256 * 2) & ~0xf                # lodOffset(1) for 16bpp
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    for yy in range(4):
+        for xx in range(4):
+            q.ww(BAR1 + toff + (yy * 256 + xx) * 2, rgb565(255, 0, 0))          # L0
+            q.ww(BAR1 + toff + l1off + (yy * 128 + xx) * 2, rgb565(0, 255, 0))  # L1
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0x100)   # lodmin=0, lodmax=1
+    q.wl(D3 + TEXMODE, (10 << 8) | TC)
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 10, 10, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 138, 10, 0xffffffff, s=256.0, t=0.0)
+    svert(q, 10, 138, 0xffffffff, s=0.0, t=256.0)
+    mv = pix(q, 12, 12)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("mipmap LOD minified->L1", near(mv, 0, 255, 0, tol=48), hex(mv))
+
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
     q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)   # blue bg
