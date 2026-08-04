@@ -176,6 +176,14 @@ def run():
     w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
     line("bilinear", "0x%04x" % pix(t, 100, 110))
 
+    clear(t, 0); t.ww(BAR1 + toff, 0xffff)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | (1 << 27) | (1 << 10) | (1 << 13))
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    vert(t, 40, 40, 0xffff0000, 1); vert(t, 40, 200, 0xffff0000, 0); vert(t, 280, 120, 0xffff0000, 0)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("combine-modulate", "0x%04x" % pix(t, 100, 110))
+
     clear(t, 0x000000ff); w3(t, CHROMAKEY, 0x00ff00ff)
     w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 1)); w3(t, FBZCOLORPATH, 0)
     w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))

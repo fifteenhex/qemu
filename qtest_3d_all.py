@@ -332,6 +332,56 @@ def run():
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
     check("LOD offset (1x1)", near(v, 255, 0, 0, tol=24), hex(v))
 
+    # 9h. fbzColorPath combine unit. Ctmu = texel (REPLACE); the fbz stage
+    # then does out = (Cother - 0) * factor + 0. MODULATE = rgbselect texture,
+    # mselect MCLOCAL, reverse_blend, local iterated => texel * iterated.
+    def combine_case(cpath, texel, iterated_argb, expect_rgb):
+        toff = W * H * 2 * 6
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+        q.ww(BAR1 + toff, texel)
+        q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0)
+        q.wl(D3 + TEXMODE, (10 << 8) | TC)          # REPLACE -> Ctmu = texel
+        q.wl(D3 + FBZCOLORPATH, cpath)
+        q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+        svert(q, 40, 40, iterated_argb, first=True, s=0.0, t=0.0)
+        svert(q, 40, 200, iterated_argb, s=0.0, t=0.0)
+        svert(q, 280, 120, iterated_argb, s=0.0, t=0.0)
+        val = pix(q, 100, 110)
+        q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+        return near(val, *expect_rgb, tol=24), hex(val)
+    TEXEN = 1 << 27
+    MODULATE = 1 | TEXEN | (1 << 10) | (1 << 13)   # rgbsel=tex, MCLOCAL, reverse
+    REPLACE_TEX = 1 | TEXEN                         # rgbsel=tex, cc passes texel
+    # white texel * red iterated -> red (a plain REPLACE would give white)
+    okm, dm = combine_case(MODULATE, rgb565(255, 255, 255), 0xffff0000, (255, 0, 0))
+    check("combine modulate white*red", okm, dm)
+    # white texel * 50% grey iterated -> grey (scaling works)
+    okg, dg = combine_case(MODULATE, rgb565(255, 255, 255), 0xff808080, (128, 128, 128))
+    check("combine modulate white*grey", okg, dg)
+    # rgbselect=texture, cc pass-through -> texel unchanged (green)
+    okr, dr = combine_case(REPLACE_TEX, rgb565(0, 255, 0), 0xffff0000, (0, 255, 0))
+    check("combine replace texel", okr, dr)
+
+    # 9i. P8 palette texture: download a CLUT entry via nccTable0[4..11]
+    # (bit31 | index<<24 | rgb), then index it from an 8bpp texel.
+    def nccpal(idx, rgb):
+        q.wl(D3 + 0x324 + 16 + (idx & 7) * 4,
+             0x80000000 | ((idx & 0xFE) << 23) | (rgb & 0xFFFFFF))
+    toff = W * H * 2 * 7
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    nccpal(5, 0xff0000)                              # palette[5] = red
+    q.cmd("writeb 0x%x 0x5" % (BAR1 + toff))        # texel(0,0) = index 5
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0)
+    q.wl(D3 + TEXMODE, (5 << 8) | TC)               # P8, REPLACE -> palette[5]
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+    svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+    v = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("P8 palette texture", near(v, 255, 0, 0, tol=24), hex(v))
+
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
     q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)   # blue bg

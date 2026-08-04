@@ -26,20 +26,23 @@
  * alpha/Z, and the fog table), alpha blend, fastfill and swapbuffer,
  * over a 565 colour and 16bpp depth buffer.
  *
+ * The colour path implements the full SST combine units: the textureMode
+ * tc/tca combine (TMU colour from the texel) feeding the fbzColorPath cc/cca
+ * combine (final colour), so pass/replace/modulate/blend all work.
+ *
  * Simplifications: memory is always 16 MB (dramInit sizing bits are
  * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
  * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
- * (miscInit0 30/31) is unimplemented. The colour path uses the
- * rgb/aselect mux rather than the full fbzColorPath/textureMode combine
- * units; palette/NCC textures, mipmap LOD selection, a second TMU, and
- * pixel-pipeline LFB writes are not modelled yet.
+ * (miscInit0 30/31) is unimplemented. A second TMU, NCC (YIQ) textures,
+ * mipmap LOD selection, the combine's LOD/Z/W factor sources, and
+ * pixel-pipeline LFB writes are not modelled yet. Palette textures
+ * (P8/P8_RGBA/AP88) are, via the nccTable0 CLUT download.
  *
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
- * tdfx_texmap. texBaseAddr is taken as the corner of the sampled level;
- * the hardware treats it as the corner of the virtual 256x256 level, so
- * mip/sub-256 textures still need the per-level offset added (TODO,
- * pending a hardware probe of the smaller LODs).
+ * tdfx_texmap; the linear per-level (sub-256/mip) offset is applied and
+ * hw-validated with tdfx_texlod. The tiled per-level offset is not applied
+ * yet (tiled + mipmapped + sub-256 only).
  */
 
 #include "qemu/osdep.h"
@@ -236,6 +239,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_3D_TEXTUREMODE       0x300
 #define V3_3D_TLOD              0x304
 #define V3_3D_TEXBASEADDR       0x30c
+#define V3_3D_NCCTABLE0         0x324    /* nccTable0[12]: NCC + palette */
 
 #define V3_3D_INTRCTRL          0x004   /* interrupt control */
 
@@ -291,13 +295,33 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_BLEND_OMCOLOR        0x6
 #define V3_BLEND_OMDSTALPHA     0x7
 
-/* fbzColorPath bits (subset) */
-#define V3_CP_RGBSELECT_MASK    0x3     /* 0=iterated, 1=texture, 2=color1 */
+/*
+ * fbzColorPath: input selects plus the RGB (cc_*) and alpha (cca_*) combine
+ * units. The combine is out = (other - clocal) * factor + add, factor picked
+ * by mselect and flipped by reverse_blend; see voodoo3_combine1.
+ */
+#define V3_CP_RGBSELECT_MASK    0x3     /* 0=iterated 1=texture 2=color1 3=lfb */
 #define V3_CP_ASELECT_SHIFT     2
 #define V3_CP_ASELECT_MASK      (0x3 << V3_CP_ASELECT_SHIFT)
+#define V3_CP_LOCALSELECT       BIT(4)   /* 0=iterated 1=color0 */
+#define V3_CP_ALOCALSELECT_SHIFT 5       /* 0=iter.a 1=c0.a 2=z 3=w */
+#define V3_CP_CC_ZERO_OTHER     BIT(8)
+#define V3_CP_CC_SUB_CLOCAL     BIT(9)
+#define V3_CP_CC_MSELECT_SHIFT  10
+#define V3_CP_CC_REVERSE_BLEND  BIT(13)
+#define V3_CP_CC_ADD_CLOCAL     BIT(14)
+#define V3_CP_CC_ADD_ALOCAL     BIT(15)
+#define V3_CP_CC_INVERT_OUTPUT  BIT(16)
+#define V3_CP_CCA_ZERO_OTHER    BIT(17)
+#define V3_CP_CCA_SUB_CLOCAL    BIT(18)
+#define V3_CP_CCA_MSELECT_SHIFT 19
+#define V3_CP_CCA_REVERSE_BLEND BIT(22)
+#define V3_CP_CCA_ADD_CLOCAL    BIT(23)
+#define V3_CP_CCA_ADD_ALOCAL    BIT(24)
+#define V3_CP_CCA_INVERT_OUTPUT BIT(25)
 #define V3_CP_TEXTURE_EN        BIT(27) /* enable texture mapping (TREX->FBI) */
 
-/* textureMode bits */
+/* textureMode bits, incl. the TMU RGB (tc_*) and alpha (tca_*) combine */
 #define V3_TEX_ENABLE           BIT(0)   /* perspective/enable (tpersp) */
 #define V3_TEX_MINFILTER        BIT(1)   /* 1 = bilinear minification */
 #define V3_TEX_MAGFILTER        BIT(2)   /* 1 = bilinear magnification */
@@ -305,8 +329,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_TEX_CLAMPT           BIT(7)   /* 1 = clamp T (else wrap) */
 #define V3_TEX_TFORMAT_SHIFT    8
 #define V3_TEX_TFORMAT_MASK     (0xf << V3_TEX_TFORMAT_SHIFT)
+#define V3_TEX_TC_ZERO_OTHER    BIT(12)
+#define V3_TEX_TC_SUB_CLOCAL    BIT(13)
+#define V3_TEX_TC_MSELECT_SHIFT 14
+#define V3_TEX_TC_REVERSE_BLEND BIT(17)
 #define V3_TEX_TC_ADD_CLOCAL    BIT(18)  /* TMU RGB: add local texel */
+#define V3_TEX_TC_ADD_ALOCAL    BIT(19)
+#define V3_TEX_TC_INVERT_OUTPUT BIT(20)
+#define V3_TEX_TCA_ZERO_OTHER   BIT(21)
+#define V3_TEX_TCA_SUB_CLOCAL   BIT(22)
+#define V3_TEX_TCA_MSELECT_SHIFT 23
+#define V3_TEX_TCA_REVERSE_BLEND BIT(26)
 #define V3_TEX_TCA_ADD_CLOCAL   BIT(27)  /* TMU alpha: add local texel */
+#define V3_TEX_TCA_ADD_ALOCAL   BIT(28)
+#define V3_TEX_TCA_INVERT_OUTPUT BIT(29)
 /* texture formats (textureMode[11:8]) - values per the Avenger spec */
 #define V3_TFMT_RGB332          0        /* 8bpp 3-3-2 */
 #define V3_TFMT_YIQ             1        /* 8bpp NCC (table 0) */
@@ -395,6 +431,8 @@ struct Voodoo3State {
     bool draminit0_written;
     bool draminit1_written;
     bool dram_mode_set;
+
+    uint32_t tex_palette[256];  /* texture CLUT, 0xRRGGBB (nccTable0 download) */
 
     /* host-to-screen blt in progress */
     struct {
@@ -1245,7 +1283,16 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
             *a = (px >> 4) * 255 / 15;
             *r = *g = *b = (px & 0xf) * 255 / 15;
             break;
-        default: /* P8/P8_RGBA/YIQ: palette+NCC not modelled -> intensity */
+        case V3_TFMT_P8:
+        case V3_TFMT_P8_RGBA: {
+            /* palette lookup (P8_RGBA's 6666 alpha isn't downloaded -> 255) */
+            uint32_t c = s->tex_palette[px];
+            *r = (c >> 16) & 0xff;
+            *g = (c >> 8) & 0xff;
+            *b = c & 0xff;
+            break;
+        }
+        default: /* YIQ: NCC not modelled -> intensity */
             *r = *g = *b = px;
             break;
         }
@@ -1280,7 +1327,16 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
         *a = (t >> 8) & 0xff;
         *r = *g = *b = t & 0xff;
         break;
-    default: /* AYIQ/AP88: palette+NCC not modelled -> alpha+intensity */
+    case V3_TFMT_AP88: {
+        /* alpha(8) : palette(8) */
+        uint32_t c = s->tex_palette[t & 0xff];
+        *a = (t >> 8) & 0xff;
+        *r = (c >> 16) & 0xff;
+        *g = (c >> 8) & 0xff;
+        *b = c & 0xff;
+        break;
+    }
+    default: /* AYIQ: NCC not modelled -> alpha+intensity */
         *a = (t >> 8) & 0xff;
         *r = *g = *b = t & 0xff;
         break;
@@ -1407,6 +1463,136 @@ static float voodoo3_fog_factor(Voodoo3State *s, uint32_t srcz)
 }
 
 /*
+ * SST colour/alpha combine unit, shared by the textureMode (tc/tca, TMU
+ * output) and fbzColorPath (cc/cca, final colour) stages. One channel:
+ *   out = ((zero_other ? 0 : other) - (sub_clocal ? clocal : 0)) * factor
+ *          + (add_clocal ? clocal : add_alocal ? alocal : 0)   [invert]
+ * factor = reverse_blend ? base : (1 - base), base picked by mselect. mselect
+ * MONE (0) gives base 0 -> factor 1, so a zeroed control word passes its
+ * input through - which is why fbzColorPath/textureMode = 0 emit the iterated
+ * colour / the texel unchanged.
+ */
+typedef struct {
+    bool zero_other, sub_clocal, reverse, add_clocal, add_alocal, invert;
+    unsigned mselect;
+} V3Combine;
+
+static V3Combine v3_comb_ctl(uint32_t w, int zero, int sub, int msel,
+                             int rev, int addc, int adda, int inv)
+{
+    V3Combine c;
+    c.zero_other = (w >> zero) & 1;
+    c.sub_clocal = (w >> sub) & 1;
+    c.mselect    = (w >> msel) & 7;
+    c.reverse    = (w >> rev) & 1;
+    c.add_clocal = (w >> addc) & 1;
+    c.add_alocal = (w >> adda) & 1;
+    c.invert     = (w >> inv) & 1;
+    return c;
+}
+
+/* mselect base value: MONE, MCLOCAL, MAOTHER, MALOCAL, MATMU, MRGBTMU
+ * (mselect 4/5 are LOD-based for the TMU stage; unmodelled -> 0) */
+static float v3_mbase(unsigned msel, float clocal, float aother,
+                      float alocal, float atmu, float ctmu)
+{
+    switch (msel & 7) {
+    case 1: return clocal;
+    case 2: return aother;
+    case 3: return alocal;
+    case 4: return atmu;
+    case 5: return ctmu;
+    default: return 0.0f;
+    }
+}
+
+static float v3_comb(const V3Combine *c, float other, float clocal,
+                     float base, float alocal)
+{
+    float o = c->zero_other ? 0.0f : other;
+    float s = c->sub_clocal ? clocal : 0.0f;
+    float f = c->reverse ? base : (1.0f - base);
+    float add = c->add_clocal ? clocal : (c->add_alocal ? alocal : 0.0f);
+    float out = (o - s) * f + add;
+
+    if (c->invert) {
+        out = 1.0f - out;
+    }
+    return v3_clampf(out, 0.0f, 1.0f);
+}
+
+/*
+ * textureMode combine for a single TMU (the downstream "other" input is
+ * zero): fold the fetched texel through the tc/tca combine into the TMU
+ * colour. All values 0..1.
+ */
+static void voodoo3_tmu_combine(uint32_t tmode,
+                                float tr, float tg, float tb, float ta,
+                                float *or_, float *og, float *ob, float *oa)
+{
+    V3Combine cc = v3_comb_ctl(tmode, 12, 13, 14, 17, 18, 19, 20);
+    V3Combine ca = v3_comb_ctl(tmode, 21, 22, 23, 26, 27, 28, 29);
+
+    *or_ = v3_comb(&cc, 0.0f, tr, v3_mbase(cc.mselect, tr, 0, ta, 0, 0), ta);
+    *og  = v3_comb(&cc, 0.0f, tg, v3_mbase(cc.mselect, tg, 0, ta, 0, 0), ta);
+    *ob  = v3_comb(&cc, 0.0f, tb, v3_mbase(cc.mselect, tb, 0, ta, 0, 0), ta);
+    *oa  = v3_comb(&ca, 0.0f, ta, v3_mbase(ca.mselect, ta, 0, ta, 0, 0), ta);
+}
+
+/*
+ * fbzColorPath combine: select the "other" (iterated / TMU / color1) and
+ * "local" (iterated / color0) inputs and fold them through the cc/cca
+ * combine into the final pixel colour. All values 0..1.
+ */
+static void voodoo3_fbz_combine(uint32_t cpath,
+                                float ir, float ig, float ib, float ia,
+                                float tr, float tg, float tb, float ta,
+                                uint32_t c0, uint32_t c1, float zl, float wl,
+                                float *fr, float *fg, float *fb, float *fa)
+{
+    unsigned rgbsel = cpath & 3;
+    unsigned asel = (cpath >> V3_CP_ASELECT_SHIFT) & 3;
+    bool localsel = cpath & V3_CP_LOCALSELECT;
+    unsigned alocalsel = (cpath >> V3_CP_ALOCALSELECT_SHIFT) & 3;
+    float c0r = ((c0 >> 16) & 0xff) / 255.0f, c0g = ((c0 >> 8) & 0xff) / 255.0f;
+    float c0b = (c0 & 0xff) / 255.0f, c0a = ((c0 >> 24) & 0xff) / 255.0f;
+    float c1r = ((c1 >> 16) & 0xff) / 255.0f, c1g = ((c1 >> 8) & 0xff) / 255.0f;
+    float c1b = (c1 & 0xff) / 255.0f, c1a = ((c1 >> 24) & 0xff) / 255.0f;
+    float o_r, o_g, o_b, o_a, l_r, l_g, l_b, l_a;
+    V3Combine cc = v3_comb_ctl(cpath, 8, 9, 10, 13, 14, 15, 16);
+    V3Combine ca = v3_comb_ctl(cpath, 17, 18, 19, 22, 23, 24, 25);
+
+    switch (rgbsel) {
+    case 1:  o_r = tr; o_g = tg; o_b = tb; break;           /* texture */
+    case 2:  o_r = c1r; o_g = c1g; o_b = c1b; break;        /* color1 */
+    case 3:  o_r = o_g = o_b = 0; break;                    /* lfb (n/a) */
+    default: o_r = ir; o_g = ig; o_b = ib; break;           /* iterated */
+    }
+    switch (asel) {
+    case 1:  o_a = ta; break;
+    case 2:  o_a = c1a; break;
+    case 3:  o_a = 0; break;
+    default: o_a = ia; break;
+    }
+    if (localsel) {
+        l_r = c0r; l_g = c0g; l_b = c0b;
+    } else {
+        l_r = ir; l_g = ig; l_b = ib;
+    }
+    switch (alocalsel) {
+    case 1:  l_a = c0a; break;
+    case 2:  l_a = zl; break;
+    case 3:  l_a = wl; break;
+    default: l_a = ia; break;
+    }
+
+    *fr = v3_comb(&cc, o_r, l_r, v3_mbase(cc.mselect, l_r, o_a, l_a, ta, tr), l_a);
+    *fg = v3_comb(&cc, o_g, l_g, v3_mbase(cc.mselect, l_g, o_a, l_a, ta, tg), l_a);
+    *fb = v3_comb(&cc, o_b, l_b, v3_mbase(cc.mselect, l_b, o_a, l_a, ta, tb), l_a);
+    *fa = v3_comb(&ca, o_a, l_a, v3_mbase(ca.mselect, l_a, o_a, l_a, ta, ta), l_a);
+}
+
+/*
  * Rasterise one triangle through the pixel pipeline: Gouraud colour or
  * texture, depth test/write, chroma-key, alpha test, fog and alpha
  * blending, honouring fbzMode/alphaMode/fbzColorPath/textureMode/fogMode.
@@ -1429,12 +1615,11 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     uint32_t clr = s->d3_regs[V3_3D_CLIPLEFTRIGHT / 4];
     uint32_t cbt = s->d3_regs[V3_3D_CLIPBOTTOMTOP / 4];
     unsigned zfunc = (fbz & V3_FBZ_ZFUNC_MASK) >> V3_FBZ_ZFUNC_SHIFT;
-    unsigned rgbsel = cpath & V3_CP_RGBSELECT_MASK;
     unsigned afunc = (alpham & V3_ALPHA_FUNC_MASK) >> V3_ALPHA_FUNC_SHIFT;
     unsigned sblend = (alpham >> V3_ALPHA_SRCFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
     unsigned dblend = (alpham >> V3_ALPHA_DSTFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
     unsigned aref = (alpham >> V3_ALPHA_REF_SHIFT) & 0xff;
-    bool texen = (rgbsel == 1) && (cpath & V3_CP_TEXTURE_EN);
+    bool texen = cpath & V3_CP_TEXTURE_EN;
     int clx0, clx1, cly0, cly1;
     float area, minx, maxx, miny, maxy;
     int ix0, ix1, iy0, iy1, x, y;
@@ -1507,38 +1692,41 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 }
             }
 
-            if (texen) {
-                float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
-                float sc = (l0 * v0->sow + l1 * v1->sow + l2 * v2->sow);
-                float tc = (l0 * v0->tow + l1 * v1->tow + l2 * v2->tow);
-                if (oow != 0) {
-                    sc /= oow;
-                    tc /= oow;
+            {
+                /* iterated (Gouraud) colour, 0..1 */
+                float ir = v3_clampf(l0 * v0->r + l1 * v1->r + l2 * v2->r, 0, 255) / 255.0f;
+                float ig = v3_clampf(l0 * v0->g + l1 * v1->g + l2 * v2->g, 0, 255) / 255.0f;
+                float ib = v3_clampf(l0 * v0->b + l1 * v1->b + l2 * v2->b, 0, 255) / 255.0f;
+                float ia = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255) / 255.0f;
+                float tr = 0, tg = 0, tb = 0, ta = 0, fr, fg, fb, fa;
+
+                /* TMU: fetch the (perspective-correct) texel and fold it
+                 * through the textureMode combine into the TMU colour */
+                if (texen) {
+                    float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
+                    float sc = (l0 * v0->sow + l1 * v1->sow + l2 * v2->sow);
+                    float tc = (l0 * v0->tow + l1 * v1->tow + l2 * v2->tow);
+                    float xr, xg, xb, xa;
+                    if (oow != 0) {
+                        sc /= oow;
+                        tc /= oow;
+                    }
+                    voodoo3_texel(s, sc, tc, &xr, &xg, &xb, &xa);
+                    voodoo3_tmu_combine(tmode, xr / 255.0f, xg / 255.0f,
+                                        xb / 255.0f, xa / 255.0f,
+                                        &tr, &tg, &tb, &ta);
                 }
-                voodoo3_texel(s, sc, tc, &sr, &sg, &sb, &sa);
-                /*
-                 * Single-TMU combine: the texel reaches the TMU output
-                 * only when textureMode adds the local texel; with the
-                 * combine at reset the TMU emits zero (so a texture needs
-                 * the combine set up, unlike plain iterated colour).
-                 */
-                if (!(tmode & V3_TEX_TC_ADD_CLOCAL)) {
-                    sr = sg = sb = 0;
-                }
-                if (!(tmode & V3_TEX_TCA_ADD_CLOCAL)) {
-                    sa = 0;
-                }
-            } else if (rgbsel == 2) {
-                uint32_t c1 = s->d3_regs[V3_3D_C1 / 4];
-                sr = (c1 >> 16) & 0xff;
-                sg = (c1 >> 8) & 0xff;
-                sb = c1 & 0xff;
-                sa = (c1 >> 24) & 0xff;
-            } else {
-                sr = v3_clampf(l0 * v0->r + l1 * v1->r + l2 * v2->r, 0, 255);
-                sg = v3_clampf(l0 * v0->g + l1 * v1->g + l2 * v2->g, 0, 255);
-                sb = v3_clampf(l0 * v0->b + l1 * v1->b + l2 * v2->b, 0, 255);
-                sa = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255);
+
+                /* fbzColorPath combine -> final pixel colour, 0..255 */
+                voodoo3_fbz_combine(cpath, ir, ig, ib, ia, tr, tg, tb, ta,
+                                    s->d3_regs[V3_3D_C0 / 4],
+                                    s->d3_regs[V3_3D_C1 / 4],
+                                    v3_clampf(zf / 65535.0f, 0, 1), 1.0f,
+                                    &fr, &fg, &fb, &fa);
+                sr = fr * 255.0f;
+                sg = fg * 255.0f;
+                sb = fb * 255.0f;
+                sa = fa * 255.0f;
             }
 
             /* chroma-key: discard pixels whose colour matches chromaKey */
@@ -1900,6 +2088,19 @@ static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
     s->d3_regs[reg / 4] = deposit32(s->d3_regs[reg / 4], (addr & 3) * 8,
                                     size * 8, data);
 
+    /*
+     * Texture palette download: entries are written to nccTable0[4..11]
+     * with bit 31 set, the CLUT index packed in [30:24] and 0xRRGGBB in
+     * [23:0] (Glide _grTexDownloadPalette). Capture them into tex_palette.
+     */
+    if (reg >= V3_3D_NCCTABLE0 + 16 && reg < V3_3D_NCCTABLE0 + 48 &&
+        (s->d3_regs[reg / 4] & 0x80000000)) {
+        uint32_t v = s->d3_regs[reg / 4];
+        unsigned col = (reg - (V3_3D_NCCTABLE0 + 16)) / 4;   /* 0..7 */
+        unsigned row = ((v >> 24) & 0x7f) >> 2;              /* 0..31 */
+        s->tex_palette[row * 8 + col] = v & 0xffffff;
+    }
+
     switch (reg) {
     case V3_3D_TRIANGLECMD:
         voodoo3_direct_tri(s, false);
@@ -2184,6 +2385,7 @@ static void voodoo3_reset(DeviceState *dev)
     memset(s->io_regs, 0, sizeof(s->io_regs));
     memset(s->d2_regs, 0, sizeof(s->d2_regs));
     memset(s->d3_regs, 0, sizeof(s->d3_regs));
+    memset(s->tex_palette, 0, sizeof(s->tex_palette));
     s->snvert = 0;
     /*
      * Cold power-on state: PLLs unlocked, DRAM controller
@@ -2222,7 +2424,7 @@ static int voodoo3_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_voodoo3 = {
     .name = "voodoo3",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = voodoo3_post_load,
     .fields = (const VMStateField[]) {
@@ -2239,6 +2441,7 @@ static const VMStateDescription vmstate_voodoo3 = {
         VMSTATE_UINT32(h2s.x, Voodoo3State),
         VMSTATE_UINT32(h2s.y, Voodoo3State),
         VMSTATE_UINT8(mode, Voodoo3State),
+        VMSTATE_UINT32_ARRAY_V(tex_palette, Voodoo3State, 256, 2),
         VMSTATE_END_OF_LIST()
     }
 };
