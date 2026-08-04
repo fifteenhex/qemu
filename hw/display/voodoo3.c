@@ -33,6 +33,13 @@
  * rgb/aselect mux rather than the full fbzColorPath/textureMode combine
  * units; palette/NCC textures, mipmap LOD selection, a second TMU, and
  * pixel-pipeline LFB writes are not modelled yet.
+ *
+ * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
+ * with the tile stride in [31:25]) is validated against hardware with
+ * tdfx_texmap. texBaseAddr is taken as the corner of the sampled level;
+ * the hardware treats it as the corner of the virtual 256x256 level, so
+ * mip/sub-256 textures still need the per-level offset added (TODO,
+ * pending a hardware probe of the smaller LODs).
  */
 
 #include "qemu/osdep.h"
@@ -1177,13 +1184,39 @@ static unsigned voodoo3_tfmt_bpt(unsigned fmt)
     return fmt <= V3_TFMT_P8_RGBA ? 1 : 2;
 }
 
+/*
+ * Texture memory address of texel (u,v). A linear texture is row-major with
+ * a dim-wide pitch. A tiled texture (texBaseAddr bit 0) is stored in
+ * 128-byte x 32-row tiles laid out tile-row-major, the tile stride coming
+ * from texBaseAddr[31:25] in tiles. Both layouts verified against hardware
+ * with tdfx_texmap: e.g. for a 256x256 16bpp tiled surface texel (64,0)
+ * lands at slot 2048 and (0,32) at slot 8192, matching this arithmetic.
+ */
+#define V3_TILE_W 128u   /* bytes  */
+#define V3_TILE_H 32u    /* rows   */
+
+static uint32_t voodoo3_texel_off(uint32_t base, unsigned bpt, unsigned dim,
+                                  bool tiled, unsigned stride_tiles,
+                                  int u, int v)
+{
+    if (tiled) {
+        unsigned xb = (unsigned)u * bpt;
+        unsigned tx = xb / V3_TILE_W, ix = xb % V3_TILE_W;
+        unsigned ty = (unsigned)v / V3_TILE_H, iy = (unsigned)v % V3_TILE_H;
+        return base + (ty * stride_tiles + tx) * (V3_TILE_W * V3_TILE_H)
+                    + iy * V3_TILE_W + ix;
+    }
+    return base + (unsigned)(v * (int)dim + u) * bpt;
+}
+
 /* fetch and decode one texel at integer (u,v) into 0..255 RGBA floats */
 static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
-                                unsigned dim, int u, int v,
+                                unsigned dim, bool tiled, unsigned stride_tiles,
+                                int u, int v,
                                 float *r, float *g, float *b, float *a)
 {
     unsigned bpt = voodoo3_tfmt_bpt(fmt);
-    uint32_t off = base + (unsigned)(v * (int)dim + u) * bpt;
+    uint32_t off = voodoo3_texel_off(base, bpt, dim, tiled, stride_tiles, u, v);
     uint32_t t;
 
     *a = 255.0f;
@@ -1260,16 +1293,48 @@ static int voodoo3_wrap(int c, unsigned dim, bool clamp)
     return c & (int)(dim - 1);
 }
 
+/*
+ * texBaseAddr points at the corner of the virtual 256x256 level, so when a
+ * smaller level is sampled its texel(0,0) sits at base + lodOffset(L), where
+ * lodOffset is the memory occupied by the larger levels (Glide's
+ * _grTexCalcBaseAddress: sum of texels of levels 0..L-1, times bpt, aligned
+ * down to 16). Square textures only, matching the rest of this sampler.
+ */
+static uint32_t voodoo3_lod_offset(unsigned lod, unsigned bpt)
+{
+    uint32_t texels = 0;
+    unsigned i;
+    for (i = 0; i < lod; i++) {
+        unsigned d = 256u >> i;
+        texels += d * d;
+    }
+    return (texels * bpt) & ~0xfu;
+}
+
 /* sample the texture at (sc,tc); point-sampled or bilinear per textureMode */
 static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
                           float *r, float *g, float *b, float *a)
 {
     uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
-    uint32_t base = s->d3_regs[V3_3D_TEXBASEADDR / 4] & 0xffffff;
+    uint32_t texbase = s->d3_regs[V3_3D_TEXBASEADDR / 4];
+    uint32_t base = texbase & 0xfffff0;   /* [23:4] byte address, 16-byte units */
+    bool tiled = texbase & 1;             /* [0] SST_TEXTURE_IS_TILED */
+    unsigned stride_tiles = (texbase >> 25) & 0x7f;  /* [31:25] tile stride */
     uint32_t lod = s->d3_regs[V3_3D_TLOD / 4];
     unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
     unsigned lodmin = (lod & 0x3f) >> 2;  /* tLOD lodmin, 4.2 -> integer LOD */
     unsigned dim = 256 >> (lodmin > 8 ? 8 : lodmin);
+
+    /*
+     * Add the per-level offset for the linear layout (verified with
+     * tdfx_texlod). The tiled layout's per-level offset is not applied yet
+     * (pending the tiled column of that probe), so tiled sub-256 textures
+     * are still addressed from base.
+     */
+    if (!tiled) {
+        base += voodoo3_lod_offset(lodmin > 8 ? 8 : lodmin,
+                                   voodoo3_tfmt_bpt(fmt));
+    }
     bool clamps = tmode & V3_TEX_CLAMPS;
     bool clampt = tmode & V3_TEX_CLAMPT;
     /* no LOD gradient here, so use the magnification filter selector */
@@ -1278,7 +1343,8 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
     if (!bilinear) {
         int u = voodoo3_wrap((int)floorf(sc), dim, clamps);
         int v = voodoo3_wrap((int)floorf(tc), dim, clampt);
-        voodoo3_fetch_texel(s, base, fmt, dim, u, v, r, g, b, a);
+        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+                            u, v, r, g, b, a);
         return;
     } else {
         float fs = sc - 0.5f, ft = tc - 0.5f;
@@ -1293,10 +1359,14 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc,
         float r00, g00, b00, a00, r10, g10, b10, a10;
         float r01, g01, b01, a01, r11, g11, b11, a11;
 
-        voodoo3_fetch_texel(s, base, fmt, dim, ua, va, &r00, &g00, &b00, &a00);
-        voodoo3_fetch_texel(s, base, fmt, dim, ub, va, &r10, &g10, &b10, &a10);
-        voodoo3_fetch_texel(s, base, fmt, dim, ua, vb, &r01, &g01, &b01, &a01);
-        voodoo3_fetch_texel(s, base, fmt, dim, ub, vb, &r11, &g11, &b11, &a11);
+        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+                            ua, va, &r00, &g00, &b00, &a00);
+        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+                            ub, va, &r10, &g10, &b10, &a10);
+        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+                            ua, vb, &r01, &g01, &b01, &a01);
+        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+                            ub, vb, &r11, &g11, &b11, &a11);
         *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
         *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
         *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;

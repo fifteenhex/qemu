@@ -245,7 +245,7 @@ def run():
         for k, byteval in enumerate(texel_bytes):
             q.cmd("writeb 0x%x 0x%x" % (BAR1 + toff + k, byteval))
         q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
-        q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, (8 << 2))   # 1x1 texture (lodmin=8)
+        q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0)   # 256x256: texel(0,0) at base
         q.wl(D3 + TEXMODE, (fmt << 8) | TC)             # point sample + pass texel
         q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))  # rgbselect=texture + texture enable
         q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
@@ -268,13 +268,14 @@ def run():
     check("texture ARGB1555", ok1555, d1)
     check("texture ARGB4444", ok4444, d4)
 
-    # 9e. bilinear filtering: 2x2 texture, sample the centre -> 4-texel average
+    # 9e. bilinear filtering: 256x256 texture, 4 distinct texels at (0,0),
+    # (1,0),(0,1),(1,1); sample the centre -> equal 4-texel average
     q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
     toff = W * H * 2 * 3
-    for k, texv in enumerate([rgb565(255, 0, 0), rgb565(0, 255, 0),
-                              rgb565(0, 0, 255), rgb565(255, 255, 255)]):
-        q.ww(BAR1 + toff + k * 2, texv)
-    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 7 << 2)      # 2x2 (lodmin=7)
+    for slot, texv in [(0, rgb565(255, 0, 0)), (1, rgb565(0, 255, 0)),
+                       (256, rgb565(0, 0, 255)), (257, rgb565(255, 255, 255))]:
+        q.ww(BAR1 + toff + slot * 2, texv)
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0)           # 256x256
     q.wl(D3 + TEXMODE, (10 << 8) | (1 << 2) | TC)          # RGB565 + magfilter + pass texel
     q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
     q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
@@ -284,6 +285,52 @@ def run():
     v = pix(q, 100, 110)
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
     check("bilinear filter", near(v, 127, 127, 127, tol=40), hex(v))
+
+    # 9f. tiled texture addressing: 256x256 (TLOD 0), tiled base (bit0) with a
+    # 4-tile stride. Hardware (tdfx_texmap) puts texel (64,0) at byte 4096 and
+    # (0,32) at byte 16384 within the surface, vs 128 / 8192 if it were linear.
+    # Plant the "tiled" colour at the tiled offset and a decoy at the linear
+    # offset; a correct tiled fetch returns the tiled colour.
+    def tiled_case(u, v_, tiled_byte, expect_rgb):
+        toff = W * H * 2 * 4
+        q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+        q.ww(BAR1 + toff + tiled_byte, rgb565(*expect_rgb))     # tiled location
+        q.ww(BAR1 + toff + (v_ * 256 + u) * 2, rgb565(0, 0, 255))  # linear decoy
+        q.wl(D3 + TEXBASE, toff | 1 | (4 << 25))   # tiled, stride 4 tiles
+        q.wl(D3 + TLOD, 0)                          # 256x256
+        q.wl(D3 + TEXMODE, (10 << 8) | TC)
+        q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+        q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+        svert(q, 40, 40, 0xffffffff, first=True, s=float(u), t=float(v_))
+        svert(q, 40, 200, 0xffffffff, s=float(u), t=float(v_))
+        svert(q, 280, 120, 0xffffffff, s=float(u), t=float(v_))
+        val = pix(q, 100, 110)
+        q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+        return near(val, *expect_rgb, tol=24), hex(val)
+    okt1, dt1 = tiled_case(64, 0, 4096, (255, 0, 0))
+    okt2, dt2 = tiled_case(64, 32, 20480, (0, 255, 0))
+    check("tiled texture (64,0)", okt1, dt1)
+    check("tiled texture (64,32)", okt2, dt2)
+
+    # 9g. sub-256 LOD base offset: texBaseAddr is the virtual 256x256 corner,
+    # so a 1x1 texture's texel(0,0) sits at base + lodOffset(8). Plant red
+    # there and a blue decoy at base; a correct fetch returns red.
+    def lodoff(L, bpt=2):
+        return (sum((256 >> i) ** 2 for i in range(L)) * bpt) & ~0xf
+    toff = W * H * 2 * 5
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    q.ww(BAR1 + toff + lodoff(8), rgb565(255, 0, 0))   # texel at base + offset
+    q.ww(BAR1 + toff, rgb565(0, 0, 255))               # decoy at base
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 8 << 2)  # 1x1 (lodmin=8)
+    q.wl(D3 + TEXMODE, (10 << 8) | TC)
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+    svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+    v = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("LOD offset (1x1)", near(v, 255, 0, 0, tol=24), hex(v))
 
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
