@@ -272,6 +272,25 @@ def run():
     w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
     line("mipmap-lod", "0x%04x" % pix(t, 12, 12))
 
+    # 16b. NCC (YIQ) texture
+    clear(t, 0)
+    w3(t, NCCTABLE0 + 0, 0); w3(t, NCCTABLE0 + 16, (255 << 9)); w3(t, NCCTABLE0 + 32, 0)
+    t.cmd("writeb 0x%x 0x0" % (BAR1 + toff))
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (1 << 8) | TC)
+    w3(t, FBZCOLORPATH, 1 | TEXEN); flat_tex()
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("tex-YIQ-ncc", "0x%04x" % pix(t, 100, 110))
+
+    # 18. table fog: full fog -> pixel replaced with fogColor (red)
+    clear(t, 0); w3(t, FBZCOLORPATH, 0); w3(t, FOGCOLOR, 0xff0000)
+    for i in range(32):
+        w3(t, 0x160 + i * 4, 0xff00ff00)
+    w3(t, FOGMODE, 1)
+    w3(t, SSETUPMODE, 1 | (1 << 1) | (1 << 2) | (1 << 3))
+    vert(t, 40, 40, 0xff00ff00, 1); vert(t, 40, 200, 0xff00ff00, 0); vert(t, 280, 120, 0xff00ff00, 0)
+    w3(t, FOGMODE, 0)
+    line("fog-table-full", "0x%04x" % pix(t, 100, 110))
+
     # 17. colour-source 2D host-to-screen blt
     clear(t, 0)
     w2(0x08, 0); w2(0x0c, 0x0fff0fff)

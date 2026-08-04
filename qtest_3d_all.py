@@ -419,6 +419,26 @@ def run():
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
     check("mipmap LOD minified->L1", near(mv, 0, 255, 0, tol=48), hex(mv))
 
+    # 9l. NCC (YIQ) texture: build a table so texel 0 -> green (Y0=0, I0=(0,255,0),
+    # Q0=0), then sample a YIQ (fmt 1) texel of index 0.
+    toff = W * H * 2 * 9
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    NCC0 = 0x324
+    q.wl(D3 + NCC0 + 0, 0)                         # Y[0..3] = 0
+    q.wl(D3 + NCC0 + 16, (0 << 18) | (255 << 9) | 0)  # I[0] = (r0,g255,b0)
+    q.wl(D3 + NCC0 + 32, 0)                        # Q[0] = 0
+    q.cmd("writeb 0x%x 0x0" % (BAR1 + toff))       # texel(0,0) = index 0
+    q.wl(D3 + TEXBASE, toff); q.wl(D3 + TLOD, 0)
+    q.wl(D3 + TEXMODE, (1 << 8) | TC)              # fmt 1 = YIQ
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+    svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+    nv = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("NCC YIQ texture", near(nv, 0, 255, 0, tol=24), hex(nv))
+
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
     q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)   # blue bg

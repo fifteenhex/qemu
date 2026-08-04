@@ -33,11 +33,13 @@
  * Simplifications: memory is always 16 MB (dramInit sizing bits are
  * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
  * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
- * (miscInit0 30/31) is unimplemented. A second TMU, NCC (YIQ) textures,
- * trilinear mip blending (LOD picks the nearest level only), the combine's
- * LOD/Z/W factor sources, and pixel-pipeline LFB writes are not modelled
- * yet. Palette textures (P8/P8_RGBA/AP88) work via the nccTable0 CLUT
- * download; the mip level is chosen from the screen-space LOD gradient.
+ * (miscInit0 30/31) is unimplemented. Trilinear mip blending (the LOD picks
+ * the nearest level only), the combine's LOD/Z/W factor sources, and
+ * pixel-pipeline LFB writes (a Glide-only path; the fbdev uses the linear
+ * aperture) are not modelled yet. All texture formats work, including
+ * palette (P8/P8_RGBA/AP88) via the nccTable0 CLUT download and NCC
+ * (YIQ/AYIQ) via the nccTable0 Y/I/Q tables; the mip level is chosen from
+ * the screen-space LOD gradient. (The Voodoo3 has a single TMU.)
  *
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
@@ -369,7 +371,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_FOG_CONSTANT         BIT(5)   /* add fogColor constant */
 
 /* fog table: 32 32-bit words (64 entries), 3D reg index 0x60 */
-#define V3_3D_FOGTABLE          0x180
+#define V3_3D_FOGTABLE          0x160    /* 32 words (64 entries), ends at 0x1e0 */
 #define V3_3D_FOGTABLE_NB       32
 
 /* sSetupMode: which per-vertex params are valid */
@@ -1262,6 +1264,34 @@ static unsigned voodoo3_tfmt_bpt(unsigned fmt)
 }
 
 /*
+ * NCC (YIQ) decode. nccTable0 packs 16 Y bytes (4 per word in [0..3]) and two
+ * 4-entry chroma tables I and Q as 3x 9-bit signed values per word (I in
+ * [4..7], Q in [8..11]; Glide g3df.c packing). The 8-bit texel selects
+ * iy=[7:4], ia=[3:2], ib=[1:0] and each channel is Y[iy] + I[ia] + Q[ib],
+ * clamped (Glide txYABtoPal256).
+ */
+static void voodoo3_ncc_texel(Voodoo3State *s, uint8_t px,
+                              float *r, float *g, float *b)
+{
+    const uint32_t *ncc = &s->d3_regs[V3_3D_NCCTABLE0 / 4];
+    unsigned iy = (px >> 4) & 0xf, ia = (px >> 2) & 3, ib = px & 3;
+    int y = (ncc[iy >> 2] >> ((iy & 3) * 8)) & 0xff;
+    float *out[3] = { r, g, b };
+    int c;
+
+    for (c = 0; c < 3; c++) {
+        int iv = (ncc[4 + ia] >> (18 - c * 9)) & 0x1ff;
+        int qv = (ncc[8 + ib] >> (18 - c * 9)) & 0x1ff;
+        int v;
+
+        iv = (iv & 0x100) ? iv - 0x200 : iv;   /* 9-bit signed */
+        qv = (qv & 0x100) ? qv - 0x200 : qv;
+        v = y + iv + qv;
+        *out[c] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+}
+
+/*
  * Texture memory address of texel (u,v). A linear texture is row-major with
  * a dim-wide pitch. A tiled texture (texBaseAddr bit 0) is stored in
  * 128-byte x 32-row tiles laid out tile-row-major, the tile stride coming
@@ -1328,7 +1358,10 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
             *b = c & 0xff;
             break;
         }
-        default: /* YIQ: NCC not modelled -> intensity */
+        case V3_TFMT_YIQ:
+            voodoo3_ncc_texel(s, px, r, g, b);
+            break;
+        default: /* unreachable (all 1-byte formats handled) */
             *r = *g = *b = px;
             break;
         }
@@ -1372,7 +1405,11 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
         *b = c & 0xff;
         break;
     }
-    default: /* AYIQ: NCC not modelled -> alpha+intensity */
+    case V3_TFMT_AYIQ:
+        *a = (t >> 8) & 0xff;
+        voodoo3_ncc_texel(s, t & 0xff, r, g, b);
+        break;
+    default: /* unreachable (all 2-byte formats handled) */
         *a = (t >> 8) & 0xff;
         *r = *g = *b = t & 0xff;
         break;
@@ -1506,18 +1543,37 @@ static inline float v3_edge(const V3Vertex *a, const V3Vertex *b,
 }
 
 /*
- * Fog blending factor from the 64-entry fog table. The hardware indexes
- * it with the MSBs of a normalised float(1/w); lacking that here we index
- * by the iterated Z and interpolate with the low bits - good enough to
- * exercise the table, exact indexing to be confirmed on real hardware.
+ * Fog blending factor from the 64-entry fog table, indexed by eye-space W
+ * (= 1/oow): the entries correspond to the W values Glide's
+ * guFogTableIndexToW(i) produces, so bracket W between two entries and
+ * interpolate factor + delta*frac (each entry packs an 8-bit fog value and
+ * an 8-bit delta). The exact hw index derivation from the float W bits may
+ * differ by an entry at the boundaries; confirm with a W-gradient probe.
  */
-static float voodoo3_fog_factor(Voodoo3State *s, uint32_t srcz)
+/* eye-space W at fog table entry i (Glide guFogTableIndexToW) */
+static float v3_fog_w(int i)
 {
-    unsigned idx = (srcz >> 10) & 0x3f;
-    unsigned frac = (srcz >> 2) & 0xff;
-    uint32_t word = s->d3_regs[(V3_3D_FOGTABLE / 4) + (idx >> 1)];
+    return (float)(1u << (3 + (i >> 2))) / (8 - (i & 3));
+}
+
+static float voodoo3_fog_factor(Voodoo3State *s, float w)
+{
+    int idx = 0;
+    float w0, w1, frac;
+    uint32_t word;
     unsigned factor, delta;
 
+    /* the 64 entries correspond to the W values guFogTableIndexToW(i);
+     * find the bracketing entry and interpolate factor + delta*frac */
+    while (idx < 63 && w >= v3_fog_w(idx + 1)) {
+        idx++;
+    }
+    w0 = v3_fog_w(idx);
+    w1 = v3_fog_w(idx < 63 ? idx + 1 : 63);
+    frac = w1 > w0 ? (w - w0) / (w1 - w0) : 0.0f;
+    frac = v3_clampf(frac, 0, 1);
+
+    word = s->d3_regs[(V3_3D_FOGTABLE / 4) + (idx >> 1)];
     if (idx & 1) {
         factor = (word >> 24) & 0xff;
         delta = (word >> 16) & 0xff;
@@ -1525,7 +1581,7 @@ static float voodoo3_fog_factor(Voodoo3State *s, uint32_t srcz)
         factor = (word >> 8) & 0xff;
         delta = word & 0xff;
     }
-    return v3_clampf((factor + delta * frac / 256.0f) / 255.0f, 0, 1);
+    return v3_clampf((factor + delta * frac) / 255.0f, 0, 1);
 }
 
 /*
@@ -1862,7 +1918,8 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                     } else if (fogm & V3_FOG_ALPHA) {
                         af = sa / 255.0f;
                     } else {
-                        af = voodoo3_fog_factor(s, srcz);
+                        float ow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
+                        af = voodoo3_fog_factor(s, ow > 1e-9f ? 1.0f / ow : 1e9f);
                     }
                     af = v3_clampf(af, 0, 1);
                     sr = v3_clampf(af * ar + (1 - af) * cr, 0, 255);
