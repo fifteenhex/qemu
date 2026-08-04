@@ -530,6 +530,18 @@ struct Voodoo3State {
     int64_t max_busy_ns;        /* cap on queued virtual debt (FIFO backpressure) */
     int64_t fifo_ns;            /* backlog that reads as a full command FIFO */
 
+    /*
+     * DMA command FIFO (cmdFifo0): a ring in VRAM the guest fills with command
+     * packets, then advances via the `bump` register; we parse+execute them
+     * through the normal register-write path.  Registers live in the SstCRegs
+     * block at aperture 0x80000 (cmdFifo0 at +0x20).  See CMDFIFO.md.
+     */
+    uint32_t cmdfifo_base;      /* ring base (VRAM byte offset, or bus addr if AGP) */
+    uint32_t cmdfifo_size;      /* ring size in bytes */
+    uint32_t cmdfifo_rdptr;     /* read pointer (VRAM byte offset, or bus addr if AGP) */
+    bool cmdfifo_en;
+    bool cmdfifo_agp;           /* ring is in system RAM, read via PCI DMA */
+
     bool draminit0_written;
     bool draminit1_written;
     bool dram_mode_set;
@@ -3116,12 +3128,242 @@ static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
 /* ---------------------------------------------------------------- */
 /* memory regions                                                   */
 
+/* ---------------------------------------------------------------- */
+/* DMA command FIFO (cmdFifo0) -- see CMDFIFO.md                     */
+/* ---------------------------------------------------------------- */
+#define V3_CMDFIFO0            0x80020      /* SstCRegs + 0x20 */
+#define V3_CMDFIFO_BASEADDRL   (V3_CMDFIFO0 + 0x00)
+#define V3_CMDFIFO_BASESIZE    (V3_CMDFIFO0 + 0x04)
+#define V3_CMDFIFO_BUMP        (V3_CMDFIFO0 + 0x08)
+#define V3_CMDFIFO_RDPTRL      (V3_CMDFIFO0 + 0x0c)
+#define V3_CMDFIFO_DEPTH       (V3_CMDFIFO0 + 0x24)
+#define V3_CMDFIFO_EN          BIT(8)       /* baseSize[8] */
+#define V3_CMDFIFO_AGP         BIT(9)       /* baseSize[9]: ring in system RAM */
+
+/*
+ * Read one ring word.  The ring normally lives in VRAM (a local byte offset);
+ * with the AGP bit set it lives in system RAM and is fetched by PCI DMA at the
+ * bus address the guest programmed -- exactly what a target that CAN bus-master
+ * would use.  The payload is little-endian in memory either way.
+ */
+static uint32_t voodoo3_cmdfifo_ld(Voodoo3State *s, uint32_t addr)
+{
+    if (s->cmdfifo_agp) {
+        uint32_t v = 0;
+
+        pci_dma_read(&s->dev, addr, &v, 4);
+        return le32_to_cpu(v);
+    }
+    return ldl_le_p(s->vga.vram_ptr + addr);
+}
+
+/* would reading `n` bytes at `addr` fall outside the ring / mapped VRAM? */
+static bool voodoo3_cmdfifo_oob(Voodoo3State *s, uint32_t addr, uint32_t n)
+{
+    if (s->cmdfifo_agp) {
+        return (uint64_t)addr + n > (uint64_t)s->cmdfifo_base + s->cmdfifo_size;
+    }
+    return addr + n > s->vga.vram_size;
+}
+
+/*
+ * Execute up to `nbytes` of command packets from the ring starting at the read
+ * pointer.  PKT0 NOP/JMP handle ring control; PKT1 is a register-write burst,
+ * executed through the same 2D/3D write path as PIO so all engine behaviour is
+ * reused.  Rasterisation is synchronous, so the whole committed range runs here
+ * and the read pointer ends at the write position.  PKT2/PKT4 are not parsed.
+ */
+static void voodoo3_cmdfifo_run(Voodoo3State *s, uint32_t nbytes)
+{
+    uint32_t rp = s->cmdfifo_rdptr, consumed = 0;
+
+    if (!s->cmdfifo_en || !s->cmdfifo_size) {
+        return;
+    }
+    while (consumed + 4 <= nbytes) {
+        uint32_t hdr, type;
+
+        if (voodoo3_cmdfifo_oob(s, rp, 4)) {
+            break;
+        }
+        hdr = voodoo3_cmdfifo_ld(s, rp);
+        rp += 4;
+        consumed += 4;
+        type = hdr & 7;
+        if (type == 0) {                        /* PKT0: control */
+            if (((hdr >> 3) & 7) == 3) {        /* JMP_LOCAL: wrap */
+                rp = ((hdr >> 6) & 0x7fffff) << 2;
+            }
+        } else if (type == 1) {                 /* PKT1: register burst */
+            uint32_t regbase = ((hdr >> 3) & 0x3ff) << 2;
+            bool is2d = hdr & BIT(14);
+            bool inc = hdr & BIT(15);
+            uint32_t nw = (hdr >> 16) & 0xffff, i;
+
+            for (i = 0; i < nw && consumed + 4 <= nbytes; i++) {
+                uint32_t off = regbase + (inc ? i * 4 : 0), val;
+
+                if (voodoo3_cmdfifo_oob(s, rp, 4)) {
+                    break;
+                }
+                val = voodoo3_cmdfifo_ld(s, rp);
+                rp += 4;
+                consumed += 4;
+                if (is2d) {
+                    voodoo3_2d_write(s, off, val, 4);
+                } else {
+                    voodoo3_3d_write(s, off, val, 4);
+                }
+            }
+        } else if (type == 3) {                 /* PKT3: native setup vertices */
+            uint32_t cmd = (hdr >> 3) & 7;      /* BDDBDD/BDDDDD/DDDDDD */
+            uint32_t nvert = (hdr >> 6) & 0xf;
+            uint32_t pmask = (hdr >> 10) & 0xfff;   /* SST_SETUP_* bits */
+            bool packed = hdr & BIT(28);
+            bool trunc = false;
+            uint32_t vtx, w;
+
+            /* read one data word into `w`, guarding ring/commit bounds */
+#define V3_PKT3_RD() do {                                                     \
+                if (voodoo3_cmdfifo_oob(s, rp, 4) || consumed + 4 > nbytes) { \
+                    trunc = true; goto pkt3_end;                             \
+                }                                                            \
+                w = voodoo3_cmdfifo_ld(s, rp);                               \
+                rp += 4; consumed += 4;                                       \
+            } while (0)
+            for (vtx = 0; vtx < nvert; vtx++) {
+                /* op per vertex: begin resets the strip window (v0) */
+                bool begin = (cmd == 0) ? (vtx % 3 == 0)
+                           : (cmd == 1) ? (vtx == 0) : false;
+
+                V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SVX, w, 4);
+                V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SVY, w, 4);
+                if (pmask & BIT(0)) {           /* RGB */
+                    if (packed) {
+                        V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SARGB, w, 4);
+                    } else {
+                        V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SRED, w, 4);
+                        V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SGREEN, w, 4);
+                        V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SBLUE, w, 4);
+                    }
+                }
+                if (pmask & BIT(1)) {           /* A */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SALPHA, w, 4);
+                }
+                if (pmask & BIT(2)) {           /* Z */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SVZ, w, 4);
+                }
+                if (pmask & BIT(3)) {           /* Wfbi (1/w) */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SWOOWFBI, w, 4);
+                }
+                if (pmask & BIT(4)) {           /* W tmu0 */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SOOW0, w, 4);
+                }
+                if (pmask & BIT(5)) {           /* S0,T0 */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SSOW0, w, 4);
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_STOW0, w, 4);
+                }
+                if (pmask & BIT(6)) {           /* W tmu1 */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SOOW1, w, 4);
+                }
+                if (pmask & BIT(7)) {           /* S1,T1 */
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_SSOW1, w, 4);
+                    V3_PKT3_RD(); voodoo3_3d_write(s, V3_3D_STOW1, w, 4);
+                }
+                voodoo3_3d_write(s, begin ? V3_3D_SBEGINTRICMD
+                                          : V3_3D_SDRAWTRICMD, 1, 4);
+            }
+pkt3_end:
+#undef V3_PKT3_RD
+            if (trunc) {
+                break;                          /* malformed: stop parsing */
+            }
+        } else if (type == 5) {                 /* PKT5: linear data burst */
+            uint32_t nwords = (hdr >> 3) & 0x7ffff;
+            uint32_t space = (hdr >> 30) & 3;   /* 0 LFB, 1 YUV, 2 3DLFB, 3 TEXPORT */
+            uint32_t base, i;
+
+            /* word1 = destination base byte address (4-aligned) */
+            if (voodoo3_cmdfifo_oob(s, rp, 4) || consumed + 4 > nbytes) {
+                break;
+            }
+            base = voodoo3_cmdfifo_ld(s, rp) & 0x1ffffff;
+            rp += 4;
+            consumed += 4;
+            /*
+             * The payload is inline in the ring; write it linearly into VRAM.
+             * LFB/TEXPORT are raw linear writes (texture / framebuffer data);
+             * YUV / 3DLFB colour-convert paths are not modelled -- their words
+             * are still consumed so the stream stays aligned.
+             */
+            for (i = 0; i < nwords; i++) {
+                uint32_t d;
+
+                if (voodoo3_cmdfifo_oob(s, rp, 4) || consumed + 4 > nbytes) {
+                    break;
+                }
+                d = voodoo3_cmdfifo_ld(s, rp);
+                rp += 4;
+                consumed += 4;
+                if ((space == 0 || space == 3) &&
+                    (uint64_t)base + i * 4 + 4 <= s->vga.vram_size) {
+                    stl_le_p(s->vga.vram_ptr + base + i * 4, d);
+                }
+            }
+        } else {
+            break;                              /* unhandled packet: stop */
+        }
+        if (rp >= s->cmdfifo_base + s->cmdfifo_size) {
+            rp = s->cmdfifo_base;               /* auto-wrap */
+        }
+    }
+    s->cmdfifo_rdptr = rp;
+}
+
+static void voodoo3_cmd_write(Voodoo3State *s, hwaddr addr, uint32_t val)
+{
+    switch (addr) {
+    case V3_CMDFIFO_BASEADDRL:
+        s->cmdfifo_base = (val & 0xffffff) << 12;   /* 4KB pages -> bytes */
+        s->cmdfifo_rdptr = s->cmdfifo_base;
+        break;
+    case V3_CMDFIFO_BASESIZE:
+        s->cmdfifo_size = ((val & 0xff) + 1) << 12;
+        s->cmdfifo_en = val & V3_CMDFIFO_EN;
+        s->cmdfifo_agp = val & V3_CMDFIFO_AGP;   /* ring in system RAM */
+        break;
+    case V3_CMDFIFO_RDPTRL:
+        s->cmdfifo_rdptr = val;
+        break;
+    case V3_CMDFIFO_BUMP:
+        voodoo3_cmdfifo_run(s, val);                /* commit `val` bytes */
+        break;
+    default:
+        break;
+    }
+}
+
+static uint32_t voodoo3_cmd_read(Voodoo3State *s, hwaddr addr)
+{
+    switch (addr) {
+    case V3_CMDFIFO_RDPTRL:
+        return s->cmdfifo_rdptr;
+    case V3_CMDFIFO_DEPTH:
+        return 0;                                   /* synchronous: drained */
+    default:
+        return 0;
+    }
+}
+
 static uint64_t voodoo3_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     Voodoo3State *s = opaque;
 
     if (addr < 0x100) {
         return voodoo3_reg_read(s, addr, size);
+    }
+    if (addr >= 0x80000 && addr < 0x80100) {
+        return voodoo3_cmd_read(s, addr);
     }
     if (addr >= 0x100000 && addr < 0x200000) {
         return voodoo3_2d_read(s, addr - 0x100000, size);
@@ -3139,6 +3381,8 @@ static void voodoo3_mmio_write(void *opaque, hwaddr addr, uint64_t data,
 
     if (addr < 0x100) {
         voodoo3_reg_write(s, addr, data, size);
+    } else if (addr >= 0x80000 && addr < 0x80100) {
+        voodoo3_cmd_write(s, addr, data);
     } else if (addr >= 0x100000 && addr < 0x200000) {
         voodoo3_2d_write(s, addr - 0x100000, data, size);
     } else if (addr >= 0x200000 && addr < 0x600000) {
@@ -3400,6 +3644,9 @@ static void voodoo3_reset(DeviceState *dev)
     s->vsync_irq = false;
     s->idle_irq = false;
     s->busy_until = 0;
+    s->cmdfifo_en = false;
+    s->cmdfifo_agp = false;
+    s->cmdfifo_base = s->cmdfifo_size = s->cmdfifo_rdptr = 0;
     pci_set_irq(&s->dev, 0);
 
     memset(s->io_regs, 0, sizeof(s->io_regs));
