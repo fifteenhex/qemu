@@ -306,6 +306,37 @@ def run():
     w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0); w3(t, 0x800 + 0x300, 0)
     line("dual-tmu-mtex", "0x%04x" % pix(t, 100, 110))
 
+    # 20. tiled sub-256 mip: level 1 of a tiled texture, stride 6 tiles
+    clear(t, 0)
+    t.ww(BAR1 + W * H * 2 * 12 + 0x4000, 0xf800)
+    w3(t, TEXBASE, (W * H * 2 * 12) | 1 | (6 << 25)); w3(t, TLOD, 1 << 2)
+    w3(t, TEXMODE, (10 << 8) | TC); w3(t, FBZCOLORPATH, 1 | TEXEN)
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    vert(t, 40, 40, 0xffffffff, 1); vert(t, 40, 200, 0xffffffff, 0); vert(t, 280, 120, 0xffffffff, 0)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0)
+    line("tiled-sub256-lod", "0x%04x" % pix(t, 100, 110))
+
+    # 21. dithering (fbzMode ENDITHER): flat R=4 -> ordered-dithered r5
+    clear(t, 0)
+    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 8))
+    w3(t, FBZCOLORPATH, 0); w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    vert(t, 40, 40, 0xff040000, 1); vert(t, 40, 200, 0xff040000, 0); vert(t, 280, 120, 0xff040000, 0)
+    w3(t, FBZMODE, (7 << 5) | RGBW)
+    line("dither-4x4", "lo=0x%04x hi=0x%04x" % (pix(t, 100, 110), pix(t, 100, 101)))
+
+    # 22. chroma-range: key out R in [10,20]; R=15 keyed, R=30 drawn
+    w3(t, FBZCOLORPATH, 0)
+    w3(t, 0x134, 0x0a0000); w3(t, 0x138, 0x14ffff)
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    w3(t, C1, 0x000000ff); w3(t, FBZMODE, (7 << 5) | RGBW); w3(t, FASTFILL, 1)
+    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 1) | (1 << 28))
+    vert(t, 40, 40, 0xff0f0000, 1); vert(t, 40, 200, 0xff0f0000, 0); vert(t, 280, 120, 0xff0f0000, 0)
+    ck = pix(t, 100, 110)
+    vert(t, 40, 40, 0xff1e0000, 1); vert(t, 40, 200, 0xff1e0000, 0); vert(t, 280, 120, 0xff1e0000, 0)
+    cd = pix(t, 100, 110)
+    w3(t, FBZMODE, (7 << 5) | RGBW)
+    line("chroma-range", "keyed=0x%04x drawn=0x%04x" % (ck, cd))
+
     # 17. colour-source 2D host-to-screen blt
     clear(t, 0)
     w2(0x08, 0); w2(0x0c, 0x0fff0fff)

@@ -48,8 +48,8 @@
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
  * tdfx_texmap; the linear per-level (sub-256/mip) offset is applied and
- * hw-validated with tdfx_texlod. The tiled per-level offset is not applied
- * yet (tiled + mipmapped + sub-256 only).
+ * hw-validated with tdfx_texlod. The tiled per-level offset ports Glide's
+ * fractal mip packing (square textures, all levels present).
  */
 
 #include "qemu/osdep.h"
@@ -221,6 +221,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_3D_FOGCOLOR          0x12c
 #define V3_3D_ZACOLOR           0x130
 #define V3_3D_CHROMAKEY         0x134
+#define V3_3D_CHROMARANGE       0x138
 #define V3_3D_C0                0x144
 #define V3_3D_C1                0x148
 #define V3_3D_RENDERMODE        0x1e0
@@ -276,12 +277,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 /* fbzMode bits */
 #define V3_FBZ_ENCLIP           BIT(0)
 #define V3_FBZ_ENCHROMAKEY      BIT(1)
+#define V3_FBZ_ENCHROMARANGE    BIT(28)
+/* chromaRange register mode bits */
+#define V3_CR_BLUE_EX           BIT(24)
+#define V3_CR_GREEN_EX          BIT(25)
+#define V3_CR_RED_EX            BIT(26)
+#define V3_CR_BLOCK_OR          BIT(27)
 #define V3_FBZ_ENDEPTH          BIT(4)
 #define V3_FBZ_ZFUNC_SHIFT      5
 #define V3_FBZ_ZFUNC_MASK       (0x7 << V3_FBZ_ZFUNC_SHIFT)
 #define V3_FBZ_ENDITHER         BIT(8)
 #define V3_FBZ_RGBWRMASK        BIT(9)
 #define V3_FBZ_DEPTHWRMASK      BIT(10)
+#define V3_FBZ_DITHER2x2        BIT(11)  /* 0 = 4x4 dither, 1 = 2x2 */
 #define V3_FBZ_DRAWBUFFER_SHIFT 14
 #define V3_FBZ_DRAWBUFFER_MASK  (0x3 << V3_FBZ_DRAWBUFFER_SHIFT)
 #define V3_FBZ_ENWBUFFER        BIT(20)
@@ -1458,6 +1466,50 @@ static uint32_t voodoo3_lod_offset(unsigned lod, unsigned bpt)
     return (texels * bpt) & ~0xfu;
 }
 
+/*
+ * Tiled per-level offset. The mip chain is packed 2D (256 on the left, the
+ * smaller levels stacked to its right) with a texStrideBytes pitch, then that
+ * (x,y) position is converted to the tiled address (128x32 tiles, tile stride
+ * texStrideTiles). Ports Glide's _grTexCalcMipmapLevelOffsetTiled +
+ * _grTexCalcBaseAddressTiled for a square texture with all levels present.
+ * lod is the sampled level in this model's numbering (dim = 256 >> lod).
+ */
+static uint32_t voodoo3_tiled_lod_offset(unsigned lod, unsigned bpt,
+                                         unsigned stride_tiles)
+{
+    /* contribution of each Glide level (0..7) to the 2D corner position */
+    static const struct { uint16_t dx, dy; } contrib[8] = {
+        {0, 2}, {0, 4}, {0, 8}, {0, 16}, {32, 0}, {64, 0}, {0, 128}, {256, 0},
+    };
+    unsigned g = lod >= 8 ? 0 : 8 - lod;   /* Glide level of the sampled lod */
+    uint32_t tilex = 0, tiley = 0, i;
+    uint32_t stride_bytes = stride_tiles * 128;
+    uint32_t byteoff, offx, offy, toffx, toffy, slopx, slopy, a;
+
+    for (i = g; i < 8; i++) {
+        tilex += contrib[i].dx;
+        tiley += contrib[i].dy;
+    }
+    if (!stride_bytes) {
+        return 0;
+    }
+    byteoff = tilex * bpt + tiley * stride_bytes;
+    offy = byteoff / stride_bytes;
+    offx = byteoff % stride_bytes;
+    toffy = offy >> 5;                /* 32-row tiles  */
+    toffx = offx >> 7;               /* 128-byte tiles */
+    slopy = offy & 31;
+    slopx = offx & 127;
+    a = (toffy * stride_tiles + toffx) << 12;   /* 128*32 = 4096 = 1<<12 */
+    if (slopx) {
+        a += (1u << 12) - ((1u << 7) - slopx);
+    }
+    if (slopy) {
+        a += (stride_tiles << 12) - (((1u << 5) - slopy) << 7);
+    }
+    return a;
+}
+
 /* sample TMU `tmu` (byte offset 0 or V3_3D_TMU1) at (sc,tc) */
 static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
                           float sc, float tc, float lodval,
@@ -1504,13 +1556,12 @@ static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
     sc /= scale;
     tc /= scale;
 
-    /*
-     * Add the per-level offset for the linear layout (verified with
-     * tdfx_texlod). The tiled layout's per-level offset is not applied yet
-     * (pending the tiled column of that probe), so tiled sub-256 textures
-     * are still addressed from base.
-     */
-    if (!tiled) {
+    /* add the per-level offset (linear verified with tdfx_texlod; tiled ports
+     * Glide's fractal mip packing) so sub-256 / mip levels sample correctly */
+    if (tiled) {
+        base += voodoo3_tiled_lod_offset(level, voodoo3_tfmt_bpt(fmt),
+                                         stride_tiles);
+    } else {
         base += voodoo3_lod_offset(level, voodoo3_tfmt_bpt(fmt));
     }
     /* minfilter minifies, magfilter magnifies */
@@ -1787,6 +1838,69 @@ static void voodoo3_fbz_combine(uint32_t cpath,
 }
 
 /*
+ * Ordered dither matrices (0..15), from the reverse-engineered 3dfx tables.
+ * fbzMode ENDITHER selects 4x4 by default, 2x2 with DITHER2x2.
+ */
+static const uint8_t v3_dither_4x4[16] = {
+     0,  8,  2, 10,
+    12,  4, 14,  6,
+     3, 11,  1,  9,
+    15,  7, 13,  5,
+};
+static const uint8_t v3_dither_2x2[16] = {
+     8, 10,  8, 10,
+    11,  9, 11,  9,
+     8, 10,  8, 10,
+    11,  9, 11,  9,
+};
+
+/*
+ * Chroma-key match. Exact against chromaKey, or (fbzMode ENCHROMARANGE) a
+ * per-channel range [chromaKey, chromaRange] with per-channel exclusive bits
+ * and an AND/OR combine (chromaRange BLOCK_OR). Returns true if keyed out.
+ */
+static bool voodoo3_chroma_match(uint32_t key, uint32_t range, uint32_t fbz,
+                                 int r, int g, int b)
+{
+    int kr = (key >> 16) & 0xff, kg = (key >> 8) & 0xff, kb = key & 0xff;
+    int rr, rg, rb;
+    bool mr, mg, mb;
+
+    if (!(fbz & V3_FBZ_ENCHROMARANGE)) {
+        return kr == r && kg == g && kb == b;
+    }
+    rr = (range >> 16) & 0xff; rg = (range >> 8) & 0xff; rb = range & 0xff;
+    mr = r >= kr && r <= rr;
+    mg = g >= kg && g <= rg;
+    mb = b >= kb && b <= rb;
+    if (range & V3_CR_RED_EX) { mr = !mr; }
+    if (range & V3_CR_GREEN_EX) { mg = !mg; }
+    if (range & V3_CR_BLUE_EX) { mb = !mb; }
+    return (range & V3_CR_BLOCK_OR) ? (mr || mg || mb) : (mr && mg && mb);
+}
+
+/* pack 8-bit RGB to 565, ordered-dithered when enabled (else truncated) */
+static uint16_t voodoo3_pack565(int r, int g, int b, int x, int y,
+                                bool dither, bool dither2x2)
+{
+    unsigned r5, g6, b5;
+
+    if (dither) {
+        unsigned d = (dither2x2 ? v3_dither_2x2 : v3_dither_4x4)
+                     [(y & 3) * 4 + (x & 3)];
+        r5 = ((r << 1) - (r >> 4) + (r >> 7) + d) >> 4;
+        g6 = ((g << 2) - (g >> 4) + (g >> 6) + d) >> 4;
+        b5 = ((b << 1) - (b >> 4) + (b >> 7) + d) >> 4;
+        r5 = MIN(r5, 31); g6 = MIN(g6, 63); b5 = MIN(b5, 31);
+    } else {
+        r5 = (unsigned)r >> 3;
+        g6 = (unsigned)g >> 2;
+        b5 = (unsigned)b >> 3;
+    }
+    return (r5 << 11) | (g6 << 5) | b5;
+}
+
+/*
  * Rasterise one triangle through the pixel pipeline: Gouraud colour or
  * texture, depth test/write, chroma-key, alpha test, fog and alpha
  * blending, honouring fbzMode/alphaMode/fbzColorPath/textureMode/fogMode.
@@ -1801,6 +1915,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     uint32_t fogm = s->d3_regs[V3_3D_FOGMODE / 4];
     uint32_t fogc = s->d3_regs[V3_3D_FOGCOLOR / 4];
     uint32_t ckey = s->d3_regs[V3_3D_CHROMAKEY / 4] & 0xffffff;
+    uint32_t crange = s->d3_regs[V3_3D_CHROMARANGE / 4];
     uint32_t cbase = s->d3_regs[V3_3D_COLBUFFERADDR / 4] & 0xffffff;
     uint32_t cstride = s->d3_regs[V3_3D_COLBUFFERSTRIDE / 4] & 0xffff;
     uint32_t zbase = s->d3_regs[V3_3D_AUXBUFFERADDR / 4] & 0xffffff;
@@ -1932,11 +2047,10 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 sa = fa * 255.0f;
             }
 
-            /* chroma-key: discard pixels whose colour matches chromaKey */
+            /* chroma-key: discard pixels matching chromaKey (or the range) */
             if (fbz & V3_FBZ_ENCHROMAKEY) {
-                if (((ckey >> 16) & 0xff) == (unsigned)sr &&
-                    ((ckey >> 8) & 0xff) == (unsigned)sg &&
-                    (ckey & 0xff) == (unsigned)sb) {
+                if (voodoo3_chroma_match(ckey, crange, fbz,
+                                         (int)sr, (int)sg, (int)sb)) {
                     continue;
                 }
             }
@@ -2008,9 +2122,9 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 sb = v3_clampf(sb, 0, 255);
             }
 
-            pix = (((uint16_t)sr >> 3) << 11) |
-                  (((uint16_t)sg >> 2) << 5) |
-                  ((uint16_t)sb >> 3);
+            pix = voodoo3_pack565((int)sr, (int)sg, (int)sb, x, y,
+                                  fbz & V3_FBZ_ENDITHER,
+                                  fbz & V3_FBZ_DITHER2x2);
             if (fbz & V3_FBZ_RGBWRMASK) {
                 stw_le_p(s->vga.vram_ptr + coff, pix);
             }

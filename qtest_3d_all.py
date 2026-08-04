@@ -59,7 +59,7 @@ ENCLIP = 1 << 0        # fbzMode: enable clip rectangle
 TC = (1<<12)|(1<<18)|(1<<21)|(1<<27)   # textureMode: pass the texel
 CLIPLR, CLIPBT = 0x118, 0x11c
 COLBUF, COLSTRIDE, AUXBUF, AUXSTRIDE = 0x1ec, 0x1f0, 0x1f4, 0x1f8
-ZACOLOR, C1, CHROMAKEY = 0x130, 0x148, 0x134
+ZACOLOR, C1, CHROMAKEY, CHROMARANGE = 0x130, 0x148, 0x134, 0x138
 FOGMODE, FOGCOLOR = 0x108, 0x12c
 FASTFILL, SWAPBUF, NOP, INTRCTRL = 0x124, 0x128, 0x120, 0x004
 STATUS = 0x000
@@ -461,6 +461,72 @@ def run():
     dv = pix(q, 100, 110)
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0); q.wl(D3 + TMU1 + 0x300, 0)
     check("dual-TMU multitexture", near(dv, 255, 0, 0, tol=24), hex(dv))
+
+    # 9n. tiled sub-256 mip: sample level 1 (128) of a tiled texture (stride 6
+    # tiles); texel(0,0) sits at base + tiled_lod_offset(1) via Glide's packing.
+    def tiled_lodoff(lod, bpt, st):
+        contrib = [(0, 2), (0, 4), (0, 8), (0, 16), (32, 0), (64, 0), (0, 128), (256, 0)]
+        g = 0 if lod >= 8 else 8 - lod
+        tx = sum(contrib[i][0] for i in range(g, 8))
+        ty = sum(contrib[i][1] for i in range(g, 8))
+        sb = st * 128
+        bo = tx * bpt + ty * sb
+        offy, offx = bo // sb, bo % sb
+        a = ((offy >> 5) * st + (offx >> 7)) << 12
+        if offx & 127: a += (1 << 12) - ((1 << 7) - (offx & 127))
+        if offy & 31: a += (st << 12) - (((1 << 5) - (offy & 31)) << 7)
+        return a
+    toff = W * H * 2 * 12
+    off1 = tiled_lodoff(1, 2, 6)
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    q.ww(BAR1 + toff + off1, rgb565(255, 0, 0))    # level-1 texel(0,0) = red
+    q.wl(D3 + TEXBASE, toff | 1 | (6 << 25)); q.wl(D3 + TLOD, 1 << 2)
+    q.wl(D3 + TEXMODE, (10 << 8) | TC)
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+    svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+    tv = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
+    check("tiled sub-256 LOD", near(tv, 255, 0, 0, tol=24), hex(tv))
+
+    # 9o. dithering (fbzMode ENDITHER): a flat R=4 (below one 565 step) is
+    # ordered-dithered so some pixels round to r5=0 and others to r5=1
+    # depending on the 4x4 matrix. Pixel (100,110) dith=3 -> 0x0000, pixel
+    # (100,101) dith=12 -> 0x0800.
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK | (1 << 8))   # ENDITHER
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    svert(q, 40, 40, 0xff040000, first=True)
+    svert(q, 40, 200, 0xff040000)
+    svert(q, 280, 120, 0xff040000)
+    di_lo, di_hi = pix(q, 100, 110), pix(q, 100, 101)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+    check("dither 4x4 low", di_lo == 0x0000, hex(di_lo))
+    check("dither 4x4 high", di_hi == 0x0800, hex(di_hi))
+
+    # 9p. chroma-range: key out R in [10,20] (G,B full range). R=15 is keyed
+    # (background shows), R=30 is drawn.
+    q.wl(D3 + FBZCOLORPATH, 0)
+    q.wl(D3 + CHROMAKEY, 0x0a0000)      # lo: R=10
+    q.wl(D3 + CHROMARANGE, 0x14ffff)    # hi: R=20, G=255, B=255
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    q.wl(D3 + C1, 0x000000ff); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+    q.wl(D3 + FASTFILL, 1)              # blue background
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK | (1 << 1) | (1 << 28))  # key+range
+    svert(q, 40, 40, 0xff0f0000, first=True)      # R=15 -> keyed
+    svert(q, 40, 200, 0xff0f0000)
+    svert(q, 280, 120, 0xff0f0000)
+    cr_keyed = pix(q, 100, 110)
+    svert(q, 40, 40, 0xff1e0000, first=True)      # R=30 -> drawn
+    svert(q, 40, 200, 0xff1e0000)
+    svert(q, 280, 120, 0xff1e0000)
+    cr_drawn = pix(q, 100, 110)
+    q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK)
+    check("chroma-range keyed", cr_keyed == 0x001f, hex(cr_keyed))
+    check("chroma-range drawn", cr_drawn == 0x1800, hex(cr_drawn))
 
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
