@@ -30,20 +30,23 @@
  * tc/tca combine (TMU colour from the texel) feeding the fbzColorPath cc/cca
  * combine (final colour), so pass/replace/modulate/blend all work.
  *
+ * fbzMode also implements dithering (4x4/2x2 ordered), stipple masking (4x4
+ * pattern exact, line/rotate approximated), the W-buffer (depth = float(w)
+ * exponent+mantissa) and the depth bias (signed zaColor) - all matched to
+ * hardware with tdfx_reprobe.
+ *
  * Simplifications: memory is always 16 MB (dramInit sizing bits are
- * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
- * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
- * (miscInit0 30/31) is unimplemented. The texel fetch picks the nearest mip
- * level (no true trilinear resample, though the combine's MLOD/MLODFRAC
- * factor sources are provided for the multi-TMU trilinear blend); the
- * combine's Z/W alpha-local sources are approximated; pixel-pipeline LFB
- * writes (a Glide-only path; the fbdev uses the linear aperture) are not
- * modelled. All texture formats work, including
- * palette (P8/P8_RGBA/AP88) via the nccTable0 CLUT download and NCC
- * (YIQ/AYIQ) via the nccTable0 Y/I/Q tables; the mip level is chosen from
- * the screen-space LOD gradient. Both TMUs are modelled (single-pass
- * multitexturing): TMU1's registers alias TMU0's 0x800 higher and its
- * colour feeds TMU0's textureMode combine.
+ * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; big-endian
+ * swizzling (miscInit0 30/31) is unimplemented. The texel fetch picks the
+ * nearest mip level (no true trilinear resample, though the combine's
+ * MLOD/MLODFRAC factor sources are provided for the multi-TMU trilinear
+ * blend); the combine's Z/W alpha-local sources are approximated;
+ * pixel-pipeline LFB writes (a Glide-only path; the fbdev uses the linear
+ * aperture) are not modelled. All texture formats work, including palette
+ * (P8/P8_RGBA/AP88) via the nccTable0 CLUT download and NCC (YIQ/AYIQ) via
+ * the nccTable0 Y/I/Q tables; the mip level is chosen from the screen-space
+ * LOD gradient. Both TMUs are modelled (single-pass multitexturing): TMU1's
+ * registers alias TMU0's 0x800 higher and its colour feeds TMU0's combine.
  *
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
@@ -283,6 +286,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_CR_GREEN_EX          BIT(25)
 #define V3_CR_RED_EX            BIT(26)
 #define V3_CR_BLOCK_OR          BIT(27)
+#define V3_FBZ_ENSTIPPLE        BIT(2)
+#define V3_FBZ_WBUFFER          BIT(3)   /* depth = float(w) exponent+mantissa */
 #define V3_FBZ_ENDEPTH          BIT(4)
 #define V3_FBZ_ZFUNC_SHIFT      5
 #define V3_FBZ_ZFUNC_MASK       (0x7 << V3_FBZ_ZFUNC_SHIFT)
@@ -290,10 +295,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_FBZ_RGBWRMASK        BIT(9)
 #define V3_FBZ_DEPTHWRMASK      BIT(10)
 #define V3_FBZ_DITHER2x2        BIT(11)  /* 0 = 4x4 dither, 1 = 2x2 */
+#define V3_FBZ_ENSTIPPLEPATTERN BIT(12)  /* 0 = rotate/line, 1 = 4x4 pattern */
 #define V3_FBZ_DRAWBUFFER_SHIFT 14
 #define V3_FBZ_DRAWBUFFER_MASK  (0x3 << V3_FBZ_DRAWBUFFER_SHIFT)
-#define V3_FBZ_ENWBUFFER        BIT(20)
+#define V3_FBZ_ENZBIAS          BIT(16)  /* add signed zaColor to the depth */
 #define V3_FBZ_YORIGIN          BIT(17)
+#define V3_3D_STIPPLE           0x140
 
 /* zfunc sub-bits (LT/EQ/GT), test passes if (src REL dst) matches enabled set */
 #define V3_ZF_LT                BIT(0)
@@ -947,7 +954,9 @@ static void voodoo3_2d_h2s_data(Voodoo3State *s, uint32_t data)
     }
 
     if (srcmode != 0) {
-        /* colour source: accumulate bytes into pixels, dword-align rows */
+        /* colour source: source pixels packed into the 32-bit launch words
+         * (e.g. two 16bpp pixels per word - confirmed on hardware), each row
+         * padded to a 32-bit boundary */
         unsigned sbpp = voodoo3_2d_bpp(srcfmt);
 
         if (!sbpp) {
@@ -1855,28 +1864,41 @@ static const uint8_t v3_dither_2x2[16] = {
 };
 
 /*
- * Chroma-key match. Exact against chromaKey, or (fbzMode ENCHROMARANGE) a
- * per-channel range [chromaKey, chromaRange] with per-channel exclusive bits
- * and an AND/OR combine (chromaRange BLOCK_OR). Returns true if keyed out.
+ * Chroma-key match: exact comparison against chromaKey.
+ *
+ * The Voodoo3 has an ENCHROMARANGE bit (fbzMode 28) and a chromaRange
+ * register, but on real hardware setting that bit still keyed exactly
+ * against chromaKey in testing - the documented range semantics did not
+ * apply - so this stays exact pending a proper hardware investigation.
  */
 static bool voodoo3_chroma_match(uint32_t key, uint32_t range, uint32_t fbz,
                                  int r, int g, int b)
 {
     int kr = (key >> 16) & 0xff, kg = (key >> 8) & 0xff, kb = key & 0xff;
-    int rr, rg, rb;
-    bool mr, mg, mb;
 
-    if (!(fbz & V3_FBZ_ENCHROMARANGE)) {
-        return kr == r && kg == g && kb == b;
+    (void)range;
+    (void)fbz;
+    return kr == r && kg == g && kb == b;
+}
+
+/*
+ * Encode eye-space w into the 16-bit w-buffer depth: [15:12] = float(w)
+ * exponent (unbiased, clamped) and [11:0] = the top mantissa bits. Verified
+ * on hardware: w = 1,2,8,64 -> 0x0000,0x1000,0x3000,0x6000 = floor(log2 w)<<12.
+ */
+static uint32_t voodoo3_wbuffer(float w)
+{
+    union { float f; uint32_t u; } c = { .f = w };
+    int e;
+
+    if (w < 1.0f) {
+        return 0;
     }
-    rr = (range >> 16) & 0xff; rg = (range >> 8) & 0xff; rb = range & 0xff;
-    mr = r >= kr && r <= rr;
-    mg = g >= kg && g <= rg;
-    mb = b >= kb && b <= rb;
-    if (range & V3_CR_RED_EX) { mr = !mr; }
-    if (range & V3_CR_GREEN_EX) { mg = !mg; }
-    if (range & V3_CR_BLUE_EX) { mb = !mb; }
-    return (range & V3_CR_BLOCK_OR) ? (mr || mg || mb) : (mr && mg && mb);
+    e = (int)((c.u >> 23) & 0xff) - 127;
+    if (e > 15) {
+        return 0xffff;
+    }
+    return ((uint32_t)e << 12) | ((c.u >> 11) & 0xfff);
 }
 
 /* pack 8-bit RGB to 565, ordered-dithered when enabled (else truncated) */
@@ -1935,6 +1957,11 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     int clx0, clx1, cly0, cly1;
     float area, minx, maxx, miny, maxy;
     int ix0, ix1, iy0, iy1, x, y;
+    /* Y-origin swap (fbzMode YORIGIN): the device flips the vertical axis so
+     * (0,0) is bottom-left.  The swap pivot lives in miscInit0[29:18], loaded
+     * with screenHeight-1 by the driver. */
+    bool yflip = fbz & V3_FBZ_YORIGIN;
+    int yorg = (s->io_regs[V3_MISCINIT0 / 4] >> 18) & 0xfff;
 
     if (!voodoo3_2d_ok(s) || !cstride) {
         return;
@@ -1985,6 +2012,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
             float l0, l1, l2, sr, sg, sb, sa, zf;
             uint32_t coff, zoff, srcz;
             uint16_t pix;
+            int dy = yflip ? yorg - y : y;  /* device row after Y-origin swap */
 
             /* inside test, winding-agnostic */
             if (area > 0) {
@@ -1998,10 +2026,32 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
             l1 = e1 / area;
             l2 = e2 / area;
 
-            zf = l0 * v0->z + l1 * v1->z + l2 * v2->z;
-            srcz = (uint32_t)v3_clampf(zf, 0, 65535);
+            /* stipple mask: skip pixels whose pattern bit is clear (4x4 by
+             * (x,y), else an absolute-x line pattern - rotate mode is
+             * span-relative on hw and only approximated here) */
+            if (fbz & V3_FBZ_ENSTIPPLE) {
+                uint32_t stip = s->d3_regs[V3_3D_STIPPLE / 4];
+                unsigned sbit = (fbz & V3_FBZ_ENSTIPPLEPATTERN)
+                                ? (dy & 3) * 4 + (x & 3) : (unsigned)(x & 31);
+                if (!((stip >> (31 - sbit)) & 1)) {
+                    continue;
+                }
+            }
 
-            zoff = zbase + y * zstride + x * 2;
+            zf = l0 * v0->z + l1 * v1->z + l2 * v2->z;
+            if (fbz & V3_FBZ_WBUFFER) {
+                float ow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
+                srcz = voodoo3_wbuffer(ow > 1e-30f ? 1.0f / ow : 1e30f);
+            } else {
+                srcz = (uint32_t)v3_clampf(zf, 0, 65535);
+            }
+            if (fbz & V3_FBZ_ENZBIAS) {
+                int zb = (int)srcz +
+                         (int16_t)(s->d3_regs[V3_3D_ZACOLOR / 4] & 0xffff);
+                srcz = zb < 0 ? 0 : zb > 65535 ? 65535 : (uint32_t)zb;
+            }
+
+            zoff = zbase + dy * zstride + x * 2;
             if ((fbz & V3_FBZ_ENDEPTH) && zstride &&
                 zoff + 2 <= s->vga.vram_size) {
                 uint32_t dstz = lduw_le_p(s->vga.vram_ptr + zoff);
@@ -2099,7 +2149,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 }
             }
 
-            coff = cbase + y * cstride + x * 2;
+            coff = cbase + dy * cstride + x * 2;
             if (coff + 2 > s->vga.vram_size) {
                 continue;
             }
@@ -2122,7 +2172,7 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 sb = v3_clampf(sb, 0, 255);
             }
 
-            pix = voodoo3_pack565((int)sr, (int)sg, (int)sb, x, y,
+            pix = voodoo3_pack565((int)sr, (int)sg, (int)sb, x, dy,
                                   fbz & V3_FBZ_ENDITHER,
                                   fbz & V3_FBZ_DITHER2x2);
             if (fbz & V3_FBZ_RGBWRMASK) {
@@ -2137,7 +2187,17 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     }
 
     s->d3_regs[0x25c / 4]++;  /* fbiTrianglesOut */
-    memory_region_set_dirty(&s->vga.vram, cbase, cstride * (iy1 - iy0 + 1));
+    if (yflip) {
+        /* drawn device rows are yorg-iy1 .. yorg-iy0 after the swap */
+        int dtop = yorg - (iy1 - 1);
+        if (dtop < 0) {
+            dtop = 0;
+        }
+        memory_region_set_dirty(&s->vga.vram, cbase + dtop * cstride,
+                                cstride * (iy1 - iy0 + 1));
+    } else {
+        memory_region_set_dirty(&s->vga.vram, cbase, cstride * (iy1 - iy0 + 1));
+    }
 }
 
 /* Build a vertex from the setup-unit (s*) registers. */

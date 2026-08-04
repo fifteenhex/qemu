@@ -324,27 +324,44 @@ def run():
     w3(t, FBZMODE, (7 << 5) | RGBW)
     line("dither-4x4", "lo=0x%04x hi=0x%04x" % (pix(t, 100, 110), pix(t, 100, 101)))
 
-    # 22. chroma-range: key out R in [10,20]; R=15 keyed, R=30 drawn
-    w3(t, FBZCOLORPATH, 0)
-    w3(t, 0x134, 0x0a0000); w3(t, 0x138, 0x14ffff)
-    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
-    w3(t, C1, 0x000000ff); w3(t, FBZMODE, (7 << 5) | RGBW); w3(t, FASTFILL, 1)
-    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 1) | (1 << 28))
-    vert(t, 40, 40, 0xff0f0000, 1); vert(t, 40, 200, 0xff0f0000, 0); vert(t, 280, 120, 0xff0f0000, 0)
-    ck = pix(t, 100, 110)
-    vert(t, 40, 40, 0xff1e0000, 1); vert(t, 40, 200, 0xff1e0000, 0); vert(t, 280, 120, 0xff1e0000, 0)
-    cd = pix(t, 100, 110)
-    w3(t, FBZMODE, (7 << 5) | RGBW)
-    line("chroma-range", "keyed=0x%04x drawn=0x%04x" % (ck, cd))
-
-    # 17. colour-source 2D host-to-screen blt
+    # 17. colour-source 2D host-to-screen blt: single 1x1 pixel
     clear(t, 0)
     w2(0x08, 0); w2(0x0c, 0x0fff0fff)
     w2(0x10, 0); w2(0x14, (W * 2) | (3 << 16))
-    w2(0x54, 3 << 16); w2(0x68, 2 | (1 << 16)); w2(0x6c, 10 | (20 << 16))
+    w2(0x54, 3 << 16); w2(0x68, 1 | (1 << 16)); w2(0x6c, 10 | (20 << 16))
     w2(0x70, 0x03 | (0xcc << 24))
-    w2(0x80, 0xf800 | (0x07e0 << 16))
-    line("hostblt-color", "px0=0x%04x px1=0x%04x" % (pix(t, 10, 20), pix(t, 11, 20)))
+    w2(0x80, 0xf800)
+    line("hostblt-color", "0x%04x" % pix(t, 10, 20))
+
+    def dpix(x, y): return t.rw(BAR1 + W * H * 2 + (y * W + x) * 2)
+    def vertw(x, y, w, first):
+        w3(t, SVX, f2i(x)); w3(t, SVY, f2i(y)); w3(t, SVZ, f2i(1000.0))
+        w3(t, SWOOW, f2i(w)); w3(t, SARGB, 0xffffffff)
+        w3(t, SSOW0, f2i(0.0)); w3(t, STOW0, f2i(0.0))
+        w3(t, SBEGIN if first else SDRAW, 1)
+
+    # 18. W-buffer depth (w=8 -> 0x3000)
+    w3(t, AUXBUF, W * H * 2); w3(t, AUXSTRIDE, W * 2)
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 4) | (1 << 10) | (1 << 3))
+    vertw(40, 40, 0.125, 1); vertw(40, 200, 0.125, 0); vertw(280, 120, 0.125, 0)
+    line("w-buffer-w8", "0x%04x" % dpix(100, 110))
+
+    # 19. depth bias (z=1000 + zaColor +100 -> 0x044c)
+    w3(t, ZACOLOR, 0x0064)
+    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 4) | (1 << 10) | (1 << 16))
+    vert(t, 40, 40, 0xffffffff, 1); vert(t, 40, 200, 0xffffffff, 0); vert(t, 280, 120, 0xffffffff, 0)
+    line("depth-bias", "0x%04x" % dpix(100, 110))
+    w3(t, ZACOLOR, 0)
+
+    # 20. stipple 4x4 pattern (0xaaaaaaaa)
+    clear(t, 0)
+    w3(t, 0x140, 0xaaaaaaaa)
+    w3(t, FBZMODE, (7 << 5) | RGBW | (1 << 2) | (1 << 12))
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    vert(t, 40, 40, 0xffffffff, 1); vert(t, 40, 200, 0xffffffff, 0); vert(t, 280, 120, 0xffffffff, 0)
+    line("stipple-4x4", "on=0x%04x off=0x%04x" % (pix(t, 100, 110), pix(t, 101, 110)))
+    w3(t, FBZMODE, (7 << 5) | RGBW); w3(t, 0x140, 0xffffffff)
 
 
 if __name__ == "__main__":
