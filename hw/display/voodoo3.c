@@ -368,6 +368,9 @@ struct Voodoo3State {
     MemoryRegion lfb;       /* BAR 1: 32 MB linear framebuffer window */
     MemoryRegion lfb_dead;  /* ... backing while DRAM is uninitialised */
     MemoryRegion io;        /* BAR 2: 256 byte I/O space */
+    MemoryRegion vbios;     /* ROM BAR: synthetic config-table VBIOS */
+
+    bool fake_vbios;        /* synthesise a minimal VBIOS when none supplied */
 
     uint32_t io_regs[V3_IO_REG_NB];
     uint32_t d2_regs[V3_2D_REG_NB];
@@ -2035,6 +2038,73 @@ static const MemoryRegionOps voodoo3_lfb_dead_ops = {
 
 /* ---------------------------------------------------------------- */
 
+/*
+ * Build a minimal PCI option ROM good enough for tdfxfb to cold-boot the
+ * card without a real 3dfx VBIOS. A real card's VBIOS runs at POST and
+ * leaves an "OEM config" table in the ROM that the driver reads (via
+ * pci_map_rom) to program the PLLs and DRAM. We don't need executable BIOS
+ * code - the driver does the init itself - only the ROM signature, a PCI
+ * data structure so Linux accepts the image, and that config table pointed
+ * to from ROM[0x50]. Values are chosen so the memory PLL lands ~100 MHz and
+ * DRAM comes up, matching this model's memory gate.
+ */
+#define V3_VBIOS_SIZE 512
+#define V3_VBIOS_ROMCFG 0x60    /* ROM config table */
+#define V3_VBIOS_OEMCFG 0x70    /* OEM config table (struct tdfx_bios_cfg) */
+
+static void voodoo3_put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+
+static void voodoo3_build_vbios(uint8_t *rom)
+{
+    unsigned sum = 0, i;
+
+    memset(rom, 0, V3_VBIOS_SIZE);
+
+    /* option ROM header */
+    rom[0x00] = 0x55;
+    rom[0x01] = 0xaa;
+    rom[0x02] = V3_VBIOS_SIZE / 512;   /* size in 512-byte blocks */
+    rom[0x03] = 0xcb;                  /* entry point: retf (no-op init) */
+    rom[0x18] = 0x1c; rom[0x19] = 0x00;/* pointer to PCI data structure */
+
+    /* PCI data structure at 0x1c */
+    rom[0x1c] = 'P'; rom[0x1d] = 'C'; rom[0x1e] = 'I'; rom[0x1f] = 'R';
+    rom[0x20] = PCI_VENDOR_ID_3DFX & 0xff;
+    rom[0x21] = PCI_VENDOR_ID_3DFX >> 8;
+    rom[0x22] = PCI_DEVICE_ID_3DFX_VOODOO3 & 0xff;
+    rom[0x23] = PCI_DEVICE_ID_3DFX_VOODOO3 >> 8;
+    rom[0x26] = 0x18;                  /* PCIR struct length */
+    rom[0x2b] = 0x03;                  /* class code: display controller */
+    rom[0x2c] = V3_VBIOS_SIZE / 512;   /* image length in 512-byte blocks */
+    rom[0x30] = 0x00;                  /* code type: x86 */
+    rom[0x31] = 0x80;                  /* last image */
+
+    /* ROM[0x50] -> ROM config table -> OEM config table */
+    rom[0x50] = V3_VBIOS_ROMCFG & 0xff; rom[0x51] = V3_VBIOS_ROMCFG >> 8;
+    rom[V3_VBIOS_ROMCFG] = V3_VBIOS_OEMCFG & 0xff;
+    rom[V3_VBIOS_ROMCFG + 1] = V3_VBIOS_OEMCFG >> 8;
+
+    /* struct tdfx_bios_cfg at OEMCFG */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x00, 0x00000180); /* pciinit0 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x04, 0x00000000); /* miscinit0 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x08, 0x00000000); /* miscinit1 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x0c, 0x0817a100); /* draminit0 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x10, 0x00000000); /* draminit1 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x14, 0x00000000); /* agpinit0 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x18, 0x00001a01); /* pllctrl1 ~100MHz */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x1c, 0x00000000); /* pllctrl2 */
+    voodoo3_put_le32(rom + V3_VBIOS_OEMCFG + 0x20, 0x00000000); /* sgrammode */
+
+    /* option ROM checksum: whole image must sum to 0 mod 256 */
+    for (i = 0; i < V3_VBIOS_SIZE - 1; i++) {
+        sum += rom[i];
+    }
+    rom[V3_VBIOS_SIZE - 1] = (uint8_t)(-sum);
+}
+
 static void voodoo3_realize(PCIDevice *dev, Error **errp)
 {
     Voodoo3State *s = VOODOO3(dev);
@@ -2079,6 +2149,18 @@ static void voodoo3_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_TYPE_32, &s->mmio);
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->lfb);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
+
+    /*
+     * With no external romfile, synthesise a minimal VBIOS carrying the OEM
+     * config table so tdfxfb can cold-boot the card. Skip it if the user
+     * supplied a real ROM (the generic PCI code registers that one).
+     */
+    if (s->fake_vbios && (!dev->romfile || !dev->romfile[0])) {
+        memory_region_init_rom(&s->vbios, OBJECT(s), "voodoo3.vbios",
+                               V3_VBIOS_SIZE, &error_fatal);
+        voodoo3_build_vbios(memory_region_get_ram_ptr(&s->vbios));
+        pci_register_bar(dev, PCI_ROM_SLOT, 0, &s->vbios);
+    }
 
     dev->config[PCI_INTERRUPT_PIN] = 1;
 
@@ -2163,6 +2245,7 @@ static const VMStateDescription vmstate_voodoo3 = {
 
 static const Property voodoo3_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", Voodoo3State, vga.vram_size_mb, 16),
+    DEFINE_PROP_BOOL("fake-vbios", Voodoo3State, fake_vbios, true),
     DEFINE_EDID_PROPERTIES(Voodoo3State, i2cddc.edid_info),
 };
 

@@ -128,6 +128,13 @@ def run():
     vert(t, 160, 30, 0xffff0000, 1); vert(t, 40, 210, 0xff00ff00, 0); vert(t, 280, 210, 0xff0000ff, 0)
     line("setup-fan-gouraud", "0x%04x" % pix(t, 160, 150))
 
+    clear(t, 0); w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3))
+    vert(t, 40, 40, 0xffff0000, 1); vert(t, 40, 200, 0xffff0000, 0); vert(t, 280, 120, 0xffff0000, 0)
+    line("sargb-red", "0x%04x" % pix(t, 100, 110))
+    clear(t, 0)
+    vert(t, 40, 40, 0xff0000ff, 1); vert(t, 40, 200, 0xff0000ff, 0); vert(t, 280, 120, 0xff0000ff, 0)
+    line("sargb-blue", "0x%04x" % pix(t, 100, 110))
+
     clear(t, 0); w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 18))
     vert(t, 40, 40, 0xffffff00, 1); vert(t, 40, 200, 0xffffff00, 0)
     vert(t, 280, 40, 0xffffff00, 0); vert(t, 280, 200, 0xffffff00, 0)
@@ -140,13 +147,18 @@ def run():
     w3(t, ALPHAMODE, 0); line("alpha-blend", "0x%04x" % pix(t, 100, 110))
 
     toff = W * H * 2 * 2
+    print("# toff = 0x%x" % toff)
+    t.ww(BAR1 + toff, 0xabcd)
+    line("vram-roundtrip", "0x%04x" % t.rw(BAR1 + toff))
+    t.ww(BAR1 + toff, 0xf800)
+    line("tex-vram-readback", "0x%04x" % t.rw(BAR1 + toff))
     for fmt, nbytes, val, nm in [(10, 2, 0xf800, "tex-RGB565"), (0, 1, 0xe0, "tex-RGB332"),
                                  (11, 2, 0x8000 | (31 << 10), "tex-ARGB1555"),
                                  (12, 2, 0xf000 | (0xf << 8), "tex-ARGB4444")]:
         clear(t, 0)
         if nbytes == 1: t.cmd("writeb 0x%x 0x%x" % (BAR1 + toff, val))
         else: t.ww(BAR1 + toff, val)
-        w3(t, TEXBASE, toff); w3(t, TLOD, 8 << 2); w3(t, TEXMODE, (fmt << 8) | TC)
+        w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (fmt << 8) | TC)
         w3(t, FBZCOLORPATH, 1 | (1 << 27))
         w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
         vert(t, 40, 40, 0xffffffff, 1, s=0.0, tt=0.0); vert(t, 40, 200, 0xffffffff, 0, s=0.0, tt=0.0)
@@ -155,9 +167,9 @@ def run():
         line(nm, "0x%04x" % pix(t, 100, 110))
 
     clear(t, 0)
-    for k, texv in enumerate([0xf800, 0x07e0, 0x001f, 0xffff]):
-        t.ww(BAR1 + toff + k * 2, texv)
-    w3(t, TEXBASE, toff); w3(t, TLOD, 7 << 2); w3(t, TEXMODE, (10 << 8) | (1 << 2) | TC)
+    for slot, texv in [(0, 0xf800), (1, 0x07e0), (256, 0x001f), (257, 0xffff)]:
+        t.ww(BAR1 + toff + slot * 2, texv)
+    w3(t, TEXBASE, toff); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | (1 << 2) | TC)
     w3(t, FBZCOLORPATH, 1 | (1 << 27)); w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
     vert(t, 40, 40, 0xffffffff, 1, s=1.0, tt=1.0); vert(t, 40, 200, 0xffffffff, 0, s=1.0, tt=1.0)
     vert(t, 280, 120, 0xffffffff, 0, s=1.0, tt=1.0)
