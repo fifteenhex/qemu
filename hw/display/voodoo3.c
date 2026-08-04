@@ -33,13 +33,17 @@
  * Simplifications: memory is always 16 MB (dramInit sizing bits are
  * ignored); legacy VGA decode isn't gated on vgaInit0 bit 9; host blts
  * pack rows byte-aligned (what tdfxfb generates); big-endian swizzling
- * (miscInit0 30/31) is unimplemented. Trilinear mip blending (the LOD picks
- * the nearest level only), the combine's LOD/Z/W factor sources, and
- * pixel-pipeline LFB writes (a Glide-only path; the fbdev uses the linear
- * aperture) are not modelled yet. All texture formats work, including
+ * (miscInit0 30/31) is unimplemented. The texel fetch picks the nearest mip
+ * level (no true trilinear resample, though the combine's MLOD/MLODFRAC
+ * factor sources are provided for the multi-TMU trilinear blend); the
+ * combine's Z/W alpha-local sources are approximated; pixel-pipeline LFB
+ * writes (a Glide-only path; the fbdev uses the linear aperture) are not
+ * modelled. All texture formats work, including
  * palette (P8/P8_RGBA/AP88) via the nccTable0 CLUT download and NCC
  * (YIQ/AYIQ) via the nccTable0 Y/I/Q tables; the mip level is chosen from
- * the screen-space LOD gradient. (The Voodoo3 has a single TMU.)
+ * the screen-space LOD gradient. Both TMUs are modelled (single-pass
+ * multitexturing): TMU1's registers alias TMU0's 0x800 higher and its
+ * colour feeds TMU0's textureMode combine.
  *
  * Texture memory addressing (linear and 128x32 tiled, texBaseAddr bit 0
  * with the tile stride in [31:25]) is validated against hardware with
@@ -237,6 +241,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_3D_SOOW0             0x288
 #define V3_3D_SSOW0             0x28c
 #define V3_3D_STOW0             0x290
+#define V3_3D_SOOW1             0x294
+#define V3_3D_SSOW1             0x298
+#define V3_3D_STOW1             0x29c
 #define V3_3D_SDRAWTRICMD       0x2a0
 #define V3_3D_SBEGINTRICMD      0x2a4
 #define V3_3D_TEXTUREMODE       0x300
@@ -244,9 +251,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Voodoo3State, VOODOO3)
 #define V3_3D_TEXBASEADDR       0x30c
 #define V3_3D_NCCTABLE0         0x324    /* nccTable0[12]: NCC + palette */
 
+/*
+ * The Voodoo3 has two TMUs (single-pass multitexturing). TMU1's texture
+ * registers alias TMU0's 0x800 higher (Glide SST_TMU: base + 0x800<<n), so
+ * textureMode1 is at 0xB00, texBaseAddr1 at 0xB0c, nccTable0_1 at 0xB24, etc.
+ */
+#define V3_3D_TMU1              0x800
+
 #define V3_3D_INTRCTRL          0x004   /* interrupt control */
 
-#define V3_3D_REG_NB            (0x400 / 4)
+#define V3_3D_REG_NB            (0xc00 / 4)
 
 /* status register bits (BAR0 + 0x200000) */
 #define V3_STATUS_VRETRACE      BIT(6)
@@ -396,7 +410,8 @@ typedef struct V3Vertex {
     float z;            /* depth, 0..65535 */
     float oow;          /* 1/w for perspective-correct texturing */
     float r, g, b, a;   /* colour components, 0..255 */
-    float sow, tow;     /* s/w, t/w */
+    float sow, tow;     /* TMU0 s/w, t/w */
+    float sow1, tow1;   /* TMU1 s/w, t/w */
 } V3Vertex;
 
 struct Voodoo3State {
@@ -1270,10 +1285,10 @@ static unsigned voodoo3_tfmt_bpt(unsigned fmt)
  * iy=[7:4], ia=[3:2], ib=[1:0] and each channel is Y[iy] + I[ia] + Q[ib],
  * clamped (Glide txYABtoPal256).
  */
-static void voodoo3_ncc_texel(Voodoo3State *s, uint8_t px,
+static void voodoo3_ncc_texel(Voodoo3State *s, unsigned tmu, uint8_t px,
                               float *r, float *g, float *b)
 {
-    const uint32_t *ncc = &s->d3_regs[V3_3D_NCCTABLE0 / 4];
+    const uint32_t *ncc = &s->d3_regs[(V3_3D_NCCTABLE0 + tmu) / 4];
     unsigned iy = (px >> 4) & 0xf, ia = (px >> 2) & 3, ib = px & 3;
     int y = (ncc[iy >> 2] >> ((iy & 3) * 8)) & 0xff;
     float *out[3] = { r, g, b };
@@ -1317,9 +1332,9 @@ static uint32_t voodoo3_texel_off(uint32_t base, unsigned bpt, unsigned dim,
 }
 
 /* fetch and decode one texel at integer (u,v) into 0..255 RGBA floats */
-static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
-                                unsigned dim, bool tiled, unsigned stride_tiles,
-                                int u, int v,
+static void voodoo3_fetch_texel(Voodoo3State *s, unsigned tmu, uint32_t base,
+                                unsigned fmt, unsigned dim, bool tiled,
+                                unsigned stride_tiles, int u, int v,
                                 float *r, float *g, float *b, float *a)
 {
     unsigned bpt = voodoo3_tfmt_bpt(fmt);
@@ -1359,7 +1374,7 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
             break;
         }
         case V3_TFMT_YIQ:
-            voodoo3_ncc_texel(s, px, r, g, b);
+            voodoo3_ncc_texel(s, tmu, px, r, g, b);
             break;
         default: /* unreachable (all 1-byte formats handled) */
             *r = *g = *b = px;
@@ -1407,7 +1422,7 @@ static void voodoo3_fetch_texel(Voodoo3State *s, uint32_t base, unsigned fmt,
     }
     case V3_TFMT_AYIQ:
         *a = (t >> 8) & 0xff;
-        voodoo3_ncc_texel(s, t & 0xff, r, g, b);
+        voodoo3_ncc_texel(s, tmu, t & 0xff, r, g, b);
         break;
     default: /* unreachable (all 2-byte formats handled) */
         *a = (t >> 8) & 0xff;
@@ -1443,16 +1458,17 @@ static uint32_t voodoo3_lod_offset(unsigned lod, unsigned bpt)
     return (texels * bpt) & ~0xfu;
 }
 
-/* sample the texture at (sc,tc); point-sampled or bilinear per textureMode */
-static void voodoo3_texel(Voodoo3State *s, float sc, float tc, float lodval,
+/* sample TMU `tmu` (byte offset 0 or V3_3D_TMU1) at (sc,tc) */
+static void voodoo3_texel(Voodoo3State *s, unsigned tmu,
+                          float sc, float tc, float lodval,
                           float *r, float *g, float *b, float *a)
 {
-    uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
-    uint32_t texbase = s->d3_regs[V3_3D_TEXBASEADDR / 4];
+    uint32_t tmode = s->d3_regs[(V3_3D_TEXTUREMODE + tmu) / 4];
+    uint32_t texbase = s->d3_regs[(V3_3D_TEXBASEADDR + tmu) / 4];
     uint32_t base = texbase & 0xfffff0;   /* [23:4] byte address, 16-byte units */
     bool tiled = texbase & 1;             /* [0] SST_TEXTURE_IS_TILED */
     unsigned stride_tiles = (texbase >> 25) & 0x7f;  /* [31:25] tile stride */
-    uint32_t lod = s->d3_regs[V3_3D_TLOD / 4];
+    uint32_t lod = s->d3_regs[(V3_3D_TLOD + tmu) / 4];
     unsigned fmt = (tmode & V3_TEX_TFORMAT_MASK) >> V3_TEX_TFORMAT_SHIFT;
     unsigned lodmin = (lod & 0x3f) >> 2;      /* tLOD lodmin, 4.2 -> integer */
     unsigned lodmax = ((lod >> 6) & 0x3f) >> 2;
@@ -1503,7 +1519,7 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc, float lodval,
     if (!bilinear) {
         int u = voodoo3_wrap((int)floorf(sc), dim, clamps);
         int v = voodoo3_wrap((int)floorf(tc), dim, clampt);
-        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+        voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             u, v, r, g, b, a);
         return;
     } else {
@@ -1519,13 +1535,13 @@ static void voodoo3_texel(Voodoo3State *s, float sc, float tc, float lodval,
         float r00, g00, b00, a00, r10, g10, b10, a10;
         float r01, g01, b01, a01, r11, g11, b11, a11;
 
-        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+        voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             ua, va, &r00, &g00, &b00, &a00);
-        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+        voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             ub, va, &r10, &g10, &b10, &a10);
-        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+        voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             ua, vb, &r01, &g01, &b01, &a01);
-        voodoo3_fetch_texel(s, base, fmt, dim, tiled, stride_tiles,
+        voodoo3_fetch_texel(s, tmu, base, fmt, dim, tiled, stride_tiles,
                             ub, vb, &r11, &g11, &b11, &a11);
         /* hardware rounds the bilinear result to nearest (a 4-texel average
          * of e.g. 127.5 lands on 128, not 127) */
@@ -1644,21 +1660,77 @@ static float v3_comb(const V3Combine *c, float other, float clocal,
 }
 
 /*
- * textureMode combine for a single TMU (the downstream "other" input is
- * zero): fold the fetched texel through the tc/tca combine into the TMU
- * colour. All values 0..1.
+ * textureMode combine: fold the fetched texel (Clocal) through the tc/tca
+ * combine with the downstream TMU's colour as "other" (cor/cog/cob/coa; zero
+ * for the last TMU in the chain) into this TMU's colour. All values 0..1.
  */
 static void voodoo3_tmu_combine(uint32_t tmode,
                                 float tr, float tg, float tb, float ta,
+                                float cor, float cog, float cob, float coa,
+                                float lod, float lodfrac,
                                 float *or_, float *og, float *ob, float *oa)
 {
     V3Combine cc = v3_comb_ctl(tmode, 12, 13, 14, 17, 18, 19, 20);
     V3Combine ca = v3_comb_ctl(tmode, 21, 22, 23, 26, 27, 28, 29);
 
-    *or_ = v3_comb(&cc, 0.0f, tr, v3_mbase(cc.mselect, tr, 0, ta, 0, 0), ta);
-    *og  = v3_comb(&cc, 0.0f, tg, v3_mbase(cc.mselect, tg, 0, ta, 0, 0), ta);
-    *ob  = v3_comb(&cc, 0.0f, tb, v3_mbase(cc.mselect, tb, 0, ta, 0, 0), ta);
-    *oa  = v3_comb(&ca, 0.0f, ta, v3_mbase(ca.mselect, ta, 0, ta, 0, 0), ta);
+    /* for the TMU combine mselect 4/5 are MLOD / MLODFRAC (trilinear blend),
+     * passed as the atmu/ctmu factor sources */
+    *or_ = v3_comb(&cc, cor, tr, v3_mbase(cc.mselect, tr, coa, ta, lod, lodfrac), ta);
+    *og  = v3_comb(&cc, cog, tg, v3_mbase(cc.mselect, tg, coa, ta, lod, lodfrac), ta);
+    *ob  = v3_comb(&cc, cob, tb, v3_mbase(cc.mselect, tb, coa, ta, lod, lodfrac), ta);
+    *oa  = v3_comb(&ca, coa, ta, v3_mbase(ca.mselect, ta, coa, ta, lod, lodfrac), ta);
+}
+
+/*
+ * Run one TMU stage at a pixel: interpolate its perspective-correct
+ * texcoords (TMU0 uses sow/tow, TMU1 sow1/tow1), estimate the screen-space
+ * LOD by finite difference against the neighbouring pixels, sample the
+ * texel and fold it through the textureMode combine with the downstream
+ * TMU's colour as "other". Output 0..1.
+ */
+static void voodoo3_tmu_stage(Voodoo3State *s, unsigned tmu,
+        const V3Vertex *v0, const V3Vertex *v1, const V3Vertex *v2,
+        float l0, float l1, float l2, float e0, float e1, float e2,
+        float de0dx, float de0dy, float de1dx, float de1dy,
+        float de2dx, float de2dy, float area,
+        float cor, float cog, float cob, float coa,
+        float *or_, float *og, float *ob, float *oa)
+{
+    bool t1 = tmu != 0;
+    float s0 = t1 ? v0->sow1 : v0->sow, s1 = t1 ? v1->sow1 : v1->sow;
+    float s2 = t1 ? v2->sow1 : v2->sow;
+    float t0 = t1 ? v0->tow1 : v0->tow, t1v = t1 ? v1->tow1 : v1->tow;
+    float t2 = t1 ? v2->tow1 : v2->tow;
+    float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
+    float sc = l0 * s0 + l1 * s1 + l2 * s2;
+    float tc = l0 * t0 + l1 * t1v + l2 * t2;
+    float l0x = (e0 + de0dx) / area, l1x = (e1 + de1dx) / area;
+    float l2x = (e2 + de2dx) / area;
+    float l0y = (e0 + de0dy) / area, l1y = (e1 + de1dy) / area;
+    float l2y = (e2 + de2dy) / area;
+    float ow_x = l0x * v0->oow + l1x * v1->oow + l2x * v2->oow;
+    float sc_x = l0x * s0 + l1x * s1 + l2x * s2;
+    float tc_x = l0x * t0 + l1x * t1v + l2x * t2;
+    float ow_y = l0y * v0->oow + l1y * v1->oow + l2y * v2->oow;
+    float sc_y = l0y * s0 + l1y * s1 + l2y * s2;
+    float tc_y = l0y * t0 + l1y * t1v + l2y * t2;
+    float dsx, dtx, dsy, dty, g2, lodval, xr, xg, xb, xa;
+    uint32_t tmode = s->d3_regs[(V3_3D_TEXTUREMODE + tmu) / 4];
+
+    if (oow != 0) { sc /= oow; tc /= oow; }
+    if (ow_x != 0) { sc_x /= ow_x; tc_x /= ow_x; }
+    if (ow_y != 0) { sc_y /= ow_y; tc_y /= ow_y; }
+    dsx = sc_x - sc; dtx = tc_x - tc;
+    dsy = sc_y - sc; dty = tc_y - tc;
+    g2 = MAX(dsx * dsx + dtx * dtx, dsy * dsy + dty * dty);
+    lodval = g2 > 1e-12f ? 0.5f * log2f(g2) : 0.0f;
+    /* LOD factor sources for the combine (MLOD / MLODFRAC), best-effort */
+    float lodfrac = lodval > 0 ? v3_clampf(lodval - floorf(lodval), 0, 1) : 0.0f;
+    float lodlev = v3_clampf(lodval, 0, 1);
+    voodoo3_texel(s, tmu, sc, tc, lodval, &xr, &xg, &xb, &xa);
+    voodoo3_tmu_combine(tmode, xr / 255.0f, xg / 255.0f, xb / 255.0f,
+                        xa / 255.0f, cor, cog, cob, coa, lodlev, lodfrac,
+                        or_, og, ob, oa);
 }
 
 /*
@@ -1726,7 +1798,6 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     uint32_t fbz = s->d3_regs[V3_3D_FBZMODE / 4];
     uint32_t alpham = s->d3_regs[V3_3D_ALPHAMODE / 4];
     uint32_t cpath = s->d3_regs[V3_3D_FBZCOLORPATH / 4];
-    uint32_t tmode = s->d3_regs[V3_3D_TEXTUREMODE / 4];
     uint32_t fogm = s->d3_regs[V3_3D_FOGMODE / 4];
     uint32_t fogc = s->d3_regs[V3_3D_FOGCOLOR / 4];
     uint32_t ckey = s->d3_regs[V3_3D_CHROMAKEY / 4] & 0xffffff;
@@ -1742,6 +1813,10 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
     unsigned dblend = (alpham >> V3_ALPHA_DSTFUNC_SHIFT) & V3_ALPHA_BLENDFUNC_MASK;
     unsigned aref = (alpham >> V3_ALPHA_REF_SHIFT) & 0xff;
     bool texen = cpath & V3_CP_TEXTURE_EN;
+    /* TMU1 feeds TMU0 when its combine is non-trivial (SST_TMU_ACTIVE): the
+     * tc/tca combine fields [29:12] differ from PASS (all zero) */
+    uint32_t tmode1 = s->d3_regs[(V3_3D_TEXTUREMODE + V3_3D_TMU1) / 4];
+    bool tmu1_en = texen && (tmode1 & 0x3ffff000u);
     int clx0, clx1, cly0, cly1;
     float area, minx, maxx, miny, maxy;
     int ix0, ix1, iy0, iy1, x, y;
@@ -1828,39 +1903,21 @@ static void voodoo3_3d_triangle(Voodoo3State *s, const V3Vertex *v0,
                 float ia = v3_clampf(l0 * v0->a + l1 * v1->a + l2 * v2->a, 0, 255) / 255.0f;
                 float tr = 0, tg = 0, tb = 0, ta = 0, fr, fg, fb, fa;
 
-                /* TMU: fetch the (perspective-correct) texel and fold it
-                 * through the textureMode combine into the TMU colour */
+                /* TMU chain: TMU1 (if active) feeds its colour into TMU0's
+                 * combine as "other"; TMU0's colour goes to the fbz stage */
                 if (texen) {
-                    float oow = l0 * v0->oow + l1 * v1->oow + l2 * v2->oow;
-                    float sc = (l0 * v0->sow + l1 * v1->sow + l2 * v2->sow);
-                    float tc = (l0 * v0->tow + l1 * v1->tow + l2 * v2->tow);
-                    float xr, xg, xb, xa, lodval;
-                    /* texcoords one pixel over in x and y for the LOD */
-                    float l0x = (e0 + de0dx) / area, l1x = (e1 + de1dx) / area;
-                    float l2x = (e2 + de2dx) / area;
-                    float l0y = (e0 + de0dy) / area, l1y = (e1 + de1dy) / area;
-                    float l2y = (e2 + de2dy) / area;
-                    float ow_x = l0x * v0->oow + l1x * v1->oow + l2x * v2->oow;
-                    float sc_x = l0x * v0->sow + l1x * v1->sow + l2x * v2->sow;
-                    float tc_x = l0x * v0->tow + l1x * v1->tow + l2x * v2->tow;
-                    float ow_y = l0y * v0->oow + l1y * v1->oow + l2y * v2->oow;
-                    float sc_y = l0y * v0->sow + l1y * v1->sow + l2y * v2->sow;
-                    float tc_y = l0y * v0->tow + l1y * v1->tow + l2y * v2->tow;
-                    float dsx, dtx, dsy, dty, g2;
-                    if (oow != 0) {
-                        sc /= oow;
-                        tc /= oow;
+                    float c1r = 0, c1g = 0, c1b = 0, c1a = 0;
+                    if (tmu1_en) {
+                        voodoo3_tmu_stage(s, V3_3D_TMU1, v0, v1, v2,
+                                          l0, l1, l2, e0, e1, e2,
+                                          de0dx, de0dy, de1dx, de1dy,
+                                          de2dx, de2dy, area, 0, 0, 0, 0,
+                                          &c1r, &c1g, &c1b, &c1a);
                     }
-                    if (ow_x != 0) { sc_x /= ow_x; tc_x /= ow_x; }
-                    if (ow_y != 0) { sc_y /= ow_y; tc_y /= ow_y; }
-                    dsx = sc_x - sc; dtx = tc_x - tc;
-                    dsy = sc_y - sc; dty = tc_y - tc;
-                    g2 = MAX(dsx * dsx + dtx * dtx, dsy * dsy + dty * dty);
-                    lodval = g2 > 1e-12f ? 0.5f * log2f(g2) : 0.0f;
-                    voodoo3_texel(s, sc, tc, lodval, &xr, &xg, &xb, &xa);
-                    voodoo3_tmu_combine(tmode, xr / 255.0f, xg / 255.0f,
-                                        xb / 255.0f, xa / 255.0f,
-                                        &tr, &tg, &tb, &ta);
+                    voodoo3_tmu_stage(s, 0, v0, v1, v2, l0, l1, l2, e0, e1, e2,
+                                      de0dx, de0dy, de1dx, de1dy,
+                                      de2dx, de2dy, area, c1r, c1g, c1b, c1a,
+                                      &tr, &tg, &tb, &ta);
                 }
 
                 /* fbzColorPath combine -> final pixel colour, 0..255 */
@@ -1993,6 +2050,8 @@ static void voodoo3_setup_vertex(Voodoo3State *s, V3Vertex *v)
     }
     v->sow = v3_reg_f(s, V3_3D_SSOW0);
     v->tow = v3_reg_f(s, V3_3D_STOW0);
+    v->sow1 = v3_reg_f(s, V3_3D_SSOW1);
+    v->tow1 = v3_reg_f(s, V3_3D_STOW1);
 }
 
 /* Setup unit: accumulate a vertex and emit triangles (strip or fan). */
@@ -2193,7 +2252,7 @@ static uint64_t voodoo3_3d_read(Voodoo3State *s, hwaddr addr, unsigned size)
 {
     uint32_t val;
 
-    if (addr >= 0x400) {
+    if (addr >= 0xc00) {
         return 0;
     }
     switch (addr & ~3) {
@@ -2228,7 +2287,7 @@ static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
 {
     unsigned reg;
 
-    if (addr >= 0x400) {
+    if (addr >= 0xc00) {
         return;
     }
     reg = (addr & ~3);
@@ -2238,14 +2297,22 @@ static void voodoo3_3d_write(Voodoo3State *s, hwaddr addr, uint64_t data,
     /*
      * Texture palette download: entries are written to nccTable0[4..11]
      * with bit 31 set, the CLUT index packed in [30:24] and 0xRRGGBB in
-     * [23:0] (Glide _grTexDownloadPalette). Capture them into tex_palette.
+     * [23:0] (Glide _grTexDownloadPalette). The palette is broadcast to
+     * both TMUs (one global CLUT), so capture writes to either TMU's
+     * nccTable into the shared tex_palette.
      */
-    if (reg >= V3_3D_NCCTABLE0 + 16 && reg < V3_3D_NCCTABLE0 + 48 &&
-        (s->d3_regs[reg / 4] & 0x80000000)) {
-        uint32_t v = s->d3_regs[reg / 4];
-        unsigned col = (reg - (V3_3D_NCCTABLE0 + 16)) / 4;   /* 0..7 */
-        unsigned row = ((v >> 24) & 0x7f) >> 2;              /* 0..31 */
-        s->tex_palette[row * 8 + col] = v & 0xffffff;
+    {
+        unsigned nreg = reg;
+        if (nreg >= V3_3D_TMU1) {
+            nreg -= V3_3D_TMU1;
+        }
+        if (nreg >= V3_3D_NCCTABLE0 + 16 && nreg < V3_3D_NCCTABLE0 + 48 &&
+            (s->d3_regs[reg / 4] & 0x80000000)) {
+            uint32_t v = s->d3_regs[reg / 4];
+            unsigned col = (nreg - (V3_3D_NCCTABLE0 + 16)) / 4;  /* 0..7 */
+            unsigned row = ((v >> 24) & 0x7f) >> 2;              /* 0..31 */
+            s->tex_palette[row * 8 + col] = v & 0xffffff;
+        }
     }
 
     switch (reg) {
@@ -2571,7 +2638,7 @@ static int voodoo3_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_voodoo3 = {
     .name = "voodoo3",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = voodoo3_post_load,
     .fields = (const VMStateField[]) {

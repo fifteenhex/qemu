@@ -291,6 +291,21 @@ def run():
     w3(t, FOGMODE, 0)
     line("fog-table-full", "0x%04x" % pix(t, 100, 110))
 
+    # 19. dual-TMU multitexture: white(TMU0) * red(TMU1) -> red
+    clear(t, 0)
+    toff0, toff1 = W * H * 2 * 10, W * H * 2 * 11
+    tc_mult = (1 << 14) | (1 << 17) | (1 << 23) | (1 << 26)
+    t.ww(BAR1 + toff0, 0xffff); t.ww(BAR1 + toff1, 0xf800)
+    w3(t, TEXBASE, toff0); w3(t, TLOD, 0); w3(t, TEXMODE, (10 << 8) | tc_mult)
+    w3(t, 0x800 + 0x30c, toff1); w3(t, 0x800 + 0x304, 0)
+    w3(t, 0x800 + 0x300, (10 << 8) | TC)
+    w3(t, 0x298, f2i(0.0)); w3(t, 0x29c, f2i(0.0))
+    w3(t, FBZCOLORPATH, 1 | TEXEN)
+    w3(t, SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    vert(t, 40, 40, 0xffffffff, 1); vert(t, 40, 200, 0xffffffff, 0); vert(t, 280, 120, 0xffffffff, 0)
+    w3(t, FBZCOLORPATH, 0); w3(t, TEXMODE, 0); w3(t, 0x800 + 0x300, 0)
+    line("dual-tmu-mtex", "0x%04x" % pix(t, 100, 110))
+
     # 17. colour-source 2D host-to-screen blt
     clear(t, 0)
     w2(0x08, 0); w2(0x0c, 0x0fff0fff)

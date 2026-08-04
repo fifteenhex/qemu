@@ -439,6 +439,29 @@ def run():
     q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0)
     check("NCC YIQ texture", near(nv, 0, 255, 0, tol=24), hex(nv))
 
+    # 9m. dual-TMU multitexture: TMU1 REPLACE (Ctmu1 = texel1), TMU0 modulates
+    # its texel by the TMU1 colour (MULT). white(TMU0) * red(TMU1) -> red,
+    # proving the second TMU's colour feeds TMU0's combine.
+    toff0, toff1 = W * H * 2 * 10, W * H * 2 * 11
+    TMU1 = 0x800
+    TC_MULT = (1 << 14) | (1 << 17) | (1 << 23) | (1 << 26)   # MCLOCAL|REVERSE
+    q.wl(D3 + C1, 0); q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)
+    q.ww(BAR1 + toff0, 0xffff)          # TMU0 texel = white
+    q.ww(BAR1 + toff1, 0xf800)          # TMU1 texel = red
+    q.wl(D3 + TEXBASE, toff0); q.wl(D3 + TLOD, 0)
+    q.wl(D3 + TEXMODE, (10 << 8) | TC_MULT)          # TMU0: texel0 * other
+    q.wl(D3 + TMU1 + 0x30c, toff1); q.wl(D3 + TMU1 + 0x304, 0)   # TMU1 base,lod
+    q.wl(D3 + TMU1 + 0x300, (10 << 8) | TC)          # TMU1: REPLACE -> texel1
+    q.wl(D3 + 0x298, f2i(0.0)); q.wl(D3 + 0x29c, f2i(0.0))   # SSOW1/STOW1 = 0
+    q.wl(D3 + FBZCOLORPATH, 1 | (1 << 27))
+    q.wl(D3 + SSETUPMODE, 1 | (1 << 2) | (1 << 3) | (1 << 5))
+    svert(q, 40, 40, 0xffffffff, first=True, s=0.0, t=0.0)
+    svert(q, 40, 200, 0xffffffff, s=0.0, t=0.0)
+    svert(q, 280, 120, 0xffffffff, s=0.0, t=0.0)
+    dv = pix(q, 100, 110)
+    q.wl(D3 + FBZCOLORPATH, 0); q.wl(D3 + TEXMODE, 0); q.wl(D3 + TMU1 + 0x300, 0)
+    check("dual-TMU multitexture", near(dv, 255, 0, 0, tol=24), hex(dv))
+
     # 9f. chroma-key: matching colour discarded, non-matching drawn
     q.wl(D3 + C1, 0x000000ff)
     q.wl(D3 + FBZMODE, (7 << 5) | RGBWRMASK); q.wl(D3 + FASTFILL, 1)   # blue bg
