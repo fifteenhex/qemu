@@ -2,9 +2,11 @@
  * Commodore Amiga 4000.
  *
  * 68040 at 25MHz with the AGA chipset (Alice/Lisa) and 2MB chip RAM.
- * This is an early bring-up: it boots the A4000 Kickstart on the AGA
- * chipset IDs; the onboard IDE and the AGA-only display features are
- * not modelled yet, so the OS renders through the ECS-compatible path.
+ * It boots the A4000 Kickstart on the AGA chipset IDs and drives the
+ * onboard IDE (the same ATA core as Gayle, rebased to 0xdd2020, without
+ * the gate array; see hw/ide/gayle.c), so hard disks attach with
+ * -drive if=ide.  The AGA-only display features are not modelled, so
+ * the OS renders through the ECS-compatible path.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -96,6 +98,9 @@ static void a4000_board_init(AmigaMachineState *ams)
             break;
         }
     }
+
+    /* the onboard IDE at 0xdd2020 (INT2), for -drive if=ide hard disks */
+    amiga_a4000ide_init(ams);
 }
 
 static void a4000_machine_class_init(ObjectClass *oc, const void *data)
@@ -107,11 +112,20 @@ static void a4000_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
     mc->default_ram_size = 8 * MiB;
     mc->default_ram_id = "amiga.fastram";
+    mc->block_default_type = IF_IDE;
 
     amc->rom_base = A4000_ROM_BASE;
     amc->rom_size = 512 * KiB;
     amc->chipram_size = 2 * MiB;
-    amc->open_bus_size = 0x10000000;
+    /*
+     * Fat Gary terminates every unpopulated cycle in the 68040's 32-bit
+     * space with a bus timeout (reading open bus), rather than faulting.
+     * The whole space must therefore read open bus under the real chips
+     * so that, with a full 128MB processor-slot SIMM (fast RAM ending
+     * exactly at 0x10000000), the OS's RAM sizing probe reads 0xff one
+     * chunk past the top and stops, instead of taking a fatal bus error.
+     */
+    amc->open_bus_size = 0x100000000ULL;
     /* AGA: 2MB Alice reports VPOSR id 0x23, Lisa reports Denise id 0xf8 */
     amc->agnus_id = 0x23;
     amc->denise_id = 0xf8;

@@ -79,6 +79,8 @@ struct Mediator4000State {
     /* PCI memory and I/O spaces behind the bridge */
     MemoryRegion pci_mem;
     MemoryRegion pci_io;
+    /* bus-master DMA sees only PCI space, never Amiga RAM (real bridge) */
+    AddressSpace pci_dma_as;
 
     /* the Control board body and its windows */
     MemoryRegion control_body;
@@ -240,6 +242,17 @@ static void mediator_set_irq(void *opaque, int irq_num, int level)
 
 /* --- the PCI host bridge proper --- */
 
+static AddressSpace *mediator_pci_dma_as(PCIBus *bus, void *opaque, int devfn)
+{
+    Mediator4000State *s = opaque;
+
+    return &s->pci_dma_as;
+}
+
+static const PCIIOMMUOps mediator_pci_dma_ops = {
+    .get_address_space = mediator_pci_dma_as,
+};
+
 static void mediator_pci_host_realize(DeviceState *dev, Error **errp)
 {
     Mediator4000PCIHost *h = MEDIATOR4000_PCI_HOST(dev);
@@ -250,6 +263,19 @@ static void mediator_pci_host_realize(DeviceState *dev, Error **errp)
                                      mediator_map_irq, s, &s->pci_mem,
                                      &s->pci_io, PCI_DEVFN(0, 0),
                                      PCI_NUM_PINS, TYPE_PCI_BUS);
+
+    /*
+     * The real Mediator does not forward PCI-initiated (bus-master) cycles
+     * back to the Amiga: a card can only reach PCI space -- other cards'
+     * BARs and the bridge's own windows -- not chip or fast RAM.  Without
+     * an IOMMU, QEMU would default device DMA to the system address space
+     * (Amiga RAM), so root every device's DMA at the PCI memory space
+     * instead.  Bus-master reads/writes to RAM addresses then hit
+     * unassigned PCI memory and fail, exactly as on the hardware; the CPU
+     * still sees everything, so drivers move data by hand (or via swiotlb).
+     */
+    address_space_init(&s->pci_dma_as, &s->pci_mem, "mediator4000.pci-dma");
+    pci_setup_iommu(phb->bus, &mediator_pci_dma_ops, s);
 }
 
 static void mediator_pci_host_class_init(ObjectClass *klass, const void *data)

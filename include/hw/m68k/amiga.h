@@ -115,4 +115,11 @@ extern const MemoryRegionOps amiga_open_bus_ops;
  */
 void amiga_gayle_init(AmigaMachineState *ams);
 
+/*
+ * The A4000 onboard IDE (the same ATA core without the Gayle gate
+ * array), at 0xdd2020/0xdd3020, interrupting on INT2, with the IF_IDE
+ * drives attached; for the A4000/A4000T board_init hooks.
+ */
+void amiga_a4000ide_init(AmigaMachineState *ams);
+
 #endif

@@ -1644,7 +1644,8 @@ static void amiga_custom_ports_irq(void *opaque, int n, int level)
 {
     AmigaCustomState *s = opaque;
 
-    amiga_custom_level_irq(s, &s->ports_levels, 1, level, INT_PORTS);
+    /* source 0 is CIA-A; the board /INT2 lines start at source 1 */
+    amiga_custom_level_irq(s, &s->ports_levels, 1 + n, level, INT_PORTS);
 }
 
 static void amiga_custom_exter_irq(void *opaque, int n, int level)
@@ -1732,7 +1733,7 @@ static void amiga_custom_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->ipl);
     qdev_init_gpio_in_named(dev, amiga_custom_cia_irq, "cia-irq", 2);
-    qdev_init_gpio_in_named(dev, amiga_custom_ports_irq, "ports-irq", 1);
+    qdev_init_gpio_in_named(dev, amiga_custom_ports_irq, "ports-irq", 2);
     qdev_init_gpio_in_named(dev, amiga_custom_exter_irq, "exter-irq", 1);
     qdev_init_gpio_out_named(dev, &s->mouse_btn, "mouse-btn", 1);
     qdev_init_gpio_out_named(dev, &s->joy2_btn, "joy2-btn", 1);

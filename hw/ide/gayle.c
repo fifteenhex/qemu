@@ -28,6 +28,15 @@
  *             starting with the MSB on D7.  A600/A1200 Gayle IDs as
  *             0xd0.
  *
+ * The A4000/A4000T carry the same ATA core on the motherboard, but
+ * without the Gayle gate array: the "a4000" property rebases the ATA
+ * block to 0xdd2020 (so the data port is at 0xdd2020, the task file at
+ * +2 + reg*4, and the control/alt-status block at 0xdd3020) and drops
+ * the PCMCIA interrupt registers and the Gayle ID.  There the drive's
+ * INTRQ is reported live in bit 7 of the interrupt-status register at
+ * 0xdd3020 (control block, register 0) and drives INT2 directly, with
+ * no enable/latch gate; reading the ATA status register clears it.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -53,6 +62,15 @@
 /* the IDEACK output bits in the change register store their value */
 #define GAYLE_INT_IDEACK        0x03
 
+/*
+ * A4000 IDE: the control block (addr & GAYLE_ATA_CTRL_BLOCK) holds the
+ * interrupt-status register in register 0 (0xdd3020) with the live
+ * drive INTRQ in bit 7, alongside the ATA alt-status/device-control in
+ * register 6 (0xdd303a) as on Gayle.
+ */
+#define A4000_IDE_CTRL_INTSTATUS 0
+#define A4000_IDE_INT_HD         0x80
+
 OBJECT_DECLARE_SIMPLE_TYPE(GayleIDEState, GAYLE_IDE)
 
 struct GayleIDEState {
@@ -70,10 +88,16 @@ struct GayleIDEState {
     uint8_t intena;             /* 0xdaa000: interrupt enable bits */
     uint8_t cfg;                /* 0xdab000 */
     bool ide_level;             /* live INTRQ from the drive */
+    bool a4000;                 /* A4000 onboard IDE: no Gayle gate array */
 };
 
 static void gayle_update_irq(GayleIDEState *s)
 {
+    if (s->a4000) {
+        /* the drive's INTRQ drives INT2 directly, with no enable gate */
+        qemu_set_irq(s->irq, s->ide_level);
+        return;
+    }
     qemu_set_irq(s->irq, !!(s->intreq & s->intena & GAYLE_INT_IDE));
 }
 
@@ -216,6 +240,49 @@ static const MemoryRegionOps gayle_ctrl_ops = {
     },
 };
 
+/*
+ * The A4000 onboard IDE control block at 0xdd3020: register 0 is the
+ * interrupt-status register (bit 7 = live drive INTRQ) and register 6 is
+ * the ATA alt-status/device-control, on the same +2+reg*4 stride as the
+ * task file.  Byte-wide and big-endian, like Gayle's control registers,
+ * so scsi.device's word/longword reads of the interrupt status put bit 7
+ * in the right lane (the little-endian ATA data region would swap it).
+ */
+static uint64_t a4000_ide_ctrl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    GayleIDEState *s = opaque;
+    unsigned reg = (addr >> 2) & 7;
+
+    if (reg == A4000_IDE_CTRL_INTSTATUS) {
+        return s->ide_level ? A4000_IDE_INT_HD : 0;
+    }
+    if (reg == 6) {
+        return ide_status_read(&s->bus, 0);         /* alt status */
+    }
+    return 0xff;
+}
+
+static void a4000_ide_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    GayleIDEState *s = opaque;
+    unsigned reg = (addr >> 2) & 7;
+
+    if (reg == 6) {
+        ide_ctrl_write(&s->bus, 0, val);            /* device control */
+    }
+}
+
+static const MemoryRegionOps a4000_ide_ctrl_ops = {
+    .read = a4000_ide_ctrl_read,
+    .write = a4000_ide_ctrl_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
 static uint64_t gayle_id_read(void *opaque, hwaddr addr, unsigned size)
 {
     GayleIDEState *s = opaque;
@@ -280,6 +347,24 @@ static void gayle_ide_realize(DeviceState *dev, Error **errp)
     ide_bus_init_output_irq(&s->bus,
                             qemu_allocate_irq(gayle_ide_intrq, s, 0));
 
+    if (s->a4000) {
+        /*
+         * The A4000 onboard IDE: the little-endian ATA data/task-file
+         * window at 0xdd2020 (sysbus MMIO 0), and a big-endian control
+         * window at 0xdd3020 (MMIO 1) holding the interrupt-status and
+         * alt-status/device-control registers.  No PCMCIA registers, no
+         * Gayle ID.  Two regions (not one) so the status register keeps
+         * Gayle's big-endian byte lane, away from the data port's swap.
+         */
+        memory_region_init_io(&s->ata, OBJECT(s), &gayle_ata_ops, s,
+                              "a4000ide.ata", A4000_IDE_ATA_SIZE);
+        memory_region_init_io(&s->ctrl, OBJECT(s), &a4000_ide_ctrl_ops, s,
+                              "a4000ide.ctrl", A4000_IDE_CTRL_SIZE);
+        sysbus_init_mmio(d, &s->ata);
+        sysbus_init_mmio(d, &s->ctrl);
+        return;
+    }
+
     memory_region_init_io(&s->ata, OBJECT(s), &gayle_ata_ops, s,
                           "gayle.ata", GAYLE_IDE_ATA_SIZE);
     memory_region_init_io(&s->ctrl, OBJECT(s), &gayle_ctrl_ops, s,
@@ -315,6 +400,8 @@ void gayle_ide_init_drives(DeviceState *dev, DriveInfo *hd0, DriveInfo *hd1)
 static const Property gayle_ide_properties[] = {
     /* the A600/A1200 Gayle identifies as 0xd0 */
     DEFINE_PROP_UINT8("gayle-id", GayleIDEState, gayle_id, 0xd0),
+    /* the A4000 onboard IDE has no Gayle gate array around the ATA core */
+    DEFINE_PROP_BOOL("a4000", GayleIDEState, a4000, false),
 };
 
 static void gayle_ide_class_init(ObjectClass *oc, const void *data)

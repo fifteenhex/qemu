@@ -221,6 +221,36 @@ void amiga_gayle_init(AmigaMachineState *ams)
     }
 }
 
+void amiga_a4000ide_init(AmigaMachineState *ams)
+{
+    DeviceState *ide = qdev_new(TYPE_GAYLE_IDE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(ide);
+    int i;
+
+    qdev_prop_set_bit(ide, "a4000", true);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    /*
+     * Map above the low open-bus filler (and, on the A4000T, above the
+     * Gary-watched NCR slot region the mobo lays over 0xdd0000).
+     */
+    memory_region_add_subregion_overlap(get_system_memory(), A4000_IDE_ATA_BASE,
+                                        sysbus_mmio_get_region(sbd, 0), 1);
+    memory_region_add_subregion_overlap(get_system_memory(), A4000_IDE_CTRL_BASE,
+                                        sysbus_mmio_get_region(sbd, 1), 1);
+    /* the onboard IDE interrupt is a second source on INT2/PORTS */
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in_named(ams->custom, "ports-irq", 1));
+    gayle_ide_init_drives(ide, drive_get(IF_IDE, 0, 0),
+                          drive_get(IF_IDE, 0, 1));
+
+    for (i = 0; i < AMIGA_RSTO_DEVS; i++) {
+        if (!ams->rsto_dev[i]) {
+            ams->rsto_dev[i] = ide;
+            break;
+        }
+    }
+}
+
 static void rerandomize_rng_seed(void *opaque)
 {
     struct bi_record *rng_seed = opaque;
