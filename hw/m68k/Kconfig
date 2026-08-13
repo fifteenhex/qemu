@@ -154,6 +154,11 @@ config AMIGA
     select AT24C
     select PCI
     imply PCI_DEVICES
+    # device-tree direct boot of an MMU-less 68000 kernel (a500): a
+    # goldfish console the DT kernel's drivers bind to, and libfdt to
+    # synthesise the blob handed over in d7.
+    select GOLDFISH_TTY
+    select DEVICE_TREE
 
 config ATARIST
     bool

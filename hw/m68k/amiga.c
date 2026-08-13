@@ -21,6 +21,8 @@
 #include "elf.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "system/device_tree.h"
+#include <libfdt.h>
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "standard-headers/asm-m68k/bootinfo.h"
@@ -168,6 +170,17 @@ static void amiga_cpu_reset(void *opaque)
          */
         cpu->env.aregs[7] = ams->fastram_base;
         cpu->env.pc = ams->kernel_entry;
+        /*
+         * An MMU-less device-tree kernel takes the DT blob address in d7
+         * (matching its head.S "u-boot gives us the DT in d7"), where an
+         * MMU kernel instead walks a bootinfo chain.  The kernel is linked
+         * at, and loaded to, its own physical base, so SP just has to sit
+         * in valid RAM until head.S installs its own stack.
+         */
+        if (ams->kernel_nommu) {
+            cpu->env.aregs[7] = ams->fastram_base + ams->fastram_size;
+            cpu->env.dregs[7] = ams->dtb_addr;
+        }
         return;
     }
     /* initial SP/PC come from the ROM via the reset-time overlay */
@@ -305,6 +318,204 @@ static uint64_t amiga_kernel_translate(void *opaque, uint64_t addr)
     return ams->fastram_base + addr;
 }
 
+/*
+ * binutils tags a 68000/68010 object with EF_M68K_M68000 in e_flags; an
+ * MMU (68020+) kernel leaves it clear.  The 68000 has no MMU, so this bit
+ * distinguishes the device-tree kernel (entered with the DT in d7, linked
+ * at its own physical base) from an MMU kernel (bootinfo chain, linked at
+ * 0 and relocated by the fast RAM base).  Peek it from the ELF header
+ * before load_elf(), since the two need different load translations.
+ */
+#define EF_M68K_M68000 0x01000000
+
+/* the sole phandle in our small tree: the root interrupt controller */
+#define PHANDLE_INTC 1
+
+static bool amiga_kernel_is_nommu(const char *filename)
+{
+    uint8_t hdr[40];
+    uint32_t e_flags;
+    FILE *f = fopen(filename, "rb");
+
+    if (!f) {
+        return false;
+    }
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    if (memcmp(hdr, "\x7f" "ELF", 4) != 0) {
+        return false;
+    }
+    /* ELF32 big-endian: e_flags is the 4 bytes at offset 36 */
+    e_flags = (hdr[36] << 24) | (hdr[37] << 16) | (hdr[38] << 8) | hdr[39];
+    return (e_flags & EF_M68K_M68000) != 0;
+}
+
+/*
+ * Direct-boot an MMU-less device-tree 68000 kernel (see the a500).  Unlike
+ * the MMU path this hands over no bootinfo: the kernel is linked at its own
+ * physical load address (CONFIG_KERNELBASE, the fast RAM base) and taught
+ * about its world entirely through a flattened device tree, whose address
+ * lands in d7 at reset.  The tree describes the RAM it runs from, any
+ * initrd, the command line and a goldfish console for earlycon/the tty
+ * driver to bind to.
+ */
+static void amiga_load_kernel_dt(AmigaMachineState *ams)
+{
+    MachineState *machine = MACHINE(ams);
+    CPUState *cs = CPU(ams->cpu);
+    hwaddr ram_base = ams->fastram_base;
+    uint64_t ram_size = ams->fastram_size;
+    hwaddr ram_end = ram_base + ram_size;
+    uint64_t elf_entry, high;
+    ssize_t kernel_size;
+    hwaddr dtb_base, initrd_base = 0;
+    int64_t initrd_size = 0;
+    g_autofree char *nodename = NULL;
+    g_autofree char *stdout_path = NULL;
+    g_autofree char *bootargs = NULL;
+    void *fdt;
+    int fdt_size;
+
+    if (!ram_size || !ams->gf_tty_base) {
+        error_report("this Amiga model does not support device-tree boot "
+                     "(needs fast RAM and a goldfish console)");
+        exit(1);
+    }
+
+    /* the nommu kernel is linked at its physical base, so load it as-is */
+    kernel_size = load_elf(machine->kernel_filename, NULL, NULL, NULL,
+                           &elf_entry, NULL, &high, NULL,
+                           ELFDATA2MSB, EM_68K, 0, 0);
+    if (kernel_size < 0) {
+        error_report("could not load kernel '%s'", machine->kernel_filename);
+        exit(1);
+    }
+    if (elf_entry < ram_base || high >= ram_end) {
+        error_report("device-tree kernel [0x%" PRIx64 "-0x%" PRIx64 "] does "
+                     "not fit its fast RAM at 0x%" HWADDR_PRIx,
+                     elf_entry, high, ram_base);
+        exit(1);
+    }
+    ams->kernel_entry = elf_entry;
+    ams->kernel_nommu = true;
+
+    /* initrd sits at the very top of RAM, out of the kernel's way */
+    if (machine->initrd_filename) {
+        initrd_size = get_image_size(machine->initrd_filename, NULL);
+        if (initrd_size < 0) {
+            error_report("could not load initial ram disk '%s'",
+                         machine->initrd_filename);
+            exit(1);
+        }
+        initrd_base = (ram_end - initrd_size) & TARGET_PAGE_MASK;
+        if (initrd_base < high + 64 * KiB) {
+            error_report("initial ram disk does not fit above the kernel");
+            exit(1);
+        }
+        load_image_targphys(machine->initrd_filename, initrd_base,
+                            ram_end - initrd_base, &error_fatal);
+    }
+
+    /* the DT blob goes just above the kernel image */
+    dtb_base = QEMU_ALIGN_UP(high + 8, 16);
+
+    fdt = create_device_tree(&fdt_size);
+    if (!fdt) {
+        error_report("could not create the device tree");
+        exit(1);
+    }
+    qemu_fdt_setprop_cell(fdt, "/", "#address-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/", "#size-cells", 1);
+    qemu_fdt_setprop_string(fdt, "/", "compatible", "commodore,a500");
+    qemu_fdt_setprop_string(fdt, "/", "model", "Commodore Amiga 500");
+
+    /*
+     * The 68000 autovector interrupt controller, the root of the tree's
+     * interrupt hierarchy.  The kernel binds it (motorola,mc68000-intc-vect)
+     * both to install its exception/autovector handlers and to give the
+     * goldfish devices below an interrupt domain; a one-cell interrupt is
+     * the autovector index (IPL level - 1).  Everything defaults to it via
+     * interrupt-parent on the root.
+     */
+    qemu_fdt_add_subnode(fdt, "/interrupt-controller");
+    qemu_fdt_setprop_string(fdt, "/interrupt-controller", "compatible",
+                            "motorola,mc68000-intc-vect");
+    qemu_fdt_setprop(fdt, "/interrupt-controller", "interrupt-controller",
+                     NULL, 0);
+    qemu_fdt_setprop_cell(fdt, "/interrupt-controller", "#interrupt-cells", 1);
+    qemu_fdt_setprop_cell(fdt, "/interrupt-controller", "phandle",
+                          PHANDLE_INTC);
+    qemu_fdt_setprop_cell(fdt, "/", "interrupt-parent", PHANDLE_INTC);
+
+    nodename = g_strdup_printf("/memory@%" HWADDR_PRIx, ram_base);
+    qemu_fdt_add_subnode(fdt, nodename);
+    qemu_fdt_setprop_string(fdt, nodename, "device_type", "memory");
+    qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                 1, ram_base, 1, ram_size);
+    g_clear_pointer(&nodename, g_free);
+
+    /* goldfish console, matched by the DT tty driver and by earlycon */
+    stdout_path = g_strdup_printf("/serial@%" HWADDR_PRIx, ams->gf_tty_base);
+    qemu_fdt_add_subnode(fdt, stdout_path);
+    qemu_fdt_setprop_string(fdt, stdout_path, "compatible",
+                            "google,goldfish-tty");
+    qemu_fdt_setprop_sized_cells(fdt, stdout_path, "reg",
+                                 1, ams->gf_tty_base, 1, 0x1000);
+    if (ams->gf_tty_irq >= 0) {
+        qemu_fdt_setprop_cell(fdt, stdout_path, "interrupts", ams->gf_tty_irq);
+    }
+
+    /*
+     * The goldfish system timer (its registers live in the RTC block).
+     * This is what carries the kernel out of calibrate_delay and gives it a
+     * scheduling tick, so it is what turns the earlycon boot log into a
+     * running system.
+     */
+    if (ams->gf_rtc_base) {
+        nodename = g_strdup_printf("/timer@%" HWADDR_PRIx, ams->gf_rtc_base);
+        qemu_fdt_add_subnode(fdt, nodename);
+        qemu_fdt_setprop_string(fdt, nodename, "compatible",
+                                "google,goldfish-timer");
+        qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                     1, ams->gf_rtc_base, 1, 0x1000);
+        qemu_fdt_setprop_cell(fdt, nodename, "interrupts", ams->gf_rtc_irq);
+        g_clear_pointer(&nodename, g_free);
+    }
+
+    qemu_fdt_add_subnode(fdt, "/chosen");
+    qemu_fdt_setprop_string(fdt, "/chosen", "stdout-path", stdout_path);
+    /*
+     * Force earlycon on so the whole boot log appears before the full tty
+     * driver takes over the console; a bare "earlycon" resolves against
+     * stdout-path above.
+     */
+    bootargs = g_strdup_printf("earlycon%s%s",
+                               machine->kernel_cmdline ? " " : "",
+                               machine->kernel_cmdline ?: "");
+    qemu_fdt_setprop_string(fdt, "/chosen", "bootargs", bootargs);
+    if (initrd_size) {
+        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start",
+                              initrd_base);
+        qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end",
+                              initrd_base + initrd_size);
+    }
+
+    if (fdt_pack(fdt) < 0) {
+        error_report("could not pack the device tree");
+        exit(1);
+    }
+    if (dtb_base + fdt_totalsize(fdt) > (initrd_size ? initrd_base : ram_end)) {
+        error_report("no room for the device tree above the kernel");
+        exit(1);
+    }
+    rom_add_blob_fixed_as("dtb", fdt, fdt_totalsize(fdt), dtb_base, cs->as);
+    ams->dtb_addr = dtb_base;
+    g_free(fdt);
+}
+
 static void amiga_load_kernel(AmigaMachineState *ams)
 {
     MachineState *machine = MACHINE(ams);
@@ -320,6 +531,12 @@ static void amiga_load_kernel(AmigaMachineState *ams)
     int64_t initrd_size;
     void *param_blob, *param_ptr, *param_rng_seed;
     uint8_t rng_seed[32];
+
+    /* an MMU-less 68000 kernel boots from a device tree, not bootinfo */
+    if (ams->kernel_nommu) {
+        amiga_load_kernel_dt(ams);
+        return;
+    }
 
     if (amc->amiga_model == AMI_UNKNOWN) {
         error_report("this Amiga model does not support direct kernel boot");
@@ -475,6 +692,14 @@ static void amiga_machine_init(MachineState *machine)
     int i;
 
     ams->linux_boot = machine->kernel_filename != NULL;
+    /*
+     * An MMU-less 68000 kernel device-tree boots (d7 handover, goldfish
+     * console) rather than via bootinfo.  Detect it up front so the board
+     * wires its console and the serials are routed accordingly, before any
+     * of that hardware is created.
+     */
+    ams->kernel_nommu = ams->linux_boot &&
+                        amiga_kernel_is_nommu(machine->kernel_filename);
 
     /*
      * Register the overlay reset before creating the CPU so the ROM is
@@ -561,9 +786,15 @@ static void amiga_machine_init(MachineState *machine)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(ams->fdc[i]), &error_fatal);
     }
 
-    /* custom chips */
+    /*
+     * Custom chips.  Paula's serial normally takes the first -serial, but
+     * a board that also exposes a goldfish console for a device-tree boot
+     * gives that the first chardev (it is the Linux console) and pushes
+     * Paula to the second, so a plain "-serial stdio" reaches the kernel.
+     */
     ams->custom = qdev_new(TYPE_AMIGA_CUSTOM);
-    qdev_prop_set_chr(ams->custom, "chardev", serial_hd(0));
+    qdev_prop_set_chr(ams->custom, "chardev",
+                      serial_hd(ams->kernel_nommu ? 1 : 0));
     if (machine->audiodev) {
         qdev_prop_set_string(ams->custom, "audiodev", machine->audiodev);
     }

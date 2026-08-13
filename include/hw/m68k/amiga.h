@@ -40,9 +40,36 @@ struct AmigaMachineState {
      * board_init hook; a direct-boot Linux kernel is loaded here.
      */
     hwaddr fastram_base;
+    /*
+     * Size of that fast RAM bank.  On the big Amigas machine->ram is the
+     * fast RAM, so this mirrors machine->ram_size; on the A500 the fast
+     * RAM is a separate expansion (machine->ram is chip-bus slow RAM), so
+     * the board records its size here for the direct-boot code.
+     */
+    uint64_t fastram_size;
     /* -kernel boot: entry point the CPU reset routes to instead of ROM */
     bool linux_boot;
     hwaddr kernel_entry;
+    /*
+     * MMU-less device-tree boot (a 68000 kernel): the CPU is entered with
+     * the DT blob address in d7 rather than a bootinfo chain, and the
+     * board exposes a goldfish console at gf_tty_base for the kernel's DT
+     * drivers to bind to.  gf_tty_base 0 means the board has no such
+     * console (and so cannot device-tree boot).
+     */
+    bool kernel_nommu;
+    hwaddr dtb_addr;
+    hwaddr gf_tty_base;
+    hwaddr gf_rtc_base;
+    /*
+     * Device-tree interrupt cells for the goldfish console and timer: the
+     * value is the m68k autovector index (IPL level - 1), matching both the
+     * m68k-irqc GPIO input the device is wired to and the "motorola,
+     * mc68000-intc-vect" domain the kernel unflattens.  -1 means the device
+     * has no interrupt wired (e.g. the console is earlycon/TX only).
+     */
+    int gf_tty_irq;
+    int gf_rtc_irq;
     /*
      * The Zorro III bridge, on machines with an expansion bus; the
      * kernel is loaded from a machine-done notifier so that boards
