@@ -428,23 +428,66 @@ failed), `0x10` (local RAM failed) and `0x3F` (unexpected exception).
 
 ## 9. Firmware download
 
-With strap bit 1 set the ROM does not run the serial firmware. Instead it
-runs a loader that uses a two-character handshake at DPRAM offset
-`0x0080`:
+With strap bit 1 set the ROM runs a loader instead of the serial
+firmware, so the host can put its own code on the card. The loader lives
+at ROM address `0x00C00626` and, importantly, runs *from ROM* — the
+branch to it happens before the ROM shadows itself into RAM at `0x400`,
+which is exactly where the downloaded image goes.
+
+### The handshake
+
+One 16-bit big-endian word at DPRAM offset `0x0080`, and a fixed 2 KiB
+staging buffer at DPRAM offset `0x0100`:
 
 ```
-card:  0x0080 <- 'OK'   (0x4F4B), then polls it
-host:  place up to 2 KiB of code at DPRAM 0x0100
-host:  0x0080 <- 'LD'   (0x4C44)
-card:  copies 2 KiB from 0x0100 into local RAM at 0x400 (advancing),
-       writes 'OK' again
-   ... repeat for as many 2 KiB chunks as needed ...
-host:  0x0080 <- 'GO'   (0x474F)
+card:  0x0080 <- 'OK' (0x4F4B), then polls it every few cycles
+host:  fill DPRAM 0x0100..0x08FF with the next 2 KiB of the image
+host:  0x0080 <- 'LD' (0x4C44)
+card:  copies 1024 words from 0x0100 to the destination pointer,
+       advances the pointer by 2 KiB, writes 'OK' again
+  ... repeat ...
+host:  0x0080 <- 'GO' (0x474F)
 card:  jumps to local address 0x400
 ```
 
-Any value other than `'LD'` or `'GO'` is ignored, so the host can write
-`'OK'` back or leave it alone while preparing the next chunk.
+Details that matter:
+
+* The destination pointer starts at `0x400` and only ever advances, so
+  chunks land contiguously. `'GO'` always enters at `0x400` regardless of
+  how many chunks were sent.
+* Every `'LD'` copies **exactly** 2048 bytes, whatever you actually wrote.
+  Pad the last chunk.
+* There is no bounds check on the destination pointer. 255 chunks
+  (510 KiB) would run off the top of the 512 KiB of RAM.
+* No checksum, no error reporting, no way to abort. The card never writes
+  anything except `'OK'`.
+* Any word that is neither `'LD'` nor `'GO'` makes the card rewrite `'OK'`
+  and carry on polling, so a garbled write costs you nothing — but wait
+  to see `'OK'` again before staging the next chunk.
+* The handshake word sits inside what would be channel 0's block in
+  normal operation. Harmless, since the serial firmware is not running.
+
+### State handed to the downloaded code
+
+The loader is reached *after* the ROM's power-on initialisation, so quite
+a lot is already set up. At the `jmp $400`:
+
+| | |
+|---|---|
+| Local RAM `0x400`–`0x7FFFF` | tested and left **zeroed** (the test's last pass writes a pattern, EORs it with itself and checks for zero) |
+| Dual ported RAM `0xFF0000`–`0xFF0FFB` | tested and left zeroed; `0x0FFC`/`0x0FFD`/`0x0FFE` explicitly cleared, `0x0FFF` untouched |
+| `VBR` | 0. All 256 vectors point at a ROM stub at `0x00C005D6` that writes 3 to DPRAM `0x0FFE`, lights all six LEDs, moves the stack and VBR to `0x200000` and wedges. **Install your own table early.** |
+| `SR` | `0x2700` — supervisor, all interrupts masked |
+| `CACR` | 1 — instruction cache enabled |
+| `A7` | `0x7FFFC`, holding the longword `'LAST'` (`0x4C415354`) |
+| SCCs | hard reset (WR9 = `0xC0`), then WR2 = `0x70`/`0x80`/`0x90`, WR1 = 0, WR15 = 0. Nothing else programmed; receivers and transmitters disabled. |
+| Z8536 CIO | fully initialised: counter 1 loaded with 20000, mode "continuous", vector `0xA0`, interrupt enabled. **The tick starts firing the moment you lower the interrupt mask.** |
+| LEDs (`0xF0000E`) | all off — that is the visible sign that the card is in the loader |
+| Doorbell enables | never touched by the loader path, so undefined; disable them (`0xF2000n` ← channel) before enabling interrupts |
+
+If you want the vector layout, interrupt levels and doorbell semantics the
+stock firmware uses, they are in §1, §6 and §11 — but nothing obliges
+downloaded code to keep them.
 
 ---
 
