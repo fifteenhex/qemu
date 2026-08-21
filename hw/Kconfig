@@ -24,6 +24,7 @@ source misc/Kconfig
 source net/Kconfig
 source nitro/Kconfig
 source nubus/Kconfig
+source vme/Kconfig
 source nvme/Kconfig
 source nvram/Kconfig
 source pci-bridge/Kconfig

@@ -45,6 +45,7 @@
 #include "target/m68k/cpu.h"
 #include "hw/intc/m68k_irqc.h"
 #include "hw/block/flash.h"
+#include "hw/vme/vme.h"
 
 #define MVME147_ROM_BANK1    0xff800000
 #define MVME147_ROM_BANK1_SZ (2 * MiB)
@@ -60,6 +61,15 @@
 #define MVME147_SCC          0xfffe3000
 #define MVME147_SCC2         0xfffe3800
 #define MVME147_SCSI         0xfffe4000
+
+/*
+ * Where the board sees the VMEbus.  A VME slave card mapped here answers to
+ * the 68030; the AVME-352 serial card is jumpered so its dual ported RAM
+ * lands at 0xf0c00000.  Model that as a VME host bridge whose slave space
+ * starts at this local address (so a card at VME base 0 appears here).
+ */
+#define MVME147_VME_WINDOW   0xf0c00000
+#define MVME147_VME_WINDOW_SZ (16 * MiB)
 
 void ledma_memory_read(void *opaque, hwaddr addr,
                        uint8_t *buf, int len, int do_bswap);
@@ -98,12 +108,40 @@ void ledma_memory_read(void *opaque, hwaddr addr,
     }
 }
 
-/* PCC interrupt output, encoded as (level << 8) | vector */
+/*
+ * The 68030's seven interrupt levels are shared between the on-board PCC
+ * and the VMEbus.  Each source presents its request encoded as
+ * (level << 8) | vector (0 = idle); the higher level wins and supplies the
+ * vector the CPU acknowledges.
+ */
+typedef struct {
+    M68kCPU *cpu;
+    int pcc;        /* (level << 8) | vector, 0 = idle */
+    int vme;
+} MVME147IRQState;
+
+static void mvme147_update_irq(MVME147IRQState *s)
+{
+    int enc = (s->vme >> 8) > (s->pcc >> 8) ? s->vme : s->pcc;
+
+    m68k_set_irq_level(s->cpu, enc >> 8, enc & 0xff);
+}
+
 static void mvme147_pcc_irq(void *opaque, int n, int value)
 {
-    M68kCPU *cpu = opaque;
+    MVME147IRQState *s = opaque;
 
-    m68k_set_irq_level(cpu, value >> 8, value & 0xff);
+    s->pcc = value;
+    mvme147_update_irq(s);
+}
+
+/* VME host bridge request, same (level << 8) | vector encoding. */
+static void mvme147_vme_irq(void *opaque, int n, int value)
+{
+    MVME147IRQState *s = opaque;
+
+    s->vme = value;
+    mvme147_update_irq(s);
 }
 
 static void main_cpu_reset(void *opaque)
@@ -133,8 +171,10 @@ static void mvme147_init(MachineState *machine)
     DeviceState *pcc_dev;
     DeviceState *lance_dev;
     DeviceState *vmechip_dev;
+    DeviceState *vmebridge_dev;
     DeviceState *serial_dev;
     DeviceState *scsi_dev;
+    MVME147IRQState *irqs;
 
     if(!machine)
         printf("machine is null\n");
@@ -142,6 +182,10 @@ static void mvme147_init(MachineState *machine)
     /* CPU init */
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
     qemu_register_reset(main_cpu_reset, cpu);
+
+    /* the PCC and the VMEbus share the 68030's interrupt levels */
+    irqs = g_new0(MVME147IRQState, 1);
+    irqs->cpu = cpu;
 
     /* RAM */
     memory_region_add_subregion(sysmem, 0, machine->ram);
@@ -190,7 +234,7 @@ static void mvme147_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcc_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(pcc_dev), 0, MVME147_PCC);
     sysbus_connect_irq(SYS_BUS_DEVICE(pcc_dev), 0,
-                       qemu_allocate_irq(mvme147_pcc_irq, cpu, 0));
+                       qemu_allocate_irq(mvme147_pcc_irq, irqs, 0));
     qdev_connect_gpio_out_named(scsi_dev, "drq", 0,
                                 qdev_get_gpio_in_named(pcc_dev, "dma-drq", 0));
 
@@ -205,10 +249,24 @@ static void mvme147_init(MachineState *machine)
     		SYS_BUS_DEVICE(lance_dev)->mmio[0].memory, 0, 0x4);
     memory_region_add_subregion(sysmem, MVME147_LANCE + 0x4, lance_alias);
 
-    /* VMEChip */
+    /* VMEChip: the control/status registers the firmware probes */
     vmechip_dev = qdev_new(TYPE_MVME147_VMECHIP);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vmechip_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vmechip_dev), 0, MVME147_VMECHIP);
+
+    /*
+     * The VMEbus itself: a host bridge whose slave address space appears at
+     * MVME147_VME_WINDOW.  Slave cards are added with -device on this bus,
+     * e.g. -device avme352,rom=avme352.bin,serial-base=4 for the six channel
+     * serial card, which then answers at 0xf0c00000.  Its interrupt joins
+     * the PCC's on the shared 68030 levels.
+     */
+    vmebridge_dev = qdev_new(TYPE_VME_BRIDGE);
+    qdev_prop_set_uint64(vmebridge_dev, "size", MVME147_VME_WINDOW_SZ);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(vmebridge_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(vmebridge_dev), 0, MVME147_VME_WINDOW);
+    sysbus_connect_irq(SYS_BUS_DEVICE(vmebridge_dev), 0,
+                       qemu_allocate_irq(mvme147_vme_irq, irqs, 0));
 
     /* SCC, serial ports 1 and 2 */
     serial_dev = qdev_new(TYPE_ESCC);

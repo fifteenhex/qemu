@@ -128,6 +128,8 @@ config MVME147
     select M48T59
     select LANCE
     select WD33C93
+    select VME
+    select AVME352
 
 config ELTEC_E17
     bool
@@ -173,3 +175,10 @@ config MEGADRIVE
     select M68K_IRQC
     select MEGADRIVE_VDP
     select MEGADRIVE_EVERDRIVE
+
+config AVME352
+    bool
+    default y
+    depends on M68K
+    select ESCC
+    select VME
