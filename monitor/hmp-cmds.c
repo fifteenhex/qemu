@@ -712,6 +712,35 @@ void hmp_physical_memory_dump(Monitor *mon, const QDict *qdict)
     memory_dump(mon, count, format, size, addr, true);
 }
 
+/*
+ * Poke guest physical memory - the write counterpart to "xp".  Handy for
+ * scripted control of a guest from the monitor (e.g. teleporting the classic
+ * Mac OS cursor by writing its low-memory globals, which sidesteps the ADB
+ * mouse being relative-only).  The value is stored big-endian, the natural
+ * order for the m68k targets this fork cares about.
+ */
+void hmp_physical_memory_write(Monitor *mon, const QDict *qdict)
+{
+    hwaddr addr = qdict_get_int(qdict, "addr");
+    int size = qdict_get_int(qdict, "size");
+    uint64_t val = qdict_get_int(qdict, "val");
+    uint8_t buf[8];
+
+    switch (size) {
+    case 1: stb_p(buf, val); break;
+    case 2: stw_be_p(buf, val); break;
+    case 4: stl_be_p(buf, val); break;
+    case 8: stq_be_p(buf, val); break;
+    default:
+        monitor_printf(mon, "invalid size %d (use 1, 2, 4 or 8)\n", size);
+        return;
+    }
+    if (address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                            buf, size) != MEMTX_OK) {
+        monitor_printf(mon, "Cannot access memory\n");
+    }
+}
+
 void *gpa2hva(MemoryRegion **p_mr, hwaddr addr, uint64_t size, Error **errp)
 {
     Int128 gpa_region_size;

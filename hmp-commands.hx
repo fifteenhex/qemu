@@ -535,6 +535,19 @@ SRST
 ERST
 
     {
+        .name       = "wp",
+        .args_type  = "addr:l,size:i,val:l",
+        .params     = "addr size value",
+        .help       = "write 'value' (big-endian, size 1/2/4/8) to physical 'addr'",
+        .cmd        = hmp_physical_memory_write,
+    },
+
+SRST
+``wp`` *addr* *size* *value*
+  Write *value* as a *size*-byte big-endian quantity to physical *addr*.
+ERST
+
+    {
         .name       = "gpa2hva",
         .args_type  = "addr:l",
         .params     = "addr",
