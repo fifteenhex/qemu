@@ -565,3 +565,130 @@ Addendum (session 7, later) — GRAY DESKTOP reached:
   is exercised only by the probe sweep so far.  QMP input-send-event
   reaches adb-kbd/adb-mouse (shift-at-boot test delivered the event,
   though the OS ignored it at that phase).
+
+### HEAP HANG ROOT-CAUSED + FIXED — MacOS GUI now boots (2026-08-23, session 8)
+
+MILESTONE: the gray-desktop heap-coalesce hang is ROOT-CAUSED and FIXED,
+and the boot now advances ALL the way to the **MacOS GUI System Error
+dialog** ("Sorry, a system error occurred / bus error", bomb icon,
+Restart button, live cursor) — i.e. the System file loads, QuickDraw +
+the Font/Window/Dialog managers run, and the OS is loading its
+extensions/drivers when one specific driver bus-errors.  Two intermediate
+screenshots: /tmp/shots/maciisi-24bit-welcome.png (empty Welcome box),
+maciisi-syserr-dialog.png (the bomb dialog).
+
+ROOT CAUSE of the heap hang (verified by two-stage capture):
+- The whole Memory Manager picks 24-bit- vs 32-bit-FORMAT block routines
+  from a **global** mode flag: lowmem 0x1EFC bit0.  The ROM builds twin
+  dispatch tables at lowmem 0x1E00 (24-bit) and 0x1F00 (32-bit) from a
+  template at ROM 0xCB20 (installer 0xCC60-0xCCFC), and every MM trap
+  indexes the active table via ROM 0xDCEA (`btst #0,0x1EFC; +0x1E00 or
+  +0x1F00`).  It is NOT per-zone; the zone's own format byte at zone+30
+  is only recorded.
+- The ROM builds the boot heap (SysZone at 0x2000) as a **24-bit** zone
+  whenever VM is off — the zone-format choice at ROM 0x40800240-0x268
+  (and the SysZone builder at 0x408004ae-0x508) keys on XPRAM 0x8A **bit2
+  (VM)**, NOT bit0: `btst #2,0x1EFC; bit2? bset #0 : bclr #0` around the
+  `_InitZone`.  So VM off ⇒ operative mode cleared ⇒ 24-bit boot heap.
+- We were FORCING XPRAM 0x8A bit0=1 ("32-bit addressing") in the model's
+  RTC read path.  The ROM read that, flipped the global operative mode to
+  32-bit, and then grow/split operations on the 24-bit boot heap used the
+  32-bit-FORMAT free-block writers.  Captured corruptor (gdb break on
+  0x4080DDF4 with $a0<0x10000): GROW32 (ROM 0x4080E4D0, retaddr
+  0x4080E4EA) wrote a 32-bit-format free block {tag:0 @off0, size @off4}
+  at 0x7BF4 inside the 24-bit zone.  The 24-bit coalesce walk (ROM
+  0xE128/0xE158) then read [0x7BF4]=0 as a {size=0, free} block and
+  a0=a1+0 looped forever.  Confirmed: every ddf4 low-mem write had
+  zoneflag(zone+30)=0 (24-bit zone) yet m1efc=1 (32-bit global).
+- WHY this differs from real HW: classic MacOS boots the ROM in **24-bit
+  mode**; "32-Bit Addressing" (XPRAM bit0) is engaged LATER by the System
+  ("32-Bit Enabler"/Mode32), which re-inits the Memory Manager in 32-bit
+  form.  During ROM boot the operative mode must stay 24-bit to match the
+  24-bit boot heap.  Our forced bit0=1 created the inconsistency.
+
+FIX 1 (hw/m68k/maciisi.c, the real root cause): stop forcing XPRAM 0x8A
+bit0.  Boot 24-bit-consistent (seed PRAM[0x8A]=0x00, RTC read no longer
+ORs 0x01).  The A31-half physical decode (0x80000000.. -> low 24 bits,
+added session 7) already resolves 24-bit tagged master pointers, so the
+old session-4 blocker does not recur.  This alone eliminates the heap
+hang.
+
+That exposed the next 24-bit blockers — the onboard-video apertures are
+only mapped at their 32-bit physical addresses, but in 24-bit mode the
+ROM's PMMU map reaches them through the classic 24-bit->32-bit slot
+compat window, which **zeros the level-A index nibble** (bits 20-23):
+- Sad Mac 0000000F/00000001 at DrawStartupScreen gray-fill (ROM
+  0x4084AD12, `movel d3,(a0)+`, a0=ScrnBase=0xFBB08000).  `-d mmu`:
+  `addr=fbb08000 -> phys=fb008000` (TableA[0xB] early-terminates to page
+  frame 0xFB000000; TC=0x80F84500 => IS=8, PS=32K, TIA=4, TIB=5).  The
+  fb only lived at 0xFBB08000.
+  FIX 2: alias the framebuffer at **0xFB008000** (vram_alias24).
+- Then a 4492x spin (video driver RAM pc 0x000564EC) polling the slot-$E
+  aperture 0xFEE03944 -> phys 0xFE003944 (TableA[0xE] -> 0xFE000000),
+  unmapped, bus-erroring every iteration.
+  FIX 3: alias the same VRAM at **0xFE000000** (vram_slote_alias24) — the
+  24-bit view of the slot-$E ScrnBase window 0xFEE00000.
+
+With FIX 1+2+3 the boot clears DrawStartupScreen, paints the desktop, the
+System loads over the 5380, and MacOS runs its GUI (fonts/dialogs) — a
+huge jump past the old ROM-heap frontier.
+
+NEW FRONTIER (session-8 end): a System driver/extension bus-errors and
+the GUI SysError dialog appears.  Crash captured from lowmem
+(0xC70=crashPC, 0xC30/0xC50=regs, 0xAF0=errcode):
+- crashPC = **0x000752F6**, faulting a0 = **0x00A44000**, d0 =
+  0x44617665 = **'Dave'**.  errcode 0xAF0 = 0x00010000 (SysError 1/bus
+  error).  `-d mmu`: `addr=00a44000 -> phys=fa044000` (24-bit slot
+  space), resp=2, pc=000752F6 — this one is NOT recovered (unlike the
+  ROM's slot-scan probes at 0x40805E84 which do recover).
+- The routine at 0x752F6 is a signature-scan loop: `cmp.l (a0)+,d0 ; bne
+  0x752f6` searching UPWARD from 0x00A44000 for the longword 'Dave'.
+  0x00A44000 is above our 8 MB RAM (and in 24-bit mode RAM caps at 8 MB,
+  slot/I-O sit above), so the first read bus-errors and the driver's
+  handler (if any) does not catch it.
+- OPEN: is this (a) a driver that expects to bus-error-recover while
+  scanning and our 24-bit-mode bus-error frame/SSW delivery to RAM-level
+  handlers is subtly wrong (cf. session-7 format-$B work — but that was
+  for the ROM catcher; check the RAM handler's expectations), or (b) a
+  specific OpenRetro-image extension probing for a card/ROM signature
+  that simply is not present.  The dialog itself says "restart holding
+  shift to disable extensions" — booting with Shift held (inject via
+  adb-kbd during INIT load) is the obvious next experiment; if the Finder
+  then comes up we have a usable OS and can bisect which extension.
+- Next-session concrete steps: (1) shift-boot to skip extensions and try
+  to reach the Finder; (2) if that works, re-enable extensions and find
+  the 'Dave' one (dump the driver name near 0x75000, e.g. the resource
+  header / DRVR name) — it may be Ethernet/SCSI-card related and thus
+  relevant to the NuBus-Ethernet goal; (3) investigate RAM-level
+  bus-error recovery: break the 68k bus-error vector while this scan runs
+  and see whether an installed handler RTEs (frame format $A vs $B, SSW
+  DF/RW/RM bits) — the ROM slot probes recover, so compare their vector
+  state with this driver's.
+
+Model changes this session (all hw/m68k/maciisi.c only; q800 re-verified
+booting to its blinking-disk desktop, /tmp/shots/q800-chk.png — no shared
+code touched):
+1. RTC/PRAM 0x8A read no longer ORs bit0; seed PRAM[0x8A]=0x00 (24-bit
+   boot).  THE root-cause fix for the heap hang.
+2. vram_alias24 @ 0xFB008000  — 24-bit view of the fb (ScrnBase
+   0xFBB08000).
+3. vram_slote_alias24 @ 0xFE000000 — 24-bit view of slot-$E aperture
+   (0xFEE00000).
+
+Shift-boot experiment (negative): held Shift down via QMP
+input-send-event (adb-kbd) across the whole extension-load window
+(repeated key-down, no up, ~180-390s into boot).  Same 'Dave' bus-error
+dialog — so either the 'Dave' scan is core System startup (Slot Manager
+/ a boot-time driver), not a disableable INIT, OR our ADB modifier state
+is not being reported to the OS's shift-check.  Worth re-trying with a
+cleaner "modifier held" path (verify the adb-kbd reports the shift bit in
+its Talk R2, and that autopoll delivers it) before concluding it is core.
+
+gdb/tooling notes for next time: the m68k remote calls a6 "fp" (use
+`info registers fp`, not a6, or the whole command list errors out).
+`if $a0 < ...` needs the `$`.  Two-stage capture works great here; the
+`-d mmu -D <file>` "txn fail: phys=.. addr=.. type=.. resp=.. pc=.."
+lines are the fastest way to pin a fatal fault (grep the tail; RAM pcs
+are 0x000xxxxx, ROM 0x408xxxxx).  Boots ~4-5 min at -icount shift=7.
+HMP `pmemsave 0x<addr> <declen> "<path>"` dumps RAM to disassemble
+(m68k-linux-gnu-objdump -b binary -m m68k:68030 --adjust-vma=).

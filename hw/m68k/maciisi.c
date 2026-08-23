@@ -42,6 +42,7 @@
 #include "hw/block/swim.h"
 #include "hw/scsi/ncr5380.h"
 #include "hw/scsi/scsi.h"
+#include "hw/nubus/mac-nubus-bridge.h"
 #include "hw/input/adb.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -340,21 +341,28 @@ static void via1_rtc_update(MOS6522MacIIsiState *v1s)
                 /* it's a read */
                 v1s->data_in = v1s->PRAM[sector * 32 + addr];
                 /*
-                 * Force 32-bit addressing (XPRAM 0x8A): the 24-bit MMU
-                 * path derefs tagged handles that our translation
-                 * doesn't wrap; 32-bit-clean boot avoids it entirely.
+                 * XPRAM 0x8A boot flags.  Historically we forced bit0
+                 * ("32-bit addressing") on to dodge the 24-bit tagged
+                 * master pointers our no-op PMMU didn't wrap.  That was
+                 * wrong: classic MacOS boots the ROM in 24-BIT mode and
+                 * only engages 32-bit addressing LATER from the System
+                 * (the "32-Bit Addressing" enabler).  The ROM builds its
+                 * boot heap (SysZone at 0x2000) as a 24-bit zone whenever
+                 * VM is off (see ROM 0x40800240-0x268: the zone format is
+                 * keyed on bit2/VM, not bit0), while the operative Memory
+                 * Manager dispatch (twin routine tables at lowmem 0x1e00/
+                 * 0x1f00, selected by 0x1efc bit0 at ROM 0xdcea) followed
+                 * our forced bit0=1 into 32-bit format.  The resulting
+                 * format mismatch made grow/split write 32-bit-format free
+                 * blocks into the 24-bit boot heap; the 24-bit coalesce
+                 * walk (ROM 0xe128) then read a header long of 0 as a
+                 * zero-size free block and spun forever (the gray-desktop
+                 * hang).  The A31-half physical decode added since (0x8000
+                 * 0000.. -> low 24 bits) now makes 24-bit tagged pointers
+                 * resolve, so leave bit0 CLEAR and boot 24-bit-consistent.
+                 * (Bit2/VM stays off too: forcing it installs a 90MB
+                 * logical space our 030 can't back.)
                  */
-                if (sector * 32 + addr == 0x8a) {
-                    /*
-                     * Bit 0 only (32-bit addressing).  Bit 2 — the old
-                     * |= 0x05 — additionally means VIRTUAL MEMORY ON:
-                     * the 7.5.3 memory manager then installs a 90MB
-                     * logical address space (matching the disk's saved
-                     * VM Storage size) that our 030 emulation cannot
-                     * back, and the boot parks at the splash screen.
-                     */
-                    v1s->data_in |= 0x01;
-                }
                 v1s->data_in_cnt = 8;
                 v1s->cmd = REG_EMPTY;
             } else {
@@ -561,12 +569,15 @@ struct MacIIsiMachineState {
     ASCState asc;
     Swim swim;
     NCR5380State scsi;
+    MacNubusBridge mac_nubus_bridge;
 
     MacIIsiFbState fb;
     MemoryRegion rom;
     MemoryRegion rom_alias;
     MemoryRegion rom_slot_alias;
     MemoryRegion vram_alias;
+    MemoryRegion vram_alias24;
+    MemoryRegion vram_slote_alias24;
     MemoryRegion rom_alias24;
     MemoryRegion ramio;
     MemoryRegion ramio_a31;
@@ -1596,6 +1607,24 @@ static const MemoryRegionOps maciisi_iotrace_ops = {
     },
 };
 
+/*
+ * A NuBus card in slot S raises its interrupt through the RBV slot-interrupt
+ * register: RSIFR bit (S - 8).  Bits for slots 9-D summarise into IFR bit 1
+ * (level 2); slot E's bit is the pollable onboard-video VBL, handled above.
+ */
+static void maciisi_nubus_irq(void *opaque, int n, int level)
+{
+    MacIIsiMachineState *m = opaque;
+    uint8_t bit = 1 << ((n & 0xf) - 8);
+
+    if (level) {
+        m->rbv_sifr |= bit;
+    } else {
+        m->rbv_sifr &= ~bit;
+    }
+    maciisi_rbv_update_irq(m);
+}
+
 static void maciisi_machine_init(MachineState *machine)
 {
     MacIIsiMachineState *m = MACIISI_MACHINE(machine);
@@ -1700,7 +1729,7 @@ static void maciisi_machine_init(MachineState *machine)
     m->via1.PRAM[0x0d] = 0x75;      /* 'u' */
     m->via1.PRAM[0x0e] = 0x4d;      /* 'M' */
     m->via1.PRAM[0x0f] = 0x63;      /* 'c' */
-    m->via1.PRAM[0x8a] = 0x01;      /* boot 32-bit clean, VM off */
+    m->via1.PRAM[0x8a] = 0x00;      /* boot 24-bit (ROM era), VM off */
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
@@ -1879,6 +1908,71 @@ static void maciisi_machine_init(MachineState *machine)
                              sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
     memory_region_add_subregion(get_system_memory(), 0xfee00000,
                                 &m->vram_alias);
+
+    /*
+     * 24-bit-mode view of the framebuffer.  When the machine boots in
+     * 24-bit addressing (the ROM/System default before "32-Bit
+     * Addressing" is engaged), the onboard-video ScrnBase 0xFBB08000 is
+     * a virtual address that the ROM's 24-bit PMMU map resolves via the
+     * classic 24-bit->32-bit slot compatibility window: the level-A
+     * descriptor for index 0xB early-terminates onto page frame
+     * 0xFB000000, so the CPU emits physical 0xFB008000 (i.e. the base
+     * shifted down by 0xB00000).  Alias the framebuffer there too so the
+     * gray-desktop / QuickDraw fills in 24-bit mode land on screen.
+     * (In 32-bit mode ScrnBase resolves identity to 0xFBB08000 above.)
+     */
+    memory_region_init_alias(&m->vram_alias24, NULL, "maciisi.vram-24bit",
+                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
+    memory_region_add_subregion(get_system_memory(), 0xfb008000,
+                                &m->vram_alias24);
+
+    /*
+     * 24-bit-mode view of the slot-$E aperture (0xFEE00000).  The loaded
+     * video driver also reaches the framebuffer through the slot window
+     * ScrnBase 0xFEE00000; in 24-bit mode the ROM's compat map strips the
+     * slot nibble the same way (VA 0xFEExxxxx -> 24-bit 0xE0xxxxx ->
+     * level-A page frame 0xFE000000 -> physical 0xFE0xxxxx), so alias the
+     * same VRAM at 0xFE000000.  Without it the driver's aperture polls
+     * (observed spinning on 0xFEE03944 -> phys 0xFE003944) bus-error.
+     */
+    memory_region_init_alias(&m->vram_slote_alias24, NULL,
+                             "maciisi.vram-slote-24bit",
+                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
+    memory_region_add_subregion(get_system_memory(), 0xfe000000,
+                                &m->vram_slote_alias24);
+
+    /*
+     * NuBus card bus.  The IIsi has only the 030 PDS, but a PDS->NuBus
+     * adapter (and QEMU) presents card slots 9-D in the standard-slot and
+     * super-slot spaces; slot E remains the onboard-video pseudo-slot mapped
+     * above.  Map the bridge windows below the onboard-video decodes
+     * (priority -1, still above the A31 catch-all at -2) so those keep their
+     * own decode, and route card slot interrupts into the RBV.
+     */
+    {
+        SysBusDevice *nb;
+        qemu_irq *slot_irq;
+        int slot;
+
+        object_initialize_child(OBJECT(machine), "mac-nubus-bridge",
+                                &m->mac_nubus_bridge, TYPE_MAC_NUBUS_BRIDGE);
+        nb = SYS_BUS_DEVICE(&m->mac_nubus_bridge);
+        sysbus_realize(nb, &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                            MAC_NUBUS_FIRST_SLOT * NUBUS_SUPER_SLOT_SIZE,
+                            sysbus_mmio_get_region(nb, 0), -1);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                            NUBUS_SLOT_BASE +
+                            MAC_NUBUS_FIRST_SLOT * NUBUS_SLOT_SIZE,
+                            sysbus_mmio_get_region(nb, 1), -1);
+
+        slot_irq = qemu_allocate_irqs(maciisi_nubus_irq, m,
+                                      MAC_NUBUS_LAST_SLOT + 1);
+        for (slot = MAC_NUBUS_FIRST_SLOT; slot <= MAC_NUBUS_LAST_SLOT; slot++) {
+            qdev_connect_gpio_out(DEVICE(&m->mac_nubus_bridge), slot,
+                                  slot_irq[slot]);
+        }
+    }
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     if (filename) {

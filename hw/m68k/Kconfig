@@ -61,6 +61,8 @@ config MACIISI
     select OR_IRQ
     select FRAMEBUFFER
     select NCR5380
+    select NUBUS
+    select NUBUS_MAC8390
 
 config M68K_VIRT
     bool
