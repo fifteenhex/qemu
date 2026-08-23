@@ -598,12 +598,27 @@ static void q800_machine_init(MachineState *machine)
         BOOTINFO1(param_ptr,
                   BI_MAC_MEMSIZE, ram_size >> 20); /* in MB */
         BOOTINFO2(param_ptr, BI_MEMCHUNK, 0, ram_size);
-        BOOTINFO1(param_ptr, BI_MAC_VADDR,
-                  VIDEO_BASE + macfb_mode->offset);
-        BOOTINFO1(param_ptr, BI_MAC_VDEPTH, macfb_mode->depth);
-        BOOTINFO1(param_ptr, BI_MAC_VDIM,
-                  (graphic_height << 16) | macfb_mode->width);
-        BOOTINFO1(param_ptr, BI_MAC_VROW, macfb_mode->stride);
+        if (m->radius_primary) {
+            /*
+             * Model "only the Radius has a monitor, so the ROM made it
+             * primary": point the boot console framebuffer at the card's
+             * VRAM (NuBus slot 0xd standard space) in the fixed 640x480x16
+             * mode its boot-init leaves it in.  Add the card with
+             * -device radius-24xp,slot=0xd,boot-init=on.
+             */
+            hwaddr fb = NUBUS_SLOT_BASE + 0xd * NUBUS_SLOT_SIZE;
+            BOOTINFO1(param_ptr, BI_MAC_VADDR, fb);
+            BOOTINFO1(param_ptr, BI_MAC_VDEPTH, 16);
+            BOOTINFO1(param_ptr, BI_MAC_VDIM, (480 << 16) | 640);
+            BOOTINFO1(param_ptr, BI_MAC_VROW, 640 * 2);
+        } else {
+            BOOTINFO1(param_ptr, BI_MAC_VADDR,
+                      VIDEO_BASE + macfb_mode->offset);
+            BOOTINFO1(param_ptr, BI_MAC_VDEPTH, macfb_mode->depth);
+            BOOTINFO1(param_ptr, BI_MAC_VDIM,
+                      (macfb_mode->height << 16) | macfb_mode->width);
+            BOOTINFO1(param_ptr, BI_MAC_VROW, macfb_mode->stride);
+        }
         BOOTINFO1(param_ptr, BI_MAC_SCCBASE, SCC_BASE);
 
         memory_region_init_ram_ptr(&m->rom, NULL, "m68k_fake_mac.rom",
@@ -700,6 +715,16 @@ static void q800_set_easc(Object *obj, bool value, Error **errp)
     ms->easc = value;
 }
 
+static bool q800_get_radius_primary(Object *obj, Error **errp)
+{
+    return Q800_MACHINE(obj)->radius_primary;
+}
+
+static void q800_set_radius_primary(Object *obj, bool value, Error **errp)
+{
+    Q800_MACHINE(obj)->radius_primary = value;
+}
+
 static void q800_init(Object *obj)
 {
     Q800MachineState *ms = Q800_MACHINE(obj);
@@ -744,6 +769,13 @@ static void q800_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "easc", q800_get_easc, q800_set_easc);
     object_class_property_set_description(oc, "easc",
         "Set to off to use ASC rather than EASC");
+
+    object_class_property_add_bool(oc, "radius-primary",
+        q800_get_radius_primary, q800_set_radius_primary);
+    object_class_property_set_description(oc, "radius-primary",
+        "Boot Linux with a Radius PrecisionColor 24Xp in slot 0xd as the "
+        "primary display (as the Mac ROM would if only it had a monitor).  "
+        "Add -device radius-24xp,slot=0xd,boot-init=on,romfile=...");
 }
 
 static const TypeInfo q800_machine_typeinfo = {

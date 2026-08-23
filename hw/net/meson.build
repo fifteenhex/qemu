@@ -1,6 +1,7 @@
 system_ss.add(when: 'CONFIG_DP8393X', if_true: files('dp8393x.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xen_nic.c'))
 system_ss.add(when: 'CONFIG_NE2000_COMMON', if_true: files('ne2000.c'))
+system_ss.add(when: 'CONFIG_NUBUS_MAC8390', if_true: files('nubus-mac8390.c'))
 
 # PCI network cards
 system_ss.add(when: 'CONFIG_NE2000_PCI', if_true: files('ne2000-pci.c'))

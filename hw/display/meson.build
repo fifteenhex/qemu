@@ -34,6 +34,7 @@ system_ss.add(when: 'CONFIG_TCX', if_true: files('tcx.c'))
 system_ss.add(when: 'CONFIG_CG3', if_true: files('cg3.c'))
 system_ss.add(when: 'CONFIG_E17_VID', if_true: files('e17_vid.c'))
 system_ss.add(when: 'CONFIG_MACFB', if_true: files('macfb.c'))
+system_ss.add(when: 'CONFIG_RADIUS24XP', if_true: files('radius24xp.c'))
 system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
 
 system_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))

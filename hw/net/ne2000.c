@@ -257,7 +257,7 @@ ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
     return size_;
 }
 
-static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 {
     NE2000State *s = opaque;
     int offset, page, index;
@@ -361,7 +361,7 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     }
 }
 
-static uint32_t ne2000_ioport_read(void *opaque, uint32_t addr)
+uint32_t ne2000_ioport_read(void *opaque, uint32_t addr)
 {
     NE2000State *s = opaque;
     int offset, page, ret;

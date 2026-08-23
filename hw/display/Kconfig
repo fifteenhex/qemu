@@ -155,6 +155,11 @@ config MACFB
     select FRAMEBUFFER
     depends on NUBUS
 
+config RADIUS24XP
+    bool
+    select FRAMEBUFFER
+    depends on NUBUS
+
 config XLNX_DISPLAYPORT
     bool
     # defaults to "N", enabled by specific boards

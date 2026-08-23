@@ -27,6 +27,8 @@ config Q800
     select MAC_VIA
     select NUBUS
     select MACFB
+    select RADIUS24XP
+    select NUBUS_MAC8390
     select SWIM
     select ESCC
     select ESP

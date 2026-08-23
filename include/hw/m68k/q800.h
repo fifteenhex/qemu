@@ -48,6 +48,7 @@ struct Q800MachineState {
     MachineState parent_obj;
 
     bool easc;
+    bool radius_primary;
     M68kCPU cpu;
     MemoryRegion rom;
     MemoryRegion rom_alias;

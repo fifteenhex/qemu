@@ -39,4 +39,13 @@ extern const VMStateDescription vmstate_ne2000;
 void ne2000_reset(NE2000State *s);
 ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_);
 
+/*
+ * The DP8390 register file, exposed so shared-memory NuBus cards (which
+ * memory-map the registers rather than using the NE2000 I/O port window) can
+ * drive the core directly.  @addr is the DP8390 register number (0..15), the
+ * remote-DMA data port (0x10) or the reset port (0x1f).
+ */
+void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val);
+uint32_t ne2000_ioport_read(void *opaque, uint32_t addr);
+
 #endif
