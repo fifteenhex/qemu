@@ -180,7 +180,7 @@ static void glue_reset_hold(Object *obj, ResetType type)
     GLUEState *s = GLUE(obj);
 
     s->ipr = 0;
-    s->auxmode = 0;
+    s->auxmode = s->auxmode_default;
 
     timer_del(s->nmi_release);
 }
@@ -205,6 +205,13 @@ static const VMStateDescription vmstate_glue = {
  */
 static const Property glue_properties[] = {
     DEFINE_PROP_LINK("cpu", GLUEState, cpu, TYPE_M68K_CPU, M68kCPU *),
+    /*
+     * IRQ mapping after reset: 0 = A/UX (as strapped on the Quadra 800,
+     * where the ROM drives the mode from VIA1 PB6), 1 = classic.  Boards
+     * whose VIA1 has no auxmode output (LC475: the VIA1 is inside the
+     * Cuda) pin classic mode here.
+     */
+    DEFINE_PROP_UINT8("auxmode-default", GLUEState, auxmode_default, 0),
 };
 
 static void glue_finalize(Object *obj)

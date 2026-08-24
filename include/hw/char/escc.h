@@ -47,6 +47,8 @@ typedef struct ESCCChannelState {
     /* external/status interrupt state (DCD input via the "dcd" gpios) */
     uint32_t extint;
     bool dcd;
+    /* baud-rate generator zero-count interrupt (WR15 bit 1) */
+    QEMUTimer *zcount_timer;
     QemuInputHandlerState *hs;
     char *sunkbd_layout;
     int sunmouse_dx;

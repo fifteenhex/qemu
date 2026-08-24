@@ -307,7 +307,15 @@ static void macfb_draw_graphic(MacfbState *s)
                                              DIRTY_MEMORY_VGA);
 
     ymin = -1;
-    page = s->mode->offset;
+    if (s->vaddr_base) {
+        /*
+         * DAFB revisions that use the VADDR register (Quadra 700) point
+         * the framebuffer base at VADDR1 * 0x200 within VRAM
+         */
+        page = (s->regs[DAFB_MODE_VADDR1 >> 2] & 0x3fff) * 0x200;
+    } else {
+        page = s->mode->offset;
+    }
     for (y = 0; y < s->height; y++, page += macfb_stride) {
         if (macfb_check_dirty(s, snap, page, macfb_stride)) {
             uint8_t *data_display;
@@ -564,6 +572,9 @@ static void macfb_ctrl_write(void *opaque,
     switch (addr) {
     case DAFB_MODE_VADDR1:
     case DAFB_MODE_VADDR2:
+        if (s->regs[addr >> 2] != val && s->vaddr_base) {
+            macfb_invalidate_display(s);
+        }
         s->regs[addr >> 2] = val;
         break;
     case DAFB_MODE_CTRL1 ... DAFB_MODE_CTRL1 + 3:
@@ -764,6 +775,7 @@ static void macfb_nubus_reset(DeviceState *d)
 }
 
 static const Property macfb_sysbus_properties[] = {
+    DEFINE_PROP_BOOL("vaddr-base", MacfbSysBusState, macfb.vaddr_base, false),
     DEFINE_PROP_UINT32("width", MacfbSysBusState, macfb.width, 640),
     DEFINE_PROP_UINT32("height", MacfbSysBusState, macfb.height, 480),
     DEFINE_PROP_UINT8("depth", MacfbSysBusState, macfb.depth, 8),
@@ -782,6 +794,7 @@ static const VMStateDescription vmstate_macfb_sysbus = {
 };
 
 static const Property macfb_nubus_properties[] = {
+    DEFINE_PROP_BOOL("vaddr-base", MacfbNubusState, macfb.vaddr_base, false),
     DEFINE_PROP_UINT32("width", MacfbNubusState, macfb.width, 640),
     DEFINE_PROP_UINT32("height", MacfbNubusState, macfb.height, 480),
     DEFINE_PROP_UINT8("depth", MacfbNubusState, macfb.depth, 8),

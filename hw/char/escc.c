@@ -30,6 +30,7 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/char/escc.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
@@ -146,6 +147,7 @@
 #define MISC2_PLLCMD1  0x40
 #define MISC2_PLLCMD2  0x80
 #define W_EXTINT 15
+#define EXTINT_ZCOUNT  0x02
 #define EXTINT_DCD     0x08
 #define EXTINT_SYNCINT 0x10
 #define EXTINT_CTSINT  0x20
@@ -373,6 +375,9 @@ static void escc_reset(DeviceState *d)
             cs->rregs[j] = 0;
             cs->wregs[j] = 0;
         }
+        if (cs->zcount_timer) {
+            timer_del(cs->zcount_timer);
+        }
 
         /*
          * ...but there is an exception. The "Transmit Interrupts and Transmit
@@ -500,6 +505,55 @@ static inline void clr_extint(ESCCChannelState *s)
     }
     refresh_ext_ivec(s);
     escc_update_irq(s);
+}
+
+/*
+ * Baud-rate generator zero-count external/status interrupt (WR15 bit 1).
+ *
+ * Only known user is the Quadra 700/900 ROM's POST, which programs the
+ * BRG with time constant 0xFFFF, enables the zero-count interrupt and
+ * measures the spacing of two consecutive interrupts with a dbra-style
+ * busy loop, requiring 0x100 < spacing <= 0x10000 iterations (and the
+ * first interrupt within 0x50000 iterations).  As with the TimeDBRA
+ * calibration (see mac_via.c), TCG executes the loop far faster than a
+ * 25 MHz 68040, so the realistic ~18 ms BRG period would overflow the
+ * window; a short fixed period keeps the measured spacing inside it.
+ */
+#define ZCOUNT_PERIOD_NS 50000
+
+static void escc_zcount_update(ESCCChannelState *s)
+{
+    bool run = (s->wregs[W_MISC2] & MISC2_BRG_EN) &&
+               (s->wregs[W_EXTINT] & EXTINT_ZCOUNT);
+
+    if (!s->zcount_timer) {
+        return;
+    }
+    if (run) {
+        if (!timer_pending(s->zcount_timer)) {
+            timer_mod(s->zcount_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      ZCOUNT_PERIOD_NS);
+        }
+    } else {
+        timer_del(s->zcount_timer);
+    }
+}
+
+static void escc_zcount_cb(void *opaque)
+{
+    ESCCChannelState *s = opaque;
+
+    if (!(s->wregs[W_MISC2] & MISC2_BRG_EN) ||
+        !(s->wregs[W_EXTINT] & EXTINT_ZCOUNT)) {
+        return;
+    }
+    s->rregs[R_STATUS] |= STATUS_ZERO;
+    if (s->wregs[W_INTR] & INTR_INTALL) {
+        set_extint(s);
+    }
+    timer_mod(s->zcount_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ZCOUNT_PERIOD_NS);
 }
 
 static inline void clr_rxint(ESCCChannelState *s)
@@ -639,6 +693,7 @@ static void escc_mem_write(void *opaque, hwaddr addr,
                 newreg |= CMD_HI;
                 break;
             case CMD_RST_EXT:
+                s->rregs[R_STATUS] &= ~STATUS_ZERO;
                 clr_extint(s);
                 break;
             case CMD_CLR_TXINT:
@@ -679,11 +734,15 @@ static void escc_mem_write(void *opaque, hwaddr addr,
         case W_INTR:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
+            s->wregs[s->reg] = val;
+            break;
         case W_MISC2:
             s->wregs[s->reg] = val;
+            escc_zcount_update(s);
             break;
         case W_EXTINT:
             s->wregs[s->reg] = val;
+            escc_zcount_update(s);
             /*
              * RR15 reads back WR15 (bits 0 and 2 exist only as WR7'
              * enables and always read 0).  The Macintosh ROM's SCC
@@ -1183,6 +1242,11 @@ static void escc_init1(Object *obj)
     }
     s->chn[0].otherchn = &s->chn[1];
     s->chn[1].otherchn = &s->chn[0];
+
+    for (i = 0; i < 2; i++) {
+        s->chn[i].zcount_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                              escc_zcount_cb, &s->chn[i]);
+    }
 
     sysbus_init_mmio(dev, &s->mmio);
 

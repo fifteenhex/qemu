@@ -375,8 +375,15 @@ static uint64_t iwmctrl_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case IWM_READSTATUS0:
     case IWM_READSTATUS1:
-        /* status reads back mode register bits 0-4; enable (bit 5) off */
-        value = swimctrl->iwmregs[IWM_WRITESETMODE] & 0x1f;
+        /*
+         * status reads back mode register bits 0-4; enable (bit 5) off.
+         * Bit 7 is the SENSE input from the drive status multiplexer:
+         * report it deasserted (no disk inserted / write-protect off /
+         * no drive), otherwise the Quadra 700 ROM's IWM-mode .Sony
+         * driver sees a phantom locked unreadable floppy and MacOS
+         * loops a "Disk initialization failed" alert
+         */
+        value = 0x80 | (swimctrl->iwmregs[IWM_WRITESETMODE] & 0x1f);
         break;
     default:
         value = 0;

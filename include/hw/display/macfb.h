@@ -64,6 +64,8 @@ typedef struct MacfbState {
     uint32_t width, height; /* in pixels */
     uint8_t depth;
     uint8_t type;
+    /* framebuffer base follows the DAFB_MODE_VADDR1 register (Quadra 700) */
+    bool vaddr_base;
 
     uint32_t regs[MACFB_NUM_REGS];
     const MacFbMode *mode;

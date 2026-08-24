@@ -38,6 +38,36 @@ config Q800
     select IOSB
     select ASC
 
+config QUADRA700
+    bool
+    default y
+    depends on M68K
+    # IRQ glue comes from q800-glue.c (CONFIG_Q800, always on here)
+    select MAC_VIA
+    select NUBUS
+    select MACFB
+    select SWIM
+    select ESCC
+    select ESP
+    select DP8393X
+    select OR_IRQ
+    select ASC
+
+config LC475
+    bool
+    default y
+    depends on M68K
+    # IRQ glue comes from q800-glue.c (CONFIG_Q800, always on here)
+    select ADB
+    select MOS6522
+    select MAC_VIA
+    select ESCC
+    select ESP
+    select SWIM
+    select ASC
+    select OR_IRQ
+    select FRAMEBUFFER
+
 config MAC128K
     bool
     default y

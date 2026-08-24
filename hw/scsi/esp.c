@@ -395,6 +395,13 @@ static void handle_s_without_atn(ESPState *s)
     }
 
     esp_set_phase(s, STAT_CD);
+    /*
+     * Selection succeeded and the bus is in command phase: report the
+     * sequence step accordingly (the Quadra 700 ROM polls RSEQ to
+     * detect that its DMA select connected before it hands over the
+     * CDB through the pseudo-DMA port)
+     */
+    s->rregs[ESP_RSEQ] = SEQ_CD;
     s->cmdfifo_cdb_offset = 0;
 
     if (s->dma) {

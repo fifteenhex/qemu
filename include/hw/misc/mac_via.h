@@ -77,6 +77,15 @@ struct MOS6522Q800VIA1State {
 
     /* SETUPTIMEK hack */
     int timer_hack_state;
+
+    /* board ID straps read back in the port A CPUID bits */
+    uint8_t cpuid;
+    /*
+     * levels presented by port A input pins (board straps/pull-ups);
+     * values > 0xff leave the historical behaviour of reading back the
+     * output latch for input pins
+     */
+    uint16_t pins_a;
 };
 
 

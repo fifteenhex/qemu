@@ -711,6 +711,14 @@ static void adb_via_send(MOS6522Q800VIA1State *v1s, int state, uint8_t data)
 
     /* If the command is complete, execute it */
     if (v1s->adb_data_out_index == adb_via_send_len(v1s->adb_data_out[0])) {
+        /*
+         * The Quadra 700 ROM can start a command with an EVEN/ODD
+         * transition rather than via ADB_STATE_NEW, so make sure
+         * autopoll is blocked before the request executes
+         */
+        if (!adb_bus->autopoll_blocked) {
+            adb_autopoll_block(adb_bus);
+        }
         v1s->adb_data_in_size = adb_request(adb_bus, v1s->adb_data_in,
                                             v1s->adb_data_out,
                                             v1s->adb_data_out_index);
@@ -1041,8 +1049,12 @@ static uint64_t mos6522_q800_via1_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case VIA_REG_A:
     case VIA_REG_ANH:
-        /* Quadra 800 Id */
-        ret = (ret & ~VIA1A_CPUID_MASK) | VIA1A_CPUID_Q800;
+        /* input pins read the board strap/pull-up levels if provided */
+        if (s->pins_a <= 0xff) {
+            ret = (ret & ms->dira) | (s->pins_a & ~ms->dira);
+        }
+        /* Machine ID straps (Quadra 800 by default) */
+        ret = (ret & ~VIA1A_CPUID_MASK) | (s->cpuid & VIA1A_CPUID_MASK);
         break;
     case VIA_REG_T2CH:
         if (s->timer_hack_state == 6) {
@@ -1324,6 +1336,8 @@ static const VMStateDescription vmstate_q800_via1 = {
 
 static const Property mos6522_q800_via1_properties[] = {
     DEFINE_PROP_DRIVE("drive", MOS6522Q800VIA1State, blk),
+    DEFINE_PROP_UINT8("cpuid", MOS6522Q800VIA1State, cpuid, VIA1A_CPUID_Q800),
+    DEFINE_PROP_UINT16("pins-a", MOS6522Q800VIA1State, pins_a, 0x100),
 };
 
 static void mos6522_q800_via1_class_init(ObjectClass *oc, const void *data)
