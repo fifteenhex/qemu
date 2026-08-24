@@ -934,7 +934,19 @@ static uint64_t maciisi_rbv_read(void *opaque, hwaddr addr, unsigned size)
         }
         break;
     case RBV_RSIFR:
-        val = m->rbv_sifr;
+        /*
+         * The slot-interrupt flags mirror the physical /IRQ lines and
+         * read ACTIVE LOW (idle 0xFF): the ROM's level-2 slot
+         * dispatcher (0x40806EAA) computes ~(0x80 | SIFR) & SIER to
+         * find pending slots — an active-high reading makes every
+         * idle slot look asserted and ends in dsBadSlotInt on the
+         * empty slots the moment the OS enables the summary (IER bit
+         * 1, done by the Vertical Retrace Manager when the first slot
+         * VBL task — the cursor task — is installed).  Internally
+         * rbv_sifr keeps the asserted-bits mask; only the guest view
+         * is inverted.
+         */
+        val = ~m->rbv_sifr & 0xff;
         break;
     case RBV_RIER:
         val = m->rbv_ier | 0x80;
@@ -1009,13 +1021,18 @@ static const MemoryRegionOps maciisi_rbv_ops = {
 static void maciisi_rbv_update_irq(MacIIsiMachineState *m)
 {
     /*
-     * The onboard-video VBL (slot $E, SIFR bit 6) is a pollable status
-     * line only — the ROM's frame wait reads it directly and does not
-     * install a slot interrupt handler for it, so it must not raise a
-     * CPU interrupt (that yields dsBadSlotInt).  Other slot bits do
-     * summarise into IFR bit 1 → level 2.
+     * All enabled slot lines summarise into IFR bit 1 → level 2,
+     * INCLUDING the onboard-video VBL (slot $E, SIFR bit 6): the OS
+     * runs its Vertical Retrace Manager slot tasks — among them the
+     * cursor task that couples MTemp → RawMouse and redraws the mouse
+     * pointer — off this interrupt (SIER reads 0x7F at the Finder).
+     * The ROM-era boot polls the line before any handler exists; that
+     * is safe because the line PULSES (1.3ms per frame, dropped by
+     * maciisi_vbl_off) instead of latching, so a masked blank is
+     * missed rather than serviced stale (the old dsBadSlotInt came
+     * from the pre-pulse latch model, not from delivering bit 6).
      */
-    uint8_t slot_cpu = m->rbv_sifr & m->rbv_sier & 0x3f;
+    uint8_t slot_cpu = m->rbv_sifr & m->rbv_sier & 0x7f;
 
     if (slot_cpu) {
         m->rbv_ifr |= RBV_IFR_SLOT;
@@ -1198,46 +1215,6 @@ static void maciisi_egret_process(MacIIsiMachineState *m)
 }
 
 /*
- * Egret-initiated transfer: when autopolling finds fresh device data
- * and the transport is idle, load the first byte into the shift
- * register, assert /XCVR_SESSION and raise the shift interrupt — the
- * host's TIP/TACK handshake then clocks the remaining bytes exactly
- * like a command response.
- */
-static void maciisi_egret_adb_poll(void *opaque)
-{
-    MacIIsiMachineState *m = opaque;
-    MOS6522MacIIsiState *v1s = &m->via1;
-    MOS6522State *s = MOS6522(v1s);
-    uint8_t obuf[ADB_MAX_OUT_LEN + 2];
-    int olen;
-
-    /* only when no exchange is in progress and the shifter is inbound */
-    if (m->egret_session || m->egret_resp_len > 0 || (s->acr & SR_OUT)) {
-        return;
-    }
-
-    olen = adb_poll(&v1s->adb_bus, obuf, v1s->adb_bus.autopoll_mask);
-    if (olen <= 0) {
-        return;
-    }
-    /* adb_poll tags the data with the Talk R0 command byte at obuf[0] */
-    memcpy(m->egret_resp, obuf, olen);
-    m->egret_resp_len = olen;
-    m->egret_resp_idx = 1;
-    m->egret_no_resp = false;
-    m->egret_session = true;            /* Egret-initiated session */
-    s->sr = m->egret_resp[0];
-    maciisi_egret_set_xcvr(v1s, true);
-    maciisi_egret_schedule_int(m);
-    qemu_log_mask(LOG_UNIMP,
-                  "maciisi egret: unsol len=%d [%02x %02x %02x %02x]\n",
-                  m->egret_resp_len, obuf[0], obuf[1],
-                  m->egret_resp_len > 2 ? obuf[2] : 0,
-                  m->egret_resp_len > 3 ? obuf[3] : 0);
-}
-
-/*
  * /XCVR_SESSION (PB3) as sampled by the ROM driver at each shift
  * interrupt (dispatch 0x4080a700: btst #3, then the continuation
  * branches on it):
@@ -1283,16 +1260,68 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
     uint8_t hs_change = (s->b ^ v1s->last_b) & (EGRET_SYS_SESSION |
                                                 EGRET_VIA_FULL);
 
-    if (sys && !m->egret_session) {
+    /*
+     * Session-open detection must be EDGE-triggered: after an exchange
+     * completes, /TIP is often left asserted (the OS-era driver chains
+     * poll exchanges without ever parking the bus), and unrelated port
+     * B writes — the RTC bit-bang on PB0-2 runs from the Time Manager
+     * between exchanges — must not re-open a session (observed: such a
+     * write reset /XCVR to idle underneath an armed end-of-response
+     * continuation; the pending "session closed" interrupt then read
+     * /XCVR high = "more data" and clocked junk until the exchange
+     * died).  A session opens on:
+     *  - a /TIP assert edge (fresh session, or the poll cadence's
+     *    ORB ^= 0x20 receive reopen after its ORB ^= 0x30 close), or
+     *  - a /TACK assert edge with /TIP already held and the shifter
+     *    outbound (chained send via 0x4080a656: ORB &= 0xCF straight
+     *    after the previous exchange, /TIP never released).
+     */
+    if (sys && !m->egret_session &&
+        ((hs_change & EGRET_SYS_SESSION) ||
+         ((hs_change & EGRET_VIA_FULL) && !(s->b & EGRET_VIA_FULL) &&
+          (s->acr & SR_OUT)))) {
         m->egret_session = true;
         m->egret_cmd_len = 0;
-        m->egret_resp_len = 0;
-        m->egret_resp_idx = 0;
-        /* /XCVR returns to idle before the new exchange */
-        maciisi_egret_set_xcvr(v1s, false);
-        /* the ROM preloads the first byte before asserting the session */
         if (s->acr & SR_OUT) {
+            /*
+             * Send session: a new command begins; any response still
+             * held from the previous exchange is stale — discard it.
+             * The ROM preloads the first byte into SR before asserting
+             * the session, so collect it now.
+             */
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+            /* /XCVR returns to idle before the new exchange */
+            maciisi_egret_set_xcvr(v1s, false);
             maciisi_egret_sr_written(v1s);
+        } else if (m->egret_resp_len > 0 && m->egret_resp_idx == 0) {
+            /*
+             * Receive session with a held response: the poll cadence
+             * (ROM 0x4080a5f6/0x4080a5fc: turnaround ORB ^= 0x30 which
+             * transiently releases /TIP, then ORB ^= 0x20 re-asserting
+             * it with the shifter inbound) closes the command session
+             * and opens a fresh session to collect the answer.  The
+             * first byte must already be in SR when the opening shift
+             * interrupt is dispatched (cont 0x4080a624 reads SR at the
+             * NEXT interrupt via 0x4080a68e).
+             */
+            s->sr = m->egret_resp[0];
+            m->egret_resp_idx = 1;
+            maciisi_egret_set_xcvr(v1s, m->egret_no_resp);
+            maciisi_egret_schedule_int(m);
+        } else {
+            /*
+             * Receive session with nothing to deliver: the Egret has
+             * nothing to say — run the no-response signature (/XCVR
+             * low throughout, two junk bytes clocked and discarded).
+             */
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+            maciisi_egret_no_response(m);
+            s->sr = m->egret_resp[0];
+            m->egret_resp_idx = 1;
+            maciisi_egret_set_xcvr(v1s, true);
+            maciisi_egret_schedule_int(m);
         }
         return;
     }
@@ -1301,8 +1330,9 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
      * TIP/TACK toggles during the receive phase acknowledge the byte
      * in SR and clock the next one; /TIP alternates as part of the ack
      * cadence (ORB ^= 0x30), so mid-receive states always have exactly
-     * one of TIP/TACK asserted.  BOTH released means the host walked
-     * away from the exchange (close/park), never an ack.
+     * one of TIP/TACK asserted.  BOTH released while a response is
+     * flowing is not an ack (it is the poll cadence's session close,
+     * handled below).
      */
     if (m->egret_session && !(s->acr & SR_OUT) && hs_change
         && m->egret_resp_len > 0
@@ -1312,15 +1342,17 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
         return;
     }
 
-    if (!sys) {
+    /*
+     * Host released /TIP: the session is closed.  Only act on the
+     * transition — further port B writes with /TIP high (e.g. the RTC
+     * bit-bang on PB0-2) must not disturb the transport state.
+     */
+    if (!sys && (hs_change & EGRET_SYS_SESSION)) {
         /*
-         * Host released the session.
-         *
          * A packet sent without the receive turnaround (Listen
          * commands: the driver expects no response) is processed now —
          * it was never seen by maciisi_egret_process, and ADB Listens
-         * must reach the devices (address relocation!).  Any response
-         * it builds is discarded, nobody is listening.
+         * must reach the devices (address relocation!).
          */
         if (m->egret_cmd_len > 0 && m->egret_resp_len == 0
             && m->egret_resp_idx == 0) {
@@ -1328,18 +1360,27 @@ static void maciisi_egret_session_update(MOS6522MacIIsiState *v1s)
         }
         m->egret_session = false;
         m->egret_cmd_len = 0;
-        m->egret_resp_len = 0;
-        m->egret_resp_idx = 0;
+        /*
+         * A staged but undelivered response SURVIVES the close: the
+         * poll cadence closes the command session (ORB ^= 0x30) and
+         * immediately reopens a receive session (ORB ^= 0x20) to
+         * collect it.  A response already being delivered (idx > 0)
+         * was abandoned mid-read — drop it.
+         */
+        if (m->egret_resp_idx > 0) {
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+        }
         /* /XCVR_SESSION returns to idle (PB3 high) */
         maciisi_egret_set_xcvr(v1s, false);
         /*
          * The Egret clocks one final shift-register interrupt when the
          * host releases /TIP: the "session closed" acknowledgement.
          * The OS Egret driver parks its state machine (state byte 0x01)
-         * on this interrupt after every exchange; without it the next
-         * queued ADB request is never started (observed: boot hangs at
-         * the splash screen with an armed continuation and an idle
-         * bus).  The ROM driver simply eats the extra interrupt.
+         * on this interrupt after every exchange, and the poll cadence
+         * advances on it (cont 0x4080a5fc does the ORB ^= 0x20 reopen);
+         * without it the next queued ADB request is never started.
+         * The ROM startup driver simply eats the extra interrupt.
          */
         maciisi_egret_schedule_int(m);
     }
@@ -1769,7 +1810,14 @@ static void maciisi_machine_init(MachineState *machine)
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_egret_timer_cb,
                                   m);
 
-    /* ADB devices behind the Egret */
+    /*
+     * ADB devices behind the Egret.  No Egret-initiated/unsolicited
+     * delivery is modelled: on this machine the HOST polls — the ADB
+     * manager's completion path (ROM 0x4080a70e-0x4080a734) walks the
+     * active-device bitmap (transport globals +334) and re-issues Talk
+     * R0 to the next device after every no-data poll, so keyboard and
+     * mouse data is collected by the guest's own continuous rotation.
+     */
     {
         BusState *adb_bus = qdev_get_child_bus(DEVICE(&m->via1), "adb.0");
 
@@ -1777,10 +1825,6 @@ static void maciisi_machine_init(MachineState *machine)
         qdev_realize_and_unref(dev, adb_bus, &error_fatal);
         dev = qdev_new(TYPE_ADB_MOUSE);
         qdev_realize_and_unref(dev, adb_bus, &error_fatal);
-
-        adb_register_autopoll_callback(&m->via1.adb_bus,
-                                       maciisi_egret_adb_poll, m);
-        adb_set_autopoll_enabled(&m->via1.adb_bus, true);
     }
     m->vbl_off_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_vbl_off, m);
     m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciisi_sixty_hz, m);

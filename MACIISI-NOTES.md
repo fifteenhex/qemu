@@ -910,3 +910,122 @@ ADB-input investigation (session 9 end, for next session):
   WRITE(6)/WRITE(10) — if writes fail the Finder treats the volume as
   locked).  Investigate after input works (the alert also blocks the
   desktop until dismissable).
+
+### ADB INPUT CRACKED — THE FINDER IS INTERACTIVE (2026-08-24, session 10)
+
+MILESTONE: keyboard and mouse work in the running Finder.  Injected QMP
+events visibly act on the GUI: a keypress type-selects in a Finder
+window, the cursor moves, a click OPENS THE APPLE MENU
+(/tmp/shots/maciisi-interactive-apple-menu.png), Cmd-N CREATES A NEW
+FOLDER on the desktop = a successful disk WRITE
+(/tmp/shots/maciisi-newfolder-diskwrite.png; `info blockstats`: 46
+write ops / 78KB through the 5380).  Three root causes, all found by
+reading the ROM transport at the wedge PCs and diffing model state
+against it; all fixes are hw/m68k/maciisi.c ONLY (no shared code
+touched this session — q800 etc. unaffected by construction).
+
+ROOT CAUSE 1 — the Talk-R0 wedge: the poll cadence closes and reopens
+the session, and the model treated the close as "host walked away".
+Ground truth (ROM disasm): after the sweep, the OS ADB manager idles by
+HOST-DRIVEN POLLING — the end-of-exchange path (0x4080A70E-0x4080A734,
+mirrored in the OS RAM dispatcher at 0xBEC4) walks an active-device
+bitmap (transport globals a3+334) and re-issues Talk R0 to the NEXT
+device after every no-data poll ([2c]/[3c] forever, kbd addr 2 / mouse
+addr 3).  There is NO Egret-initiated autopoll on this machine at all.
+The poll send path (kick handler 0x4080A5AA -> 0x4080A5C0) does its
+receive turnaround DIFFERENTLY from the sweep exchanges:
+  - sweep Talks (mode A): ACR->in, tst SR, ORB ^= 0x10 (TACK only),
+    then per-byte ORB ^= 0x30 acks — session held throughout;
+  - rotation polls (mode B, via 0x4080A5F6/0x4080A5FC): ACR->in, tst
+    SR, ORB ^= 0x30 — which RELEASES /TIP with /TACK, i.e. transiently
+    "both handshake lines high" — one SR_INT later ORB ^= 0x20
+    RE-ASSERTS /TIP with the shifter inbound = a fresh RECEIVE session
+    that collects the response to the command sent in the previous
+    session.  (Continuation chain: cont a5fc does the ^0x20, cont a624
+    is the first-data interrupt, 0x4080A68E reads SR per byte.)
+The old model's release branch fired on the transient ^0x30 state,
+cleared the staged response and went idle; the reopened receive session
+then found nothing, no SR_INT ever came, and the driver parked forever
+with cont=0x4080A624 armed (the session-9 wedge signature: ORB=0xDF,
+flags(350)=0x90 — which is NOT a collision, it is the normal ori #0x90
+at 0x4080A5FC).  The "51 ADBReInits" were NOT caused by this wedge (a
+healthy boot still runs ~51 sweeps — INIT-time ADBReInit calls); only
+the FIRST rotation poll ever wedged, at the very end of boot.
+FIX (maciisi_egret_session_update rewrite):
+  - session CLOSE only on a /TIP release EDGE (hs_change bit5), and a
+    staged-but-undelivered response (resp_idx==0) SURVIVES the close;
+    a response mid-delivery (idx>0) is dropped.  RTC bit-bang port-B
+    writes (bits 0-2, /TIP parked low between exchanges!) no longer
+    disturb the transport (they used to run the whole release branch
+    + schedule spurious SR_INTs).
+  - session OPEN is EDGE-triggered: /TIP assert edge (fresh session or
+    the mode-B ^0x20 reopen), or /TACK assert edge with /TIP already
+    held + shifter outbound (chained send via 0x4080A656's ORB &= 0xCF
+    straight after an exchange — /TIP is never released between OS-era
+    exchanges).  The old level-triggered "sys && !session" open branch
+    was the LAST wedge: after the final ack of a poll response, any
+    port-B write (RTC Time-Manager traffic) re-opened a session and
+    idled /XCVR high underneath the armed end-of-response continuation;
+    the pending "session closed" SR_INT then read XCVR-high = "more
+    data" and clocked junk until the model went silent (that is how
+    boot3 still parked once per boot even after the close fix).
+  - receive-session open with a held response loads SR with byte 0,
+    sets /XCVR per no_resp and raises the SR_INT (cont a624 expects
+    the first byte ALREADY in SR); with nothing held it runs the
+    no-response signature.
+  - the never-used Egret-initiated autopoll injection
+    (maciisi_egret_adb_poll + QEMU adb autopoll timer) is REMOVED: the
+    guest polls.  (Explains session-9's "autopoll never fires": there
+    is no such mechanism on this machine to begin with.)
+With this the rotation runs continuously (~thousands of [2c]/[3c]
+exchanges — beware -d unimp: the egret log grows at ~2MB/s at the
+Finder; use HMP "log none") and keyboard data reaches the OS (typing
+works — key-repeat doubling in tests is just icount virtual-time
+compression tripping MacOS auto-repeat, not a model bug).
+
+ROOT CAUSE 2 — mouse data arrived but the cursor never moved: the
+cursor task never ran.  Evidence: MTemp (lowmem 0x828, phys +0x50000)
+accumulated every injected delta while RawMouse (0x82C) stayed frozen;
+CrsrNew=0xFF armed; jCrsrTask [0x8EE]=0x4082DF94 would couple them but
+is only called from the Vertical Retrace Manager's SLOT $E VBL task —
+and the session-5 model deliberately never raised the slot-E summary
+interrupt (SIFR bit 6 was masked out of the CPU path).  At the Finder
+the OS has SIER=0x7F and enables IER bit 1 (write 0x82 at 0x40809FE2,
+gated on [0xDD1] bit 2 = Egret/RBV machine) exactly when the first
+slot VBL task is installed.  FIX: include bit 6 in the slot summary
+(mask 0x3f -> 0x7f in maciisi_rbv_update_irq).
+
+ROOT CAUSE 3 — enabling that summary sad-mac'd the boot with
+dsBadSlotInt (0000000F/00000033): the RBV SIFR reads ACTIVE LOW.  The
+ROM's level-2 slot dispatcher (0x40806EAA: IFR ack, then
+d0 = ~(0x80 | SIFR(+0x02)) & SIER(+0x12), dispatch if nonzero) inverts
+the register — our active-high SIFR made every IDLE slot (bits 0-5,
+empty slots 9-D) look asserted, and the dispatcher raised dsBadSlotInt
+on the first summary interrupt.  The flags mirror the physical /IRQ
+lines (idle 0xFF), like VIA2 port A on q800.  FIX: RSIFR read returns
+~rbv_sifr (internal state stays an asserted-bits mask; RSIFR write
+still clears written bits — the RBV1 driver's VBL handler acks with
+0x40 -> +0x02 at 0x4084B49C/B568; the driver enables/disables the VBL
+via 0xC0/0x40 -> +0x12 at 0x4084AA76/AA3E; its frame-sync helper
+0x4084AC8A waits a full bit-6 cycle so it works in either polarity —
+which is why the polarity bug survived sessions 3-9 unnoticed).
+
+DISK "locked" alert: does NOT reproduce on a clean image.  The
+partition map of /workspace/files/HD0-OpenRetroSCSI-7.5.3.hda has ONE
+HFS volume (+ map/driver/free) — there is no second volume to fail to
+mount.  Session 9 ran from a possibly-torn private copy; all session-10
+boots ran the pristine image with -snapshot and no alert ever appeared,
+and Finder writes succeed (new folder created + renamed; 46 WRITEs on
+the block layer).  The 5380 data-out path needed no changes.
+
+Repro/runbook (session 10):
+  build/qemu-system-m68k -M maciisi -bios .../maciisi.rom \
+    -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+    -snapshot -display none -monitor unix:/tmp/mon.sock,server=on,wait=off \
+    -qmp unix:/tmp/qmp.sock,server=on,wait=off -icount shift=7
+  (-icount shift=7 is REQUIRED: without it TimeDBRA calibration
+  divides by zero -> sad mac 0000000F/00000004.  Finder in ~7 min.)
+  Input via QMP input-send-event (rel/btn/key qcodes) or HMP
+  sendkey/mouse_move — both reach adb-kbd/adb-mouse now.
+Commits: hw/m68k/maciisi: Egret session-edge model + RBV slot-int
+polarity; MacOS 7.5.3 Finder is interactive (this session).
