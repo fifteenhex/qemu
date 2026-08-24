@@ -465,8 +465,20 @@ static void mos6522_maciisi_class_init(ObjectClass *klass, const void *data)
 }
 
 /*
- * Onboard video framebuffer: 640x480 1-bit at the slot $E aperture
- * (ScrnBase 0xFEE00000), rowbytes 80.
+ * Onboard video framebuffer: 640x480 1-bit, rowbytes 80.
+ *
+ * The IIsi's RBV video has no dedicated VRAM: the frame buffer is the
+ * BOTTOM of RAM bank A.  When a monitor is sensed the ROM reserves
+ * physical 0x0000..0x4FFFF (320 KiB, enough for 8-bit 640x480) for
+ * video and builds its MMU maps with logical RAM relocated up by
+ * 0x50000 (level-A entries 0-6 -> frames 0x050000, 0x150000, ... in
+ * the 24-bit map at CRP [0x7FF920]) while the video windows (24-bit
+ * 0xB08000, 32-bit virtual 0xFBB08000, slot views) translate down to
+ * physical 0x0000.  So the display scans system RAM at offset 0; the
+ * CPU never touches a separate VRAM device.  (The old model's fake
+ * VRAM at physical 0xFBB08000 + 24-bit aliases only ever worked
+ * because a monitor-sense bug made the ROM build no-video identity
+ * maps that happened to land on it.)
  */
 
 #define TYPE_MACIISI_FB "maciisi-fb"
@@ -479,7 +491,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MacIIsiFbState, MACIISI_FB)
 struct MacIIsiFbState {
     SysBusDevice parent_obj;
 
-    MemoryRegion vram;
+    MemoryRegion *ram;          /* scanout source: system RAM, offset 0 */
     MemoryRegionSection fbsection;
     QemuConsole *con;
     int invalidate;
@@ -508,7 +520,7 @@ static bool maciisi_fb_update(void *opaque)
     int first = 0, last = 0;
 
     if (s->invalidate) {
-        framebuffer_update_memory_section(&s->fbsection, &s->vram, 0,
+        framebuffer_update_memory_section(&s->fbsection, s->ram, 0,
                                           MACIISI_FB_HEIGHT,
                                           MACIISI_FB_ROWBYTES);
         s->invalidate = 0;
@@ -539,9 +551,10 @@ static void maciisi_fb_realize(DeviceState *dev, Error **errp)
 {
     MacIIsiFbState *s = MACIISI_FB(dev);
 
-    memory_region_init_ram(&s->vram, OBJECT(dev), "maciisi.vram", 0x180000,
-                           &error_fatal);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->vram);
+    if (!s->ram) {
+        error_setg(errp, "maciisi-fb: scanout RAM region not set");
+        return;
+    }
 
     s->invalidate = 1;
     s->con = qemu_graphic_console_create(dev, 0, &maciisi_fb_ops, s);
@@ -574,10 +587,6 @@ struct MacIIsiMachineState {
     MacIIsiFbState fb;
     MemoryRegion rom;
     MemoryRegion rom_alias;
-    MemoryRegion rom_slot_alias;
-    MemoryRegion vram_alias;
-    MemoryRegion vram_alias24;
-    MemoryRegion vram_slote_alias24;
     MemoryRegion rom_alias24;
     MemoryRegion ramio;
     MemoryRegion ramio_a31;
@@ -890,8 +899,12 @@ static const MemoryRegionOps maciisi_via1_ops = {
 
 /*
  * RBV: VIA2 functionality (IFR/IER with the VIA set/clear protocol,
- * slot interrupt flags) plus video control.  Register 0x10 carries the
- * monitor sense in the low bits; 6 = Apple 13" 640x480 RGB.
+ * slot interrupt flags) plus video control.  Register 0x10 (monP)
+ * carries the raw monitor sense lines in bits 3-5; 6 = Apple 13"
+ * 640x480 RGB.  Every reader in the ROM extracts it as (monP >> 3) & 7
+ * (the family PrimaryInit at ROM 0x7EEC6/0x7F0A8, the RBV1 driver body
+ * at 0x4A674, the video mode code at 0x42088).  The low bits are the
+ * sense-line drive/control side and read back as written.
  */
 
 #define RBV_RSIFR  0x02    /* slot interrupt flags (bit 6 = slot $E VBL) */
@@ -930,7 +943,7 @@ static uint64_t maciisi_rbv_read(void *opaque, hwaddr addr, unsigned size)
         val = m->rbv_sier | 0x80;
         break;
     case RBV_RMONP:
-        val = (m->rbv_regs[addr] & 0xf8) | RBV_MONITOR_SENSE;
+        val = (m->rbv_regs[addr] & ~0x38) | (RBV_MONITOR_SENSE << 3);
         break;
     default:
         val = m->rbv_regs[addr];
@@ -1011,6 +1024,28 @@ static void maciisi_rbv_update_irq(MacIIsiMachineState *m)
     }
     qemu_set_irq(qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_RBV),
                  (m->rbv_ifr & m->rbv_ier & 0x7f) != 0);
+}
+
+/*
+ * NCR5380 interrupt: on the IIsi the SCSI IRQ is an RBV/VIA2 interrupt
+ * source (IFR bit 3, same layout as the classic VIA2 used by the OS's
+ * level-2 dispatcher), NOT a direct CPU line.  Wiring it straight to
+ * the level-2 glue input starved the RBV IFR of any visible/clearable
+ * cause and produced an endless level-2 interrupt storm the moment the
+ * System enabled SCSI interrupts.
+ */
+#define RBV_IFR_SCSI_IRQ   0x08
+
+static void maciisi_scsi_irq(void *opaque, int n, int level)
+{
+    MacIIsiMachineState *m = opaque;
+
+    if (level) {
+        m->rbv_ifr |= RBV_IFR_SCSI_IRQ;
+    } else {
+        m->rbv_ifr &= ~RBV_IFR_SCSI_IRQ;
+    }
+    maciisi_rbv_update_irq(m);
 }
 
 static void maciisi_vbl_off(void *opaque)
@@ -1856,7 +1891,7 @@ static void maciisi_machine_init(MachineState *machine)
     sysbus = SYS_BUS_DEVICE(&m->scsi);
     sysbus_realize(sysbus, &error_fatal);
     sysbus_connect_irq(sysbus, 0,
-                       qdev_get_gpio_in(DEVICE(&m->glue), MACIISI_GLUE_RBV));
+                       qemu_allocate_irq(maciisi_scsi_irq, m, 0));
     memory_region_add_subregion(&m->macio, SCSI_OFS,
                                 sysbus_mmio_get_region(sysbus, 0));
     memory_region_init_io(&m->scsi_pdma, OBJECT(machine),
@@ -1882,64 +1917,32 @@ static void maciisi_machine_init(MachineState *machine)
                                 &m->rom_alias);
 
     /*
-     * The onboard video is a pseudo NuBus slot: the ROM (whose top holds
-     * the video Declaration ROM) also decodes at the top of slot $E
-     * super space, where the Slot Manager's byte-lane probe finds it.
+     * NOTE: the onboard-video Declaration ROM (top 0x1400 bytes of the
+     * system ROM) must NOT be aliased into slot $E standard space.  The
+     * ROM registers the motherboard DeclROM itself as pseudo-slot 0
+     * (sInfo siDirPtr = 0x4087EC1A, read straight out of the system
+     * ROM), and the family PrimaryInit sExec in the DeclROM prunes the
+     * slot-0 Slot Resource Table records down to the machine- and
+     * monitor-appropriate subset with spSlot hardcoded to 0.  An alias
+     * at 0xFEF80000 (tried earlier) makes the generic slot scan register
+     * a SECOND, never-pruned copy of the whole family DeclROM as slot
+     * $E; the System then opens every video sResource in it, including
+     * the Mac LC's .Display_Video_Apple_VISA driver whose stub scans
+     * the LC ROM location 0x00A44000 for its 'Dave'-tagged body and
+     * bus-errors fatally on a IIsi.
      */
-    memory_region_init_alias(&m->rom_slot_alias, NULL, "maciisi.rom-slote",
-                             &m->rom, 0, MACIISI_ROM_SIZE);
-    memory_region_add_subregion(get_system_memory(),
-                                0xff000000 - MACIISI_ROM_SIZE,
-                                &m->rom_slot_alias);
 
     /*
-     * Onboard video framebuffer.  The machine table in the ROM hardwires
-     * the physical base 0xFBB08000; the same memory also appears at the
-     * slot $E view 0xFEE00000 that the Declaration ROM's video driver
-     * publishes as ScrnBase.
+     * Onboard video: the display scans the bottom of RAM (see the
+     * maciisi-fb comment).  All CPU-side framebuffer addresses
+     * (ScrnBase 0xFBB08000, the 24-bit window 0xB08000, slot views)
+     * are VIRTUAL and resolve through the ROM's PMMU maps to physical
+     * RAM 0x0000+; there is no separate VRAM decode to model.
      */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACIISI_FB);
+    m->fb.ram = machine->ram;
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
-    memory_region_add_subregion(get_system_memory(), 0xfbb08000,
-                                sysbus_mmio_get_region(sysbus, 0));
-
-    memory_region_init_alias(&m->vram_alias, NULL, "maciisi.vram-slote",
-                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
-    memory_region_add_subregion(get_system_memory(), 0xfee00000,
-                                &m->vram_alias);
-
-    /*
-     * 24-bit-mode view of the framebuffer.  When the machine boots in
-     * 24-bit addressing (the ROM/System default before "32-Bit
-     * Addressing" is engaged), the onboard-video ScrnBase 0xFBB08000 is
-     * a virtual address that the ROM's 24-bit PMMU map resolves via the
-     * classic 24-bit->32-bit slot compatibility window: the level-A
-     * descriptor for index 0xB early-terminates onto page frame
-     * 0xFB000000, so the CPU emits physical 0xFB008000 (i.e. the base
-     * shifted down by 0xB00000).  Alias the framebuffer there too so the
-     * gray-desktop / QuickDraw fills in 24-bit mode land on screen.
-     * (In 32-bit mode ScrnBase resolves identity to 0xFBB08000 above.)
-     */
-    memory_region_init_alias(&m->vram_alias24, NULL, "maciisi.vram-24bit",
-                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
-    memory_region_add_subregion(get_system_memory(), 0xfb008000,
-                                &m->vram_alias24);
-
-    /*
-     * 24-bit-mode view of the slot-$E aperture (0xFEE00000).  The loaded
-     * video driver also reaches the framebuffer through the slot window
-     * ScrnBase 0xFEE00000; in 24-bit mode the ROM's compat map strips the
-     * slot nibble the same way (VA 0xFEExxxxx -> 24-bit 0xE0xxxxx ->
-     * level-A page frame 0xFE000000 -> physical 0xFE0xxxxx), so alias the
-     * same VRAM at 0xFE000000.  Without it the driver's aperture polls
-     * (observed spinning on 0xFEE03944 -> phys 0xFE003944) bus-error.
-     */
-    memory_region_init_alias(&m->vram_slote_alias24, NULL,
-                             "maciisi.vram-slote-24bit",
-                             sysbus_mmio_get_region(sysbus, 0), 0, 0x180000);
-    memory_region_add_subregion(get_system_memory(), 0xfe000000,
-                                &m->vram_slote_alias24);
 
     /*
      * NuBus card bus.  The IIsi has only the 030 PDS, but a PDS->NuBus

@@ -692,3 +692,221 @@ lines are the fastest way to pin a fatal fault (grep the tail; RAM pcs
 are 0x000xxxxx, ROM 0x408xxxxx).  Boots ~4-5 min at -icount shift=7.
 HMP `pmemsave 0x<addr> <declen> "<path>"` dumps RAM to disassemble
 (m68k-linux-gnu-objdump -b binary -m m68k:68030 --adjust-vma=).
+
+### THE 'Dave' BUS ERROR ROOT-CAUSED (2026-08-24, session 9)
+
+The System-startup bus-error dialog (crash pc 0x000752F6, a0=0x00A44000,
+d0='Dave') is fully explained — it is NOT a fault-recovery bug and NOT
+an extension; it is a machine-model bug dating back to session 3.
+
+Evidence chain (all from the live crashed machine + ROM disassembly):
+- The crashing code is a 26-byte DRVR stub named
+  ".Display_Video_Apple_VISA", copied verbatim from the system ROM's
+  Declaration ROM (DeclROM file offset 0x7f7c0; DeclROM = top 0x13E6
+  bytes of the 512K ROM).  The stub is a trampoline:
+  `movea.l #0x00A44000,a0; move.l #'Dave',d0; loop: cmp.l (a0)+,d0;
+  bne loop` then replaces dCtlDriver with the found body and jumps
+  into it.  Its sibling ".Display_Video_Apple_RBV1" (offset 0x7f768)
+  scans #0x40844000 for 'Fung' the same way.  The driver BODIES are in
+  the main ROM: 'Fung' @ROM+0x4a5f4 (RBV1), 'Dave' @ROM+0x4ad9c
+  (VISA).  0x00A44000 is the Mac LC's ROM window (LC ROM lives at
+  0xA00000; body at 0xA4AD9C) — the VISA stub is ONLY runnable on an
+  LC.  There is no bus-error catcher; on the machine it belongs to the
+  scan always terminates.  On a IIsi 0xA44000 is empty slot-$A space:
+  instant unrecoverable bus error.  (So: no fault-frame issue at all.)
+- This $067C ROM is a universal "Macintosh Family 2.0" ROM; its
+  DeclROM carries board sResources for II/IIx/IIcx/SE30/IIci/IIfx +
+  "Macintosh A/B" (IIsi/LC) and video sResources for BOTH video chips:
+  RBV1 ids 129-159 (drhw 0x18) and VISA ids 162-186 (drhw 0x1A).
+- Unit table at the crash (UTableBase 0x4B60): units 48..62 = DCEs for
+  EVERY RBV id (129,130,134,135,137,138,142,143,145,146,150,151,154,
+  158,159), all successfully opened (dCtlDriver -> ROM body
+  0x4084A5F8), then unit 63 = id 162, slot 0x0E, devBase 0xFEE00000 —
+  the first VISA sResource, which died in its Open.  The System was
+  enumerating and opening EVERY video sResource of pseudo-slot $E.
+- Why real hardware never does that: the sResource set is pruned at
+  ROM-boot time by the family PrimaryInit sExec in the DeclROM
+  (code 0x4087EDFC..0x4087F232; the only PrimaryInit item, attached to
+  the IIci board sResource, is shared by the whole family).  It reads
+  the machine byte [[0xDD8]+18], keeps the matching board sResource
+  (table @0x4087F248: IIsi = index 12 -> board id 7 "Macintosh A"),
+  deletes the other boards, reads the RBV monitor sense ([0xCEC]+0x10
+  >> 3), and prunes the video ids (table @0x4087F258) down to the one
+  matching machine+monitor via SDeleteSRTRec/SSetSRsrcState —
+  **with spSlot hardcoded to 0** (it clears SpBlock+49).
+- gdb trace of the ROM PrimaryInit phase (0x4080624A: swaps to 24-bit,
+  then runs slots 0,14,13,...,1): in OUR boot it found a board
+  sResource and EXECUTED PrimaryInit **twice** — once for slot 0
+  (sInfo 0x4244, siDirPtr 0x4087EC1A = the DeclROM read directly from
+  the system ROM: the ROM registers the motherboard DeclROM itself as
+  pseudo-slot 0!) and once for slot 14 (sInfo 0x425C, siDirPtr
+  0xFEFFEC1A = our session-3 alias of the ROM at 0xFEF80000).  Both
+  runs prune only SLOT 0's records; the duplicate slot-$E copy stays
+  complete and unpruned, boot video got registered from it (first
+  video id >= 0x80 present = 129 rather than the sense-matched one),
+  and the System's video enumeration walked all 23 slot-E entries into
+  the VISA stub.
+- Conclusion: real IIsi hardware does NOT decode the DeclROM at the
+  top of slot $E standard space.  The 0xFEF80000 ROM alias (added in
+  session 3 to make "the Slot Manager find the card") was wrong; the
+  correct discovery path is the ROM's own slot-0 registration, which
+  needs no alias at all.
+
+FIX (hw/m68k/maciisi.c only): remove the maciisi.rom-slote alias at
+0xFEF80000 (rom_slot_alias).  Slot 0's registration is untouched by
+this (it reads 0x4087xxxx), PrimaryInit still runs for slot 0 and now
+prunes the ONLY copy of the sResources.
+
+Continuation (session 9, same day) — FINDER DESKTOP REACHED.  Removing
+the alias alone broke the boot differently (white screen, ScrnBase
+garbage; then a machine-check death) and pulling THAT thread uncovered
+four more real bugs, each root-caused in turn:
+
+- PrimaryInit gdb trace (phase runner ROM 0x4080624A: swaps to 24-bit,
+  runs slot 0 then 14..1; per-slot 0x4080627A finds the board sResource
+  via SGetTypeSRsrc cat=1, checks sInfo, SFindStructs item 34, sExecs
+  it): with the alias gone, slot 0 finds the board and EXECUTES
+  PrimaryInit, slots 1-14 report smNoMoresRsrcs (0xFEC7).  Correct.
+- But the boot-video path (0x40801002: SpBlock cat/typ/sw = 3/1/1,
+  spSlot starts at 0, sNextTypeSRsrc; found -> sFindDevBase -> ScrnBase
+  [0x824], register DCE 0x40800CA0, marker [0xDB0]=test pattern) then
+  found NO video sResource: PrimaryInit had pruned ALL of them.  Its
+  monitor sense read is (RBV+0x10 >> 3) & 7 — as is the RBV1 driver
+  body's (ROM 0x4A674) and the mode code's (0x42088) — while the model
+  reported sense 6 in the LOW bits (journal session 1 had it wrong):
+  PrimaryInit saw 0 = no monitor = delete everything.  FIX: monP
+  returns sense 6 in bits 3-5 (low bits are the drive side, read back
+  as written).
+- With sense visible, PrimaryInit painted the startup gray screen
+  through the ROM's 24-bit map... into LOW RAM, destroying vectors +
+  the running sExec copy (QEMU abort: PC=0xAAAAAAAA).  The dumped live
+  tables (CRP {7FFF0003, 007FF920}) revealed the REAL IIsi memory
+  layout: with a monitor sensed the ROM reserves PHYSICAL 0x0000-4FFFF
+  (320 KiB) as the frame buffer (RBV video = bottom of RAM bank A, as
+  on the IIci) and relocates logical RAM +0x50000 in BOTH PMMU maps
+  (level-A/B frames 0x050000, 0x150000, ...); the video windows
+  (ScrnBase 0xFBB08000, 24-bit 0xB08000, VideoInfo at [univ+8]
+  rom+0x3982 says base 0xFBB08000) translate DOWN to phys 0.  All the
+  session-5..8 VRAM devices/aliases at 0xFBB08000/0xFB008000/
+  0xFEE00000/0xFE000000 only ever worked because the sense bug made
+  the ROM build no-video IDENTITY maps that landed on them.  FIX:
+  delete the fake VRAM + aliases; maciisi-fb now scans MACHINE RAM at
+  offset 0 (fb.ram = machine->ram).
+- The gray fill still crashed: QEMU's 030 walk masked early-
+  termination page frames down to the covered span
+  ((table & ~(span-1)) | offset), so frame 0x50000 with a 1 MB span
+  became 0 -> the relocation map degenerated to identity and the fill
+  again hit low RAM.  The 030 ADDS the residual logical bits to the
+  PS-aligned frame (UM 9.5.3).  FIX in get_physical_address_030
+  (+ only advertise span-sized TLB pages when the frame is aligned).
+- Boot then died in a level-2 interrupt storm (a million Level 2 INTs
+  at the SCSI wait 0x40807826): the 5380 IRQ was wired STRAIGHT to the
+  CPU level-2 glue input, invisible to and unclearable by the OS's
+  level-2 dispatcher (and fighting the RBV's own line updates).  FIX:
+  route it into RBV IFR bit 3 (VIA2 layout, cf. Linux mac via2).
+- Then a deterministic DOUBLE MMU FAULT during the System's boot-time
+  MMU-table rebuild (RAM pc ~0x1273E/0x129BA/0x129D6): it reserves new
+  table space below BufPtr [0x10C] (a workspace block from NewPtr,Sys,
+  ptr stored at [0x394]) and ZEROES logical 0x7A5E00-0x7AF540 — which
+  maps over the ROM's LIVE tables region — before loading its own
+  root pointer, trusting the real 030's ATC to keep translating
+  meanwhile.  QEMU refills the TLB in 4K subpages of the guest's 32K
+  pages and re-walked the half-wiped tables mid-loop.  FIX 1: software
+  ATC in the 030 walk (16 entries, guest-page granularity, keyed on
+  the IS-masked address so 24-bit-tagged and plain pointers coincide;
+  store-through-read-entry re-walks for the M bit; flushed by
+  PMOVE/PFLUSH).  FIX 2 (the final one): PAGE descriptors carry their
+  page address in bits 31-8, but the walk masked with the
+  table-descriptor mask ~0xF, leaking U/M status bits into the frame
+  (short desc 0x007F8019 -> 0x7F8010): the wipe loop then wrote +0x10
+  high, crossed a 4K boundary at offset 0xFFC (ATC entry with a
+  +0x1000 addend) and REALLY corrupted the live level-A table at phys
+  0x7FF958 (caught with a per-iteration gdb breakpoint watching
+  [0x7FF958]).  Masking page addresses with ~0xFF fixes it.
+
+MILESTONE: with all of the above, MacOS 7.5.3 boots from the 5380 disk
+to a RUNNING FINDER DESKTOP: menu bar (File/Edit/View/Label/Special),
+ticking menu clock, desktop pattern, Launcher strip; screenshot
+/tmp/shots/maciisi-finder-desktop.png (also /tmp/dave/run39-*.png).
+One modal alert sits on screen: "Disk initialization failed because
+the disk is locked!" — some second volume in the OpenRetro image
+failed to mount (the boot volume itself is fine — the Finder runs from
+it).  NOTE: run from a PRIVATE COPY of the disk image (a concurrent
+lc475 session in /workspace/src/qemu-mac intermittently locks
+/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda; I used /tmp/dave/hd0.hda
+— possibly a torn copy, which may itself explain the unmountable
+second volume; re-copy cleanly next time).
+
+CURRENT FRONTIER: ADB input into the running Finder.  QMP
+input-send-event (rel moves, buttons, keys) reaches adb-mouse/adb-kbd
+but the cursor never moves and Return doesn't dismiss the dialog.  The
+Egret model HAS unsolicited/autopoll delivery (maciisi_egret_adb_poll,
+autopoll_mask 0xFFFF, enabled at init) — so either the OS never sees
+the unsolicited sessions (check -d unimp egret log lines 'unsol/feed/
+response complete' during input), the packet framing for
+Egret-initiated ADB data differs from command responses (a status/type
+prefix byte?), or the OS's transport rejects them at this phase.
+Next: boot to Finder (~9 min at icount shift=7), send input, grep the
+egret exchange log, and compare against the OS ADB driver's
+expectations (RAM driver, globals at [0xB78]; session-7 notes have the
+transport pinout/flow).
+
+Verified no regressions: -M q800 ROM boot to insert-disk desktop
+(/tmp/dave/q800-chk.png), -M mvme147 147Bug monitor prompt (both
+exercise the shared m68k translation code; q800 is 040, mvme147 uses
+the 030 walk incl. the shift>=32 early-termination identity path).
+
+Commits: 48ad070bbe (target/m68k: three 030 PMMU translation fixes),
+75639dc7cb (hw/m68k/maciisi: the four machine-model fixes).
+
+Tooling notes for next session:
+- gdb/HMP-xp reads on this machine BYPASS the 030 MMU (the debug path
+  checks the 040 TCR only): with the video-relocation maps active,
+  "lowmem" reads at 0xXXX actually read the VIDEO BUFFER; real lowmem
+  lives at PHYS +0x50000.  All lowmem spelunking must add the offset
+  (or fix m68k_cpu_get_phys_addr_debug to use the 030 walk).
+- Boot-to-crash points are deterministic; conditional hbreak command
+  lists (silent/if/continue) work well and ~1400-iteration polling
+  loops are fine.  gdb 'watch' on this stub = software watchpoints =
+  unusable crawl.
+- Concurrent sessions share /workspace/files disk images — always
+  check 'fuser' before blaming QEMU lock errors, never pkill.
+
+ADB-input investigation (session 9 end, for next session):
+- At the Finder desktop the OS runs the ADBReInit collision sweep
+  ([2b 0f fe]/[2f]/[fb 02 fe] for kbd addr 2, [3b 0f fe]/[3f]/[fb 03
+  fe] for mouse addr 3, [ff] Talk R3 addr 15) ~50 TIMES over the boot
+  (grep 'cmd len' of a -d unimp log: 50-51 of each), i.e. it keeps
+  REINITIALIZING adb — on a healthy machine it runs once.  ZERO
+  unsolicited/autopoll packets were ever delivered (grep 'unsol' = 0)
+  even though maciisi_egret_adb_poll + QEMU adb autopoll are armed
+  (mask 0xffff, enabled; ACR parks at 0x0C = shift-in, so the SR_OUT
+  guard is not the blocker).  QMP input events queue into adb-kbd/
+  adb-mouse but nothing moves; Return does not dismiss the dialog.
+- The transport ends WEDGED mid-exchange: last exchange = host sends
+  [2c] (Talk R0 kbd), does the receive turnaround (model stages a
+  2-byte null response, XCVR low), the ROM-transport turnaround helper
+  reads SR once (log '-> 0x2c (#0/2) pc=4080a682 b=c7') and then the
+  expected ORB^=0x10 TACK toggle at 0x4080a686 NEVER ARRIVES — no
+  further egret log lines at all, ORB parks at 0xDF (TIP still
+  asserted!), and the driver globals ([phys 0x50CF8] -> a3=0x5100,
+  continuation a3+312) hold cont=0x4080A624 = armed waiting for an SR
+  interrupt forever.  Straight-line ROM code was abandoned between two
+  instructions => an OS-level layer (VBL task/watchdog timeout?)
+  yanked control and never resumed the exchange.  Hypothesis: each of
+  the 51 sweeps ends in exactly such an upstream timeout because
+  autopoll data never arrives; find the OS ADB manager's timeout/
+  retry logic (RAM driver, globals [0xB78! remember +0x50000 for
+  physical dumps]) and what it expects the Egret to do about
+  device-initiated data — the parked-Talk-R0 model (Egret holds the
+  response until data exists) vs unsolicited-session model needs to be
+  settled from that code, and maciisi_egret_adb_poll made to match.
+- Autopoll never fires even DURING the sweeps (why? add a log line in
+  maciisi_egret_adb_poll's early-return to see which guard trips; the
+  QEMU adb_poll may also simply have no data when no input was sent).
+- The 'Disk initialization failed because the disk is locked!' Finder
+  alert reproduces on a clean image copy; possibly a second partition
+  the model can't write (check whether the ncr5380 model accepts
+  WRITE(6)/WRITE(10) — if writes fail the Finder treats the volume as
+  locked).  Investigate after input works (the alert also blocks the
+  desktop until dismissable).
