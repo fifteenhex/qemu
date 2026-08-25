@@ -703,6 +703,32 @@ static void macse30_via1_portA_write(MOS6522State *s)
 
 static void macse30_via1_portB_write(MOS6522State *s)
 {
+    /*
+     * PB4/PB5 (the ADB transceiver ST1/ST0 state lines, cf.
+     * VIA1B_vADB_StateMask) are host-driven outputs with no other
+     * source modeled here; mos6522's generic ORB/IRB handling only
+     * updates bits that DDRB currently claims as outputs and silently
+     * retains whatever was last latched for the rest (see
+     * mos6522_write's `s->b = (s->b & ~dirb) | (val & dirb)`).  Real
+     * VIA1 hardware reads floating/undriven state-line pins as the
+     * idle bus level (ADB_STATE_IDLE == 3, all ones) rather than a
+     * stale zero.  Without this, an early ROM VIA self-test that
+     * walks DDRB through an all-output/all-input pattern (observed on
+     * the II/IIx/SE30 ROM before the ADB Manager ever touches this
+     * VIA) can leave the ST1/ST0 latch bits stuck at 0 ("new
+     * transaction") once DDRB reverts those two bits to inputs; the
+     * ADB Manager's very first real transition to ADB_STATE_NEW (also
+     * 0) then reads as *no* state change at all (old == new == 0),
+     * macse30_adb_update() never calls macse30_adb_send(), the ADB
+     * SR interrupt never fires, and the ROM's ADBReInit wait loop
+     * (btst of its busy flag) spins forever -- this was traced live
+     * with gdb + a temporary trace and confirmed zero adb send/receive
+     * calls ever fired.  Force state-line bits that DDRB currently
+     * marks as inputs back to the idle level on every ORB write, so
+     * the latch can never carry a stale non-idle value across a DDRB
+     * direction change.
+     */
+    s->b |= VIA1B_vADB_StateMask & ~s->dirb;
 }
 
 static void mos6522_macse30_init(Object *obj)
@@ -891,6 +917,11 @@ struct MacSE30MachineState {
     MemoryRegion scsi_pdma;
     MemoryRegion scsi_hsk;
     MemoryRegion iotrace;
+
+    /* pseudo-slot $E onboard video: declaration ROM + 64KB VRAM */
+    MemoryRegion declrom;
+    MemoryRegion vram;
+    uint8_t declrom_data[0x2000];
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
@@ -1399,6 +1430,42 @@ static const MemoryRegionOps macse30_iotrace_ops = {
 };
 
 
+/*
+ * Pseudo-slot $E declaration ROM as a logging IO region, so the ROM Slot
+ * Manager's parse of our synthesized decl ROM is fully visible (byteLanes/
+ * testPattern/format-block, then the sResource directory + sResources).
+ * Bytes come from declrom_data[]; index 0 is physical 0x00F00000+... i.e.
+ * the region base, so the byteLanes byte (last) is at 0x00FFFFFF.
+ */
+static uint64_t macse30_declrom_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MacSE30MachineState *m = opaque;
+    static int count;
+
+    if (count < 4000) {
+        count++;
+        qemu_log_mask(LOG_UNIMP,
+                      "macse30 declrom: read +0x%04x (phys 0x%08x) -> 0x%02x\n",
+                      (unsigned)addr,
+                      (unsigned)(0xFF000000 - 0x2000 + addr),
+                      m->declrom_data[addr & 0x1fff]);
+    }
+    return m->declrom_data[addr & 0x1fff];
+}
+
+static void macse30_declrom_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+}
+
+static const MemoryRegionOps macse30_declrom_ops = {
+    .read = macse30_declrom_read,
+    .write = macse30_declrom_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+};
+
 static void macse30_machine_init(MachineState *machine)
 {
     MacSE30MachineState *m = MACSE30_MACHINE(machine);
@@ -1541,7 +1608,17 @@ static void macse30_machine_init(MachineState *machine)
                             TYPE_MOS6522_MACSE30_VIA2);
     qdev_prop_set_uint64(DEVICE(&m->via2), "frequency", VIA_TIMER_FREQ);
     sysbus_realize(SYS_BUS_DEVICE(&m->via2), &error_fatal);
-    /* DIAGNOSTIC: leave VIA2 IRQ disconnected to isolate the storm */
+    /*
+     * The earlier VIA2 longword-access interrupt storm (fixed above via
+     * macse30_via2_ops' .valid/.impl split) was root-caused to the wide
+     * access itself, not to VIA2's IRQ output; disconnecting the IRQ
+     * during that debugging session was a diagnostic dead end that was
+     * never reconnected.  Wire VIA2's own summary IRQ into GLUE level 2
+     * now, matching the RBV summary wiring the IIci uses for its VIA2
+     * site.
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&m->via2), 0,
+                       qdev_get_gpio_in(DEVICE(&m->glue), MACSE30_GLUE_VIA2));
     memory_region_init_io(&m->via2mem, OBJECT(machine), &macse30_via2_ops,
                           &m->via2, "via2", VIA_REGION_SIZE);
     memory_region_add_subregion(&m->macio, VIA1_OFS + VIA_REGION_SIZE,
@@ -1619,14 +1696,23 @@ static void macse30_machine_init(MachineState *machine)
     sysbus = SYS_BUS_DEVICE(&m->scsi);
     sysbus_realize(sysbus, &error_fatal);
     /*
-     * TODO: route via VIA2 CA1 once the handshake is right -- wiring it
-     * straight through storms the CPU (VIA2 IER starts masked, but
-     * something about the 5380's idle IRQ level plus our minimal VIA2
-     * model re-triggers immediately on every RTE).  Sink it for now,
-     * same caution as the IIci's ASC comment.
+     * Real Mac II-class GLUE wiring: the NCR5380's IRQ output feeds
+     * VIA2 CA1 (cf. Linux arch/m68k/mac/via.c and MAME's mac.cpp GLUE
+     * model -- SCSI_IRQ is a VIA2 CA1 edge on the II/IIx/SE30 family,
+     * NOT a direct GLUE/CPU line and NOT RBV-summarised as on the
+     * IIci).  A large (192-sector) blind SCSI READ was observed (gdb +
+     * -trace ncr5380_*) to stall forever after the ROM's PIO copy loop
+     * pulled exactly one 512-byte block and fell into an outer tail
+     * poll of CSB/BSR (0x40806dd8-style "wait for a flag an interrupt
+     * handler clears" idiom) that never resolves with SCSI IRQ sunk --
+     * consistent with (not yet proven) that outer dispatcher being
+     * interrupt-driven for multi-block transfers.  The previous
+     * session's storm concern here was root-caused instead to the
+     * VIA2 longword-access bug (fixed above); revisit if a genuine
+     * storm reappears now that access-size splitting is correct.
      */
     sysbus_connect_irq(sysbus, 0,
-                       qemu_allocate_irq(macse30_irq_sink, m, 0));
+                       qdev_get_gpio_in(DEVICE(&m->via2), CA1_INT_BIT));
     memory_region_add_subregion(&m->macio, SCSI_OFS,
                                 sysbus_mmio_get_region(sysbus, 0));
     memory_region_init_io(&m->scsi_pdma, OBJECT(machine),
@@ -1652,12 +1738,71 @@ static void macse30_machine_init(MachineState *machine)
                                 &m->rom_alias);
 
     /*
-     * Onboard video: fixed 512x342 1-bit compact-Mac framebuffer, no
-     * RBV video and no NuBus (this machine has only the 030 PDS).
+     * Onboard video is really a NuBus pseudo-slot ($E) device: the ROM's
+     * Slot Manager probes a declaration ROM at the top of the 24-bit slot
+     * space (0x00FFFFFF downward, confirmed by tracing the ROM's byteLanes/
+     * testPattern reader at 0x408043f4/0x408041e0) and a 64KB video RAM in
+     * the same slot; the decl ROM's video sResource advertises 512x342x1
+     * with the framebuffer at base offset $8040 into the VRAM.  Map both
+     * into slot $E's 24-bit window (0x00F00000-0x00FFFFFF), overlapping the
+     * RAM container.  The decl ROM image is generated out-of-tree and loaded
+     * from a file so it can be iterated without rebuilding QEMU.
+     */
+/*
+ * Slot $E standard slot space is 0xFE000000-0xFEFFFFFF (the ROM probes each
+ * slot $s's decl ROM at 0xF[s]FFFFFF; slot $E = 0xFEFFFFFF -- confirmed by
+ * tracing a5 in the ROM's slot loop).  Map the decl ROM + VRAM there, at a
+ * priority ABOVE the A31 24-bit-alias handler, so ONLY slot $E answers: the
+ * other slots (0xF9..0xFDFFFFFF) fall through to the A31 alias -> unbacked
+ * RAM -> read 0 -> no card, so MacOS finds exactly one video board.
+ */
+#define MACSE30_SLOTE_BASE   0xFE000000
+#define MACSE30_SLOTE_TOP    0xFF000000   /* one past slot $E's 16MB space */
+#define MACSE30_VRAM_SIZE    0x00010000   /* 64KB */
+#define MACSE30_VIDEO_OFS    0x00008040   /* decl-ROM minorBaseOS */
+#define MACSE30_DECLROM_SIZE 0x00002000   /* 8KB, ends at 0xFEFFFFFF */
+    memory_region_init_ram(&m->vram, NULL, "macse30.vram",
+                           MACSE30_VRAM_SIZE, &error_abort);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MACSE30_SLOTE_BASE, &m->vram, 2);
+
+    memory_region_init_io(&m->declrom, OBJECT(machine), &macse30_declrom_ops,
+                          m, "macse30.declrom", MACSE30_DECLROM_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MACSE30_SLOTE_TOP - MACSE30_DECLROM_SIZE,
+                                        &m->declrom, 2);
+    {
+        /*
+         * WORK IN PROGRESS: the synthesized pseudo-slot $E declaration ROM
+         * is opt-in via the MACSE30_DECLROM env var (path to the .bin built
+         * by scripts/se30-build-declrom.py).  It is NOT loaded by default
+         * because the video sResource does not yet carry a functional slot
+         * video *driver*: the ROM/OS Slot Manager successfully validates the
+         * decl ROM (byteLanes/testPattern/format/CRC) and enumerates the
+         * board, but then hangs in sReadStruct/sGetDriver trying to load the
+         * (absent) driver.  Until the driver is written, leaving the decl ROM
+         * unloaded keeps the default machine booting MacOS normally.
+         */
+        const char *dpath = getenv("MACSE30_DECLROM");
+        gchar *dbuf = NULL;
+        gsize dlen = 0;
+
+        if (dpath && g_file_get_contents(dpath, &dbuf, &dlen, NULL) && dlen &&
+            dlen <= MACSE30_DECLROM_SIZE) {
+            /* place so the last decl-ROM byte lands at 0xFEFFFFFF */
+            memcpy(m->declrom_data + (MACSE30_DECLROM_SIZE - dlen),
+                   dbuf, dlen);
+        }
+        g_free(dbuf);
+    }
+
+    /*
+     * Onboard video framebuffer scanned from the pseudo-slot VRAM at the
+     * decl-ROM's advertised base offset ($8040), 512x342 1-bit.
      */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACSE30_FB);
-    m->fb.ram = machine->ram;
-    m->fb.base = ram_size - MACSE30_FB_MAIN_OFS;
+    m->fb.ram = &m->vram;
+    m->fb.base = MACSE30_VIDEO_OFS;
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
 

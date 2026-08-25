@@ -697,6 +697,720 @@ runs without crashing, past the first hard blocker found this
 session, into a second well-characterized wait loop) for the next
 session to continue.
 
+### SE/30 continued (2026-08-25, branch `fix-se30`): ADB state-line bug found and fixed -- past the wait loop into real disk I/O
+
+Picked up on branch `fix-se30` (worktree `/workspace/src/qemu-q630`,
+based on `amiga` HEAD) with the `0x40806DD8` wait loop from above as
+the target.  Reproduced it live with `-s -S`/gdbstub (note: had to use
+`-gdb tcp::PORT` instead of bare `-s`, since other agents' worktrees
+were already holding the default `:1234` port; `set endian big` after
+`target remote` as always).
+
+**Root cause identified.**  `a3` (0x24b0 this run) is the ROM's ADB
+Manager globals struct; offset 349 is a busy/status byte, bit 5 the
+"transaction in flight" flag.  The routine at 0x40806dea is
+`ADBReInit`-shaped: it programs VIA1 ACR to shift-register
+"output/external-clock" mode (`ACR=0x1C`, `SR_OUT` bit set), writes
+the first ADB command byte (0x00 = SendReset) into VIA1's SR (reg 10),
+then writes VIA1 ORB (reg 0) with the ADB transceiver state bits
+(PB5/PB4, `VIA1B_vADB_StateMask`) set to `ADB_STATE_NEW` (0) to kick
+the transaction off -- this exactly matches our `macse30_adb_send()`/
+`macse30_adb_update()` model ported from q800's `mac_via.c`.  Added
+temporary `qemu_log_mask` tracing to `macse30_adb_update()` and
+confirmed: **zero** `macse30_adb_send()`/`macse30_adb_receive()` calls
+ever fired across 21000+ Port-B writes leading up to and including the
+kickoff.  The reason: `macse30_adb_update()` only calls send/receive
+when `(s->b & VIA1B_vADB_StateMask) != (v1s->last_b &
+VIA1B_vADB_StateMask)`, but an EARLIER ROM VIA1 self-test (part of
+generic pre-machine-ID POST, same family of walking-bit tests that
+blocks Classic II's boot on VIA1 IER -- see that section above) walks
+VIA1 DDRB through an all-output/all-input pattern and, in the process,
+leaves the ORB *output latch* bits for PB4/PB5 stuck at 0 once DDRB
+reverts those two bits to inputs.  Real 6522 silicon reads
+input-configured pins as the live external level (here, the ADB state
+lines float/pull HIGH when not host-driven -- idle == state 3, all
+ones); our `mos6522.c`'s generic `s->b = (s->b & ~dirb) | (val &
+dirb)` has no concept of a live external level for input bits and just
+retains the stale output-latch value.  So by the time the ADB Manager
+does its first *real* transition to `ADB_STATE_NEW` (== 0), the
+tracked "previous" state was *also* 0 (the self-test's leftover), the
+transition is invisible, `macse30_adb_send()` never runs, the VIA1 SR
+interrupt this whole mechanism is supposed to raise
+(`v1s->adb_data_ready`, wired to `SR_INT_BIT`) never fires, VIA1's
+IFR bit 2 never sets despite IER already enabling it (confirmed via
+QEMU's `info via` HMP command: `IFR=0x40` (T1 only), `IER=0x87`
+(CA2/CA1/SR enabled) -- SR simply never latches), and the ROM spins on
+bit 5 forever.  This is exactly the class of bug the task brief
+predicted ("a VIA timer tick... or a VIA shift-register/CA-CB edge"
+that the wiring isn't delivering) -- except the missing edge was
+entirely on the *input* side of our own VIA1 Port-B modeling, not a
+GLUE routing gap.
+
+Port A already has exactly this "board strap" fixup in
+`macse30_via1_read()` (`val = (val & s->dira) | (v1s->pins_a &
+~s->dira)`), but it only patches the CPU's *read* path, and only for
+Port A; Port B had no such thing.  A read-side-only fix would not have
+helped here anyway, since the bug is in the *internal* `s->b` value
+consumed directly by `macse30_adb_update()`/`via1_rtc_update()`, not
+just what the CPU sees on a register read.
+
+**Fix** (`hw/m68k/macse30.c`, `macse30_via1_portB_write()`, previously
+an empty stub copied from maciici.c): force any Port-B bits inside
+`VIA1B_vADB_StateMask` that DDRB currently marks as *inputs* back to
+the idle (all-ones/state-3) level on every ORB write:
+`s->b |= VIA1B_vADB_StateMask & ~s->dirb;`.  This only touches bits
+DDRB doesn't currently claim as outputs (so it can never clobber a
+real ROM-driven state write), self-heals the very next Port-B write
+after any DDRB direction change strands a stale bit, and leaves
+`VIA1B_vADBInt` (bit 3, driven entirely by our own transceiver code,
+not by DDRB) untouched.  Confirmed via the same temporary trace that
+after the fix, `macse30_adb_send()`/`macse30_adb_receive()` fire
+continuously and normally (1000+ calls within the first 25 real
+seconds: SendReset, then repeated Talk/Listen register polls with the
+keyboard/mouse -- classic ADB device enumeration traffic).
+
+**Result: boot advances from the ROM (0x408xxxxx) into RAM-resident
+code (PC in low memory, e.g. 0x000112xx) actively driving the NCR5380
+over real pseudo-DMA.**  Traced with `-trace enable='ncr5380_*'`:
+hundreds of SCSI transactions complete successfully end-to-end
+(INQUIRY/TEST-UNIT-READY-shaped 6-byte commands to target 2 timing out
+as expected -- no CD-ROM attached -- and dozens of READ(6)/READ(10)
+commands to target 0, the hard disk, succeeding with correct data
+checksums across LBAs scattered around the volume, consistent with
+boot-block, driver, and early filesystem-structure reads).  This is
+well past the originally-targeted interrupt-wait loop and into genuine
+disk-driven boot progress -- past where machine-ID/straps would have
+had to succeed already (the placeholder 0xEF strap did not visibly
+block anything).  The framebuffer at this point still shows raw
+uninitialized RAM noise, not a happy-mac icon yet, consistent with the
+hang below occurring before the ROM's first screen draw.
+
+**New, later, well-characterized blocker found (not yet resolved):**
+after ~1830 successful SCSI command completions, one large *blind*
+READ(10) for 192 sectors (98304 bytes, LBA 83548 -- large enough to
+plausibly be a System-file/resource-fork chunk or extents read) stalls
+forever.  Single-stepped/traced: the ROM's byte-copy loop at
+0x11276-0x1128a (`moveb %a0@,%a2@+` from the pseudo-DMA handshake
+aperture at 0x50F06xxx, `dbf`-counted) pulls **exactly 512 bytes**
+(one sector) of the 98304 requested, then falls through to a shared
+tail-dispatcher at 0x112e6-0x112f4 (`btst #5,a3@(64)` [CSB REQ] /
+`btst #3,a4@` [BSR PHASE_MATCH], looping while both stay set) that
+never exits, because our NCR5380 model (`hw/scsi/ncr5380.c`) pre-reads
+an entire multi-block transfer into `s->dbuf` synchronously up front
+and holds `PHASE_DI`/REQ/DRQ/PHASE_MATCH asserted until *all* 98304
+bytes are drained via the pdma aperture -- but nothing in the guest
+ever asks for bytes 512-98303.  Confirmed the 512-byte cap is a real
+ROM loop-count decision (its `dbf`-pair counters exhaust, not a
+DRQ/REQ deassertion), meaning the ROM's per-call PIO chunk size is
+genuinely bounded and it expects to be invoked again for subsequent
+chunks by an outer mechanism this session did not locate.
+
+Tried, as a bounded experiment, reconnecting two pieces of interrupt
+wiring that were leftover diagnostic disconnections/stubs from the
+*previous* session's now-fixed VIA2 longword-storm hunt: (1) VIA2's
+own summary IRQ output, unconditionally disconnected from GLUE with a
+"DIAGNOSTIC: leave VIA2 IRQ disconnected to isolate the storm" comment
+-- reconnected to `MACSE30_GLUE_VIA2` (GLUE level 2), matching the
+IIci's RBV-summary wiring; and (2) the NCR5380's IRQ output, sunk to
+`macse30_irq_sink()` with a "TODO: route via VIA2 CA1" comment --
+wired to VIA2's `CA1_INT_BIT`, matching real Mac II/IIx/SE30 GLUE-era
+hardware (Linux `arch/m68k/mac/via.c` and MAME `mac.cpp` both route
+SCSI_IRQ to VIA2 CA1 on this machine family, NOT to RBV/GLUE directly
+as on the IIci).  Neither caused a storm across 45+ real seconds and
+hundreds more successful SCSI transactions (the earlier storm's real
+cause, confirmed last session, was the VIA2 wide-access bug, already
+fixed) -- both are kept as genuine hardware-correctness improvements.
+Confirmed via `info via` that VIA2 IER does enable CA1 (0x02) by the
+time of the stall, but the stall itself did NOT clear: our
+`ncr5380_update_irq()` only asserts IRQ on `BSR_IRQ` (0x10), which our
+model only ever sets at full-*transaction* completion (bus-free/
+message-in), never mid-transfer -- so even with SCSI IRQ wired, no
+edge is available to end this particular wait, because ending it
+requires the 98304-byte transfer's remaining 97792 bytes to actually
+be drained first (chicken-and-egg).  So SCSI IRQ routing is real and
+now correct, but is NOT the missing piece for *this* stall.
+
+Next-session starting points:
+  - Find the outer caller of the 0x112aa/0x11276-style per-block PIO
+    dispatcher (search backward from 0x112e6/0x112f4's `rts` for who
+    `jsr`s into this routine, and what decides whether to call it
+    again for the next 512-byte chunk) -- likely either a fixed-size
+    "sector buffer" convention in the SCSI Manager/boot-block loader,
+    or genuinely interrupt-driven via a source not yet identified
+    (VBL? a VIA1 timer? worth re-checking whether the *tail loop's*
+    other exit condition -- BSR PHASE_MATCH going to 0 -- is the
+    intended path, which would need `ncr5380_do_command`'s "pre-read
+    the whole transfer up front" strategy to instead honor some
+    per-call transfer-size limit the ROM communicates some other way).
+  - Alternatively (probably the real fix): teach `ncr5380.c` to only
+    assert DRQ/REQ for the portion of the transfer the guest actually
+    starts consuming and let the SCSI Manager re-arm for the next
+    chunk the way real 5380 pseudo-DMA drivers do -- but note the
+    existing `ncr5380_do_command` comment ("Pre-read the ENTIRE
+    transfer synchronously... if the DI->ST transition waited on an
+    async aiocb, the trailing loop would clock in phantom stale
+    bytes") means this was already tried and reverted once for a
+    *different* symptom; any fix here needs to preserve that guarantee
+    for small/single-block transfers while unblocking large ones.
+  - `macIIx.rom`'s own machine-ID straps are still unverified (0xEF
+    borrowed from the IIci ROM) -- doesn't appear to be blocking
+    anything observed so far, but worth confirming once past the SCSI
+    stall.
+
+Command line used for testing (same as above, this worktree):
+
+    build/qemu-system-m68k -M macse30 -bios /workspace/files/mac-roms/macIIx.rom \
+      -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+      -snapshot -serial null -serial null -display none -icount shift=7 \
+      -monitor unix:/tmp/se30/mon.sock,server=on,wait=off
+
+Committed to `fix-se30`.  Net result this session: the originally
+assigned interrupt-wait loop is fixed and understood at the root
+-cause level (ADB Port-B input-pin modeling, `macse30_via1_portB_write`
+in `hw/m68k/macse30.c` only -- no shared files touched); boot now
+progresses far past machine-ID into genuine SCSI-driven disk I/O
+(hundreds of successful transactions), which is past the "good" tier
+bar in the task brief (past interrupt-wait toward machine-ID) though
+not yet at a rendered happy-mac/Finder.  A second, later, well
+-characterized blocker (large multi-block blind SCSI reads) is now the
+open item, documented above with concrete next steps.
+
+### SE/30 continued #2 (2026-08-25, `fix-se30`): chunked pseudo-DMA fix -- large SCSI reads now complete, boot runs deep into System 7.5.3
+
+Tackled the "large multi-block blind SCSI read stalls after one 512
+-byte chunk" blocker documented just above.  Full root cause, via
+`-trace enable=ncr5380_*` + gdb (`set endian big`) disassembly of the
+Mac II ROM's blind-transfer routine (entry 0x111e2, copy loop
+0x11276, tail 0x112e6):
+
+  - The routine is the ROM SCSI Manager's blind pseudo-DMA mover.  Its
+    per-call byte count arrives in `d2`; traced live to be **exactly
+    512** on every invocation (breakpoint at 0x111e2 dumping `d2` --
+    three calls seen, all `d2=512`).  So the ROM drains even a large
+    (192-sector / 98304-byte) READ(10) **512 bytes at a time**, one
+    sector per call, re-entering the routine for each subsequent
+    chunk.
+  - The copy loop (`moveb %a0@,%a2@+` through the handshake aperture at
+    0x50F06060, dbf-counted) gates each byte on **DRQ** (BSR bit 6),
+    not REQ.  After its 512-count exhausts, it falls into a tail loop
+    (0x112e6: `btst #5,CSB` [REQ, bit 5] / `btst #3,BSR` [PHASE_MATCH,
+    bit 3]) that spins until **/REQ deasserts** (then returns success
+    to fetch the next chunk) or the phase changes.
+  - Our `ncr5380.c` pre-reads the ENTIRE transfer synchronously into
+    `s->dbuf` up front (deliberate -- see the long comment in
+    `ncr5380_do_command`; it prevents phantom stale bytes on the DI->ST
+    transition) and asserts CSB REQ/DRQ/PHASE_MATCH continuously for
+    the whole data phase, only clearing REQ when the *entire* buffer
+    drains (via `ncr5380_enter_status`).  So after the ROM's first 512
+    -byte chunk, 97792 bytes still sat undrained, REQ stayed asserted,
+    and the ROM's inter-chunk "wait for /REQ low" tail spun forever.
+    Confirmed with the trace: `reg[3]<-0x01`(TCR=IO), `reg[2]<-0x02`
+    (MR=DMA), `reg[7]<-0x00`(start DMA recv), then **exactly 512**
+    `pdma_rd` events and **no further register writes** (ruling out the
+    earlier hypothesis of an interrupt handler poking TCR), then the
+    endless CSB/BSR poll.
+
+**Fix** (`hw/scsi/ncr5380.c`, `ncr5380_pdma_read`, DI branch): model
+the per-byte SCSI /REQ handshake -- deassert `CSB_REQ` after each
+pseudo-DMA byte that is *not* the final one (the final byte still goes
+through `ncr5380_enter_status`, unchanged).  This lets the chunked
+reader's inter-chunk "/REQ low" poll make progress after each 512-byte
+sector, while a **full-drain reader** (the IIci/IIsi ROMs, which read
+the whole transfer in one loop) never samples /REQ mid-transfer -- it
+only checks it once at the very end, by which point `enter_status` has
+already moved the bus to STATUS -- so the change is invisible to them.
+The chunk's byte-move loop gates on DRQ (kept asserted until the buffer
+fully drains), so clearing /REQ does not disturb the copy itself.  This
+is also simply *more* correct 5380 modelling (real /REQ pulses per
+byte), not an SE/30-specific hack, so it lives in the shared file
+rather than behind a machine flag.
+
+**Result: the 192-sector read completes and boot advances
+dramatically.**  Where the ROM previously parked forever at PC
+0x000112ee, it now churns through a wide spread of System 7.5.3 code:
+sampled PC across a single second lands on **19 distinct addresses out
+of 30 samples** spanning 0x0003bxxx / 0x0007axxx / 0x00165xxx /
+0x0037exxx-0x0037fxxx / 0x003a6xxx-0x003a8xxx / 0x000b6xxx etc. --
+i.e. deep, varied System execution (driver/extension init), with SR
+I:0 and no tight-loop parking.  This is well past the SCSI stall and
+into real OS bring-up.
+
+**Still NOT reaching a rendered happy-mac/Finder** -- but the
+remaining gap is a **video/framebuffer-base problem, not SCSI**: our
+`macse30-fb` scans a FIXED base of `ram_size - 0x5900`, whereas at
+this boot stage the low-memory `ScrnBase` (0x0824) reads 0x0000357c
+and `MemTop` (0x0108) reads 0x002bf3c8 (well below the 4MB top),
+i.e. MacOS is placing/using the screen buffer somewhere our fixed
+scanout does not point, so the display still shows static
+uninitialized-RAM noise even though the CPU is executing normally.
+Next session: make `macse30-fb` honor the ROM/OS `ScrnBase` (0x0824)
+or the standard compact-Mac `MemTop`-relative main-buffer placement
+instead of a hardcoded `ram_size - 0x5900`, and/or verify the video
+base the Mac II-family ROM programs (it differs from the compact
+-Mac128k formula this fb was cloned from).
+
+**Regression check (shared `hw/scsi/ncr5380.c` was touched):**
+  - `-M maciici` (macIIci.rom): re-verified -- boots all the way to a
+    **fully interactive Finder desktop** (Control Panels window open,
+    live menu-bar clock, all icons rendering).  No regression; this is
+    the strongest available test since it exercises the exact same
+    pseudo-DMA + handshake-aperture path and boots to the end.
+  - `-M maciisi`: its ROM is not present in this environment
+    (`/workspace/files/mac-roms/` has no IIsi image), so it could not
+    be booted this session.  The fix is invisible to full-drain
+    readers by construction (see above), and maciisi shares the IIci's
+    $067C ROM family / full-drain blind-read style.
+  - `-M q800`: uses the **ESP** SCSI controller (`hw/scsi/esp.c`), NOT
+    `ncr5380.c` -- unaffected by this change by construction (different
+    source file entirely).  Its ROM is also not present here.
+
+Command line (SE/30, this worktree):
+
+    build/qemu-system-m68k -M macse30 -bios /workspace/files/mac-roms/macIIx.rom \
+      -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+      -snapshot -serial null -serial null -display none -icount shift=7 \
+      -monitor unix:/tmp/se30/mon.sock,server=on,wait=off
+
+Committed to `fix-se30`.
+
+### SE/30 continued #3 (2026-08-25, `fix-se30`): video diagnosis -- it's a slot/declaration-ROM device, NOT a fixed main-RAM framebuffer; a base fix cannot render it
+
+Investigated the "framebuffer-base mismatch" the previous section left
+open, intending to point `macse30-fb` at the base MacOS actually uses.
+The investigation instead **overturned the premise**: there is no
+fixed main-RAM 1-bit framebuffer for our scanout to point at, because
+the SE/30's onboard video is architecturally a NuBus **pseudo-slot
+($E) declaration-ROM device** (the Mac II family way), not the
+compact-Mac fixed-RAM video the `macse30-fb` model was cloned from
+(`hw/m68k/mac128k.c`).  Evidence, all gathered this session via gdb
+(`set endian big`) full-RAM dumps (`dump binary memory`) + PIL
+rendering + monitor sampling:
+
+  1. **No 512x342 screen exists anywhere in the 4 MB RAM** while MacOS
+     is actively running.  Dumped all of RAM at ~95 s (matching the
+     time maciici takes to reach its Finder) and swept a 512x342/1-bpp
+     window across every 64-byte offset scoring for (a) a white menu
+     bar + black separator line, and (b) a 50%-gray desktop dither
+     (0xAA/0x55).  **Zero** menu-bar candidates and **zero** gray
+     -desktop regions anywhere.  A compact-Mac fixed-RAM design would
+     have a happy-mac and then a gray desktop sitting at a fixed base;
+     the SE/30 has neither in main RAM.
+  2. **`ScrnBase` (low-mem 0x0824) reads 0x0000357c** and never
+     changes -- far too low to be a screen buffer (it would overlap the
+     trap dispatch table at 0x1e00 and low globals); rendering a window
+     there shows only structured heap, no desktop.  A working compact
+     -Mac screen port would hold a valid top-of-RAM `ScrnBase`.
+  3. **The ROM never draws a POST screen (gray/happy-mac) to main
+     RAM.**  A gdb hardware watchpoint on a candidate framebuffer byte
+     (0x3fc000), filtered to ignore the ROM's own RAM-test fill loop
+     (0x40803600-0x40803900, walking pattern 0x6db6db6d up to the test
+     ceiling 0x3ffd00), caught only the RAM test and a generic
+     memory-clear (`clrl %a1@-`) touching that address -- never any
+     screen-fill/blit routine.  On the compact Macs the ROM blits the
+     happy-mac to the fixed base during POST; here it does not.
+  4. **No NuBus/slot super-space probing either.**  `-d unimp,
+     guest_errors` over a 30 s boot logged **no** accesses to slot
+     video space (0xF9/0xFB/0xFExxxxxx) and **no** bus errors there --
+     consistent with this machine having been built deliberately
+     NuBus-free (`macse30.c` removed `mac_nubus_bridge` entirely), so
+     the slot-$E declaration ROM + framebuffer the SE/30 video needs is
+     simply absent, and neither the ROM nor MacOS can find/init a
+     display.
+  5. **MacOS is nonetheless genuinely up and running** (so this is
+     purely a display-output gap, not a boot failure): monitor PC
+     sampling shows ~20 distinct PCs per 40 samples spanning System
+     code (0x0037xxxx-0x003axxxx), low-RAM OS (0x0003bxxx), and ROM
+     (0x4081e444), with the busiest single PC being 0x0000afd0 -- which
+     disassembles to the **A-line trap dispatcher** (`cmpiw #0xa800` /
+     table index off 0x1e00), i.e. the OS is actively dispatching traps
+     the whole time.
+
+**Conclusion / why the base was never the real problem:** the earlier
+`ScrnBase=0x357c` / `MemTop=0x2bf3c8` readings were red herrings -- not
+"MacOS drew the screen somewhere else," but "MacOS never established a
+linear framebuffer at all" because the built-in video is a slot device
+we don't model.  Changing `macse30-fb`'s scanout base (to `ram_size -
+0x8000`, to `MemTop`-relative, to `ScrnBase`, or anything else) cannot
+produce a visible desktop: there is no coherent framebuffer image in
+main RAM to display, at any base.  The top-of-RAM region our current
+`ram_size - 0x5900` scanout points at is used by the ROM RAM test and
+then as ordinary heap, which is exactly the "static noise" seen.
+
+**Therefore left `macse30-fb` unchanged** (a spurious base tweak would
+render identical noise and mislead the next reader) and did NOT touch
+shared display code -- so `-M maciici` / `-M q800` / the compact Macs
+are untouched and unaffected by this session (nothing to regress).
+
+**Concrete path forward for the next session (the actual required
+work, a real feature not a base fix):** emulate the SE/30 onboard
+video as a slot-$E declaration-ROM device so MacOS's Slot Manager +
+slot video driver initialise it:
+  - The tree already has a full NuBus Mac video model with a
+    declaration ROM in `hw/display/macfb.c` (the DAFB-style card q800
+    uses -- note its `MACFB_DISPLAY_*` sResource tables and the
+    `MACFB_VRAM_SIZE`/declaration-ROM plumbing).  The cleanest route is
+    probably to (a) re-introduce a minimal NuBus/slot bridge for slot
+    $E on `macse30.c` (the machine deliberately dropped it), (b) place
+    a small declaration ROM describing the built-in 512x342 1-bit video
+    (base, rowBytes=64, depth=1, dimensions) in slot-$E space, and (c)
+    back the framebuffer either in main RAM (real SE/30 scans main RAM
+    top) or a dedicated VRAM region the declaration ROM points at.
+  - Cross-check the exact SE/30 video sResource against MAME
+    `mame/src/mame/apple/mac.cpp` (`macse30` video / `jmfb`/`macpds`
+    hookup) and Linux `drivers/video/fbdev/macfb.c`
+    (`MAC_MODEL_SE30`) for the declaration-ROM contents and the
+    framebuffer base the real machine advertises.
+  - This is substantially more than adjusting a scanout base and was
+    out of reach in the remaining budget this session; the two
+    interrupt/SCSI blockers that WERE assigned are fixed and committed
+    (boot now runs deep into System 7.5.3), and this section documents
+    precisely why video is a separate, larger piece of work.
+
+### SE/30 continued #4 (2026-08-25, `fix-se30`): slot-video hardware spec fully researched; blocked on the declaration-ROM binary/toolchain
+
+Followed the plan from #3 to actually implement the slot-$E video.
+Researched the exact SE/30 onboard-video hardware (web sources cross
+-checked below) and established the complete spec, but hit a hard
+supply-chain blocker on the one artefact that cannot be synthesised
+quickly -- the video **declaration ROM** itself.
+
+**Exact SE/30 onboard-video spec (now fully known):**
+  - It is a *separate* 8 KB **2764 EPROM** on the logic board (chip
+    **UK6**), NOT part of `macIIx.rom`.  Confirmed macIIx.rom does NOT
+    embed it: the one `0x5A932BC7` (Apple decl-ROM testPattern) hit in
+    macIIx.rom at file-offset 0x8b0 is an *immediate operand* of a
+    `move.l #$5A932BC7,...` (`21FC 5A932BC7`) -- i.e. the ROM's own
+    Slot Manager code *searching* for a decl ROM, not a decl ROM.  This
+    is why the II/IIx (same ROM, no onboard video) don't falsely
+    advertise a display.
+  - The video is a NuBus **pseudo-slot** (the SE/30 has a PDS, not
+    NuBus, so Apple faked a slot so the Slot Manager enumerates the
+    built-in video like a card).  boardId **$000C**.
+  - Framebuffer: a **64 KB video RAM** aperture; screen memory starts
+    at base **offset $8040** into it (`dc.l $8040 ; base offset for
+    start of screen memory` in the decl-ROM disassembly).
+  - Base 1-bit mode (`_StandardVidParams1`): rowBytes **$40** (64),
+    width **$200** (512), height **$156** (342), pixelSize **1**.  The
+    framebuffer lives in main RAM (top), matching the compact-Mac
+    "video in main memory at a fixed offset from RAM top" model -- so
+    with VRAM = top 64 KB (0x3F0000-0x400000 on a 4 MB machine) the
+    screen base would be 0x3F0000 + $8040 = **0x3F8040** (near the
+    all-white cleared block observed at 5 s in section #2, and near the
+    prior `macse30-fb` guess of 0x3FA700 -- but note the desktop is
+    only ever drawn there once MacOS's slot video driver initialises,
+    which needs the decl ROM; see below).
+
+**Why it is blocked (the honest supply-chain problem):**
+  - MacOS cannot enumerate/initialise the display without the slot-$E
+    declaration ROM, and that decl ROM must contain a *functional 68k
+    video driver* (Open/Control/Status: cscSetMode/GetMode/SetEntries/
+    GrayPage/GetPageBase...).  A bare framebuffer + empty slot is not
+    enough -- the Slot Manager needs the sResource tree AND the driver.
+  - No **prebuilt binary** of the SE/30 video decl ROM is publicly
+    available (Macintosh Garden hosts only the 256 KB *main* ROM =
+    macIIx.rom, checksum 97221136; the 8 KB video ROM is not archived
+    as a downloadable `.bin`).
+  - The only source is Axel Muhr's disassembly (github.com/axelmuhr/
+    Mac-SE-30-video-rom: `mySE30rom.a`, `mySE30_driver_full.a`,
+    `mySE30_primaryInit.a`, `mySE30_driver_stub.a`, `mySE30_easteregg.a`
+    + a `doDeclROM` build script) which per its own README **"can be
+    assembled with MPW 3.2"** -- it uses MPW declaration-ROM assembler
+    macros (byte-lane packing, sResource offset resolution, format
+    -block CRC).  This sandbox has `m68k-linux-gnu-as` (GNU as) but NOT
+    an MPW/Retro68 decl-ROM toolchain; GNU as assembles plain 68k
+    instructions but does not implement the MPW decl-ROM structure
+    macros / CRC / byte-lane linker step, so it cannot build this
+    disassembly as-is without a large syntax+macro port.
+  - Hand-writing a minimal-but-functional decl ROM + video driver from
+    scratch (format block + CRC + sResource dir + board/functional
+    sResources + vidMode params + a working Open/Control/Status driver)
+    is a multi-day expert task, and the Slot Manager gives *no*
+    diagnostic feedback when it silently rejects a malformed decl ROM
+    or the video driver returns wrong params -- so it is high-risk to
+    attempt blind in a bounded window.
+  - Additionally the machine (`macse30.c`) was deliberately built
+    NuBus-free (`mac_nubus_bridge` removed), so slot-$E enumeration
+    also needs a minimal NuBus/slot decode re-added (super-slot
+    0xE0000000 / standard-slot 0xFE000000 for slot $E, the decl ROM at
+    the top of that space, VRAM aperture at base+$8040) plus the slot
+    VBL IRQ routed through GLUE.
+
+**Decision:** did NOT commit any half-built slot infrastructure or a
+speculative hand-rolled decl ROM -- either would risk destabilising the
+otherwise-healthy machine (which now boots MacOS deep into System 7.5.3
+thanks to the committed ADB + SCSI fixes) for an unverifiable payoff.
+No code changed this round; the committed ADB (`e40b39c3`) and SCSI
+(`e3082f0d`) fixes are intact.
+
+**Concrete implementation plan for a session that has the toolchain
+(the remaining work, now fully scoped):**
+  1. Obtain the decl-ROM binary: either dump a real SE/30 UK6 2764
+     (8 KB), or build Axel Muhr's disassembly with **MPW 3.2** (or port
+     its `doDeclROM`/macros to Retro68's decl-ROM support).  This is the
+     critical-path artefact.
+  2. In `macse30.c`, re-add a minimal slot-$E decode: map the 8 KB decl
+     ROM read-only at the top of slot $E's standard space (0xFE000000
+     region, decl ROM at the high end per Apple's format-block-at-top
+     convention, byteLanes as the ROM specifies) so the Slot Manager
+     finds it; also alias into the 24-bit slot window if the ROM probes
+     there first.
+  3. Provide a 64 KB VRAM `MemoryRegion` for slot $E and point the
+     existing `macse30-fb` scanout at VRAM + $8040 (512x342x1,
+     rowBytes 64) instead of `ram_size - 0x5900`.  (Real HW scans main
+     RAM top; a dedicated 64 KB VRAM aperture is a valid simplification
+     as long as the decl-ROM minorBaseOS/base matches what fb scans.)
+  4. Route the video VBL interrupt (the driver's cscSetInterrupt /
+     the OS's VBL task) through GLUE (a spare level, as q800 does via
+     VIA2 nubus-irq) if the OS blocks on it.
+  5. Boot `-M macse30` with the OpenRetro 7.5.3 disk; expect the happy
+     -mac then the desktop (MacOS is already proven running -- trap
+     dispatcher busy at 0xafd0 -- so once the display device
+     enumerates it should draw).  Screendump via QMP->PPM->PIL.
+  Cross-refs: Axel Muhr decl-ROM disassembly + geekdot.com "Macintosh
+  Declaration ROM 101"; Apple "Designing Cards and Drivers for the
+  Macintosh Family" (decl-ROM format, video sResource, slot driver
+  interface); QEMU `hw/display/macfb.c` + `hw/nubus/*` for the slot
+  plumbing pattern (q800 slot-9 framebuffer); Linux
+  `drivers/video/fbdev/macfb.c` `MAC_MODEL_SE30`.
+
+### SE/30 continued #5 (2026-08-25, `fix-se30`): synthesized decl ROM from scratch -- Slot Manager validates + ENUMERATES the video board; stops at driver load
+
+Took the bounded shot at hand-authoring the pseudo-slot $E video
+declaration ROM, debugging it live against the ROM Slot Manager via
+QEMU traces (the coordinator's key insight: full visibility replaces
+MPW/Slot-Manager diagnostics).  Result: a **from-scratch declaration
+ROM that the SE/30 ROM Slot Manager fully validates and enumerates as
+a video board** -- every format/CRC/byte-lane hurdle cleared.  Stops
+at the next stage (loading the absent video *driver*).
+
+**What was built (all in this worktree, non-regressing / opt-in):**
+  - `scripts/se30-build-declrom.py`: a pure-Python declaration-ROM
+    assembler (no MPW needed).  Emits the format block (byteLanes
+    0x0F = all-lanes contiguous, testPattern 0x5A932BC7, format 1,
+    rev 1, reserved 0), the Apple decl-ROM CRC (ROL-1-then-add-byte,
+    skipping the CRC field), the sResource directory, a Board
+    sResource (boardId $000C, sRsrcType catBoard, sRsrcName) and a
+    Video functional sResource (sRsrcType catDisplay/typVideo/drSwApple,
+    sRsrcName, one 1-bit 512x342 vidMode with mBaseOffset $8040 /
+    mRowBytes $40, minorBaseOS/minorLength).
+  - `hw/m68k/macse30.c`: maps pseudo-slot $E into the 24-bit slot
+    window (VRAM 64KB at 0x00F00000, decl ROM ending at 0x00FFFFFF),
+    points `macse30-fb` at the slot VRAM (base+$8040), and loads the
+    decl ROM (as a logging IO region for debugging) **only when the
+    `MACSE30_DECLROM` env var points at the .bin** -- so the default
+    machine is byte-for-byte unaffected and still boots MacOS (verified:
+    14 distinct PCs sampled, running normally).
+
+**Live-debugged validation chain (each fixed by tracing the ROM's own
+Slot Manager at 0x408041e0 / 0x40804244 / 0x4080428e):**
+  1. byteLanes: high nibble must equal `~(low nibble)&0xF` -> 0x0F. OK.
+  2. testPattern `cmpil #$5A932BC7,a4@(14)`: matched (a4@14 read back
+     as 0x5a932bc7). OK.
+  3. format block: `a4@13`(format)==1, `a4@12`(rev)<=9, `a4@18`
+     (reserved)==0. OK.
+  4. **directoryOffset bug FOUND+FIXED**: `0x4080427c` requires
+     `(dirOffset & 0xFF000000)==0`, i.e. a 24-bit value -- a negative
+     offset must be stored as `0x00FFFFxx`, not sign-extended to
+     `0xFFFFFFxx`.  (First attempt used -12=0xFFFFFFF4 -> err -307.)
+  5. **CRC verified byte-exact**: breakpoint at the compare
+     (`0x4080434e cmpl a4@(8),d6`) showed computed d6 == stored CRC ==
+     0xbcac6f67 -- my Python CRC reproduces the ROM's algorithm exactly
+     (confirms the ROL-1/add/skip-CRC-field + byte-lane stride model).
+  6. **Board ENUMERATED**: reached `0x40804476` ("slot enumerated OK")
+     for slots 9-14 (the decl ROM currently answers every slot because
+     the 24-bit slot addresses all alias to 0x00FFFFFF; harmless for
+     bring-up, MacOS finds the video in slot $E).
+
+**Exact stopping point (documented for the next step):** with the
+board enumerated but the Video sResource carrying no `sRsrcDrvrDir`
+(68k slot driver), MacOS's Slot Manager falls into `sReadStruct`/
+`sGetDriver` (a byte-lane copy loop at RAM 0x000eccfe:
+`moveb %a0@,%a3@+` with a rotating lane mask) reading a bogus driver
+length and copying forever -> boot hangs at a single PC (0x000eccfe)
+instead of the normal running MacOS.  This is precisely why the decl
+ROM is env-gated OFF by default: enabling it advances all the way to
+board enumeration but then hangs pending the driver.
+
+**Remaining work (now a small, well-scoped list -- the hard reverse
+engineering is DONE):**
+  1. Add an `sRsrcDrvrDir` (id $04) to the Video sResource pointing at
+     an `sMacOS68000` driver blob (assemble with `m68k-linux-gnu-as` +
+     `objcopy`, embed via the Python builder).  Driver header (drvrFlags,
+     offsets to Open/Prime/Ctl/Status/Close, drvrName) + minimal bodies:
+     Open (noErr + init), Control cscSetMode/SetEntries/GrayPage (ack),
+     Status cscGetMode/GetPageBase(base+$8040)/GetPageCnt/GetEntries.
+  2. Get past the `sGetDriver` copy (correct driver length in the
+     sResource) -> MacOS opens the driver -> returns the framebuffer
+     base -> QuickDraw draws to VRAM -> `macse30-fb` shows it.
+  3. Optionally constrain the decl ROM to only answer slot $E (avoid
+     the 6x alias) and route the video VBL IRQ through GLUE.
+  Reproduce this milestone:
+    python3 scripts/se30-build-declrom.py /tmp/se30_declrom.bin
+    MACSE30_DECLROM=/tmp/se30_declrom.bin build/qemu-system-m68k -M macse30 \
+      -bios /workspace/files/mac-roms/macIIx.rom -drive file=...,if=scsi \
+      -snapshot -display none -icount shift=7 -d unimp -D /tmp/trace.log
+
+Committed to `fix-se30` (macse30.c slot infra + builder; the generated
+.bin is not committed -- regenerate with the script).  ADB (`e40b39c3`)
+and SCSI (`e3082f0d`) fixes remain intact; default `-M macse30` still
+boots MacOS unchanged.
+
+### SE/30 continued #6 (2026-08-25, `fix-se30`): slot video DRIVER added -- loads past the sGetDriver hang; boot advances into the ROM's post-video startup, new stop at an ADB-completion wait
+
+Added the `sRsrcDrvrDir` + a hand-written minimal 68k slot video driver
+and iterated live.  The driver now LOADS (clearing the previous
+sGetDriver hang) and the boot advances measurably further -- into the
+ROM's post-"video-found" startup path -- where it now stops at a
+different, well-characterized point (an ADB-completion wait).
+
+**Added:**
+  - `scripts/se30-video-driver.s`: minimal `.Display_Video_SE30` DRVR
+    (assembled with `m68k-linux-gnu-as` + `objcopy`, MIT syntax):
+    standard driver header (drvrFlags 0x4C00 = dCtlEnable|dStatEnable|
+    dNeedLock, offsets to Open/Prime/Control/Status/Close, pstring
+    name), Open/Prime/Close -> noErr, Control -> noErr for the known
+    video csCodes (SetMode/SetEntries/SetGamma/GrayPage/... ) else
+    controlErr, Status -> cscGetMode fills a VDPageInfo (csMode $80,
+    csBaseAddr = 0x00F08040 = VRAM+$8040), cscGetPageCnt -> 1 page,
+    cscGetBaseAddr -> 0x00F08040, else statusErr.  Header offsets +
+    name verified via objdump.
+  - `scripts/se30-build-declrom.py`: now emits the driver as an sBlock
+    (leading physical length + driver bytes), an sDriver directory
+    (`OSLstEntry sMacOS68000 -> driver`), and adds `sRsrcDrvrDir` (id
+    $04) to the Video sResource.  Auto-assembles the .s if the .bin is
+    absent/stale (no committed binary; nothing but GNU binutils needed).
+
+**Progress (live-traced):**
+  - The previous hang (MacOS Slot Manager sReadStruct/sGetDriver copy
+    loop at RAM 0x000eccfe, reading a bogus driver length) is GONE --
+    the length-prefixed sBlock is copied correctly and the driver
+    loads.
+  - Boot now advances to ROM **0x40802432** and stops there:
+    `tstb 0x172 / bnes 0x40802432` -- a spin waiting for low-mem byte
+    0x172 to clear.  This code path is NOT taken by the default (no
+    -decl-ROM) boot (breakpoint never hit) -- it is a NEW path the ROM
+    runs only after enumerating the video card, i.e. genuine forward
+    progress into the video/startup sequence.
+
+**New exact stopping point (documented):** 0x172 is set to 0x80 at
+early init (ROM 0x4080038a) and cleared by an **ADB command-completion
+callback** at ROM 0x408074ce (`...; andib #-128,%d2; moveb %d2,0x172`;
+a3 = the ADB Manager globals, a3@(356) = the reply byte) which runs
+only when an ADB transaction completes (VIA1 SR interrupt -> ROM ADB
+ISR -> this callback).  During the hang, `info via` shows VIA1
+IFR=0x40 (T1 only), i.e. **no ADB SR interrupt pending** -- the ROM's
+post-video startup expects an ADB transaction to complete here but none
+is in flight, so 0x172 stays 0x80 forever.  (Note: 0x172 keeps bit 7 =
+d2&0x80, so it only reaches 0 when the ADB reply byte a3@(356) has bit
+7 clear -- the completion must both fire AND carry the right reply.)
+
+**Leads for the next step (making the video-startup ADB handshake
+complete):**
+  - The decl ROM currently answers ALL slots 9-14 (the 24-bit slot
+    addresses alias to 0x00FFFFFF), so the ROM may be processing 6
+    duplicate video cards; constraining it to only slot $E could change
+    this path.  Worth ruling in/out first.
+  - Determine what the ROM does immediately before 0x40802432 (what
+    sets up a2=0xa000bb2c and whether it initiates an ADB call whose SR
+    interrupt our model should raise but doesn't in this early context)
+    -- single-step from where the video-found path diverges from the
+    default boot.
+  - Possibly the ROM's video PrimaryInit / driver Open needs to run (or
+    return something) to satisfy this; check whether MacOS/ROM actually
+    called our driver's Open/Control/Status yet (add a trap-log to the
+    driver, or trace the DCE), and whether it expects the video VBL IRQ
+    (route slot $E VBL through GLUE).
+
+Env-gated as before (`MACSE30_DECLROM`), so the default machine is
+unchanged and still boots MacOS (verified 10 distinct sampled PCs).
+Reproduce:
+    python3 scripts/se30-build-declrom.py /tmp/se30_declrom.bin   # auto-builds the driver
+    MACSE30_DECLROM=/tmp/se30_declrom.bin build/qemu-system-m68k -M macse30 \
+      -bios /workspace/files/mac-roms/macIIx.rom -drive file=...,if=scsi \
+      -snapshot -display none -icount shift=7
+
+### SE/30 continued #7 (2026-08-25, `fix-se30`): slot-$E-only decode; boot reaches the ROM's video/cursor startup; final stop = a mouse-completion wait
+
+Final SE/30 round.  Two things done; render still one handshake away,
+now precisely characterized.
+
+**1. Constrained the decl ROM to slot $E ONLY (done).**  Traced a5 in
+the ROM's slot loop: it probes each slot $s's decl ROM at 0xF[s]FFFFFF
+(32-bit standard slot space), slot $E = **0xFEFFFFFF**.  The card had
+answered ALL of slots 9-14 because the machine's A31 24-bit-alias
+handler masks 0xF9..0xFEFFFFFF -> 0x00FFFFFF (where the decl ROM used
+to live).  Fix (macse30.c): map the decl ROM (ending at 0xFEFFFFFF) and
+64KB VRAM at slot $E's own space **0xFE000000**, at a priority ABOVE the
+A31 handler.  Now only 0xFExxxxxx hits the card; the other slots fall
+through the A31 alias to unbacked RAM (read 0 = no card), so MacOS finds
+exactly one video board.  Driver `FB_BASE` updated to 0xFE008040
+(= slot $E base + minorBaseOS $8040).
+
+**2. Boot advances into the ROM's post-video startup (real progress).**
+The chain now runs: decl ROM validated -> board enumerated (once) ->
+driver loaded -> ROM sets up and shows the cursor (traps 0xA851
+_SetCursor then **0xA853 _ShowCursor** at 0x40802422/24) -> enables
+interrupts -> then stops at **0x40802432** (`tstb 0x172 / bnes`), a spin
+waiting for low-mem 0x172 to clear.
+
+**Final stop, fully characterized:** 0x172 (set 0x80 at init) is cleared
+only by the ROM handler at **0x408074ce**, which is registered (via
+`lea 0x408074ce,a0; movel a0,a3@(4,d1)` in the ADB device-table setup)
+as the completion callback for **ADB device 3 = the mouse**, and clears
+0x172 to `a3@(356) & 0x80` -- i.e. only when the mouse-reply byte's bit 7
+is 0.  Live tracing shows:
+  - The ADB engine is fully active during the hang: **1047** VIA1
+    shift-register STATE transitions, actively Talk-polling device 3
+    (command byte 0x3c = Talk mouse R0) and device 2 (0x2c = keyboard).
+  - BUT the completion callback 0x408074ce is **never invoked**
+    (breakpoint never hits) and VIA1 IFR shows no lingering SR IRQ --
+    so the mouse polls are not driving the registered per-device
+    completion path that would clear 0x172.
+  - Autopoll is OFF at this point (`en=0`), so the ROM expects the
+    explicit mouse Talk it is issuing to complete through that callback.
+This is the SE/30-specific twist of the same VIA1/ADB shift-register
+engine the pre-video ADB fix (#1) already exercises: the post-video
+startup needs the explicit device-3 (mouse) Talk to complete *through
+the ROM's registered completion callback* (0x408074ce) with the reply
+byte's bit 7 clear.  Either our ADB path isn't delivering that specific
+command's completion into the callback, or the mouse reply byte keeps
+bit 7 set (button-up) so 0x172 never zeroes.  (The coordinator's VBL
+hint was chased too: the clearer is a mouse-completion callback, not a
+VIA1-VBL task, and the VIA1 60Hz VBL already fires -- so a VBL route
+does not clear 0x172; the missing piece is the device-3 completion.)
+
+**Next-session leads (crisp):**
+  - Single-step one 0x3c (Talk mouse R0) round-trip through
+    macse30_adb_send/receive and the ROM's ADB ISR, and check why the
+    per-device completion vector a3@(4, 3*12) (0x408074ce) is not
+    called on it -- vs. how the pre-video keyboard Talk (which DOES
+    complete) differs.
+  - Check the mouse reply byte our ADB mouse returns for Talk R0 when
+    idle: if bit 7 (button) is always 1, 0x172 can never reach 0 even
+    once the callback fires -- may need the mouse to report button-up
+    as bit7=0 here, or the ROM genuinely waits for the callback path,
+    not the byte.
+  - Consider whether the SE/30 mouse sits at a different ADB address
+    after the ROM's startup readdressing, so device 3 Talk times out.
+
+Status: env-gated (`MACSE30_DECLROM`) so default `-M macse30` still
+boots MacOS unchanged (verified 11 distinct sampled PCs).  No render
+yet -- VRAM (now at 0xFE008040) stays blank because boot stops at the
+mouse-completion wait before QuickDraw's first desktop draw.  Committed
+the slot-$E-only decode + driver base; ADB (`e40b39c3`), SCSI
+(`e3082f0d`), decl-ROM (`515582e3`) and driver (`3aacfa0c`) commits
+intact.  macse30.c + scripts only; maciici/q800/compact Macs untouched.
+
+**Cumulative SE/30 arc (this task):** diagnosed the video as a slot
+declaration-ROM device -> synthesized a from-scratch, CRC-byte-exact
+decl ROM the Slot Manager ENUMERATES -> hand-wrote a 68k slot video
+driver that LOADS -> constrained to a single slot-$E card -> boot now
+runs through decl-ROM enumeration, driver load, and into the ROM's
+video/cursor startup, stopping at one well-characterized ADB mouse
+-completion wait.  The hard reverse-engineering (format/CRC/byte-lanes/
+enumeration/driver-load) is all done and committed; the remaining gap
+is that single device-3 completion.
+
 ## Summary across all three machines this session
 
 - **Mac IIci (`-M maciici`)**: root-caused and fixed a boot-blocking
