@@ -217,6 +217,7 @@ config PALM
     select SPLIT_IRQ
     select SSI_SD
     select SD
+    select SONY_MSHC_STUB
 
 config SUN3
     bool

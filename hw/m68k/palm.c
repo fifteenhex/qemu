@@ -72,6 +72,7 @@
 #include "hw/sd/sd.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
+#include "hw/misc/sony_mshc_stub.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
@@ -106,6 +107,30 @@
 
 #define PALM_MMIO_SPI1       0xfffff700
 
+/*
+ * Sony CLIE (EZ-based S-series) GPIO quirks, from Cloudpilot-emu's
+ * EmRegsEzPegS300::GetPortInputValue/GetPortInternalValue and
+ * EmSonyXzWithSlot<>::GetPortInternalValue (see CLIE-RESEARCH.md sec 3.3
+ * and CLIE-POC-NOTES.md for the trace).  None of these lines are wired
+ * to a real signal in this stub build; they are simply tied to the
+ * level the Sony HAL requires so it does not spin forever waiting for
+ * a transition:
+ *   - port B bit 1: "LCD powered" sense -- HwrDisplayWake polls this
+ *     and hangs if it never reads back set.
+ *   - port D bit 4: dock/HotSync button, active low; the base EZ HAL
+ *     already forces port D bit 7 (PALM_POWERFAIL_GPIO); Sony's board
+ *     additionally wants bit 4 held so HotSync targets the cradle
+ *     port instead of the modem.
+ *   - port D bit 6: MB86189 (Memory Stick host controller) IRQ-line
+ *     sense, active low; our MS stub never raises an interrupt, so
+ *     this reads permanently idle (high).
+ *   - port D bit 3 (MS card-inserted) is intentionally left low
+ *     (its GPIO reset default): "no card in the slot".
+ */
+#define PALM_CLIE_LCDPWR_GPIO   PALM_GPIO('B', 1)
+#define PALM_CLIE_DOCKBTN_GPIO  PALM_GPIO('D', 4)
+#define PALM_CLIE_MSIDLE_GPIO   PALM_GPIO('D', 6)
+
 /* EZ SYSCLK = 32768 * ((P + 1) * 14 + Q + 1); PalmOS HAL PLL tables */
 #define EZ_SYSCLK 16580608              /* P=0x23 Q=0x01: the spec'd 16.58MHz */
 #define EZ_SYSCLK_20MHZ (32768 * 612)   /* P=0x2a Q=0x09: Palm Vx "20MHz" */
@@ -130,6 +155,13 @@ typedef struct PalmMachineClass {
     /* SED1376 color LCD controller chip select base, 0 = none */
     hwaddr sed1376_base;
     bool has_timer2;
+    /*
+     * Sony CLIE quirks: tie the GPIO lines the Sony HAL polls (see
+     * PALM_CLIE_*_GPIO above) and instantiate the Memory Stick host
+     * controller "no card" stub at this chip-select base (0 = no
+     * Sony peripherals on this machine).
+     */
+    hwaddr ms_stub_base;
 } PalmMachineClass;
 
 typedef struct PalmMachineState {
@@ -242,6 +274,18 @@ static void palm_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio_dev), 0, PALM_MMIO_GPIO);
     /* the battery is always healthy here */
     qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_POWERFAIL_GPIO));
+
+    if (pmc->ms_stub_base) {
+        /* Sony CLIE GPIO quirks -- see PALM_CLIE_*_GPIO above */
+        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_LCDPWR_GPIO));
+        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_DOCKBTN_GPIO));
+        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_MSIDLE_GPIO));
+
+        /* Memory Stick host controller: "no card" stub (Phase 1) */
+        DeviceState *ms_dev = qdev_new(TYPE_SONY_MSHC_STUB);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ms_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ms_dev), 0, pmc->ms_stub_base);
+    }
 
     /* PWM 1: the speaker */
     pwm_dev = qdev_new(TYPE_DRAGONBALL_PWM);
@@ -579,6 +623,56 @@ static void palmm515_machine_class_init(ObjectClass *oc, const void *data)
     pmc->sed1376_base = 0x1ff80000;
 }
 
+/*
+ * Sony CLIE PEG-S300 (Palm OS Phase-1 target, see CLIE-RESEARCH.md).
+ * MC68EZ328 "Sumo" reference design plus Sony's glue: confirmed
+ * kDevicePEGS300 in Cloudpilot-emu's EmDevice.cpp instantiates plain
+ * EmRegsEzPegS300 (an EZ-family HAL) with an EmRegsMB86189 Memory
+ * Stick host controller at 0x10200000 -- unlike PEG-S320, whose
+ * EmDevice.cpp entry is actually EmRegsVzPegNasca (VZ328/"Nasca"),
+ * confirmed independently by the "68VZ328 LCD Controller" and
+ * "sonynasc" strings in the archive.org PEG-S320 ROM dump.  The
+ * CLIE-RESEARCH.md taxonomy table had S320 down as EZ328/EzPegS300;
+ * S300 is the model that actually matches, so it is the PoC target
+ * (see CLIE-POC-NOTES.md).
+ *
+ * ROM layout (verified against S300en.rom, md5
+ * 16673e1569569171e57c4def5ea99479 for the archive.org zip): whole-flash
+ * dump, small-ROM reset vectors at file 0 (PC 0x100002a2, matching
+ * CLIE-RESEARCH.md sec 7.2), big-ROM card header at +0x8000 -- same
+ * shape as the Palm V/IIIx/Vx/m100 EZ machines, just with rom_base at
+ * the m500's 0x10000000 instead of the Palm V's 0x10c00000 (the S300
+ * HAL programs CSA0 to the low chip-select window).
+ */
+static void clies300_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    palm_ez_machine_class_init(oc);
+    mc->desc = "Sony CLIE PEG-S300 (MC68EZ328)";
+    mc->default_ram_size = 8 * MiB;
+    pmc->rom_base = 0x10000000;
+    pmc->rom_size = 2 * MiB;
+    pmc->rom_load_offset = 0;
+    pmc->bigrom_offset = 0x8000;
+    /*
+     * The S300 board wires the hard-button/jog-dial matrix to port F
+     * bits 0/5/6 (EmRegsEzPegS300.cpp hwrEZPegPortFKbdRow0/1/2), not
+     * the plain-EZ F4/F5/F6 wiring -- row 1 (PageUp/PageDown) is the
+     * jog-dial rotation, read through the same matrix the tree
+     * already emulates for every other Palm's hard buttons, so no new
+     * device is needed for jog rotate (see CLIE-POC-NOTES.md sec on
+     * Jog Dial).  Jog press / Back button pin numbers are not in this
+     * source file (likely a separate GPIO edge, per
+     * CLIE-RESEARCH.md sec 4.4) and are deferred to Phase 4.
+     */
+    palm_set_kbd_rows(pmc, PALM_GPIO('F', 0), PALM_GPIO('F', 5),
+                      PALM_GPIO('F', 6));
+    /* Memory Stick host controller (MB86189) chip select */
+    pmc->ms_stub_base = 0x10200000;
+}
+
 static const TypeInfo palm_machine_types[] = {
     {
         .name          = TYPE_PALM_MACHINE,
@@ -617,6 +711,11 @@ static const TypeInfo palm_machine_types[] = {
         .name          = MACHINE_TYPE_NAME("palmm515"),
         .parent        = TYPE_PALM_MACHINE,
         .class_init    = palmm515_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("clie-s300"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = clies300_machine_class_init,
     },
 };
 

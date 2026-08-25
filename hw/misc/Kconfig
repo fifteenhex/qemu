@@ -263,6 +263,9 @@ config DRAGONBALL_PLL
 config DRAGONBALL_SCR
     bool
 
+config SONY_MSHC_STUB
+    bool
+
 config MVME147_PCC
     bool
 
