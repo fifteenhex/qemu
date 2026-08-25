@@ -281,6 +281,20 @@ typedef struct Q950IOP {
     uint8_t ctrl;
     qemu_irq irq;               /* asserted while INT0/INT1 pending */
     QEMUTimer *timer;           /* defers message processing */
+
+    /*
+     * Snapshot of the last content WE posted into the ADB channel's
+     * RECEIVE message slot.  The ROM's ADB-explicit-command driver
+     * does not use a fresh SEND_MSG slot for follow-up commands in a
+     * request/reply "conversation": after consuming a reply (RECV_STATE
+     * walked NEW->RCVD->COMPLETE, i.e. back to IDLE), it stages the
+     * NEXT outgoing adb_iopmsg IN PLACE in that same RECV_MSG slot and
+     * kicks -- there is no corresponding SEND_STATE transition to
+     * NEW.  We detect this by diffing the slot's content against what
+     * we last wrote there (see q950_iop_adb_check_staged()).
+     */
+    uint8_t adb_last_recv[IOP_MSG_LEN];
+    bool adb_last_recv_valid;
 } Q950IOP;
 
 typedef struct {
@@ -764,6 +778,8 @@ static void q950_iop_update_irq(Q950IOP *iop)
     }
 }
 
+static void q950_iop_adb_msg(Q950IOP *iop, uint8_t *msg);
+
 /* post a message on an IOP receive channel (IOP -> host direction) */
 static void q950_iop_post_recv(Q950IOP *iop, int chan, const uint8_t *msg,
                                int len)
@@ -777,6 +793,44 @@ static void q950_iop_post_recv(Q950IOP *iop, int chan, const uint8_t *msg,
     q950_iop_update_irq(iop);
     q950_log("q950 iop %s: recv chan %d posted [%02x %02x %02x ...]\n",
              iop->name, chan, msg[0], msg[1], msg[2]);
+
+    if (iop->is_ism && chan == ADB_CHAN) {
+        memcpy(iop->adb_last_recv, dst, IOP_MSG_LEN);
+        iop->adb_last_recv_valid = true;
+    }
+}
+
+/*
+ * Check whether the ROM has staged a follow-up explicit ADB command
+ * directly in the ADB channel's RECEIVE message slot (see the comment
+ * on Q950IOP::adb_last_recv).  This only makes sense once the host has
+ * fully consumed our previous reply there (RECV_STATE walked back to
+ * IDLE) and the slot's content has changed to something with the
+ * EXPLICIT flag set that isn't just an echo of our own last reply.
+ */
+static bool q950_iop_adb_check_staged(Q950IOP *iop)
+{
+    uint8_t *slot;
+
+    if (!iop->is_ism || !iop->adb_last_recv_valid) {
+        return false;
+    }
+    if (iop->ram[IOP_ADDR_RECV_STATE + ADB_CHAN] != IOP_MSG_IDLE) {
+        return false;               /* host hasn't consumed our reply yet */
+    }
+
+    slot = &iop->ram[IOP_ADDR_RECV_MSG + ADB_CHAN * IOP_MSG_LEN];
+    if (!(slot[0] & ADB_IOP_EXPLICIT)) {
+        return false;
+    }
+    if (memcmp(slot, iop->adb_last_recv, IOP_MSG_LEN) == 0) {
+        return false;               /* unchanged: still our own old reply */
+    }
+
+    q950_log("q950 iop %s: DBG staged follow-up ADB cmd in recv slot "
+             "[%02x %02x %02x ...]\n", iop->name, slot[0], slot[1], slot[2]);
+    q950_iop_adb_msg(iop, slot);
+    return true;
 }
 
 /*
@@ -866,6 +920,15 @@ static void q950_iop_process(Q950IOP *iop)
         if (iop->ram[IOP_ADDR_SEND_STATE + chan] == IOP_MSG_NEW) {
             found = true;
         }
+    }
+    if (!found && q950_iop_adb_check_staged(iop)) {
+        /*
+         * A follow-up explicit ADB command was staged in place in the
+         * receive slot rather than sent via a fresh SEND_MSG (see
+         * q950_iop_adb_check_staged()); it has already been serviced
+         * and its reply posted.  Nothing else to do this kick.
+         */
+        found = true;
     }
     if (!found) {
         q950_log("q950 iop %s: kick with no NEW msg; send states "
@@ -986,6 +1049,10 @@ static uint64_t q950_iop_read(void *opaque, hwaddr addr, unsigned size)
         break;
     default:
         val = iop->ram[iop->addr & 0x7fff];
+        if ((iop->addr & 0x7fff) >= 0x200 && (iop->addr & 0x7fff) < 0x340) {
+            q950_log("q950 iop %s: DBG ram[0x%03x] -> 0x%02x pc=0x%08x\n",
+                     iop->name, iop->addr & 0x7fff, val, q950_trace_pc());
+        }
         if (iop->ctrl & IOP_AUTOINC) {
             iop->addr++;
         }
@@ -1012,6 +1079,11 @@ static void q950_iop_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     default:
         iop->ram[iop->addr & 0x7fff] = val;
+        if ((iop->addr & 0x7fff) >= 0x200 && (iop->addr & 0x7fff) < 0x340) {
+            q950_log("q950 iop %s: DBG ram[0x%03x] <- 0x%02x pc=0x%08x\n",
+                     iop->name, iop->addr & 0x7fff, (unsigned)val,
+                     q950_trace_pc());
+        }
         /*
          * Host acknowledging a receive-channel message: writing
          * IOP_MSG_COMPLETE to a RECV_STATE byte makes the IOP reset
