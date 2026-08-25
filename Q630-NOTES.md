@@ -104,7 +104,20 @@ reached.
 A gray 1152x870 desktop WAS rendered at an intermediate bring-up stage
 (before the Singer/ASC/ROM-window/RAM-mirror work); after those changes
 the boot advances further in CPU terms but the ROM reaches its
-driver-load diagnostic and paints the Sad Mac over it early (~6 s).
+driver-load diagnostic and paints the Sad Mac over it early (~6-16 s,
+timing-sensitive since Cuda/VIA are wall-clock paced).
+
+**Update (see "Session N+1" under "Suspected next step" below):** the
+previously-documented 0x1B964 F108-register lever was re-traced with
+gdb and does not fire in the current tree (three verified boot-to-Sad-Mac
+runs, zero hits on a wide watch window) — that lead is stale, do not
+pursue it without re-verifying first. The gdb session did map the
+terminal state precisely (it's the ROM's own "identify hardware, then
+freeze with interrupts masked forever" Sad Mac epilogue, working as
+intended) but did not yet locate the earlier `moveq #15,d0` /
+`SysError(dsLoadErr,1)` call site that actually triggers it — that's
+the real next lever, and it's most likely inside RAM-resident
+`_LoadSeg`ed driver code rather than another ROM/F108 MMIO gap.
 
 ### Suspected next step for dsLoadErr (unfinished)
 
@@ -118,6 +131,100 @@ a DMA/PSC or the F108 "combo" control).  Modelling that device (and/or
 whatever `_LoadSeg` needs) is the next lever.  Making unmapped in-slice
 I/O read as 0 instead of BERR was tried and does NOT change the Sad Mac
 (that 0x500FB964 probe is recoverable), so the dsLoadErr is elsewhere.
+
+### Session N+1: the 0x1B964 lever is STALE — debunked with live tracing
+
+Re-opened this with gdb per the "trace the register" instruction. Result:
+**the F108+0x1B964 window is not the blocker — it is never touched.**
+
+- Instrumented `q630_iotrace_read`/`write` (the unmapped-I/O BERR catch-all)
+  with an unconditional `fprintf(stderr, ...)` for the whole IDE→SWIM gap
+  (slice offset 0x1a180–0x1e000, a superset of 0x1B964), rebuilt, and ran
+  the full boot to the Sad Mac **three separate times**: zero hits, every
+  time. The `macio_alias` repeating-region path (which is how a
+  logical/phys address like 0x500FB964 actually gets decoded — it reduces
+  mod IO_SLICE and forwards through `address_space_ldl_be` into the same
+  `mac-io` container) funnels through the exact same catch-all, so this
+  isn't a routing blind spot. Whatever produced that probe in an earlier
+  session must have been superseded by later fixes (Singer stub, ASC FIFO
+  shim, 24-bit ROM/RAM windows) that changed the code path before ever
+  reaching it. **Do not spend more time modelling an F108 register at
+  +0x1B964 — reinstrument and re-verify before trusting that lead again.**
+  (The instrumentation was reverted after confirming this; `git diff` is
+  clean relative to the last commit.)
+
+### Session N+1: gdb pitfall — byte-swapped registers without `set endian big`
+
+`gdb-multiarch`'s `m68k` architecture, connected to QEMU's m68k gdbstub
+over `target remote`, silently returns **byte-reversed 32-bit register
+values** unless you run `set endian big` *before* `target remote`.
+Symptom: `info registers`/`p $pc` show wild-looking values like
+`0xfaa08b40` that don't correspond to any mapped region and don't match
+what the QEMU HMP monitor's own `info registers` reports for the same
+paused CPU. Diagnostic: reverse the bytes of the "garbage" value
+(`0xfaa08b40` → bytes `fa a0 8b 40` → reversed `40 8b a0 fa` =
+`0x408ba0fa`) and it resolves to a perfectly sane ROM address. Always
+`set architecture m68k` **and** `set endian big` right after connecting,
+or cross-check against HMP `info registers` (which is correct natively
+and doesn't need this).
+
+### Session N+1: what's actually at the end of the road (traced with gdb)
+
+With the endian fix, traced the machine via `-d int` (exception/trap
+log) and a conditional breakpoint (`break *0x40804bea if $sp > 0x100000`,
+using the fp-based short-call convention this ROM uses — routines return
+via `jmp (fp)` after the caller does `lea nextinsn,fp; jmp target`, no
+stack frames) to catch the *late* invocation (as opposed to the benign
+one during early machine ID) with disassembly:
+
+- Immediately before the Sad Mac settles, the ROM **re-runs its own
+  machine-identification logic**: the read-only-register verify at
+  0x40804be4–0x40804c04 (write 0/-1 to 0x5FFFFFFC, confirm readback is
+  unchanged, confirm the upper word is still 0xA55A) followed by the
+  universal-table walk at 0x40804b86 (`ROM+0xA79BC`, exactly the table
+  documented above) that matches the ID low word against `entry+0x44`.
+  This **passes** in our emulation — `machine_id_read`/`write` in
+  quadra630.c are unconditionally read-only/constant, so the verify
+  can't fail here.
+- Right after that: three repeats of the decoder-probe sequence from
+  "I/O aliasing" above — VIA1-alias reads at slice #8/#124/#128 (phys
+  0x50101c00, 0x50f81c00, 0x51001c00, pc=0x408046ac, the "writability
+  prober") and a MEMCJR read at 0x5000e000 (pc=0x408031a8) — each a
+  legitimate BERR (confirmed via `-d int`: `Access Fault(0x8)`, `ea:`
+  matches). This 5-fault group repeats exactly 3 times then stops.
+- The CPU then **permanently parks** inside the Singer "idle service"
+  routine (`q630_singer_ops`, comment block already in the source) at
+  pc≈0x408ba0f4–0x408ba0fa, with **SR = I:7 (all interrupt levels
+  masked)**. Confirmed genuinely halted, not fast-looping: sampled full
+  register state via HMP `info registers` (not gdb, to avoid the
+  reconnect-forces-a-stop confound) twice, 5s and then 15s apart, with
+  **zero register bits differing** including a live counter (D6) that
+  had been changing during the earlier boot — and the `-d int` log
+  stops producing new entries in lockstep. `info cpus` doesn't flag it
+  "halted" (no STOP opcode), so it's a genuine tight loop that happens
+  to touch no instrumented MMIO.
+
+  **Read this as expected, not a bug**: this is what a real 68k Sad Mac
+  does — identify the hardware (to know how to draw itself / what to
+  report), reconfirm a few basics, then freeze forever with interrupts
+  masked so nothing but a hardware reset can recover. It is the
+  death-routine's own prologue+epilogue, not the cause. **The actual
+  `moveq #15,d0` / dsLoadErr decision happens earlier and was not
+  located this session** — it must be searched for further back (likely
+  in RAM-resident driver/segment code: several PCs in the tail of the
+  `-d int` A-Line trace before this cluster are in low RAM, e.g.
+  0x9634/0x876c/0x8996/0x8aac/0x8b26, i.e. inside code that was already
+  `_LoadSeg`ed into memory, not ROM — that's probably where to keep
+  digging, with a breakpoint on the entry to the "identify machine +
+  freeze" block at 0x40804b6c to catch its caller's return address on
+  the stack, or a watchpoint on the Sad Mac icon's VRAM bytes to catch
+  the exact drawing call and unwind from there).
+
+Net effect on the "min" bar ("F108 combo window modelled with the driver
+advancing measurably"): **not applicable as literally stated** — there
+is no unmodelled F108 register in the failure path to model. No boot
+regression either way (byte-for-byte confirmed Sad Mac before and after;
+no source changes ended up kept, `git diff` clean).
 
 ## Q630 ROM (06684214) findings
 
