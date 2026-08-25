@@ -223,6 +223,369 @@ runs without crashing, reaches a well-characterized -- if unresolved
 -- early POST loop) so the next session has a clean, documented
 starting point rather than nothing.
 
+### Root cause found and fixed: missing VDAC blocked decoder-kind ID (2026-08-25, branch `fix-classicii`)
+
+Picked this up in worktree `/workspace/src/qemu-clie` (branch `fix-classicii`,
+based on `amiga` HEAD). Re-verified the hang exactly as documented above,
+then went past the "inner test completes cleanly" observation the previous
+session stopped at, using `-s -S` + a scripted gdb-python trace (breakpoints
+on the handful of addresses the walking-bit self-test's *callers* live at,
+auto-continuing and logging registers on each hit) instead of single-stepping
+blind. This is fast to redo: `gdb-multiarch -q -batch -x script.py` with a
+`gdb.Breakpoint` subclass whose `stop()` logs regs and returns `False`.
+
+**The mechanism** (this ROM's machine-ID protocol, shared "$067C universal"
+code with the IIci/IIsi — cf. `MACIISI-NOTES.md`'s "Machine identification
+reverse-engineered" section, which already reverse-engineered most of this
+for the IIsi and was the key that unlocked it here):
+
+- `ROM+0x32b4` is a **decoder-probe list** (2 entries found: kind 4 stub at
+  `0x40803064` wants a VIA1-IER mirror at physical `+0x20000`; kind 5 stub at
+  `0x40803082` wants a mirror at `+0x40000`, **no** mirror at `+0x20000`, AND
+  — the part that bit us — **`tstb` of RBV (`+0x26000`) and VDAC (`+0x24000`)
+  must both respond**, addresses read out of the kind-5 device table at ROM
+  `0x4080348c` (offsets +52/+56). This table is IDENTICAL between the IIci
+  and Classic II ROMs (same `0x4080348c` address, verified byte-for-byte).
+- If NEITHER decoder probe succeeds, the "current kind" byte (compared via
+  `cmpb a1@(19),d2` at `0x40802f84`) stays **0**, and the machine-entry table
+  scan (`ROM+0x32c8`, 64-byte entries) matches a **kind-0 catch-all entry**
+  (found at runtime address `0x40803900`, mask=0/match=0 — i.e. it accepts
+  *any* strap value) whose declared capability word (`entry@(-20)` relative
+  to a shared kind-dispatch table, not the entry itself) is **all zero**.
+  Every one of that word's bits is individually probed-and-conditionally-set
+  by the capability-dispatch routine at `0x40802f98`-`0x40803044`, but **bit
+  0 is never touched by any of them** — it can only come from the ROM's own
+  declared word, which is 0 for this entry. Bit 0 is exactly the bit tested
+  at `0x40802e2a` (`btst #0,d0; beqs 0x40802e20`) to decide "identification
+  successful, proceed to hardware bring-up" vs "retry". With bit 0
+  permanently 0, `0x40802e20` unconditionally resets the search kind to 0
+  and rescans — matching the *same* kind-0 entry again, forever. This is a
+  **structurally infinite, deterministic loop**: confirmed with a persistent
+  gdb-python trace (`Breakpoint.stop()` logging + auto-continue) showing
+  10000+ iterations with byte-for-byte identical register state every single
+  time (a0/a1/a2/d0/d1/d2/fp all repeat exactly).
+- Our own earlier ROM-table analysis (top of this file) had already found a
+  **`0x40803b66` kind-5 entry patched into the Classic II ROM specifically**,
+  mask 0x56 match 0x16 — i.e. Apple's ROM engineers *do* have a real,
+  presumably-capable Classic II identification entry, it's just gated behind
+  successfully resolving **kind 5**, which our machine could never reach
+  because it had no VDAC device at all (deliberately omitted: "no RBV video,
+  no VDAC" — real, since Classic II has no RBV video hardware) causing the
+  `tstb` of `+0x24000` to bus-fault, failing the kind-5 decoder probe outright
+  and stranding identification at kind 0.
+
+**Fix** (`hw/m68k/macclassicii.c` only): ported the IIci's minimal VDAC
+stub (`maciici_vdac_ops`/`vdac_regs[0x40]`: plain store + log, no real DAC
+behaviour) onto the Classic II at the same `VDAC_OFS` (`0x24000`) the
+`#define` already reserved but never mapped. This doesn't add any video
+functionality (the fixed framebuffer is untouched) — it just makes the
+address *present but inert* so the decoder-kind probe's `tstb` doesn't
+bus-fault. New struct fields: `MemoryRegion vdacmem`, `uint8_t
+vdac_regs[0x40]`.
+
+**Verified fixed**: with a fresh `-s -S` boot, the walking-bit self-test
+(`0x40803122`) is no longer hit in an infinite loop — a breakpoint at
+`0x40802e2a` (the identification-success/retry fork) now hits with **`d0 =
+0x0000773f`** (bit 0 set!), and `a1 = 0x40803b66`-relative (confirmed via
+register dump showing `a1=0x3b66` in a later stopped-instruction sample) —
+i.e. it resolves the **actual Classic-II-specific kind-5 ROM entry**, not
+the kind-0 catch-all, exactly as hypothesized. `d0=0x773f` is the same
+capability word value the working IIci boot resolves to for its own entry
+(cross-checked with an identical gdb trace against `-M maciici`). The debug
+log (`-d unimp,guest_errors`) now shows the probes succeeding in sequence:
+`macclassicii vdac: read +0x00 -> 0x00`, `macclassicii rbv: read +0x00 ->
+0x00`, then real VIA2/RBV register bring-up (`rbv-via2: read/write reg0-15`)
+— genuine forward progress past the old blocker, into real hardware init.
+
+### Second bug found and fixed: ROM relocation-base slot; RAM-alias experiment REVERTED (2026-08-25, session cont'd)
+
+**The "runaway past top of RAM" from the previous note was NOT a RAM-sizing
+bug — it was a bogus code-relocation delta.** Root-caused with a scripted
+gdb-python trace (breakpoints on the post-identification bring-up addresses,
+auto-continue + register logging; single-stepping the ~15 instructions from
+the `0x40802e2a` identification-success fork):
+
+- After machine ID succeeds (`btst #0,d0` at `0x40802e2a` taken), the shared
+  "$067C universal" bring-up computes a **relocation delta** and rebases
+  a0/a1/a4 and PC by it, so a ROM running at a non-canonical physical base
+  can transparently continue executing.  The **IIci** does this inline
+  (`0x40802e34`: `movel a0@,d3 ; subl a2,d3`) reading `device_table[0]` =
+  `0x40800000`, with `a2` = the PC-relative actual ROM base = `0x40800000`,
+  so the delta is **0** (no relocation, keep running from ROM) — and the
+  IIci boots straight through to Finder.
+- The **Classic II ROM PATCHES that site**: the 4 bytes `26 10 96 8a` become
+  `4e fa 0c 60` (`jmp 0x40803a96`), a routine that instead reads the base
+  from `device_table[28]` (offset `0x70`) and *also* rebases a0/a1.  But
+  `device_table[28]` is **0** in this ROM image (the table's live entries
+  stop at offset ~0x44; 0x70 is zero padding), so the delta becomes
+  `-0x40800000` and bring-up `jmp`s to `0x40800000 + 0x2e3e - 0x40800000 =
+  0x00002e3e` — empty low RAM — then PC "climbs through zeros" (each `0x0000`
+  word = `ori.b #0,d0`) exactly as the previous note observed.  The overrun
+  was the *symptom*, this bad delta the *cause*.
+- **Verified**: forcing the delta `d3=0` at runtime via gdb advances the boot
+  ~0x14000 bytes further into real ROM code (to `0x40814cc8`), confirming
+  `d3=0` (the IIci's natural value) is correct.  `device_table[28]` plainly
+  wants the canonical ROM base `0x40800000` (so the relocation is the no-op
+  it is on the IIci); this dump just leaves that slot zero.
+
+**Fix** (`hw/m68k/macclassicii.c`, in `macclassicii_machine_init` after the
+reset-vector setup): patch the in-memory ROM image so `device_table[28]`
+(ROM file offset `0x34fc`) holds `0x40800000` via `stl_be_p(ptr + 0x34fc,
+MACCLASSICII_ROM_ADDR)` on the `rom_ptr` blob (survives reset re-copy).
+Machine-local, touches one padding slot.  *Open question for a future
+session:* why real Classic II hardware doesn't hit this — either the dump
+differs from shipped silicon, or there's an unmodelled step that fills that
+slot; but the no-op-relocation behaviour is unambiguously what the code
+wants for an in-place ROM, and the patch is the minimal way to get it.
+
+**The previous session's RAM-alias experiment was REVERTED.** That change
+(making `ramio_read`/`_write` mirror `addr % ram_size` onto real RAM) was a
+wrong turn: the **working `-M maciici` uses the *identical* flat-"reads
+return 0, writes discarded" `ramio_ops`** (diffed the two files — byte-for-
+byte the same RAM/ramio/`ramio_a31` setup) and boots to Finder, so flat-zero
+IS the correct, proven model.  The `sp=0xfffd1348` "stack wraparound" the
+previous note worried about was an *artifact of the alias change itself*
+(the bogus relocation ran different code against aliased memory); with the
+alias reverted and the relocation delta fixed, `sp` stays a healthy
+`0x00002600` throughout.  `ramio` is now back to the maciici-identical
+flat-zero form.
+
+### New frontier: Egret MCU cold-start sync handshake (precisely characterized, unresolved)
+
+With both fixes in, boot now runs cleanly through machine ID → relocation →
+VIA2/RBV bring-up → into **Egret ADB/system-MCU startup communication**, and
+parks in a tight loop at **`0x40814cc8`–`0x40814ea2`** (a1 = VIA1 =
+`0x50f00000`).  Fully decoded:
+
+- `a1@`(reg0)=port B, `a1@(5120)`=SR (shift reg, reg10), `a1@(5632)`=ACR
+  (reg11), `a1@(6656)`=IFR (reg13).  Port-B lines: PB5=`/SYS_SESSION`(0x20),
+  PB4=`/VIA_FULL`(0x10), PB3=`/XCVR_SESSION`(0x08, Egret-driven).
+- The loop is the ROM's **Egret power-on sync**: it opens a session (`bset
+  #5`), waits (unbounded `btst #2,a1@(6656); beqs`) for IFR bit 2 (SR
+  interrupt) after each shift-register byte, clocks bytes from the Egret, and
+  keeps looping while the received byte is `0x00` (`tstb a1@(5120)` /
+  `beqs`).  It only leaves this state when **PB3/XCVR asserts** (Egret says
+  "I have a session/data", taking the send path at `0x40814d02` which *has* a
+  `dbf d4` timeout and a real exit to `0x40848eda`) or a non-zero sync byte
+  arrives.
+- **Our Egret IS responding correctly** — the SR-interrupt timer fires, the
+  log shows the full `feed 0x00 … response complete` cadence every iteration
+  — but it always feeds `0x00`/no-response (`macclassicii_egret_no_response`)
+  and holds PB3 low (observed port-B `b=40/60/70`, bit3 always 0), so the
+  ROM's sync never sees the non-zero byte / XCVR assert it's waiting for and
+  loops forever.  This is a **content/semantics** gap, not a missing
+  interrupt: at cold start the real Egret sends an *unsolicited* power-on/
+  reset packet (à la Cuda's reset notification) that this sync loop is
+  waiting to receive; our `macclassicii_egret_*` engine (ported verbatim
+  from maciisi.c, tuned to the IIsi ROM/OS ADB driver's edge cadence) never
+  stages one for this cold-sync phase.
+
+Next-session starting points:
+  - Stage an Egret power-on packet (or assert `/XCVR_SESSION` PB3) at cold
+    reset so this sync loop receives a non-zero sync byte / sees XCVR and
+    takes the timeout-bounded send path out to `0x40848eda`.  Find the exact
+    expected sync byte by disassembling that exit path and what it checks.
+    Keep it Classic-II-local (`macclassicii.c`), maciisi.c is a separate file
+    and its IIsi-tuned Egret must not be disturbed.
+  - Alternatively determine whether this sync is *meant* to time out even on
+    real HW (the send path's `dbf d4` counter) and, if so, why our receive
+    path never reaches that counter — possibly our Egret should decline the
+    session (leave SR int unset for this specific cold-sync opening) so the
+    ROM's own timeout fires.
+  - Reproduce/trace with `-d unimp -D /tmp/clii/x.log` (tmpfs!) — the egret
+    cadence is fully logged (`macclassicii egret: …`); this phase emits
+    ~680k egret lines / 20 s, so cap the run and grep, don't let it fill disk.
+
+Command line for testing (unchanged):
+
+    build/qemu-system-m68k -M macclassicii -bios /workspace/files/mac-roms/macclassic2.rom \
+      -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+      -snapshot -serial null -serial null -display none -icount shift=7 \
+      -monitor unix:/tmp/clii/mon.sock,server=on,wait=off
+
+Screen is still blank white (512x342) — the ROM does this Egret sync before
+drawing anything, so no happy-mac yet.  `-M maciici`/`-M maciisi`/`-M q800`
+re-verified to still init/run after these changes (all edits are
+`macclassicii.c`-local; nothing shared was touched).
+
+Committed to `fix-classicii`: two real, verified bug fixes (VDAC decoder
+probe; ROM relocation-base slot) advance the Classic II from "stuck in
+pre-machine-ID POST forever" all the way through machine ID, code
+relocation, and VIA2/RBV bring-up to the **Egret cold-start sync handshake**
+— a precisely-decoded new frontier — with the earlier session's incorrect
+RAM-alias experiment reverted back to the proven maciici-identical model.
+
+### Egret cold-start sync SOLVED — three fixes; now past the sync into real boot (2026-08-25, session cont'd)
+
+Got the Classic II **past the Egret cold-start sync** (the previous
+frontier) and into ~150 000+ instructions of real post-sync ROM boot code.
+The previous note's guess ("stage an unsolicited power-on packet") turned
+out to be the wrong framing; the actual mechanism, decoded instruction-by-
+instruction (a1 = VIA1 0x50f00000; `a1@(2)`>>9 reg decode: reg10=SR,
+reg11=ACR, reg13=IFR):
+
+The sync loop at `0x40814cc8` branches on **PB3 (/XCVR_SESSION)**:
+`btst #3,a1@; beqw 0x40814e00` — PB3 low (XCVR asserted) → the RECEIVE path
+that clocks bytes and loops while they read 0; PB3 high (XCVR deasserted) →
+the SEND path (`0x40814d02`) which, with no Egret responding, hits its
+`dbf d4` timeout and exits to the boot continuation at `0x40848eda`.  Three
+distinct emulation bugs kept the ROM trapped in the RECEIVE path:
+
+1. **PB3 was read from the ROM's own ORB latch, not the Egret line.**
+   `mos6522_read` returns `s->b` for port B, so the ROM's port-B *writes*
+   (it writes 0x40 during bring-up) clobbered PB3 — but PB3 is an
+   Egret-driven **input**, not a host output.  With the latch reading PB3=0,
+   the ROM always saw XCVR asserted → RECEIVE → hang.  Fix: track the Egret's
+   /XCVR line state in a dedicated `egret_xcvr_asserted` field and **override
+   PB3 on port-B reads** in `macclassicii_via1_read` (mirroring the existing
+   port-A input-strap override), reporting the Egret's line regardless of the
+   ORB write.
+2. **A spurious Egret "session" opened during VIA port-B initialisation.**
+   The ROM's one-time VIA init write (pc `0x40802ea4`, b=0x48, last_b=0xff,
+   **acr=0x00**) dropped /SYS_SESSION as an edge and was misread as a receive
+   session, asserting /XCVR before the sync even ran.  Fix: gate
+   `egret_session_update`'s session-open on `s->acr & SR_CTRL` — real Egret
+   transactions always run with the shift register enabled (acr `0x0c`/`0x1c`);
+   the init write has SR disabled (acr 0), so it's excluded.
+3. **/XCVR was asserted for the "no data" cases.** The maciisi-ported engine
+   asserts /XCVR-low as its no-response/discard marker (the IIsi ADB driver
+   reads it that way); on the Classic II ROM, /XCVR-low means "receive", so
+   any no-response assertion dropped the sync back into RECEIVE.  Fix: the
+   port-B read override reports /XCVR asserted **only for a genuine staged
+   Egret reply mid-delivery** (`egret_xcvr_asserted && !egret_no_resp &&
+   egret_resp_len > 0`).  At power-on the Egret has no unsolicited packet, so
+   /XCVR stays high and the sync runs its send/timeout path to boot.
+
+Plus a supporting change so the send/receive *framing* completes: on real
+hardware the Egret provides the SR shift clock for every byte, so
+`macclassicii_egret_sr_written` now raises the SR-completion interrupt for
+**every** SR-out shift (not only inside a formal session), and
+`macclassicii_egret_sr_read`/`_acr_changed` raise it for external-clock
+SR-input outside a session — this carries the cold-sync's byte-framing
+helpers (`0x40814e4a`/`0x40814e6a`) which clock bytes with /SYS_SESSION
+released (no formal session).  All changes are in `macclassicii.c` and its
+Egret path; maciisi.c is untouched, and `-M maciici`/`-M maciisi`/`-M q800`
+still init/run (spot-checked).
+
+Verified with `-s` gdb: PC now sits at **`0x4084a278`**, far past the sync
+(`0x40814cc8`–`0x40814f00`).  A `-d int,guest_errors` run shows only the
+*expected* early machine-ID probe Access Faults (`0x40803124`/`0x40803a8a`,
+the deliberate bus-error decoder probes) — **no fault after the sync** — and
+a break at `0x40848eda` single-steps 150 000+ instructions of genuine boot
+code before eventually reaching the loop.
+
+### New frontier: ROM MicroBug '*' serial prompt after ~150k instructions of boot
+
+PC parks in a tight loop **`0x40849b68`–`0x4084a296`** (a3 = SCC
+`0x50f04000`).  Decoded: `0x4084a268` is the ROM's **GetChar** (reads SCC RR0
+bit 0 for an Rx char; RR0 reads 0x44, bit0=0 → "no char", returns 0x8000),
+and `0x40849cb0` loads `#42` (`'*'`) and calls PutChar (`0x4084a182`) — this
+is the ROM's **MicroBug serial debugger** at its `*` command prompt.  The
+loop is pure polling (GetChar → no char → `braw 0x40849b68`); it does no boot
+work and never exits because `-serial null` never delivers a character.
+`d7` bit 17 (serial-debug enable) is set, so the ROM polls the SCC.  The
+stack is empty (sp=0x2600, no exception frame) and `-d int` logs no late
+hardware fault, so MicroBug was entered by a **software** path (a SysError
+call or an explicit debug entry) at the *end* of a long, real boot sequence
+— i.e. the machine now does substantial post-sync work and then drops into
+the debugger, rather than hanging in the transport.  Screen still blank white
+(MicroBug is entered before the framebuffer draw).
+
+### MicroBug entry was REAL (a missing PA0 strap), not spurious — FIXED (2026-08-25, session cont'd)
+
+Chased the MicroBug entry to root cause.  **d7 bit 17 (the serial-debug
+lead) was a red herring** — `bset #17,d7` at `0x4084a13c` fires
+*unconditionally* right after MicroBug's own SCC-init table loop, so it just
+means "SCC initialised", not "debugger requested".  MicroBug is entered by a
+normal software branch, not an exception (empty stack, no `-d int` fault).
+
+Traced the real decision with a `-d exec` trace (to tmpfs; grep the PC column
+for the first `0x40849b1c`): the path in is `0x40807xxx → 0x40848f04 (braw
+0x40849b1c)`.  `0x40848f04` is reached from **`0x40848ee8`**:
+
+    0x40848ee8  btst #26,d7
+    0x40848eec  bnes 0x40848f08     ; bit26 SET -> real boot continuation
+    0x40848eee  ...                 ; bit26 CLEAR -> falls through to MicroBug
+
+So **d7 bit 26 gates real-boot vs MicroBug**, and our machine had it CLEAR.
+Bit 26 is set (or not) during the post-ID hardware setup at `0x40846420`,
+which branches on the decoder kind (d2).  For **kind 5** (the Classic II) the
+check at `0x40846440` is:
+
+    bclr #0,a2@(1536)   ; DIRA bit0 = 0  -> make VIA1 PA0 an INPUT
+    bclr #1,a2@(7680)   ; ANH
+    btst #0,a2@(7680)   ; read PA0
+    bnes 0x40846494     ; PA0 == 1 -> DON'T set bit26  (=> MicroBug)
+    bras 0x40846462     ; PA0 == 0 -> bset #26,d7       (=> real boot)
+
+This is exactly the "VIA2-position PA0 NuBus pull-up" check MACIISI-NOTES.md
+flagged: the IIci/IIsi read PA0 **high** there via a NuBus pull-up on that
+pin, so *they* don't set bit 26 and take the other branch to boot.  The
+Classic II has **no NuBus**, so that pin floats **low** — PA0 must read 0,
+setting bit 26 and routing to the real boot.  Our strap was `pins-a = 0xBF`
+(PA0 = 1), so the ROM took the MicroBug branch.
+
+**Fix** (`macclassicii.c`): `pins-a = 0xBF → 0xBE` (clear PA0).  Bit 0 is
+outside the 0x56 machine-ID mask (`0xBE & 0x56 == 0x16`), so identification
+is unchanged.  Verified: d7 now reads `0x04000000` (bit 26 set) at the fork,
+the ROM takes the real-boot path (`0x40848f08`), and PC advances past
+MicroBug into genuine ADB/Egret initialisation.
+
+### New frontier: real Egret ADB transaction (byte-handshake framing) at 0x4084a556
+
+Past MicroBug, boot reaches a **real Egret ADB command→response transaction**
+and hangs in its receive loop at **`0x4084a5f8`–`0x4084a604`** (a2 = VIA1):
+
+    0x4084a5f8  btst #2,a2@(6656)   ; wait SR interrupt (fires — our SR clock)
+    0x4084a5fe  beqs 0x4084a5f8
+    0x4084a600  btst #3,a2@         ; PB3 (/XCVR_SESSION)
+    0x4084a604  bnes 0x4084a5f8     ; loop while XCVR deasserted (PB3=1)
+    0x4084a606  moveb a2@(5120),d2  ; read the Egret's response byte
+
+i.e. the ROM has sent a command and is waiting for the **Egret to assert
+/XCVR and hand back a response**.  Our Egret keeps /XCVR deasserted (no
+staged reply) → infinite loop.  The command (captured: first byte `0x01`, an
+Egret **pseudo-command** packet, host→MCU control) is shifted out by the send
+helper `0x4084a694` with **/SYS_SESSION *released* (PB5 high)** and only a
+per-byte /VIA_FULL (PB4) toggle — the opposite of the maciisi ADB driver's
+framing, where sends happen *inside* a /SYS_SESSION frame.  So our
+session-based `egret_sr_written` (which only collects command bytes while
+`egret_session` is true) never captures this command, `egret_process` never
+runs, no response is staged, and the receive turnaround finds nothing to
+deliver.  `-d unimp` confirms **zero** `macclassicii egret:` lines during
+this transaction — no session opens at all.
+
+This is a genuine protocol gap, not a small tweak: the Classic II ROM drives
+the Egret with a byte-level PB4/PB5 handshake and reserves /SYS_SESSION-low
+for the receive turnaround, whereas the maciisi-ported engine models
+/SYS_SESSION-low as the whole session.  Fixing it needs the Egret to (a)
+collect SR-out bytes as a command **regardless of /SYS_SESSION**, (b) detect
+the send→receive turnaround (ACR SR_OUT→SR_IN, or the /SYS_SESSION-low edge)
+as end-of-command, (c) run `egret_process` / a pseudo-command handler on it,
+and (d) stage the reply and assert /XCVR for the receive — **without
+disturbing the now-working cold-start sync**, which relies on the current
+session/XCVR behaviour.  It also needs the Egret **pseudo-command** semantics
+(0x01-type control packets: self-test, set-autopoll, read/write PRAM, real
+-time-clock) modelled, not just raw ADB pass-through.
+
+Next-session starting points:
+  - Decode the full command: single-step the send helpers `0x4084a694`
+    (SR-out byte) / `0x4084a6b4` (SR-in byte) from `0x4084a556`, skipping the
+    256-iter delay loops at `0x4084a6dc`, to capture all command bytes and the
+    exact turnaround sequence.  Map byte[0]=0x01 pseudo-command byte[1]=code
+    against the Egret/Cuda pseudo-command table (MAME `apple/egret.cpp`).
+  - Rework the Egret command collection to be handshake-driven (PB4/PB5 +
+    SR-out), independent of the /SYS_SESSION frame, and add a pseudo-command
+    responder; keep the cold-sync path (which sends with /SYS_SESSION released
+    too — careful not to treat those framing bytes as ADB commands) working.
+  - Screen is still blank white — the framebuffer draw is *after* this ADB
+    init, so happy-mac is gated on completing (or safely timing out) this
+    transaction.
+
+Command line for testing (unchanged from above).  `-M maciici`/`-M maciisi`/
+`-M q800` re-verified to still init/run after the strap change (macclassicii.c
+-local).
+
 ## Mac SE/30 — hw/m68k/macse30.c
 
 Approach: clone of maciici.c, keeping the classic VIA1 ADB transceiver

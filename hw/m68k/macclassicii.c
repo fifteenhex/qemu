@@ -622,6 +622,7 @@ struct MacClassicIIMachineState {
     MemoryRegion scsi_pdma;
     MemoryRegion scsi_hsk;
     MemoryRegion iotrace;
+    MemoryRegion vdacmem;
 
     uint8_t rbv_regs[0x100];
     uint8_t rbv_ifr;
@@ -629,6 +630,7 @@ struct MacClassicIIMachineState {
     uint8_t rbv_ier;
     uint8_t rbv_sier;
     uint8_t rbv_via2_regs[16];
+    uint8_t vdac_regs[0x40];
 
     /* Egret ADB/system MCU on the VIA1 shift register */
     QEMUTimer *egret_timer;
@@ -639,6 +641,14 @@ struct MacClassicIIMachineState {
     int egret_resp_idx;
     bool egret_session;
     bool egret_no_resp;
+    /*
+     * /XCVR_SESSION (PB3) is an INPUT driven by the Egret, not a host
+     * output -- track its line state here so port-B reads reflect the
+     * Egret rather than whatever the ROM last wrote to the ORB latch.
+     * Idle Egret leaves it DEASSERTED (PB3 high); it asserts (PB3 low)
+     * only while it has a packet to hand to the host.
+     */
+    bool egret_xcvr_asserted;
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
@@ -870,6 +880,35 @@ static uint64_t macclassicii_via1_read(void *opaque, hwaddr addr, unsigned size)
         val = (val & s->dira) | (v1s->pins_a & ~s->dira);
     }
 
+    /*
+     * PB3 (/XCVR_SESSION) is an Egret-driven input: report the Egret's
+     * line state, not the ROM's last ORB write.  The ROM's cold-start
+     * Egret sync (0x40814cc8) branches on this bit; if it read back the
+     * host's own port-B latch it would see /XCVR permanently asserted
+     * (PB3 low) and spin forever in the receive path.
+     *
+     * The Egret only asserts /XCVR (PB3 low) while it is actually
+     * handing a GENUINE unsolicited packet to the host -- i.e. a real
+     * ADB reply staged and mid-delivery.  It stays deasserted (PB3 high)
+     * for the "nothing to say" cases (the no-response/discard framing
+     * the maciisi ADB driver uses /XCVR-low for): asserting there would
+     * drop the Classic II ROM's cold-start sync into its receive path,
+     * which reads bytes forever expecting a non-zero sync marker.  At
+     * power-on the Egret has no unsolicited packet, so /XCVR stays high
+     * and the sync runs its send/timeout path through to boot.
+     */
+    if (reg == VIA_REG_B && v1s->machine) {
+        MacClassicIIMachineState *m = v1s->machine;
+        bool xcvr = m->egret_xcvr_asserted && !m->egret_no_resp &&
+                    m->egret_resp_len > 0;
+
+        if (xcvr) {
+            val &= ~(uint64_t)EGRET_XCVR;
+        } else {
+            val |= EGRET_XCVR;
+        }
+    }
+
     if (reg == VIA_REG_SR && v1s->machine) {
         macclassicii_egret_sr_read(v1s);
     }
@@ -1033,6 +1072,49 @@ static const MemoryRegionOps macclassicii_rbv_ops = {
     },
 };
 
+/*
+ * VDAC (CLUT DAC) stub: ported verbatim (store + log, no real DAC
+ * behaviour) from maciici.c.  The Classic II has no RBV video and thus
+ * no real VDAC chip, but the ROM's kind-5 decoder probe (shared code
+ * with the IIci/IIsi, see machine-identification notes) requires this
+ * address to answer -- with it absent the probe bus-errors, the ROM
+ * never resolves a decoder kind, and machine identification retries
+ * forever against an empty-capability kind-0 catch-all table entry.
+ * Present-but-inert is enough for the probe; no video is ever driven
+ * through it since the framebuffer is scanned straight from RAM.
+ */
+
+static uint64_t macclassicii_vdac_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    MacClassicIIMachineState *m = opaque;
+    uint64_t val = m->vdac_regs[addr & 0x3f];
+
+    qemu_log_mask(LOG_UNIMP, "macclassicii vdac: read  +0x%02x -> 0x%02"
+                  PRIx64 "\n", (unsigned)(addr & 0x3f), val);
+    return val;
+}
+
+static void macclassicii_vdac_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
+{
+    MacClassicIIMachineState *m = opaque;
+
+    qemu_log_mask(LOG_UNIMP, "macclassicii vdac: write +0x%02x <- 0x%02"
+                  PRIx64 "\n", (unsigned)(addr & 0x3f), val);
+    m->vdac_regs[addr & 0x3f] = val;
+}
+
+static const MemoryRegionOps macclassicii_vdac_ops = {
+    .read = macclassicii_vdac_read,
+    .write = macclassicii_vdac_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
 /* 60.15Hz VBL tick on CA1 and one-second tick on CA2, as on mac_via */
 
 #define VIA_60HZ_TIMER_PERIOD_NS   16625800
@@ -1140,6 +1222,16 @@ static void macclassicii_egret_set_xcvr(MOS6522MacClassicIIState *v1s,
 {
     MOS6522State *s = MOS6522(v1s);
 
+    /*
+     * PB3 is an Egret-driven input: the authoritative line state lives
+     * in the machine struct so port-B reads report it regardless of the
+     * ROM's ORB writes (see macclassicii_via1_read).  Keep s->b in sync
+     * for any code that inspects the latch, but the read override is
+     * what the guest actually observes.
+     */
+    if (v1s->machine) {
+        v1s->machine->egret_xcvr_asserted = assert;
+    }
     if (assert) {
         s->b &= ~EGRET_XCVR;            /* active low */
     } else {
@@ -1285,7 +1377,19 @@ static void macclassicii_egret_session_update(MOS6522MacClassicIIState *v1s)
      * close), or a /TACK assert edge with /TIP already held and the
      * shifter outbound (chained send, /TIP never released).
      */
-    if (sys && !m->egret_session &&
+    /*
+     * Only recognise an Egret session when the VIA shift register is
+     * actually enabled for the transport (ACR shift-control bits set).
+     * The ROM's one-time port-B *initialisation* write during early
+     * bring-up (pc 0x40802ea4) happens to drop /SYS_SESSION as an edge
+     * while ACR=0 (SR disabled); without this guard it was misread as a
+     * receive session, asserting /XCVR_SESSION (PB3) before the Egret
+     * cold-start sync ran -- which then trapped the sync in its
+     * XCVR-asserted receive path forever.  Real Egret transactions
+     * (send and receive alike) always run with the SR shifting (ACR &
+     * SR_CTRL != 0), so this excludes only the spurious init write.
+     */
+    if (sys && !m->egret_session && (s->acr & SR_CTRL) &&
         ((hs_change & EGRET_SYS_SESSION) ||
          ((hs_change & EGRET_VIA_FULL) && !(s->b & EGRET_VIA_FULL) &&
           (s->acr & SR_OUT)))) {
@@ -1388,21 +1492,33 @@ static void macclassicii_egret_sr_written(MOS6522MacClassicIIState *v1s)
     MacClassicIIMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
-    if (!m->egret_session || !(s->acr & SR_OUT)) {
+    if (!(s->acr & SR_OUT)) {
         return;
     }
+
     /*
-     * If an Egret-initiated packet is staged (resp pending), /XCVR is
-     * low: the host's send interrupt takes the collision path, turns
-     * around and receives our packet before re-sending -- the command
-     * bytes collected here get dropped at the turnaround.
+     * Inside a formal session, collect the byte as a command byte.  If
+     * an Egret-initiated packet is staged (resp pending), /XCVR is low:
+     * the host's send interrupt takes the collision path, turns around
+     * and receives our packet before re-sending -- the command bytes
+     * collected here get dropped at the turnaround.
      */
-    if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
-        m->egret_cmd[m->egret_cmd_len++] = s->sr;
+    if (m->egret_session) {
+        if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
+            m->egret_cmd[m->egret_cmd_len++] = s->sr;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: <- 0x%02x (#%d) pc=%08x b=%02x\n",
+                      s->sr, m->egret_cmd_len, macclassicii_trace_pc(), s->b);
     }
-    qemu_log_mask(LOG_UNIMP,
-                  "macclassicii egret: <- 0x%02x (#%d) pc=%08x b=%02x\n",
-                  s->sr, m->egret_cmd_len, macclassicii_trace_pc(), s->b);
+
+    /*
+     * Regardless of session framing, the Egret provides the shift clock:
+     * each byte the host shifts OUT in external-clock SR mode completes
+     * and raises the SR interrupt.  This is what carries the ROM's Egret
+     * cold-start byte-framing sync (0x40814cc8), whose send helpers clock
+     * bytes with /SYS_SESSION released (no formal session open).
+     */
     macclassicii_egret_schedule_int(m);
 }
 
@@ -1434,6 +1550,15 @@ static void macclassicii_egret_acr_changed(MOS6522MacClassicIIState *v1s)
          * bytes afterwards, so drop the partial command.
          */
         m->egret_cmd_len = 0;
+    } else if (!m->egret_session && (s->acr & SR_CTRL) && !(s->acr & SR_OUT)) {
+        /*
+         * Outside a formal session (the cold-start byte-framing sync),
+         * turning the shifter to external-clock INPUT means the Egret
+         * clocks the next byte in: raise the completion interrupt so the
+         * ROM's receive helper (0x40814e6a) advances.  SR is left 0 --
+         * the framing sync only cares that the transfers complete.
+         */
+        macclassicii_egret_schedule_int(m);
     }
 }
 
@@ -1442,7 +1567,21 @@ static void macclassicii_egret_sr_read(MOS6522MacClassicIIState *v1s)
     MacClassicIIMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
-    if ((s->acr & SR_OUT) || m->egret_resp_len == 0) {
+    if (s->acr & SR_OUT) {
+        return;
+    }
+
+    /*
+     * Cold-start framing sync (no formal session): each byte the host
+     * reads in external-clock INPUT mode is immediately followed by the
+     * Egret clocking the next one -- schedule its completion interrupt.
+     */
+    if (!m->egret_session && (s->acr & SR_CTRL)) {
+        macclassicii_egret_schedule_int(m);
+        return;
+    }
+
+    if (m->egret_resp_len == 0) {
         return;
     }
     qemu_log_mask(LOG_UNIMP,
@@ -1762,10 +1901,19 @@ static void macclassicii_machine_init(MachineState *machine)
      * == 0x46 (PA4 low); the Classic II ROM carries an additional
      * patched-in kind-5 entry matching 0x16 (PA4 HIGH -- the "sibling
      * config" the IIci/IIsi comment warns about is, on this ROM, the
-     * Classic II itself), mask unchanged at 0x56.  0xBF (PA6 low,
-     * PA1/PA2/PA4 high) satisfies (PA & 0x56) == 0x16.
+     * Classic II itself), mask unchanged at 0x56.  0xBE (PA6 low,
+     * PA1/PA2/PA4 high, PA0 low) satisfies (PA & 0x56) == 0x16.
+     *
+     * PA0 must strap LOW: after machine ID, the ROM's kind-5 setup
+     * (0x40846440) makes PA0 an input and reads it -- PA0 low sets the
+     * d7 "bit 26" flag that, post-Egret-sync, routes 0x40848ee8 to the
+     * real boot (0x40848f08) instead of the MicroBug serial monitor.
+     * The IIci/IIsi read PA0 high there via a NuBus pull-up on the
+     * VIA2-position pin; the Classic II has no NuBus, so the pin floats
+     * low.  (Bit 0 is outside the 0x56 machine-ID mask, so clearing it
+     * does not disturb identification.)
      */
-    qdev_prop_set_uint8(DEVICE(&m->via1), "pins-a", 0xbf);
+    qdev_prop_set_uint8(DEVICE(&m->via1), "pins-a", 0xbe);
     sysbus = SYS_BUS_DEVICE(&m->via1);
     sysbus_realize(sysbus, &error_fatal);
     {
@@ -1900,6 +2048,11 @@ static void macclassicii_machine_init(MachineState *machine)
                           "rbv", 0x2000);
     memory_region_add_subregion(&m->macio, RBV_OFS, &m->rbvmem);
 
+    /* VDAC stub: present-but-inert, see macclassicii_vdac_ops comment */
+    memory_region_init_io(&m->vdacmem, OBJECT(machine), &macclassicii_vdac_ops,
+                          m, "vdac", 0x40);
+    memory_region_add_subregion(&m->macio, VDAC_OFS, &m->vdacmem);
+
     /* NCR5380 SCSI controller and its pseudo-DMA aperture (+0x2000) */
     object_initialize_child(OBJECT(machine), "scsi", &m->scsi, TYPE_NCR5380);
     qdev_prop_set_uint8(DEVICE(&m->scsi), "reg-shift", 4);
@@ -1975,6 +2128,43 @@ static void macclassicii_machine_init(MachineState *machine)
             entry += MACCLASSICII_ROM_ADDR;
         }
         stl_phys(cs->as, 4, entry);
+
+        /*
+         * Relocation-base fixup for the Classic II ROM's machine
+         * bring-up.
+         *
+         * After machine identification succeeds, the shared "$067C
+         * universal" startup code computes a relocation delta and
+         * rebases a0/a1/a4 and PC by it, so that a ROM running at a
+         * non-canonical physical base can transparently continue.  The
+         * IIci ROM does this inline as `d3 = device_table[0] - a2`
+         * (a2 = the PC-relative actual ROM base); device_table[0] holds
+         * the canonical base 0x40800000, so on a ROM running in place
+         * the delta is 0 (no relocation, keep executing from ROM) --
+         * and the IIci boots straight through this to the Finder.
+         *
+         * The Classic II ROM PATCHES this site (0x40802e34: the 4 bytes
+         * `26 10 96 8a`, movel a0@,d3 / subl a2,d3, become `4e fa 0c 60`,
+         * jmp 0x40803a96) into a routine that instead reads the
+         * canonical base from device_table[28] (offset 0x70) and also
+         * relocates a0/a1.  But device_table[28] is 0 in this ROM image
+         * (the table's live entries stop at offset ~0x44; 0x70 is in its
+         * zero padding), so the computed delta becomes -0x40800000 and
+         * bring-up jumps into empty low RAM (0x00002e3e) and runs off
+         * into the weeds -- verified by gdb single-step, and confirmed
+         * that forcing the delta to 0 (as the IIci naturally gets)
+         * advances the boot hundreds of KiB further into real ROM code.
+         *
+         * device_table[28] is plainly meant to carry the canonical ROM
+         * base 0x40800000 (so the delta is the intended no-op for an
+         * in-place ROM), exactly like device_table[0] does; this dump
+         * just has that slot left zero.  Patch it to the ROM base so the
+         * relocation is the no-op it is on the IIci.  Machine-local,
+         * touches only this one padding slot of the in-memory ROM image.
+         */
+        if (bios_size > 0x34fc + 4) {
+            stl_be_p(ptr + 0x34fc, MACCLASSICII_ROM_ADDR);
+        }
     }
 }
 
