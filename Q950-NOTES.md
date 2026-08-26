@@ -123,10 +123,51 @@ beq->bra patch + checksum fixup applies verbatim.
       wrong machine value, not a code difference.  ROOT SOURCE of the
       0xF8 still not pinned (built in chained/dispatched code; see
       finding 17 for the exact leads).  NOT an icount artifact.**
-- [ ] MacOS 7.5.3 Finder
-- [x] q800 regression check: N/A — only quadra950.c changed (no shared
-      code).  q800 unaffected by construction.  Confirmed q950 still
-      reaches the post-ADB "?" state after this session (no regression).
+- [x] **FIXED (session N+2): the ddType-mismatch "?" blocker (findings
+      16/17) is RESOLVED.**  Root cause: `EGRET_CMD_READ_PRAM` (cmd 2)
+      only ever returned ONE data byte, but a second ROM consumer
+      (0x40801390/0x408013b0, reached via traps $A07D/$A084 ->
+      $A051 -> 0x40815204 -> $A092) clocks *2 or 4* bytes from a
+      single cmd-2 exchange to read a PRAM word/longword.  With only
+      one real byte supplied, the caller's stack scratch buffer was
+      never fully written by the transport and the 2nd (and 3rd/4th)
+      bytes were leftover stack garbage — that garbage is exactly
+      what landed in the boot-driver-installer's expected-ddType
+      register (0xf8 instead of the disk driver's ddType=1).  Fixed
+      by making `EGRET_CMD_READ_PRAM` stream consecutive PRAM bytes
+      the same way `EGRET_CMD_GET_PRAM` already does (host-terminated,
+      not device-terminated) — the existing single-byte consumer
+      (interrupt-driven trap dispatcher, 0x40814a58) is unaffected
+      since it only ever clocks one byte and stops, but the
+      2/4-byte consumer now gets real PRAM[addr..addr+n] data.  After
+      the fix, `PRAM[0x76..0x79]` (`00 01 ff ff`, the ROM's own
+      default block for that PRAM record, see finding 18) is
+      delivered correctly, `d3` byte1 resolves to `0x01`, the driver
+      installs, and the boot proceeds PAST the flashing "?" to the
+      "Mac OS Starting up…" screen (screendump proof:
+      `/tmp/q950_after.png`).  See finding 18 for the full derivation
+      and finding 19 for a NEW, separate stall found immediately
+      after this fix (the "Starting up" progress bar does not
+      advance) — that is NOT the ddType bug; it is a fresh blocker
+      for a future session.
+- [x] **MacOS 7.5.3 FINDER REACHED (session N+5).**  Finding 19's
+      post-"Starting up" hard hang is FIXED: the missing event was the
+      SIM 4.3 bus scan of the Quadra 900/950's SECOND (external) SCSI
+      bus — the towers have TWO 53C96 chips and the SIM scans both
+      before starting async I/O; the model only had one, so the scan
+      of the nonexistent chip at 0x50F0F402 never completed and the
+      queued target-0 read was never dispatched.  Fixed by modeling
+      the second ESP (see finding 20).  Screendump proof:
+      `/tmp/q950_finder.png` — full Finder desktop (menu bar, Control
+      Panels window, Trash, mounted "OpenRetroSCSI 7.5" volume).
+      `-M quadra900` boots to the same Finder desktop
+      (`/tmp/q900_finder.png`).
+- [x] q800/q700 regression check: only `hw/m68k/quadra950.c` changed
+      (no shared code touched).  Confirmed `-M quadra700` still boots
+      all the way to the Finder after the finding-18 fix (screendump:
+      `/tmp/q700_check.png`, shows Finder + Control Panels window);
+      the finding-20 session again touched only quadra950.c (its
+      pre-fix q700 reference run also booted normally).
 
 ## Findings
 
@@ -506,6 +547,364 @@ beq->bra patch + checksum fixup applies verbatim.
       risk); confirm `-M quadra700`/`-M q800` still boot if you touch
       anything shared.
 
+18. **THE FIX for findings 16/17 — traced `d3` all the way back to a
+    real PRAM byte using `-d exec,cpu -dfilter <narrow-range>` (NOT
+    nochain — plain `exec,cpu` logging with a tight `-dfilter` around
+    the suspect call site gives full per-instruction register dumps
+    without the nochain disk-overflow problem; this is the method to
+    use next time, cheaper than the gdb-poll loop).  Method and full
+    derivation:
+    - Oracle-diffing the two machines' registers at `0x40807264` (see
+      finding 17) plus a stack unwind at the installer entry
+      (`0x40807224`, `A7` identical on both machines: `0x400a1a`)
+      found the *outer* caller by computing the moveml/byte-push frame
+      size by hand and reading `[A7+62]`: `R_outer = 0x4080157e`,
+      i.e. the call site is `0x4080157a: jsr @(0x40801574,%a0:l)`
+      with `a0 = 0x5c7c` (a fixed literal) → target `0x408071f0`
+      (verified: `0x40801574 + 0x5c7c == 0x408071f0`).  That routine
+      (the SCSI-ID-scan entry, `moveml d1-fp` at `0x408071fc`) does
+      **not** set `d3` — entering it, `d3` is already the final wrong
+      value, so the setter is further back still.
+    - A `-d exec,cpu -dfilter 0x40801400..0x40801700` full-boot trace
+      (2-2.5 MB per machine — small, safe for /workspace even, but
+      written to /tmp per instructions) caught the actual setter
+      in-line: at `0x40801430`, `d3` starts as leftover garbage
+      (`0xfffffff6`); by `0x40801440` (after `0x40801434`'s `.short
+      0xa07d`, an **A-line trap $A07D**) `d3`'s low word has become
+      `0xff40`; by `0x40801454` (after `0x4080143e`'s trap `$A084`,
+      plus two `swap d3` instructions bracketing a second
+      `movew sp@+,d3`) `d3` is the final `0x00f8ff40`.  So `d3` is
+      built from **two A-line OS traps**, byte-for-byte:
+      `d3 = (result of trap $A084) : (result of trap $A07D)`
+      (high word : low word).
+    - Read the Line-1010-emulator vector (`VBR=0`, physical `0x28` =
+      `0x408099b0`, the ROM's generic old-style-OS-trap dispatcher:
+      `andiw #0x100,d2` selects "old" traps in `$A000-$A0FF`, then
+      `jsr @(0x400 + (trapword&0xff)*4)` — so trap handlers for
+      low-byte `0x7D`/`0x84` live at whatever's stored in RAM at
+      `0x400+0x7D*4=0x5F4` and `0x400+0x84*4=0x610`).  Read those two
+      RAM longs live via HMP `xp`: `0x5F4 -> 0x40801390`,
+      `0x610 -> 0x408013b0`.  Disassembled (byte-exact, ROM file
+      bytes: `20 3c 00 04 00 78 a0 51 4e 75` /
+      `20 3c 00 02 00 76 a0 51 4e 75`):
+      - `0x40801390`: `movel #0x00040078,d0; TRAP $A051; rts`
+      - `0x408013b0`: `movel #0x00020076,d0; TRAP $A051; rts`
+      Both call the SAME trap `$A051` (vector RAM `0x400+0x51*4=0x544`
+      -> `0x4080b186`), passing `d0` = `(subcmd:16 | pram_addr:16)`.
+      `0x4080b186` forwards to `0x40815204` (gated by `lowmem[0xdd4] &
+      0x70 == 0x20`, the **Egret-present flag** — Q700 lacks an
+      Egret so it takes the *other* branch at `0x40815260`, a
+      completely different RTC-bit-bang code path; this is WHY q700's
+      code differs here despite the ROM being "byte-identical" at the
+      installer itself — the two machines legitimately fork upstream).
+      `0x40815204` builds an Egret pseudo-packet param block: **the
+      address gets `+0x100` added** (`0x78`->`0x178`, `0x76`->`0x176`
+      — this is the "trap dispatcher adds 0x100" from finding 4/9),
+      the packet's actual on-wire command byte is **hardcoded to `2`**
+      (`READ_PRAM`) regardless of the caller's `d0` high word, and
+      the caller's original `d0` high word (`4` or `2`) is stashed as
+      a **length** field instead — i.e. this ROM helper always issues
+      a real Egret `READ_PRAM` (cmd 2) exchange, then **clocks
+      `length` bytes out of the SAME exchange** to read a PRAM
+      word (`length=2`) or longword (`length=4`), not just one byte.
+    - **The bug**: `quadra950.c`'s `EGRET_CMD_READ_PRAM` handler always
+      set `egret_resp_len = 5` (exactly one data byte after the
+      4-byte header), unlike `EGRET_CMD_GET_PRAM` which streams up to
+      260 bytes for as long as the host keeps clocking SR reads.  A
+      caller that clocks 2 or 4 bytes from a single `READ_PRAM`
+      exchange (as this ROM helper does) got byte 1 correct and then
+      ran past the end of `egret_resp[]`'s populated region — the
+      *stack scratch buffer* the ROM had reserved for the result
+      (`subaw #2,sp` / `subaw #4,sp` right before the trap) was only
+      partially written by the transport, so the un-delivered byte(s)
+      were **whatever garbage was already on the stack**, not real
+      PRAM data.  For the critical call (`addr=0x76` -> `0x176`,
+      length 2, this is `R2`/`d3`'s high word/the byte the installer
+      compares): confirmed live via `-d unimp,guest_errors` (which
+      includes the existing `q950_log("q950 egret: read 0x%03x ->
+      0x%02x\n", ...)` call) that `PRAM[0x176] == 0x00` (correct —
+      matches the ROM's own default-PRAM-rebuild data table at ROM
+      file offset `0xc68a`, dumped: `00 01 ff ff ff df 00 00 …`,
+      written via the `(addr=0x76, len=19)` block write logged as
+      `q950 egret: write 0x176 len 19 [00 ...]`), but the SECOND byte
+      (`PRAM[0x177]`, should be `0x01`) was never supplied by the
+      emulated transport at all — no `read 0x177` log line ever
+      appears — so the caller's second stack byte was leftover
+      garbage (`0xf8`), giving the observed `d3` high word `0x00f8`
+      instead of the correct `0x0001` (which is exactly what q700's
+      RTC-bit-bang path legitimately produces, reading the same
+      logical default-PRAM bytes `00 01` via a different transport).
+    - **Fix applied** (`hw/m68k/quadra950.c`, `EGRET_CMD_READ_PRAM`
+      case only): stream consecutive PRAM/clock bytes into the
+      response buffer exactly like `EGRET_CMD_GET_PRAM` already does
+      (`for (i = 0; i < 260; i++) { ... r[4+i] = ...; }`,
+      `egret_resp_len = 4 + 260`), instead of writing only `r[4]` with
+      `egret_resp_len = 5`.  This does not change behavior for the
+      existing single-byte consumer (interrupt-driven trap dispatcher
+      at `0x40814a58`, per the original comment) since it clocks
+      exactly one byte and stops (TREQ-style host-driven
+      termination, unaffected by more bytes being available behind
+      it) — it only fixes the multi-byte consumer.  Rebuilt, and
+      `PRAM[0x176..0x177]` now delivers `00 01` correctly; `d3` byte1
+      resolves to `0x01`; the driver installs.
+    - **Verified past "?"**: screendump `/tmp/q950_after.png` shows
+      the classic "Mac OS / Starting up…" boot screen (NOT the
+      flashing "?") shortly after boot.  This is further than this
+      machine has ever booted (previous best was the flashing "?").
+    - **Regression check**: only `hw/m68k/quadra950.c` was touched;
+      `-M quadra700` still boots to a fully working Finder desktop
+      (screendump `/tmp/q700_check.png`, shows a Control Panels
+      Finder window) — no shared-code risk, confirmed no regression.
+
+19. **NEW, SEPARATE blocker after the finding-18 fix — boot reaches
+    "Mac OS / Starting up…", loads ~303 KB of the System off SCSI,
+    then HARD-hangs (deterministic under `-icount shift=7`).  Deeply
+    characterized this session; NOT yet fixed.  It is emphatically a
+    software deadlock, NOT the ddType bug and NOT the SCSI/ESP.**
+    - **Hang signature (deterministic — identical registers every run):
+      PC spins at `0x800a1f72` (the `_SystemTask`/idle "run the queues"
+      loop).  Registers frozen: `A6=0x5f9f36`, `A2=0x800a9afe`,
+      `A3=A4=0x0000ef10`, `D3=0xffffff07`, `SR=2004` (IPL 0).  The A6
+      frame-chain is stable over time (verified) = truly wedged, not
+      slow.**
+    - **Read-count proof of hard hang:** with an ESP trace
+      (`-trace events=<esp_mem_readb/writeb,esp_command_complete,
+      esp_raise_irq,scsi_req_parsed_lba,…>`), q950 executes **exactly
+      606 SCSI reads and then stops forever** (read count frozen at 606
+      for >120 s at three checkpoints; last LBA 82932).  For contrast,
+      **quadra700 booting the SAME disk does 4027+ reads and keeps
+      going** — so q950 stalls partway through loading the System file
+      (the last ~40 reads are *scattered distinct* LBAs 81972–82932 =
+      a normal File-Manager extent-walk of one file, which simply
+      ceases — an upstream stop, not a SCSI retry).
+    - **The SCSI/ESP layer is byte-for-byte identical to q700 and works
+      perfectly.**  The frozen call-chain (walked via the A6 links +
+      HMP `x`) is: ROM Device-Manager trap dispatch (`0x40809a0a`, the
+      `0x408099f0`→`jsr @(0x400,%d2:w:4)` DM dispatcher) → System-heap
+      SCSI code `0x800a942a` → `0x800a99dc` → wait.  `0x800a99dc` is a
+      **SCSI CDB builder**: `moveb #40,%a3@` (0x28 = READ(10)) or
+      `moveb #8,%a3@` (0x08 = READ(6)), big-endian LBA into `a3@(2..5)`,
+      length into `a3@(7..8)`, CDB length (10/6) into the request block
+      at `+53`, buffer ptr at `+40`, byte count (blocks×blockSize) at
+      `+44`.  So the hung op **builds CDB #607 then waits for it to
+      complete** — but the ESP never receives it: at the hang the ESP
+      is fully idle (`RSTAT=RSEQ=RFLAGS=0x00`, live-read at
+      `0x5000f0{40,60,70}`), quiescent in the normal post-command
+      ENSEL/disconnected state.  q700 uses the *same* ENSEL(0x44)/
+      MSGACC→INTR_DC(0x20)/asc_mode=DIS cycle after every command
+      (3433 ENSELs, ends in the same ENSEL-idle state) and boots — so
+      **CMD_ENSEL / QEMU-esp.c's lack of reselection support is NOT the
+      cause** (both machines rely on it identically).
+    - **The wait is a classic ioResult poll.**  `R_B` at `0x800a1ec2`
+      loops `while (a4@(10) == 1) call 0x800a1f64(a3)` where
+      `a4 = 0x155b0` and `[0x155ba] == 0x0001` forever (== ioInProgress).
+      `0x155b0` is the parameter block the ROM DM was called with
+      (`a0=0x155b0` on the stack at the `0x40809a0a` frame).
+      `0x800a1f64` just runs the deferred/VBL "SystemTask" queue (checks
+      IPL via `0x800a446e`, walks `[0xc0c]`-based queues) — it does NOT
+      poll any device, confirming this is a wait for an *async
+      completion* that never fires.
+    - **Ruled out (each checked live at the hang):**
+      (a) *interrupt storm / stuck IRQ* — VIA1 IFR=0x41 **without** the
+      0x80 summary bit, VIA2 IFR=0x00; no pending interrupt; CPU at
+      IPL 0.  (b) *deferred-task-drain starvation* (the finding-14
+      worry) — the Deferred-Task-Mgr queue at `0x0d92` is EMPTY
+      (qHead=0), and we're already at IPL 0 with VBL (Ticks `0x16a`)
+      still incrementing, so tasks could drain.  (c) *ADB* — autopoll
+      Talk-R3 (cmd 2b/2f/3b/3f/fb/ff) runs normally; the lone `cmd 0x21`
+      → timeout happens exactly once (a reserved ADB command, timeout is
+      correct) and is not in the loop.  (d) *Time-Manager/VBL dead* —
+      Ticks advance, VBL(L1) + VIA2(L2) both fire.
+    - **CONCLUSION / crisp next-lead:** after ~606 reads the boot stops
+      dispatching File-Manager disk reads and wedges on an async
+      ioResult=1 that is never completed *and never handed to the ESP*
+      (ESP idle).  Since the ROM DM/SCSI code is almost certainly
+      byte-identical q700↔q950 (as the installer was in finding 17),
+      this is very likely **the SAME shape of bug as finding 18: a
+      machine-specific value/condition that q950 resolves differently,
+      steering the SCSI-Manager/File-Manager async state machine into a
+      "wait" instead of "dispatch next".**  The next session should:
+      break at the ROM DM dispatch `0x40809a04` and log `d2`(DM
+      routine selector)/`a0`(PB)/refNum for the LAST call before the
+      freeze to name the exact driver+opcode; then diff the deciding
+      register/lowmem between q700 and q950 at that call (prime suspects:
+      a gestalt/`0xdd0-0xdd8` universal-flags bit the SIM tests for
+      "disconnect/async supported", or a Time-Manager reselection-timeout
+      task that never gets armed on q950).  All heavy traces to /tmp;
+      the ESP-trace + read-count method above is the fastest way to
+      confirm any fix (read count must climb past 606 toward q700's
+      4027 → Finder).  Screenshot at the hang: still the "Starting up"
+      progress screen (`/tmp/q950_after.png` from finding 18 is
+      representative).
+    - **DEEPER TRACE of the wedge loop (session N+3, still no fix — the
+      manager is identified, the exact completion condition is not).**
+      The `_SystemTask`-style spin at `0x800a1f72` is a MANAGER on the
+      private OS A-trap **`0xA089`** (handler patched to `0x800a86be` →
+      `0x800a9c84` → `0x800a1780` → `0x800a17a6`).  Its globals live at
+      `[0xc0c] = 0xc8f0`; the "current request list" is
+      `[[0xc0c]+436] = 0xef10` (= the frozen `A3=A4`).  Reconstructed
+      loop each iteration: `R_B` (`0x800a1ec2`) does
+      `while ([0x155ba] (== a4@(10)) == 1) 0x800a1f64(0xef10)`;
+      `0x800a1f64` (the queue-runner) passes its IPL<1 +
+      `[[0xc0c]+192]==0` + `[[0xc0c]+190]==0` gates (all true here →
+      it takes the *process* path `0x800a1fb2`, NOT the defer path),
+      clears bit0 of `a4@(72)=[0xef58]`, and calls `0x800a1fd2` which
+      builds a 36-byte pblock and fires trap `0xA089` (twice) →
+      re-enters `0x800a1780`/`0x800a17a6`, whose dispatcher
+      `0x800a1b98` switches on the request's opcode `a4@(8)` (== **1**
+      for the wedged req at `0x155b0`) to `0x800a1c0e`, which arms the
+      wait.  So the manager IS actively re-servicing its queue every
+      iteration — this is NOT a starved/never-run path — yet the
+      request's status word `[0x155ba]` never leaves 1 and the SCSI
+      CDB it built is never handed to the (idle) ESP.
+    - **What 0xA089 is:** a private System dispatch trap this manager
+      installed (handler in the System heap, `0x800a86be`, a 3-way
+      `braw` table → `0x800a9c84`/`0x800a9dce`/`0x800a9c52`).  The
+      manager iterates a client/unit array at `a4@(104)`/count
+      `a4@(68)`, and the config-feature predicates right next to it
+      (`0x800a9c9a`..`0x800a9cf6`) test the universal-ROM flags
+      **`0xdd0` bit0/1/3, `0xdd1` bit5, `0xdd4` bit23, `0xdd8@(13)==15`,
+      `0xdd8@(-7)`** — q950 has `0xdd0=0x07a31807`, `0xdd4=0x02040924`,
+      `0xdd8=0x0000c8b0` (these come from the ROM universal table for
+      the q950 box and legitimately differ from q700's
+      `0x05a0183f`/`0x00000900`; they are NOT emulation-settable
+      without breaking machine-ID, so — unlike finding 18's PRAM byte —
+      a flag diff here is probably a *correct* HW-feature difference the
+      manager acts on, meaning the missing piece is the *event/IRQ that
+      path expects*, not a wrong value).  **Identifying which real
+      manager owns trap 0xA089 (Process Mgr? File/Disk-cache async?
+      the SIM's client-notify?) is the key unknown for next session** —
+      grep a System-file trap table or a live `_GetTrapAddress(0xA089)`
+      symbol, then find where opcode-1 requests are *completed* (who
+      writes `a4@(10) = 0`) and what hardware event that completion
+      waits on that q950 doesn't deliver.
+    - Method notes for next session: the System heap at `0x800xxxxx`
+      is MMU-mapped — use HMP **`x`** (virtual), NOT `xp` (fails with
+      "Cannot access memory").  The OS trap table is at physical
+      `0x400` (`handler = [0x400 + (trap&0xff)*4]`), so any A-trap in
+      the loop can be resolved to its patched handler instantly.  The
+      wedge is fully deterministic (identical regs every run:
+      `A6=0x5f9f36 A2=0x800a9afe A3=A4=0xef10 D3=0xffffff07`), so a gdb
+      watchpoint on the status word `*0x155ba` (write) will catch the
+      completer the instant it ever runs — it never fired in a multi-
+      second window, confirming the completion truly never happens.
+    - **THE MISSING EVENT, NAMED (session N+4 — ESP-CMD dispatch trace).**
+      Method: temporary logging in `esp_reg_write` (ESP_CMD case) of the
+      guest PC (`((M68kCPU *)current_cpu)->env.pc`) + WBUSID for
+      SELECT/ENSEL (0x41–0x44) — reverted afterwards; MMIO gdb
+      watchpoints DO fire (tried `watch *(char*)0x50f0f030`, hit
+      old=0/new=1) but gdb then detaches choking on the register read,
+      so the esp.c PC-log is the reliable capture.  Results:
+      - Reads 1–~612 go through **two OLD-SCSI-Manager paths**: the ROM
+        (`pc=0x40898de0`, 405×) and a loaded disk driver
+        (`pc=0x000418dc` on q950 / `0x000440ec` on q700, ~207×), all
+        `SEL|DMA` (0xc1) to **target 0** — these load the initial System
+        and work identically on both machines.
+      - Then the boot hands off to the **SCSI Manager 4.3 (SIM)** in the
+        System heap.  On BOTH machines the SIM first ENSELs target 0
+        (q950 `pc=0x800a571c` / q700 `0x800c4a5c`) then runs a **bus
+        scan**: `SELECT` (0x41) targets **6→1** (q950 `pc=0x8009fdee` /
+        q700 `0x800bf12e`), each empty → INTR_DC — **identical on both.**
+      - **THE DIVERGENCE (exact):** immediately after the 6→1 scan,
+        **quadra700 issues `SEL|DMA` (0xc1) to target 0
+        (`pc=0x800bf25e`) and then does THOUSANDS of SIM reads** of the
+        disk (`0x800bf25e`/`0x800c2b92`, 3026+3432 dispatches) → boots.
+        **quadra950 WEDGES right there — it never dispatches a single
+        SIM `SEL|DMA target 0`** (0 System-heap 0xc1 dispatches after the
+        scan).  So the missing event is precisely the **SIM 4.3
+        scan-complete → first-async-read-of-target-0 transition**: the
+        target-0 read PB is built (`0x800a99dc` CDB, finding 19 above)
+        and queued, but the SIM's bus engine never picks it up to select
+        target 0.
+    - **DRQ→VIA2-CA2 wiring difference examined and RULED OUT as the
+      fix.**  q700 forwards the ESP DRQ to VIA2 CA2 (`VIA2_IRQ_SCSI_DATA_BIT
+      == CA2_INT_BIT`, via `q700_esp_drq`→`esp_drq_via2`); q950's
+      `q950_esp_drq` does NOT (it only latches `m->esp_drq` for the DAFB
+      TurboSCSI reg).  BUT on q950 **VIA2 CA2 is deliberately the ISM/SWIM
+      IOP interrupt** (`m->swim_iop.irq = invert(gpio_in(via2,
+      VIA2_IRQ_SCSI_DATA_BIT))`, quadra950.c ~2543; matches finding 11 —
+      the ROM's L2 handler treats VIA2 IFR bit0/CA2 as the ISM IOP).
+      This is a genuine tower design point (the 900/950 route ADB/SWIM
+      through the IOP on CA2 and take SCSI DRQ only via the TurboSCSI
+      register, which q950 already provides and which the OLD-path reads
+      use successfully).  Routing DRQ to CA2 would collide with the IOP
+      and almost certainly break the ADB/IOP boot that already works, so
+      it is not the fix.
+    - **The SIM engine's own state is NOT reachable from the frozen
+      manager context** (the wedge is in the 0xA089 manager, whose
+      `a5=0x600190` is a different struct than the SIM engine's `a5`
+      HBA — its `a5@(174)` "advance/wait" callback and `a5@(438)`
+      RSTAT-phase reads need the SIM engine's live `a5`).  **Next
+      session's single concrete step:** set a gdb breakpoint at the SIM
+      scan-SELECT `0x8009fdee`, let it hit the LAST scan target (WBUSID=1),
+      then single-step the post-scan flow (`0x8009fe08`.. reads `a4@(16)`,
+      `a5@(422)` phase, `a5@(57)`, `a0@(103)` gates) to the branch that
+      diverts to "wait" instead of the target-0 `SEL|DMA` — that branch's
+      guard IS the missing event/flag.  Compare the same guard live on
+      quadra700 (which takes the read branch).  Read regs via HMP (gdb's
+      own reg reads are byte-swapped garbage / detach on stop).
+
+20. **THE FIX for finding 19 — the "missing event" was the scan
+    completion of the Q900/950's SECOND SCSI BUS (external 53C96),
+    which the model did not have.  FINDER REACHED.**
+    - Method (no gdb single-stepping needed): the SIM module was
+      dumped from BOTH machines' guest RAM via HMP `memsave` (virtual;
+      q950 base 0x80090000, q700 base 0x800b0000) and proved
+      byte-identical over `0x8009fb90..0x800a4548` ↔
+      `0x800beed0..0x800c3888` (delta 0x1f340), so q700 SIM addresses
+      map to q950 ones by subtracting 0x1f340.  Then a
+      `-d exec,cpu -dfilter 0x8009fc00..0x800a0100` (q950) /
+      `0x800bef40..0x800c0440` (q700) trace of just the SIM bus-engine
+      range captured every engine entry with full registers (~1 MB on
+      q950; on q700 kill it soon after the SIM handoff — the async
+      read flood grows the log at ~GB/min).  Disassembly of the dumped
+      module (m68k objdump on the memsave carve) gave the engine
+      structure: a3 = ESP register base, a4 = transaction block,
+      a5 = per-HBA globals, a0 = PB; scan-SELECT at 0x8009fdee (CMD
+      0x41), start-transaction/SEL|DMA routine at 0x8009fef2 (CMD 0xc1
+      at 0x8009ff1e = q700's 0x800bf25e), post-select dispatch on the
+      latched RINTR at 0x8009fe76-0x8009fec4.
+    - The register dumps at each scan SELECT told the whole story
+      instantly: q950 runs the 6→1 scan on HBA #1 (a5=0xf850,
+      **a3=0x50f0f000**) exactly like q700 — and then issues an 8th
+      SELECT from a DIFFERENT HBA instance (a5=0x94e80,
+      **a3=0x50f0f402**, target 6 again): the SIM registered TWO
+      buses and began scanning the SECOND one.  0x50f0f402 was
+      unmapped in the model (reads 0/discarded writes), so that
+      select never raised INTR_DC; the fe76 dispatch fell through to
+      its `pea 0x8009ffb6; trap $ABFF` "wait" tail and the XPT never
+      proceeded to dispatch the queued target-0 read PB (0x155b0) on
+      bus 1.  The wedge was thus not a flag at all — it was a real
+      missing DEVICE.  (This is also why the 0xdd0/0xdd4 flag
+      differences were correct machine values: they tell the SIM the
+      towers are dual-bus.)
+    - Hardware truth (Linux `drivers/scsi/mac_esp.c`,
+      MAC_SCSI_QUADRA2 = Quadra 900/950): chip N registers at
+      `0x50F0F000 + N*0x402` (reg stride 0x10, so chip 2's byte lane
+      is +2), PDMA IO at regs+0x100 (chip 2: 0x50F0F502), TurboSCSI
+      handshake regs at `0xF9800024 + N*4`, and BOTH chips share the
+      single VIA2 SCSI interrupt — Linux's ISR just polls both chips'
+      RSTAT INT bits, matching the SIM's per-HBA polling.
+    - **Fix (quadra950.c only):** second `SysBusESPState esp2` mapped
+      at `ESP2_BASE 0x50F0F400` / `ESP2_PDMA 0x50F0F500` (the esp-regs
+      MMIO decodes `addr >> it_shift`, so the +2 lane lands on the
+      right registers); its IRQ OR'd with the internal chip's through
+      a 2-input `esp_irq_orgate` feeding the inverted
+      `VIA2_IRQ_SCSI_BIT` gpio (DRQ→CA2 untouched, per finding 11 CA2
+      stays the ISM IOP); its DRQ latched into a second TurboSCSI reg
+      (`turboscsi_ctrl2`/`esp2_drq`, reg 0xF9800028, same DRQ bit 9);
+      `scsi_bus_legacy_handle_cmdline` called for it too (external
+      devices could attach as bus=1; none by default, exactly like a
+      real tower with nothing plugged in).  With no devices on bus 2,
+      each scan SELECT times out to INTR_DC in the stock ESP model —
+      the scan completes, the SIM starts the target-0 async read on
+      bus 1, and the read count blows past 606 into the thousands.
+    - **Result: `-M quadra950` boots MacOS 7.5.3 all the way to the
+      FINDER** (`/tmp/q950_finder.png`: desktop + Control Panels
+      window + mounted volume); `-M quadra900` identically
+      (`/tmp/q900_finder.png`).  Only `hw/m68k/quadra950.c` changed —
+      no shared-code regression surface.
+
 ## Current boot sequence (quadra950 AND quadra900, ~15 s to gray)
 
 POST (incl. SCC IOP RAM test) -> machine ID (straps ok) -> Egret PRAM
@@ -517,9 +916,18 @@ keyboard found, addresses reassigned) -> mouse cursor renders/tracks
 -> ROM SCSI boot scan runs: selects target 0, reads DDM block 0
 (pseudo-DMA delivers the full 512 bytes correctly; sbDrvrCount=1,
 ddType=1 both land in RAM correctly) -> the boot-driver installer
-(0x40807224) rejects the disk's driver because it wants ddType=0xF8
-but the disk's driver is ddType=1 -> no driver installed -> flashing
-"?" (no startup disk) icon, rescanning forever (see finding 16).
+(0x40807224) reads the expected ddType via a PRAM word read
+(**FIXED, finding 18**: was 0xF8 from an under-filled Egret
+READ_PRAM response, now correctly 0x0001 matching the disk's
+driver) -> driver installs -> boot proceeds PAST the flashing "?"
+to the "Mac OS / Starting up…" screen -> loads ~303 KB of the System
+via 606 SCSI reads through the old SCSI Manager -> hands off to SCSI
+Manager 4.3 (SIM), which bus-scans BOTH tower SCSI buses (**FIXED,
+finding 20**: the second/external 53C96 at 0x50F0F402 is now
+modeled, so the second scan completes instead of wedging) -> SIM
+async reads take over (thousands of SEL|DMA target-0 reads) ->
+**MacOS 7.5.3 FINDER desktop** (`/tmp/q950_finder.png`; quadra900:
+`/tmp/q900_finder.png`).
 
 ## Build/test commands
 

@@ -99,6 +99,21 @@
 #define SCC_BASE              (IO_BASE + 0x0c020)
 #define ESP_BASE              (IO_BASE + 0x0f000)
 #define ESP_PDMA              (IO_BASE + 0x0f100)
+/*
+ * The Q900/950 towers have TWO 53C96 SCSI buses (internal + external).
+ * Linux MAC_SCSI_QUADRA2: chip N at 0x50F0F000 + N*0x402, PDMA IO at
+ * +0x100, both chips sharing the single VIA2 SCSI interrupt (the ISR
+ * polls both RSTAT INT bits), TurboSCSI handshake reg at
+ * 0xF9800024 + N*4.  SCSI Manager 4.3 (the System 7.5 SIM) natively
+ * knows the towers are dual-bus and bus-scans BOTH chips before it
+ * starts async I/O -- without the second chip that scan never
+ * completes and the boot wedges (Q950-NOTES finding 20).  Register
+ * byte lane: reg N of chip 2 sits at 0x50F0F402 + N*0x10; the
+ * esp-regs MMIO decodes addr >> it_shift, so mapping the region at
+ * 0x50F0F400 puts the +2 byte lane on the same registers.
+ */
+#define ESP2_BASE             (IO_BASE + 0x0f400)
+#define ESP2_PDMA             (IO_BASE + 0x0f500)
 #define ASC_BASE              (IO_BASE + 0x14000)
 #define SWIM_IOP_BASE         (IO_BASE + 0x1E000)
 #define SWIM_BASE             (IO_BASE + 0x1E000)
@@ -320,6 +335,8 @@ struct Q950MachineState {
     ESCCState escc;
     OrIRQState escc_orgate;
     SysBusESPState esp;
+    SysBusESPState esp2;
+    OrIRQState esp_irq_orgate;
     Swim swim;
     MacNubusBridge mac_nubus_bridge;
     MacfbNubusState macfb;
@@ -337,9 +354,11 @@ struct Q950MachineState {
     MemoryRegion iotrace;
     MemoryRegion bgtrace;
 
-    /* TurboSCSI pseudo-DMA handshake */
+    /* TurboSCSI pseudo-DMA handshake (one register per SCSI bus) */
     uint32_t turboscsi_ctrl;
+    uint32_t turboscsi_ctrl2;
     int esp_drq;
+    int esp2_drq;
     qemu_irq esp_drq_via2;
 
     /* VIA1 CA1 60Hz tick and CA2 one-second tick */
@@ -735,9 +754,12 @@ static uint64_t q950_turboscsi_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t val;
     int i;
 
-    if ((addr & ~3) == 4) {     /* 0xf9800024 */
+    if ((addr & ~3) == 4) {     /* 0xf9800024: internal bus */
         reg = (m->turboscsi_ctrl & ~TURBOSCSI_DRQ) |
               (m->esp_drq ? TURBOSCSI_DRQ : 0);
+    } else if ((addr & ~3) == 8) {      /* 0xf9800028: external bus */
+        reg = (m->turboscsi_ctrl2 & ~TURBOSCSI_DRQ) |
+              (m->esp2_drq ? TURBOSCSI_DRQ : 0);
     }
 
     /* slice the 32-bit register by byte lane */
@@ -755,6 +777,8 @@ static void q950_turboscsi_write(void *opaque, hwaddr addr, uint64_t val,
 
     if ((addr & ~3) == 4) {
         m->turboscsi_ctrl = val;
+    } else if ((addr & ~3) == 8) {
+        m->turboscsi_ctrl2 = val;
     }
 }
 
@@ -1166,7 +1190,11 @@ static void q950_esp_drq(void *opaque, int n, int level)
 {
     Q950MachineState *m = opaque;
 
-    m->esp_drq = level;
+    if (n == 0) {
+        m->esp_drq = level;
+    } else {
+        m->esp2_drq = level;
+    }
 }
 
 /* unmapped I/O space bus-errors on the real machine; log the probes */
@@ -1486,25 +1514,44 @@ static void q950_egret_process(Q950MachineState *m)
             break;
         case EGRET_CMD_READ_PRAM:
             /*
-             * Trap-dispatcher single-byte read [01 02 addr_hi addr_lo]:
-             * the response is Egret-terminated — /TREQ deasserts after
-             * exactly one data byte, and the trap driver computes the
-             * data length from the bytes received before /TREQ rose
-             * (0x40814a58: received_count - 4).
+             * [01 02 addr_hi addr_lo]: like GET_PRAM this is a STREAM —
+             * the Egret keeps handing over consecutive bytes for as
+             * long as the host keeps clocking SR reads, terminated by
+             * the host (not a fixed device-side length).  Two ROM
+             * consumers rely on this: the interrupt-driven trap
+             * dispatcher (0x40814a58) clocks exactly one byte and
+             * stops (received_count - 4 == 1) — unaffected by
+             * streaming more behind it; but the low-level "read a
+             * PRAM word/longword" helper (ROM 0x40801390/0x408013b0,
+             * reached via trap $A051 -> 0x40815204 -> trap $A092)
+             * clocks 2 or 4 bytes from a SINGLE cmd-2 exchange to read
+             * consecutive PRAM bytes as a 16/32-bit value.  Returning
+             * only one byte left the 2nd..4th bytes as stale stack
+             * content on the caller's side — that stale byte is
+             * exactly what fed the Quadra 950 boot-driver-installer's
+             * ddType mismatch (0xf8 instead of the disk driver's 1):
+             * PRAM[0x76]=0x00 (correct) popped as a word with an
+             * uninitialized 2nd byte instead of the real PRAM[0x77].
              */
             if (n >= 4) {
                 int addr = (c[2] << 8) | c[3];
+                int i;
 
-                if (addr < 4) {
-                    now = v1s->tick_offset +
-                          (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                           / NANOSECONDS_PER_SECOND);
-                    r[4] = now >> ((3 - addr) * 8);
-                } else {
-                    r[4] = v1s->PRAM[addr & 0xff];
+                now = v1s->tick_offset +
+                      (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                       / NANOSECONDS_PER_SECOND);
+                for (i = 0; i < 260; i++) {
+                    int a = addr + i;
+
+                    if (a < 4) {
+                        r[4 + i] = now >> ((3 - a) * 8);
+                    } else {
+                        r[4 + i] = v1s->PRAM[a & 0xff];
+                    }
                 }
-                m->egret_resp_len = 5;
-                q950_log("q950 egret: read 0x%03x -> 0x%02x\n", addr, r[4]);
+                m->egret_resp_len = 4 + 260;
+                q950_log("q950 egret: read 0x%03x -> 0x%02x ...\n",
+                         addr, r[4]);
             }
             break;
         case EGRET_CMD_GET_PRAM:
@@ -2449,7 +2496,19 @@ static void q950_machine_init(MachineState *machine)
     memory_region_add_subregion(&m->macio, SCC_IOP_BASE - IO_BASE,
                                 &m->scc_iop.mem);
 
-    /* SCSI */
+    /* SCSI: two 53C96 buses (internal + external) sharing one IRQ */
+
+    object_initialize_child(OBJECT(machine), "esp_irq_orgate",
+                            &m->esp_irq_orgate, TYPE_OR_IRQ);
+    object_property_set_int(OBJECT(&m->esp_irq_orgate), "num-lines", 2,
+                            &error_fatal);
+    dev = DEVICE(&m->esp_irq_orgate);
+    qdev_realize(dev, NULL, &error_fatal);
+    /* SCSI IRQ is negative edge triggered */
+    qdev_connect_gpio_out(dev, 0,
+                          qemu_irq_invert(
+                              qdev_get_gpio_in(DEVICE(&m->via2),
+                                               VIA2_IRQ_SCSI_BIT)));
 
     object_initialize_child(OBJECT(machine), "esp", &m->esp,
                             TYPE_SYSBUS_ESP);
@@ -2463,11 +2522,8 @@ static void q950_machine_init(MachineState *machine)
 
     sysbus = SYS_BUS_DEVICE(&m->esp);
     sysbus_realize(sysbus, &error_fatal);
-    /* SCSI IRQ is negative edge triggered */
     sysbus_connect_irq(sysbus, 0,
-                       qemu_irq_invert(
-                           qdev_get_gpio_in(DEVICE(&m->via2),
-                                                   VIA2_IRQ_SCSI_BIT)));
+                       qdev_get_gpio_in(DEVICE(&m->esp_irq_orgate), 0));
     /*
      * SCSI DRQ: latched into the DAFB TurboSCSI handshake register
      * (MAC_SCSI_QUADRA2); VIA2 CA2 belongs to the ISM IOP here
@@ -2476,6 +2532,32 @@ static void q950_machine_init(MachineState *machine)
     memory_region_add_subregion(&m->macio, ESP_BASE - IO_BASE,
                                 sysbus_mmio_get_region(sysbus, 0));
     memory_region_add_subregion(&m->macio, ESP_PDMA - IO_BASE,
+                                sysbus_mmio_get_region(sysbus, 1));
+
+    scsi_bus_legacy_handle_cmdline(&esp->bus);
+
+    /*
+     * External SCSI bus (chip 2 at 0x50F0F402, +2 byte lane): the SIM
+     * 4.3 bus-scans it during boot; usually no devices are attached.
+     */
+    object_initialize_child(OBJECT(machine), "esp2", &m->esp2,
+                            TYPE_SYSBUS_ESP);
+    sysbus_esp = SYSBUS_ESP(&m->esp2);
+    esp = &sysbus_esp->esp;
+    esp->dma_memory_read = NULL;
+    esp->dma_memory_write = NULL;
+    esp->dma_opaque = NULL;
+    sysbus_esp->it_shift = 4;
+    esp->dma_enabled = 1;
+
+    sysbus = SYS_BUS_DEVICE(&m->esp2);
+    sysbus_realize(sysbus, &error_fatal);
+    sysbus_connect_irq(sysbus, 0,
+                       qdev_get_gpio_in(DEVICE(&m->esp_irq_orgate), 1));
+    sysbus_connect_irq(sysbus, 1, qemu_allocate_irq(q950_esp_drq, m, 1));
+    memory_region_add_subregion(&m->macio, ESP2_BASE - IO_BASE,
+                                sysbus_mmio_get_region(sysbus, 0));
+    memory_region_add_subregion(&m->macio, ESP2_PDMA - IO_BASE,
                                 sysbus_mmio_get_region(sysbus, 1));
 
     scsi_bus_legacy_handle_cmdline(&esp->bus);
