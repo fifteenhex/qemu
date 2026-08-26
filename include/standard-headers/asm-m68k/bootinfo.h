@@ -64,6 +64,12 @@ struct mem_info {
  *   - seed data    [ `length` bytes, padded to preserve 4-byte struct alignment ]
  */
 #define BI_RNG_SEED		0x0008
+/*
+ * A device tree blob address (uint32_t), consumed by boards whose kernel
+ * has generic-DT machine support (see arch/m68k/kernel/setup_mm.c's
+ * BI_FDT handling).
+ */
+#define BI_FDT			0x0009
 
     /*
      *  Linux/m68k Architectures (BI_MACHTYPE)

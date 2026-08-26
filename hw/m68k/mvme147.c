@@ -49,6 +49,7 @@
 #include "hw/vme/vme.h"
 #include "standard-headers/asm-m68k/bootinfo.h"
 #include "bootinfo.h"
+#include "system/device_tree.h"
 
 #define MVME147_ROM_BANK1    0xff800000
 #define MVME147_ROM_BANK1_SZ (2 * MiB)
@@ -333,6 +334,35 @@ static void mvme147_init(MachineState *machine)
         hwaddr parameters_base;
         hwaddr top_of_ram = machine->ram_size;
         void *param_blob, *param_ptr;
+        uint8_t pcc_reg;
+
+        /*
+         * Neither Linux's DT-based PCC timer driver
+         * (arch/m68k/mvme147/timer.c) nor its legacy platform code
+         * (arch/m68k/mvme147/config.c) ever program the PCC's
+         * interrupt vector base or master interrupt enable bit --
+         * on real hardware those come from 147Bug (or vmelilo/
+         * tftplilo, which unlike this model's -kernel path never
+         * resets the CPU, so whatever 147Bug already configured
+         * stays live). Since we jump straight into the kernel,
+         * poke the same two registers here first: vector base 0x40
+         * so PCC-sourced vectors (e.g. MVME147_PCC_VEC_TIMER1/2,
+         * see hw/misc/mvme147_pcc.c) land at VEC_USER+N, which is
+         * what arch/m68k/kernel/ints.c's intc_user irqdomain and
+         * mvme147.dts's "interrupts-extended = <&intc_user N>"
+         * properties assume; and MINTEN, without which
+         * mvme147_pcc_update_irq() never asserts anything and the
+         * timer tick the kernel relies on for jiffies never arrives
+         * (an infinite stall in calibrate_delay(), not a crash).
+         */
+        pcc_reg = 0x40;
+        address_space_write(&address_space_memory,
+                            MVME147_PCC + MVME147_PCC_INT_VECTOR_BASE,
+                            MEMTXATTRS_UNSPECIFIED, &pcc_reg, 1);
+        pcc_reg = MVME147_PCC_GEN_PURPOSE_CTRL_MINTEN;
+        address_space_write(&address_space_memory,
+                            MVME147_PCC + MVME147_PCC_GEN_PURPOSE_CTRL,
+                            MEMTXATTRS_UNSPECIFIED, &pcc_reg, 1);
 
         kernel_size = load_elf(machine->kernel_filename, NULL, NULL, NULL,
                                &elf_entry, NULL, &high, NULL, ELFDATA2MSB,
@@ -380,6 +410,34 @@ static void mvme147_init(MachineState *machine)
                                 machine->ram_size - initrd_base, &error_fatal);
             BOOTINFO2(param_ptr, BI_RAMDISK, initrd_base, initrd_size);
             top_of_ram = initrd_base;
+        }
+
+        /*
+         * -dtb: load a flattened device tree into RAM (below the initrd,
+         * if any) and hand its address to the kernel via a BI_FDT record.
+         * arch/m68k/kernel/setup_mm.c's m68k_parse_bootinfo() picks this
+         * up in its generic bootinfo scan (the BI_FDT case) regardless of
+         * BI_MACHTYPE, so this doesn't need MACH_GENERIC -- it's how the
+         * DT-bound drivers for this board (e.g. the avme352 VME card) get
+         * their device tree on a machine that also has classic bootinfo
+         * records for everything else.
+         */
+        if (machine->dtb) {
+            int dtb_size;
+            void *dtb_blob = load_device_tree(machine->dtb, &dtb_size);
+            hwaddr dtb_base;
+
+            if (!dtb_blob) {
+                error_report("could not load DTB '%s'", machine->dtb);
+                exit(1);
+            }
+
+            dtb_base = (top_of_ram - dtb_size) & TARGET_PAGE_MASK;
+            rom_add_blob_fixed_as("dtb", dtb_blob, dtb_size, dtb_base, cs->as);
+            g_free(dtb_blob);
+
+            BOOTINFO1(param_ptr, BI_FDT, dtb_base);
+            top_of_ram = dtb_base;
         }
 
         BOOTINFO0(param_ptr, BI_LAST);
