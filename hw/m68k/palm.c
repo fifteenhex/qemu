@@ -63,6 +63,7 @@
 #include "hw/char/dragonball_uart.h"
 #include "hw/display/dragonball_lcdc.h"
 #include "hw/display/sed1376.h"
+#include "hw/display/clie_lcd.h"
 #include "hw/rtc/dragonball_rtc.h"
 #include "hw/input/ads7843.h"
 #include "hw/input/palm_keypad.h"
@@ -73,6 +74,7 @@
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "hw/misc/sony_mshc_stub.h"
+#include "hw/misc/dragonball_sz.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
@@ -154,6 +156,13 @@ typedef struct PalmMachineClass {
     uint16_t kbd_row_gpio[PALM_KEYPAD_ROWS];
     /* SED1376 color LCD controller chip select base, 0 = none */
     hwaddr sed1376_base;
+    /*
+     * Sony CLIE color-HiRes "MediaQ"-class companion LCD controller
+     * (hw/display/clie_lcd.c): video aperture base, 0 = none.  Mutually
+     * exclusive with sed1376_base (only the m515 uses SED1376 here);
+     * the register window sits at clie_lcd_base + CLIE_LCD_REGS_OFFSET.
+     */
+    hwaddr clie_lcd_base;
     bool has_timer2;
     /*
      * Sony CLIE quirks: tie the GPIO lines the Sony HAL polls (see
@@ -162,6 +171,25 @@ typedef struct PalmMachineClass {
      * Sony peripherals on this machine).
      */
     hwaddr ms_stub_base;
+    /* which of the PALM_CLIE_*_GPIO lines this board's HAL needs tied */
+    bool clie_gpio_lcdpwr;
+    bool clie_gpio_dockbtn;
+    bool clie_gpio_msidle;
+    /*
+     * ROM address of the guest HwrSleep routine's entry `linkw`
+     * opcode, neutralised to an early RTS at boot (see the comment in
+     * palm_init() below); 0 = don't patch.  Address is specific to the
+     * exact ROM image each machine loads.
+     */
+    hwaddr hwrsleep_patch_addr;
+    /*
+     * MC68SZ328 "Super VZ" SoC (Sony CLIE PEG-SJ33/NR70V): entirely
+     * different register window (0xFFFE0000, not 0xfffffxxx) and an
+     * enhanced on-chip color LCDC, so this machine takes a separate
+     * bring-up path in palm_init() -- none of the EZ/VZ SCR/PLL/INTC/
+     * GPIO/timer/UART/LCDC blocks are instantiated.
+     */
+    bool is_sz328;
 } PalmMachineClass;
 
 typedef struct PalmMachineState {
@@ -248,6 +276,57 @@ static void palm_init(MachineState *machine)
         exit(1);
     }
 
+    /*
+     * CLIE: keep the digitizer alive through the Setup wizard.
+     *
+     * A second or two after boot the Sony HAL calls HwrSleep to power the
+     * unit down (an auto-off / battery-gauge decision the Sony firmware
+     * makes that the plain Palm-V HAL does not).  HwrSleep runs PenSleep,
+     * which masks the pen interrupt (INTC IRQ5) and reconfigures the
+     * /PENIRQ pin (port F bit 1) to an output — the digitizer is dead
+     * after that, the LCD keeps showing the last "Setup 1 of 4" frame, and
+     * no screen tap can wake the device (HwrSleep's wake mask is buttons
+     * only), so Setup never advances.  This is the exact "stuck at the
+     * Welcome screen" symptom the S300 PoC sessions chased (see
+     * CLIE-POC-NOTES.md Session 4).
+     *
+     * With HwrSleep neutralised (patched to an early RTS) the unit never
+     * powers the digitizer down; Setup, the digitizer calibration and the
+     * Basic-Skills tutorial can all be tapped through to the launcher.
+     * HwrSleep's entry is a `linkw %fp,#-N` (opcode 0x4e56); guard on that
+     * opcode so a mismatched address (wrong ROM revision) is left
+     * untouched instead of corrupting something else.
+     * pmc->hwrsleep_patch_addr is 0 for the Palm V/Vx/m500/m515 machines,
+     * which never take this path and stay bit-exact.
+     */
+    if (pmc->hwrsleep_patch_addr) {
+        uint8_t *rom = memory_region_get_ram_ptr(&pms->rom);
+        uint32_t off = pmc->hwrsleep_patch_addr - pmc->rom_base;
+
+        if (off + 1 < pmc->rom_size &&
+            rom[off] == 0x4e && rom[off + 1] == 0x56) {   /* linkw */
+            rom[off] = 0x4e;
+            rom[off + 1] = 0x75;                          /* rts */
+        }
+    }
+
+    if (pmc->is_sz328) {
+        /*
+         * MC68SZ328 "Super VZ": the whole on-chip register file moves to
+         * 0xFFFE0000 with a completely different layout (Cloudpilot's
+         * EmRegsSZ), so none of the EZ/VZ 0xfffffxxx peripheral models
+         * apply.  Instantiate the single SZ SoC + enhanced-LCDC device
+         * and stop -- the SZ INTC/timer/UART/GPIO dynamic behaviour is
+         * future work (see CLIE-POC-NOTES.md).  ROM/RAM/CPU/reset above
+         * are SoC-agnostic and shared.
+         */
+        DeviceState *sz_dev = qdev_new(TYPE_DRAGONBALL_SZ);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sz_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sz_dev), 0, DRAGONBALL_SZ_BASE);
+        return;
+    }
+
     /* System control / chip ID */
     scr_dev = qdev_new(TYPE_DRAGONBALL_SCR);
     qdev_prop_set_uint8(scr_dev, "chip-id", pmc->chip_id);
@@ -276,10 +355,22 @@ static void palm_init(MachineState *machine)
     qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_POWERFAIL_GPIO));
 
     if (pmc->ms_stub_base) {
-        /* Sony CLIE GPIO quirks -- see PALM_CLIE_*_GPIO above */
-        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_LCDPWR_GPIO));
-        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_DOCKBTN_GPIO));
-        qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_MSIDLE_GPIO));
+        /*
+         * Sony CLIE GPIO quirks -- see PALM_CLIE_*_GPIO above.  Which
+         * lines a given board actually needs tied differs by Sony HAL
+         * class (traced per-machine; see each machine_class_init()'s
+         * comment), hence the three individual flags rather than tying
+         * all three unconditionally.
+         */
+        if (pmc->clie_gpio_lcdpwr) {
+            qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_LCDPWR_GPIO));
+        }
+        if (pmc->clie_gpio_dockbtn) {
+            qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_DOCKBTN_GPIO));
+        }
+        if (pmc->clie_gpio_msidle) {
+            qemu_irq_raise(qdev_get_gpio_in(gpio_dev, PALM_CLIE_MSIDLE_GPIO));
+        }
 
         /* Memory Stick host controller: "no card" stub (Phase 1) */
         DeviceState *ms_dev = qdev_new(TYPE_SONY_MSHC_STUB);
@@ -386,6 +477,18 @@ static void palm_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(sed_dev), 0, pmc->sed1376_base);
         sysbus_mmio_map(SYS_BUS_DEVICE(sed_dev), 1,
                         pmc->sed1376_base + SED1376_VMEM_OFFSET);
+    } else if (pmc->clie_lcd_base) {
+        /*
+         * Color HiRes panel on a Sony "MediaQ"-class companion
+         * controller (hw/display/clie_lcd.c); the on-chip LCDC is
+         * unused on those devices, same rationale as SED1376 above.
+         */
+        DeviceState *clie_lcd_dev = qdev_new(TYPE_CLIE_LCD);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(clie_lcd_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(clie_lcd_dev), 0, pmc->clie_lcd_base);
+        sysbus_mmio_map(SYS_BUS_DEVICE(clie_lcd_dev), 1,
+                        pmc->clie_lcd_base + CLIE_LCD_REGS_OFFSET);
     } else {
         /* LCDC: 160x160 panel */
         lcdc_dev = qdev_new(TYPE_DRAGONBALL_LCDC);
@@ -671,6 +774,131 @@ static void clies300_machine_class_init(ObjectClass *oc, const void *data)
                       PALM_GPIO('F', 6));
     /* Memory Stick host controller (MB86189) chip select */
     pmc->ms_stub_base = 0x10200000;
+    /* HwrSleep entry (a `linkw %fp,#-60`) in this ROM -- see palm_init(). */
+    pmc->hwrsleep_patch_addr = 0x10076bda;
+    /* GPIO ties from the shared EmSonyXzWithSlot<> base HAL + the EZ-
+     * family "LCD powered" quirk EmRegsEzPegS300 adds on top (see
+     * PALM_CLIE_*_GPIO above). */
+    pmc->clie_gpio_lcdpwr = true;
+    pmc->clie_gpio_dockbtn = true;
+    pmc->clie_gpio_msidle = true;
+}
+
+/*
+ * Sony CLIE PEG-T600C -- a VZ328 color-HiRes CLIE (see CLIE-RESEARCH.md
+ * sec 2.1/4.2 and CLIE-POC-NOTES.md).  MC68VZ328 "DragonBall VZ" @
+ * 33MHz, 320x320 color via a companion "MediaQ" MQ11xx-class LCD
+ * controller (hw/display/clie_lcd.c).
+ *
+ * NB: this machine was first added (Session 5) as "clie-sj33" on the
+ * mistaken belief -- from CLIE-RESEARCH.md's `≈`-flagged, unconfirmed
+ * SJ33 taxonomy row -- that the PEG-SJ33 is a VZ328.  It is not: the
+ * real PEG-SJ33 is a Motorola DragonBall *Super VZ* (MC68SZ328) @
+ * 66MHz whose color comes from an *on-chip* enhanced LCD controller,
+ * not an external MediaQ (see clie-sj33 below, which models that SoC).
+ * The VZ328 + MediaQ + T600C-ROM machine built here is a faithful
+ * PEG-T600C, so it keeps that name; only the SJ33 label was wrong.
+ *
+ * ROM: PEG-T600C English (archive.org item jp.sony.clie, zip md5
+ * 2a78d3b44070d5acd067041c7c3d66d4).  The ROM self-identifies as board
+ * "Modena" (string "sonymdna"); Cloudpilot's EmDevice.cpp
+ * `case kDevicePEGT600:` instantiates `EmRegsVzPegModena` + an
+ * `EmRegsMediaQ11xx` companion controller + `EmRegsFMSound`.
+ *
+ * ROM layout (verified by header inspection,
+ * Sony-CLIE-PEG-T600C-en.rom): whole-flash dump, small ROM at file 0
+ * (SP 0x316, PC 0x100002a2), big-ROM card header at +0x8000 (SP
+ * 0x488a, PC 0x1000c796) -- the same whole-flash shape as clie-s300/
+ * T400 (rom_load_offset=0, bigrom_offset=0x8000), not the m500/m515
+ * small-ROM-at-file-offset-0x10000 shape palmm500_machine_class_init()
+ * otherwise sets up.
+ */
+static void cliet600c_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    palmm500_machine_class_init(oc, data);
+    mc->desc = "Sony CLIE PEG-T600C (MC68VZ328, 320x320 MediaQ color)";
+    mc->default_ram_size = 16 * MiB;
+    pmc->rom_base = 0x10000000;
+    pmc->rom_size = 4 * MiB;
+    pmc->rom_load_offset = 0;
+    pmc->bigrom_offset = 0x8000;
+    /*
+     * Color HiRes MediaQ controller: video aperture at T_BASE,
+     * registers at T_BASE + CLIE_LCD_REGS_OFFSET -- fixed constants
+     * for every MediaQ-equipped Sony VZ328 CLIE per Cloudpilot's
+     * EmRegsMediaQ11xx.h (T_BASE/MMIO_BASE); overrides the m500/m515
+     * SD-card/SED1376 defaults inherited above.
+     */
+    pmc->sed1376_base = 0;
+    pmc->clie_lcd_base = 0x1f000000;
+    /*
+     * Memory Stick host controller (MB86189): base per Cloudpilot's
+     * EmDevice.cpp kDevicePEGT600 case.
+     */
+    pmc->ms_stub_base = 0x10800000;
+    /*
+     * GPIO ties: EmRegsVzPegModena::GetPortInternalValue only forces
+     * dock-button + PowerFail (the latter is already the generic
+     * PALM_POWERFAIL_GPIO tie every Palm machine gets); it does *not*
+     * force the EZ-family "LCD powered" bit (that force is present but
+     * explicitly commented out in the Modena source -- a VZ-family
+     * quirk, not applicable here) or explicitly re-derive the MS-idle
+     * bit itself (inherited from the shared EmSonyXzWithSlot<> base
+     * class the S300 quirk above was also traced from, so still tied).
+     */
+    pmc->clie_gpio_lcdpwr = false;
+    pmc->clie_gpio_dockbtn = true;
+    pmc->clie_gpio_msidle = true;
+    /*
+     * HwrSleep patch: left at 0.  Unlike the S300, the T600C
+     * demonstrably keeps *drawing* into MediaQ video memory well past
+     * boot (traced this session: real 8bpp framebuffer content, not a
+     * frozen last frame), so it is not auto-sleeping the way the S300
+     * did -- no HwrSleep neutralise is needed to keep the UI live.
+     */
+    pmc->hwrsleep_patch_addr = 0;
+}
+
+/*
+ * Sony CLIE PEG-SJ33 -- the real device.  MC68SZ328 "DragonBall Super
+ * VZ" @ 66MHz, 16MB RAM, 320x320 16-bit color from the SoC's *on-chip*
+ * enhanced TFT LCD controller (there is no external MediaQ here -- that
+ * was the T600C).  This is the "Tier C" SoC CLIE-RESEARCH.md sec 4.1
+ * scoped as not-yet-modelled; see hw/misc/dragonball_sz.c.
+ *
+ * ROM: no PEG-SJ33 firmware dump is obtainable (see clie-t600c above
+ * and CLIE-POC-NOTES.md), so this uses the PEG-NR70V ROM -- the *same*
+ * MC68SZ328 SoC (halID `sonyrdwd`, confirmed in CLIE-RESEARCH.md sec
+ * 7.2), fetched from the PalmDB archive.org mirror.  The NR70V is a
+ * 320x480 flip model vs the SJ33's 320x320, but it exercises the exact
+ * same SZ328 SoC bring-up + enhanced on-chip LCDC, which is the point.
+ *
+ * ROM layout (CLIE-RESEARCH.md sec 7.2, re-verified this session): 8MB
+ * whole-flash dump, small ROM reset vectors at file 0 (PC 0x100002a2),
+ * big-ROM card header at +0x10000 (bigROMOffset 0x10010000) -- so
+ * rom_load_offset=0, bigrom_offset=0x10000, base 0x10000000.
+ */
+static void cliesj33_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PalmMachineClass *pmc = PALM_MACHINE_CLASS(oc);
+
+    mc->desc = "Sony CLIE PEG-SJ33 (MC68SZ328 Super VZ, on-chip color LCDC)";
+    mc->default_ram_size = 16 * MiB;
+
+    pmc->rom_base = 0x10000000;
+    pmc->rom_size = 8 * MiB;
+    pmc->rom_load_offset = 0;
+    pmc->bigrom_offset = 0x10000;
+    /* 66MHz CPU clock (informational; the SZ timer model is future work) */
+    pmc->sysclk = 2 * VZ_SYSCLK;
+    pmc->chip_id = 0x56;
+    pmc->mask_id = 0x01;
+    pmc->gpio_ports = 10;
+    pmc->is_sz328 = true;
 }
 
 static const TypeInfo palm_machine_types[] = {
@@ -716,6 +944,16 @@ static const TypeInfo palm_machine_types[] = {
         .name          = MACHINE_TYPE_NAME("clie-s300"),
         .parent        = TYPE_PALM_MACHINE,
         .class_init    = clies300_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("clie-t600c"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = cliet600c_machine_class_init,
+    },
+    {
+        .name          = MACHINE_TYPE_NAME("clie-sj33"),
+        .parent        = TYPE_PALM_MACHINE,
+        .class_init    = cliesj33_machine_class_init,
     },
 };
 

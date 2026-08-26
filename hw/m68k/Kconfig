@@ -211,6 +211,7 @@ config PALM
     select DRAGONBALL_LCDC
     select DRAGONBALL_RTC
     select SED1376
+    select CLIE_LCD
     select ADS7843
     select PALM_KEYPAD
     select DRAGONBALL_PWM
@@ -218,6 +219,7 @@ config PALM
     select SSI_SD
     select SD
     select SONY_MSHC_STUB
+    select DRAGONBALL_SZ
 
 config SUN3
     bool
