@@ -542,7 +542,15 @@ static void q630_fb_track_mode(Q630FbState *s)
     right = lduw_be_phys(&address_space_memory, pm + 12);
     pixsz = lduw_be_phys(&address_space_memory, pm + 32);
 
-    if ((base >> 20) != (Q630_VRAM_BASE >> 20)) {
+    /*
+     * The PixMap baseAddr is either the physical VRAM window
+     * (0xF90xxxxx, used by the ROM startup UI) or the Slot-Manager
+     * logical window 0x519xxxxx that MacOS's page tables map onto the
+     * VRAM (used once the ROM video driver publishes the real mode,
+     * e.g. the 1152x870 8bpp desktop of the 32-bit boot).  Both reduce
+     * to the same VRAM offset below.
+     */
+    if ((base >> 20) != (Q630_VRAM_BASE >> 20) && (base >> 20) != 0x519) {
         return;                 /* not pointing at VRAM (yet) */
     }
     width = (int16_t)right - (int16_t)left;
@@ -1208,6 +1216,31 @@ static void q630_cuda_timer_cb(void *opaque)
     qemu_set_irq(irq, 1);
 }
 
+/*
+ * Keep the ROM's in-RAM XPRAM mirror coherent for the addressing-mode
+ * byte 0x8A.  The ROM latches that byte into lowmem 0x1EFC via
+ * _ReadXPRam (0x4080cc60), which is served from a 256-byte cache at
+ * [lowmem 0xDE0]+102 — but the cache is initialised from a ROM default
+ * template (0x8A = 0, "24-bit"), the ROM's own direct Cuda reads of
+ * 0x8A never update it, and the cache's Cuda sync only reaches 0x8A
+ * *after* the [0x644] checkpoint at 0x408001e0 has latched the stale
+ * template value, leaving the fatal 24-bit Translate24To32 vector
+ * installed (see CUDA_CMD_GET_PRAM below).  Refresh the cached copy on
+ * every PRAM exchange once the driver struct exists, so the refresh
+ * immediately before the checkpoint sees the true value — as it would
+ * on a machine whose previous boot had written it back.
+ */
+static void q630_cuda_sync_xpram_cache(MOS6522Q630State *v1s)
+{
+    hwaddr xpram_cache = ldl_be_phys(&address_space_memory, 0xde0);
+
+    if (xpram_cache >= 0x1000 && xpram_cache < 0x10000000 - 0x200 &&
+        !(xpram_cache & 1)) {
+        stb_phys(&address_space_memory, xpram_cache + 102 + 0x8a,
+                 v1s->PRAM[0x8a] | 0x05);
+    }
+}
+
 static void q630_cuda_process(Q630MachineState *m)
 {
     ADBBusState *adb_bus = &m->via1.adb_bus;
@@ -1308,7 +1341,39 @@ static void q630_cuda_process(Q630MachineState *m)
             break;
         case CUDA_CMD_GET_PRAM:
             if (n >= 4) {
-                r[3] = v1s->PRAM[((c[2] << 8) | c[3]) & 0xff];
+                uint8_t pram_addr = ((c[2] << 8) | c[3]) & 0xff;
+
+                r[3] = v1s->PRAM[pram_addr];
+                /*
+                 * XPRAM 0x8A is the MacOS addressing-mode byte (bit 0 =
+                 * "boot 32-bit", bit 2 = "32-bit desired"; 0x05 = 32-bit).
+                 * The Q630 ROM is 32-bit-ONLY (it hardcodes MMU32Bit
+                 * lowmem 0xCB2 = 1 at 0x40803e14 with no PRAM input), but
+                 * it still keys its pointer-translation vector [0x644] off
+                 * this byte (read into lowmem 0x1EFC at 0x4080cc64, tested
+                 * at 0x408001e0): bit 0 clear leaves [0x644] = the 24-bit
+                 * Translate24To32 routine 0x4082F090, which QuickDraw's
+                 * StdBits (0x40836B60) applies unconditionally to its two
+                 * mask-region pointer params.  Any RAM pointer with bit 23
+                 * set (8-16 MiB, e.g. the boot stack at BufPtr/2 on a
+                 * 32 MiB machine) is then "translated" 0x00FFxxxx ->
+                 * 0x500Fxxxx (the F108 I/O map) and the dereference is a
+                 * guest MMU fault -> Sad Mac 0000000F/00000001 (dsBusError).
+                 * A real Q630's battery-backed Cuda carries 0x8A = 0x05
+                 * from the System's first boot; model that by forcing the
+                 * 32-bit bits on reads regardless of wipes/rebuild order,
+                 * so [0x644] becomes the 32-bit no-op (rts 0x4080047E) and
+                 * pointers pass through unmodified, matching a real 32-bit
+                 * boot.  (lc475 is different: its ROM derives the WHOLE
+                 * mode from this byte, so 0 there means a consistent
+                 * 24-bit boot with MemTop = 8 MiB and the translator is
+                 * correct; forcing 0x05 is only right for 32-bit-only
+                 * boxes like the 630.)
+                 */
+                if (pram_addr == 0x8a) {
+                    r[3] |= 0x05;
+                }
+                q630_cuda_sync_xpram_cache(v1s);
                 m->cuda_resp_len = 4;
                 q630_cuda_log("q630 cuda: get pram 0x%02x -> 0x%02x\n",
                               c[3], r[3]);
@@ -1316,9 +1381,20 @@ static void q630_cuda_process(Q630MachineState *m)
             break;
         case CUDA_CMD_SET_PRAM:
             if (n >= 5) {
-                v1s->PRAM[((c[2] << 8) | c[3]) & 0xff] = c[4];
-                q630_cuda_log("q630 cuda: set pram 0x%02x <- 0x%02x\n",
-                              c[3], c[4]);
+                uint8_t pram_addr = ((c[2] << 8) | c[3]) & 0xff;
+                int i;
+
+                /*
+                 * Real Cuda SET_PRAM writes a block of consecutive bytes;
+                 * the OS's XPRAM sync uses 4-byte blocks (cmd len 8).
+                 * Storing only the first byte silently dropped the rest.
+                 */
+                for (i = 0; i < n - 4; i++) {
+                    v1s->PRAM[(pram_addr + i) & 0xff] = c[4 + i];
+                }
+                q630_cuda_sync_xpram_cache(v1s);
+                q630_cuda_log("q630 cuda: set pram 0x%02x <- 0x%02x (x%d)\n",
+                              c[3], c[4], n - 4);
             }
             break;
         default:
@@ -1999,17 +2075,31 @@ static void q630_machine_init(MachineState *machine)
         m->via1.tick_offset = (uint32_t)mktimegm(&tm) + RTC_OFFSET;
     }
     /*
-     * Seed XPRAM with the validity signature ('NuMc' at 0x0C) and the
-     * 32-bit-addressing flag so the OS does not rebuild an "invalid"
-     * PRAM from scratch on every boot.
+     * Seed the Cuda PRAM like a battery-backed part on a machine that has
+     * booted MacOS before (UNLIKE lc475, which must leave PRAM invalid so
+     * its ROM rebuilds a 24-bit-consistent image — see LC475-NOTES #13):
+     *
+     * - 'NuMc' at 0x0C: XPRAM validity signature.  With the signature
+     *   missing, the ROM zero-wipes its in-RAM XPRAM cache (loaded from
+     *   Cuda via 256 GET_PRAMs), and _ReadXPRam serves the CACHE, so the
+     *   GET_PRAM-level 0x8A read hook alone cannot make the 32-bit flag
+     *   stick.
+     * - 0x8A = 0x05: 32-bit addressing (bit 0 boot-32bit, bit 2 32-bit
+     *   desired).  REQUIRED on Q630: the ROM hardcodes MMU32Bit=1 but
+     *   still keys the [0x644] pointer-translation vector off this byte;
+     *   0 leaves the 24-bit Translate24To32 live and QuickDraw corrupts
+     *   any bit-23 RAM pointer (0x00FFxxxx -> 0x500Fxxxx F108 I/O) ->
+     *   dsBusError Sad Mac.  See the CUDA_CMD_GET_PRAM comment.
+     * - OSDefault long at 0xF8 = 1 (MacOS): the boot scan matches the
+     *   DDM driver ddType against this; a "valid" PRAM with OSDefault 0
+     *   rejects every bootable disk (the lc475 pitfall).
      */
-    /*
-     * Leave PRAM invalid (no 'NuMc' signature): the ROM then rebuilds it
-     * with proper defaults, including the OSDefault byte (XPRAM 0xF9)
-     * that the boot scan matches against the disk's DDM ddType — seeding
-     * a "valid" but zeroed PRAM makes the ROM search for ddType 0 and
-     * reject every bootable disk.
-     */
+    m->via1.PRAM[0x0c] = 'N';
+    m->via1.PRAM[0x0d] = 'u';
+    m->via1.PRAM[0x0e] = 'M';
+    m->via1.PRAM[0x0f] = 'c';
+    m->via1.PRAM[0x8a] = 0x05;
+    m->via1.PRAM[0xfb] = 0x01;
     m->via1.machine = m;
     m->cuda_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, q630_cuda_timer_cb, m);
 
