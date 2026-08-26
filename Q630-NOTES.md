@@ -60,6 +60,13 @@ wiring, same convention that pata_platform + ata_sff expect.
 
 ## Status log
 
+- [x] **DONE: MacOS 7.5.3 boots to the Finder desktop** (session N+6;
+      commit "quadra630: boot MacOS 7.5.3 to the Finder"): SCSI boot
+      scan accepts the disk, Welcome/extensions run, Finder desktop
+      with menu bar / Control Strip / mounted OpenRetroSCSI volume;
+      the "not shut down properly" dialog is dismissed with a working
+      ADB keyboard (sendkey ret), and the ADB mouse tracks (cursor
+      moves, clicks land) via the Valkyrie VBL slot interrupt.
 - [x] baseline m68k-only build OK
 - [x] quadra630.c (lc475 copy + IDE), Kconfig QUADRA630 (+IDE_MMIO),
       meson entry; builds clean
@@ -77,18 +84,48 @@ wiring, same convention that pata_platform + ata_sff expect.
 - [x] 24-bit-mode support: ROM window at phys 0x00800000 (enabled by
       PrimeTime +0x200 write) + RAM mirror at 0x80000000 (tagged
       DCE/handle pointers); .Sony DCE now resolves
-- [ ] **BLOCKED: Sad Mac `0000000F / 00000001`.  RECLASSIFIED in
+- [x] (was BLOCKED) Sad Mac `0000000F / 00000001`: RECLASSIFIED in
       session N+3 (record/replay + gdb): this is NOT dsLoadErr(15) —
       it is dsBusError(1), a guest CPU/MMU page fault dereferencing a
       corrupt graphics pointer `0x500FB964` at ROM PC 0x40837310.  The
       top line `0000000F` is a HARDCODED boot-stage class (`moveq
       #15,d7` when lowmem 0x2BA==0), NOT the error code; the real code
       is the BOTTOM line = DSErrCode(0xAF0) = 1 = dsBusError.  See the
-      "Session N+3" block below for the full derivation.**  Does NOT
-      reach the Finder.  Video renders the Sad Mac fine (framebuffer
-      works).  IDE controller present and enumerates an attached disk.
+      "Session N+3" block below for the full derivation.  FIXED in
+      session N+5 (committed 3a547dd369): XPRAM 0x8A forced to 0x05 +
+      cache sync -> 32-bit no-op translator -> boots past the Sad Mac.
+      Video renders fine.  IDE controller present and enumerates an
+      attached disk.
 
-## FINAL STATE (honest)
+## FINAL STATE: MacOS 7.5.3 Finder, working input (sessions N+5/N+6)
+
+`-M quadra630` now boots MacOS 7.5.3 off the SCSI disk all the way to
+an interactive Finder desktop (1152x870).  Boot command = the one under
+"Build/test commands"; ~50 s wall under TCG; the "computer may not have
+been shut down properly" dialog appears (the HFS volume dirty bit AND
+the OS's own shutdown bookkeeping both re-trigger it under -snapshot;
+patching the MDB drAtrb bit 8 alone does NOT suppress it) and is
+dismissed with `sendkey ret` over the monitor — the ADB keyboard works.
+The ADB mouse tracks and clicks (RawMouse/MTemp follow, cursor redraws,
+clicks change window focus / land on the desktop).
+
+The four fixes that took it from "gray desktop + flashing ? " to this
+are documented as session N+6 below; the dsBusError fix (XPRAM 0x8A /
+translator vector) from session N+5 is in commit 3a547dd369.
+
+`-drive file=/tmp/ide0.img,format=raw,if=ide` attaches an ide-hd to the
+F108 mmio-ide bus and the machine boots to the Finder with it present,
+no interrupt storm (the slot-D IDE pending bit stays quiet); MacOS
+7.5.3 itself shows no "initialize this disk" dialog for the blank IDE
+disk — this System has no IDE support pieces (it was built for
+SCSI-only lc475-class machines), so guest-side IDE remains unverified
+beyond "the OS is undisturbed by the controller".
+
+`-M lc475` re-verified after all changes (same disk, boots to Finder,
+keyboard dismisses the same dialog).  All changes are confined to
+hw/m68k/quadra630.c.
+
+## OLD final state (pre-N+5, historical)
 
 `-M quadra630` runs the ROM through: machine identification (box 0x57 =
 Quadra 630), full real-Cuda exchange + PRAM rebuild, MEMCjr/F108 RAM
@@ -724,6 +761,125 @@ Most-promising next lever: disassemble those routines to find the
 selective `0x50F00000` merge / un-stripped 24-bit tag on those two
 entries; cross-check against the Q630 addressing-mode/PRAM setup vs
 lc475 (hypothesis 1, 24-bit-dirty master pointers).
+
+### Session N+6: flashing "?" -> Finder with working keyboard/mouse (four fixes)
+
+Startpoint: gray desktop + centered boot-disk icon flashing "?"
+(ROM scanning for a bootable disk and rejecting the SCSI volume).
+Endpoint: interactive Finder.  All fixes in hw/m68k/quadra630.c,
+commit "quadra630: boot MacOS 7.5.3 to the Finder".
+
+1. **Boot scan rejected the disk: expected ddType latched from XPRAM
+   0x77, not 0xF8-0xFB.**  Symptom: infinite lba-0 READ(6) loop on
+   targets 0 (our HD) and 2 (auto scsi-cd), never reads lba 64
+   (`-trace scsi_req_parsed_lba`).  The scan (0x40807224, entered via
+   the per-SCSI-id loop 0x408071FC from 0x40801350) compares each DDM
+   driver entry's ddType against `fp@(-10)`, latched ONCE from d3
+   before the flashing-"?" loop at 0x40801430: trap **A07D** =
+   _ReadXPRam 4 bytes @0x78 (default startup device, d3/d4) then trap
+   **A084** = _ReadXPRam 2 bytes @**0x76** (handler 0x408013B0); the
+   expected ddType is the LOW byte = **XPRAM 0x77**.  The lc475 note
+   #13 ("OSDefault low byte at 0xF8-0xFB") is that ROM's layout — on
+   THIS ROM the seeded PRAM[0xFB]=1 never reached the compare, and the
+   template-wiped XPRAM cache (see the 0x8A saga) served 0 -> the scan
+   demanded ddType 0 and rejected every disk.  FIX: seed PRAM[0x77]=1
+   and extend q630_cuda_sync_xpram_cache to refresh cache bytes
+   0x76/0x77 (ddType byte forced >=1).  After this the disk is
+   accepted, the driver loads from lba 64 and MacOS boots to the
+   Finder-stage dialog.  NOTE the latch is one-shot: the cache value
+   must be right BEFORE the scan starts (the sync-on-every-PRAM-
+   exchange hack achieves that; a mid-scan fix does nothing).
+2. **ADB dead at the Finder, part 1 — Listen/Flush ACKed as
+   "timeout".**  Our explicit-ADB response builder set flags 0x02 for
+   ANY zero-length adb_request result; MacOS's ADB Manager reads that
+   as a dead device on its Flush/Listen-R3 setup commands.  Only a
+   TALK ((cmd & 0xC) == 0xC) with no data is a real ADB timeout.
+3. **ADB dead at the Finder, part 2 — unsolicited packets need a PAD
+   byte.**  The OS uses the ROM's int-driven Cuda driver (0x408A9BB4/
+   0x408A9C3A): it stores the FIRST SR byte of any Cuda-initiated
+   session at buffer[0] and parses the packet from buffer[1] (type at
+   [1], flags at [2], cmd at [3]) — on real HW that first read is
+   stale SR content.  Host-initiated responses get this pad naturally
+   (SR still holds the last command-echo byte when the read session
+   opens), which is why they always parsed; our unsol path preloaded
+   resp[0] (the type) into SR, so the flags byte 0x40 landed where the
+   type belongs and EVERY autopolled packet was dropped at the
+   dispatch (0x408A9DB8 -> type 0x40 -> drop at 0x408A9E4A) — fully
+   read ("response complete" in the log), service routines never
+   called, nothing in the event queue (0x14A).  FIX: prepend a 0x00
+   pad to unsol packets (s->sr = pad, packet from resp[1]).
+   Diagnosis chain worth keeping: ADBBase [0xCF8] device table has
+   the service routines (keyboard RAM 0x857CA, mouse ROM 0x408B6582);
+   dispatch completion for unsol is the record at driverstruct[0xDE0]
+   +52 with proc at +16 (0x408B2FDC) -> ADB manager 0x4080A494.
+4. **Mouse cursor frozen, part 1 — stale trailing byte.**  After the
+   pad fix the mouse service routine ran but each packet gained ONE
+   trailing stale byte (the driver's final SR interrupt stores the SR
+   before noticing /TREQ deasserted): 2-byte classic mouse data became
+   count 3 = extended-mouse format, dx inflated/sign lost.  FIX: for
+   unsol sessions deassert /TREQ WITH the last fed byte (the driver
+   detects end-of-packet via PB TIP|TACK|/TREQ == 0x38 right after
+   storing each byte, 0x408A9CAE); host-initiated responses keep the
+   late deassert + final int the polled ROM drivers need
+   (m->cuda_unsol flag).  A 0x00 pad-byte hack instead breaks negative
+   deltas (extended format sign lives in the extension byte).
+5. **Mouse cursor frozen, part 2 — no video VBL interrupt, jCrsrTask
+   never ran.**  The mouse service routine only ACCUMULATES deltas in
+   the CursorDevice record (+112/116/120/124 of its data area); the
+   coupler into RawMouse/MTemp is **jCrsrTask [0x8EE]**, run from the
+   internal-video slot VBL.  On the Q630 the ROM's slot ISR
+   (0x4088BC2C, chained from the VIA2 CA1 handler via [0xD74], a1 =
+   [0xCEC] = VIA2 base) merges VIA2 PA bits 0/5 with the **F108
+   register 0x50F1A101**: bits 2-5 (bits 2-3 gated by enables in bits
+   0-1) >>1 -> pending bits 1-4 = slots A-D (our IDE flag bit 5 ->
+   slot D), and **bit 6 -> pending 0x40 -> slot table 0x40806F14
+   entry 0x06 = pseudo-slot 0 = internal video**.  The slot-0 SInt
+   handler (RAM 0xD8A70, installed by the video driver) clears the
+   Valkyrie VBL status (+0x10C), waits for +0x108 bit 2 to drop, and
+   runs the slot-0 queue -> jCrsrTask -> cursor moves.  FIX: bit 6 of
+   ifr reads = (valkyrie status bit 2) AND (valkyrie +0x104 enable bit
+   2, byte 0x107); 60 Hz tick + status-clear/enable writes recompute
+   the shared VIA2 CA1 line (OR of IDE and VBL sources).  The
+   internally stored macide-style "IDE irq enable" bit 6 must NOT leak
+   into reads: before the video driver installs the slot-0 handler an
+   empty slot queue on interrupt is a SysError (walker 0x40806F10
+   returns 51 -> 0x40806EEA = _SysError).
+6. Also fixed on the way: **GET_SET_IIC (pseudo 0x22)** now latches
+   writes into a per-device register store and answers reads from it
+   (device 0xDE/0xDF regs 0x02/0x0D observed, plus a bare 0x41 probe);
+   the OS Cuda driver write-verifies these and previously retried in a
+   loop (it settles by itself, was not the input blocker, but the
+   store ends the retry churn).  And **SET_PRAM now stores all n-4
+   data bytes** (the OS syncs XPRAM in 4-byte blocks; only byte 0 was
+   kept before) — part of the N+5 commit.
+
+**Shutdown-warning dialog**: appears every boot under -snapshot; both
+the HFS dirty bit (MDB drAtrb bit 8 — patching it on a copy did NOT
+suppress the dialog) and OS-side state are involved; not worth chasing
+since the working keyboard dismisses it (`sendkey ret`).
+
+**Verification pointers**: event queue QHdr at 0x14A (a lone stale
+diskEvt parks at qHead when input is dead); RawMouse/MTemp 0x828/0x82C;
+ADB table [0xCF8]; mouse accumulators = mouse service data area
++112..127.
+
+**Session pitfalls (new)**:
+- gdb-multiarch `-batch` treats `continue` as async against QEMU's
+  gdbstub: the script continues past it and dies/detaches while the
+  target runs.  Driving gdb through a FIFO from a SINGLE bash call
+  (spawn gdb < fifo, exec 3>fifo, echo commands with sleeps) works;
+  fd redirections do not survive across separate tool calls.
+- `-trace esp_*` produced a 10 GB trace and filled /tmp; deleted-but-
+  open trace files keep consuming tmpfs until the qemu holding them
+  dies (lsof +L1 /tmp).  Kill stale qemus BY PID before deleting their
+  logs.  When /tmp is full the monitor `screendump` can still write to
+  a path under /workspace, and command output can be routed to a file
+  and Read back.
+- `pgrep -f | head -1` grabs the oldest matching PID — after several
+  launches that is a STALE qemu, not the new one; the kills then hit
+  the wrong process and trace-writing zombies pile up.  Filter by
+  `ps -o comm=` == qemu-system-m68 and take the newest, or better keep
+  the setsid+$! discipline.
 
 ## Q630 ROM (06684214) findings
 

@@ -150,6 +150,7 @@
 #define CUDA_CMD_GET_PRAM       0x07
 #define CUDA_CMD_SET_TIME       0x09
 #define CUDA_CMD_SET_PRAM       0x0c
+#define CUDA_CMD_GET_SET_IIC    0x22
 
 /* VIA returns time offset from Jan 1, 1904, not 1970 */
 #define RTC_OFFSET 2082844800
@@ -728,12 +729,23 @@ struct Q630MachineState {
     int cuda_resp_idx;
     bool cuda_session;
     bool cuda_no_resp;
+    /* current response is a Cuda-initiated (autopoll) packet */
+    bool cuda_unsol;
     /*
      * Early-ROM polled sync exchange: session opened by asserting TACK
      * alone (TIP left high); the Cuda acks by asserting /TREQ for the
      * duration of the session (0x40885718..0x4088578a in ROM 06684214).
      */
     bool cuda_sync;
+
+    /*
+     * Cuda GET_SET_IIC (pseudo 0x22) backing store: MacOS's Cuda driver
+     * write-then-read-verifies I2C device registers (device 0x6F on the
+     * Q630); a data-less generic ACK makes it retry forever, and the
+     * permanently-pending request starves unsolicited ADB input.
+     */
+    uint8_t iic_regs[128][256];
+    uint8_t iic_last_reg[128];
 
     /* SETUPTIMEK calibration hack (see mac_via.c) */
     int timer_hack_state;
@@ -1238,6 +1250,23 @@ static void q630_cuda_sync_xpram_cache(MOS6522Q630State *v1s)
         !(xpram_cache & 1)) {
         stb_phys(&address_space_memory, xpram_cache + 102 + 0x8a,
                  v1s->PRAM[0x8a] | 0x05);
+        /*
+         * Same template-wipe problem hits the boot-scan OSDefault: this
+         * ROM's boot-disk scan (0x40801350) latches its expected DDM
+         * ddType ONCE, before the flashing-"?" loop, from OS trap A084
+         * (handler 0x408013b0) = _ReadXPRam 2 bytes at XPRAM 0x76 — the
+         * expected ddType is the LOW byte, XPRAM 0x77 (this ROM's
+         * offset; the Q605/lc475 ROM used 0xF8-0xFB for the same idea,
+         * see LC475-NOTES #13).  The wiped-to-0 cache makes the scan
+         * demand ddType 0 and reject every bootable disk (infinite
+         * lba-0 re-reads, flashing "?").  Refresh from the Cuda PRAM,
+         * forcing the ddType byte to at least 1 (= MacOS) so the scan
+         * accepts real disks (ddType 1) even if PRAM was wiped.
+         */
+        stb_phys(&address_space_memory, xpram_cache + 102 + 0x76,
+                 v1s->PRAM[0x76]);
+        stb_phys(&address_space_memory, xpram_cache + 102 + 0x77,
+                 v1s->PRAM[0x77] ? v1s->PRAM[0x77] : 1);
     }
 }
 
@@ -1252,6 +1281,7 @@ static void q630_cuda_process(Q630MachineState *m)
 
     m->cuda_resp_len = 0;
     m->cuda_resp_idx = 0;
+    m->cuda_unsol = false;
     m->cuda_no_resp = false;
 
     q630_cuda_log(
@@ -1299,8 +1329,18 @@ static void q630_cuda_process(Q630MachineState *m)
                 memcpy(r + 3, obuf, olen);
                 m->cuda_resp_len = 3 + olen;
             } else {
-                /* timeout/no data: flag bit 1 as on the real Cuda */
-                r[1] = 0x02;
+                /*
+                 * No data.  Only a TALK ((cmd & 0xC) == 0xC) with no
+                 * response is an ADB timeout (flag 0x02) — that is how
+                 * enumeration detects absent devices.  Listen / Flush /
+                 * SendReset have no reply by design and must ACK with
+                 * flags 0: MacOS's Cuda ADB Manager treats a "timeout"
+                 * on its Flush/Listen-R3 setup commands as a dead
+                 * device and then discards all autopolled input from
+                 * it (keyboard/mouse dead at the Finder despite
+                 * delivered packets).
+                 */
+                r[1] = (n >= 2 && (c[1] & 0x0c) == 0x0c) ? 0x02 : 0x00;
                 m->cuda_resp_len = 3;
             }
         }
@@ -1397,6 +1437,36 @@ static void q630_cuda_process(Q630MachineState *m)
                               c[3], c[4], n - 4);
             }
             break;
+        case CUDA_CMD_GET_SET_IIC:
+            /*
+             * [01 22 aa rr vv...]: aa = I2C bus address (bit 0 = read),
+             * rr = register subaddress.  Writes latch into the backing
+             * store; reads return the latched value so the driver's
+             * write-then-verify cycles succeed (observed: device
+             * 0xDE/0xDF regs 0x02/0x0D, and a bare probe of 0x41).
+             */
+            if (n >= 3) {
+                uint8_t dev = (c[2] >> 1) & 0x7f;
+                bool rd = c[2] & 1;
+                uint8_t reg = n >= 4 ? c[3] : m->iic_last_reg[dev];
+
+                if (rd) {
+                    r[3] = m->iic_regs[dev][reg];
+                    m->cuda_resp_len = 4;
+                    q630_cuda_log("q630 cuda: iic rd %02x[%02x] -> %02x\n",
+                                  c[2], reg, r[3]);
+                } else if (n >= 5) {
+                    int i;
+
+                    for (i = 0; i < n - 4; i++) {
+                        m->iic_regs[dev][(reg + i) & 0xff] = c[4 + i];
+                    }
+                    m->iic_last_reg[dev] = reg;
+                    q630_cuda_log("q630 cuda: iic wr %02x[%02x] <- %02x (x%d)\n",
+                                  c[2], reg, c[4], n - 4);
+                }
+            }
+            break;
         default:
             /* unknown pseudo commands are generically acknowledged */
             break;
@@ -1438,9 +1508,24 @@ static void q630_cuda_adb_poll(void *opaque)
     /* adb_poll tags the data with the Talk R0 command byte at obuf[2] */
     obuf[0] = CUDA_PKT_ADB;
     obuf[1] = 0x40;                     /* autopolled data flag */
-    memcpy(m->cuda_resp, obuf, olen + 2);
-    m->cuda_resp_len = olen + 2;
+    /*
+     * Prepend a PAD byte: the ROM/OS int-driven Cuda driver
+     * (0x408a9c3a store loop, dispatch at 0x408a9d34) stores the very
+     * first SR byte of any Cuda-initiated session at buffer[0] and
+     * parses the packet from buffer[1] on (type at [1], flags at [2],
+     * cmd at [3]) — on real hardware that first read is the stale
+     * shift-register content, not packet data.  Without the pad the
+     * flags byte 0x40 lands where the driver expects the type and
+     * every autopolled ADB packet is dropped at 0x408a9e4a (keyboard/
+     * mouse dead at the Finder despite fully-read packets).  Host-
+     * initiated responses get their pad naturally (the SR still holds
+     * the last command echo when the driver opens the read session).
+     */
+    memcpy(m->cuda_resp + 1, obuf, olen + 2);
+    m->cuda_resp[0] = 0x00;             /* pad, discarded by the driver */
+    m->cuda_resp_len = olen + 3;
     m->cuda_resp_idx = 1;
+    m->cuda_unsol = true;
     m->cuda_no_resp = false;
     m->cuda_session = true;             /* Cuda-initiated session */
     s->sr = m->cuda_resp[0];
@@ -1464,8 +1549,22 @@ static void q630_cuda_ack_toggle(MOS6522Q630State *v1s)
          * response bytes to transfer (the ROM checks it right after
          * every byte-acknowledge toggle to decide whether to keep
          * reading, 0x408b3bee).
+         *
+         * For Cuda-INITIATED (unsolicited autopoll) packets, deassert
+         * /TREQ already when the LAST byte is fed: the OS's int-driven
+         * driver stores each SR byte and then checks PB (TIP|TACK|
+         * /TREQ all high = 0x38 at 0x408a9cae) to detect end-of-packet
+         * WITH the byte just read.  Deasserting only on the following
+         * toggle makes the driver take one extra interrupt and STORE a
+         * stale trailing byte, which promotes 2-byte classic ADB mouse
+         * data to the 3-byte extended-mouse format and garbles the
+         * deltas (dx inflated / sign lost).  Host-initiated responses
+         * keep the late deassert, which the ROM's polled drivers
+         * depend on.
          */
-        q630_cuda_set_treq(v1s, true);
+        q630_cuda_set_treq(v1s,
+                           !(m->cuda_unsol &&
+                             m->cuda_resp_idx == m->cuda_resp_len));
         q630_cuda_schedule_int(m);
         q630_cuda_log(
                       "q630 cuda: feed 0x%02x (#%d/%d) pc=%08x b=%02x\n",
@@ -1479,6 +1578,7 @@ static void q630_cuda_ack_toggle(MOS6522Q630State *v1s)
          */
         m->cuda_resp_len = 0;
         m->cuda_resp_idx = 0;
+        m->cuda_unsol = false;
         /*
          * Keep the session marked open: the host still holds the
          * handshake lines and the subsequent release must be seen as
@@ -1748,6 +1848,8 @@ static const MemoryRegionOps q630_via1_ops = {
  * The 60Hz tick sets the VBL bit; writes to +0x10c clear it.
  */
 
+static void q630_ide_update_irq(Q630MachineState *m);
+
 static void q630_valkyrie_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
@@ -1755,8 +1857,15 @@ static void q630_valkyrie_write(void *opaque, hwaddr addr, uint64_t val,
     Q630RegBank *b = m->valkyrie_bank;
 
     if (addr == 0x10c || (addr <= 0x10c && addr + size > 0x10c)) {
-        /* VBL status clear */
+        /* VBL status clear (drops the slot interrupt line too) */
         m->valkyrie_regs[0x10b] &= ~0x04;
+        q630_ide_update_irq(m);
+        return;
+    }
+    if (addr <= 0x107 && addr + size > 0x104) {
+        /* interrupt enable mask update: recompute the slot line */
+        q630_regbank_write(b, addr, val, size);
+        q630_ide_update_irq(m);
         return;
     }
     if (addr == 0x20) {
@@ -1844,13 +1953,31 @@ static const MemoryRegionOps q630_valkyrie_ops = {
  * (Linux IRQ_NUBUS_F; QEMU input 6 of the via2 nubus-irq gpio array).
  */
 
+/*
+ * Valkyrie VBL pending: the ROM's Q630 slot ISR (0x4088BC2C, chained
+ * from VIA2 CA1 via lowmem 0xD74) reads THIS SAME F108 register
+ * 0x50F1A101 and treats bit 6 as the internal-video (pseudo-slot 0)
+ * VBL interrupt flag: pending byte bit 6 -> slot table 0x40806F14
+ * entry 0x06 -> slot 0, whose SInt handler (RAM, installed by the
+ * video driver) clears the Valkyrie VBL status (+0x10C) and runs the
+ * slot-0 VBL queue = jCrsrTask -> cursor/mouse coupling.  The VBL
+ * interrupt is enabled by the driver's long write of 4 to Valkyrie
+ * +0x104 and acknowledged via the Valkyrie +0x10C clear, so bit 6
+ * here simply mirrors "status AND enable".
+ */
+static bool q630_vbl_pending(Q630MachineState *m)
+{
+    return (m->valkyrie_regs[0x10b] & 0x04) &&
+           (m->valkyrie_regs[0x107] & 0x04);
+}
+
 static void q630_ide_update_irq(Q630MachineState *m)
 {
     bool flag = (m->ide_ifr & 0x20) || m->ide_irq_level;
     qemu_irq slot = qdev_get_gpio_in_named(DEVICE(&m->via2), "nubus-irq",
                                            VIA2_NUBUS_IRQ_INTVIDEO);
 
-    qemu_set_irq(slot, flag && (m->ide_ifr & 0x40));
+    qemu_set_irq(slot, (flag && (m->ide_ifr & 0x40)) || q630_vbl_pending(m));
 }
 
 static void q630_ide_set_irq(void *opaque, int n, int level)
@@ -1872,11 +1999,21 @@ static uint64_t q630_ide_ifr_read(void *opaque, hwaddr addr, unsigned size)
     if (addr != 1) {
         return 0;
     }
-    val = m->ide_ifr & 0x7f;
+    /*
+     * Visible bit 6 is the VBL pending flag (see q630_vbl_pending);
+     * the internally-stored bit 6 (macide.c-style IDE irq enable)
+     * must not leak into it or the ROM slot ISR would dispatch
+     * spurious slot-0 interrupts (SysError while the slot-0 queue is
+     * still empty).
+     */
+    val = m->ide_ifr & 0x3f;
     if (m->ide_irq_level) {
         val |= 0x20;
     }
-    if ((val & 0x20) && (val & 0x40)) {
+    if (q630_vbl_pending(m)) {
+        val |= 0x40;
+    }
+    if (val & 0x20) {
         val |= 0x80;
     }
     return val;
@@ -1915,8 +2052,9 @@ static void q630_sixty_hz(void *opaque)
     qemu_irq_lower(irq);
     qemu_irq_raise(irq);
 
-    /* Valkyrie VBL status */
+    /* Valkyrie VBL status; deliver the slot interrupt if enabled */
     m->valkyrie_regs[0x10b] |= 0x04;
+    q630_ide_update_irq(m);
 
     timer_mod(m->sixty_hz_timer,
               (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -2090,14 +2228,17 @@ static void q630_machine_init(MachineState *machine)
      *   0 leaves the 24-bit Translate24To32 live and QuickDraw corrupts
      *   any bit-23 RAM pointer (0x00FFxxxx -> 0x500Fxxxx F108 I/O) ->
      *   dsBusError Sad Mac.  See the CUDA_CMD_GET_PRAM comment.
-     * - OSDefault long at 0xF8 = 1 (MacOS): the boot scan matches the
-     *   DDM driver ddType against this; a "valid" PRAM with OSDefault 0
-     *   rejects every bootable disk (the lc475 pitfall).
+     * - OSDefault at XPRAM 0x77 = 1 (MacOS): the boot scan (trap A084 =
+     *   _ReadXPRam word at 0x76) matches the DDM driver ddType against
+     *   this; a "valid" PRAM with OSDefault 0 rejects every bootable
+     *   disk (the lc475 pitfall; that ROM kept the value at 0xF8-0xFB
+     *   instead, seeded too for good measure).
      */
     m->via1.PRAM[0x0c] = 'N';
     m->via1.PRAM[0x0d] = 'u';
     m->via1.PRAM[0x0e] = 'M';
     m->via1.PRAM[0x0f] = 'c';
+    m->via1.PRAM[0x77] = 0x01;
     m->via1.PRAM[0x8a] = 0x05;
     m->via1.PRAM[0xfb] = 0x01;
     m->via1.machine = m;
