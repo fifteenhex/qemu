@@ -71,7 +71,17 @@
 #define MACCLASSICII_ROM_FILENAME  "macclassic2.rom"
 
 #define IO_BASE               0x50000000
-#define IO_SLICE              0x00040000
+/*
+ * I/O decode granularity.  0x80000 (not the IIci's 0x40000): the ROM's
+ * decoder-kind probes distinguish the memory controllers by VIA1's
+ * mirror spacing -- kind 5 (RBV, the IIci) requires VIA1's IER to
+ * respond again at +0x40000, while kind 7 (V8/Eagle, the Classic II)
+ * requires that SAME address to be empty.  With an 0x80000 slice the
+ * +0x40000 probe falls in unbacked space (reads 0, walking-bit test
+ * fails) and the ROM resolves decoder kind 7 -- the Classic II's real
+ * identity (see the machine-ID comment at the VIA1 setup below).
+ */
+#define IO_SLICE              0x00080000
 #define IO_SLICE_MASK         (IO_SLICE - 1)
 #define IO_SIZE               0x04000000
 
@@ -83,6 +93,7 @@
 #define SWIM_OFS              0x16000
 #define VDAC_OFS              0x24000
 #define RBV_OFS               0x26000
+#define EAGLE18_OFS           0x18000
 
 #define VIA_SPACING_SHIFT     9       /* VIA regs every 0x200 */
 #define VIA_REGION_SIZE       0x2000
@@ -416,6 +427,7 @@ static void macclassicii_egret_session_update(MOS6522MacClassicIIState *v1s);
 static void macclassicii_egret_sr_written(MOS6522MacClassicIIState *v1s);
 static void macclassicii_egret_sr_read(MOS6522MacClassicIIState *v1s);
 static void macclassicii_egret_acr_changed(MOS6522MacClassicIIState *v1s);
+static bool macclassicii_egret_pseudo_try_process(MOS6522MacClassicIIState *v1s);
 
 static void macclassicii_via1_portA_write(MOS6522State *s)
 {
@@ -608,7 +620,12 @@ struct MacClassicIIMachineState {
     MacClassicIIFbState fb;
     MemoryRegion rom;
     MemoryRegion rom_alias;
-    MemoryRegion rom_alias24;
+    MemoryRegion rom_mirror32[15];
+    MemoryRegion rom_mirror24[8];
+    MemoryRegion macio24[2];
+    MemoryRegion vram;
+    MemoryRegion vidalias24;
+    MemoryRegion vram_window;
     MemoryRegion ramio;
     MemoryRegion ramio_a31;
     MemoryRegion macio;
@@ -623,6 +640,7 @@ struct MacClassicIIMachineState {
     MemoryRegion scsi_hsk;
     MemoryRegion iotrace;
     MemoryRegion vdacmem;
+    MemoryRegion eagle18mem;
 
     uint8_t rbv_regs[0x100];
     uint8_t rbv_ifr;
@@ -631,12 +649,20 @@ struct MacClassicIIMachineState {
     uint8_t rbv_sier;
     uint8_t rbv_via2_regs[16];
     uint8_t vdac_regs[0x40];
+    uint8_t eagle18_regs[0x40];
 
     /* Egret ADB/system MCU on the VIA1 shift register */
     QEMUTimer *egret_timer;
     uint8_t egret_cmd[16];
     int egret_cmd_len;
-    uint8_t egret_resp[16];
+    /*
+     * Reply staging: header (4) plus up to a full 256-byte MCU/XPRAM
+     * window -- READ_MCU replies are STREAMED (the Egret keeps handing
+     * out successive bytes and the HOST decides when it has enough by
+     * closing /SYS_SESSION; the wire command carries no length), so a
+     * worst-case whole-window read must fit.
+     */
+    uint8_t egret_resp[4 + 256];
     int egret_resp_len;
     int egret_resp_idx;
     bool egret_session;
@@ -649,6 +675,32 @@ struct MacClassicIIMachineState {
      * only while it has a packet to hand to the host.
      */
     bool egret_xcvr_asserted;
+
+    /*
+     * Egret "pseudo-command" transactions (packet type byte 0x01;
+     * self-test/autopoll/PRAM/RTC control -- cf. the Cuda/Egret
+     * pseudo-command family in MAME's apple/egret.cpp).  This ROM
+     * drives them with a byte-level PB4(/VIA_FULL)/PB5(/SYS_SESSION)
+     * handshake and /SYS_SESSION *released* throughout -- a completely
+     * different framing from the formal-session ADB commands above
+     * (egret_cmd/egret_session), collected/delivered independently.
+     */
+    /* command can carry a whole-window WRITE_MCU: [01 08 aH aL] + 256 */
+    uint8_t egret_pseudo_cmd[4 + 256];
+    uint8_t egret_mcu_mem[256];
+    int egret_pseudo_cmd_len;
+    bool egret_pseudo_active;
+    /*
+     * Set when the last reply byte has been delivered but the ROM's own
+     * teardown writes (clearing /SYS_SESSION then /VIA_FULL, ROM
+     * 0x4084a646/0x4084a650) haven't happened yet -- keeps suppressing
+     * the formal-session /SYS_SESSION-edge detector (see
+     * macclassicii_egret_session_update) through that short window, or
+     * the first of those two writes (a /SYS_SESSION-released edge with
+     * /VIA_FULL still high) is indistinguishable from a real session
+     * open and would otherwise be misread as one.
+     */
+    bool egret_pseudo_closing;
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
@@ -1055,6 +1107,20 @@ static void macclassicii_rbv_write(void *opaque, hwaddr addr, uint64_t val,
             m->rbv_sier &= ~(val & 0x7f);
         }
         break;
+    case 0x01:
+        /*
+         * V8/Eagle RAM/video configuration register.  Bit 5 enables
+         * the VRAM window at I/O +0x40000 (24-bit 0xf40000 / 32-bit
+         * 0x50f40000), which on the Eagle aliases the top 64KB of the
+         * onboard RAM bank -- the ROM enables it (0xc0 -> 0xe0 write
+         * during RAM config) and then draws the boot screen through it.
+         * It must be DISABLED at cold start: the kind-7 decoder probe
+         * requires the VIA1-IER walking-bit test at +0x41c00 to find
+         * nothing there.
+         */
+        m->rbv_regs[addr] = val;
+        memory_region_set_enabled(&m->vram_window, (val & 0x20) != 0);
+        break;
     default:
         m->rbv_regs[addr] = val;
         break;
@@ -1108,6 +1174,49 @@ static void macclassicii_vdac_write(void *opaque, hwaddr addr, uint64_t val,
 static const MemoryRegionOps macclassicii_vdac_ops = {
     .read = macclassicii_vdac_read,
     .write = macclassicii_vdac_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+/*
+ * Eagle register block at +0x18000: present-but-inert latch, same idea
+ * as the VDAC stub above.  POST phase 0x98 (routine 0x40848cf6, run for
+ * decoder kind 7 only) walking-bit tests a 6-bit R/W register at
+ * 0x50f18000 and the kind-7 bring-up pokes it early (0x40803cde,
+ * PA7-gated); with the address unbacked the read at 0x40848d10
+ * bus-errors and the fault handler dumps the boot into the serial
+ * diagnostic console.  A store-and-read-back latch makes the phase
+ * pass cleanly (d6 = 0).  (MAME's V8/Eagle leaves this unmapped and
+ * relies on its unmapped reads not faulting; a latch is tidier.)
+ */
+
+static uint64_t macclassicii_eagle18_read(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    MacClassicIIMachineState *m = opaque;
+    uint64_t val = m->eagle18_regs[addr & 0x3f];
+
+    qemu_log_mask(LOG_UNIMP, "macclassicii eagle18: read  +0x%02x -> 0x%02"
+                  PRIx64 "\n", (unsigned)(addr & 0x3f), val);
+    return val;
+}
+
+static void macclassicii_eagle18_write(void *opaque, hwaddr addr, uint64_t val,
+                                       unsigned size)
+{
+    MacClassicIIMachineState *m = opaque;
+
+    qemu_log_mask(LOG_UNIMP, "macclassicii eagle18: write +0x%02x <- 0x%02"
+                  PRIx64 "\n", (unsigned)(addr & 0x3f), val);
+    m->eagle18_regs[addr & 0x3f] = val;
+}
+
+static const MemoryRegionOps macclassicii_eagle18_ops = {
+    .read = macclassicii_eagle18_read,
+    .write = macclassicii_eagle18_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -1308,6 +1417,25 @@ static void macclassicii_egret_process(MacClassicIIMachineState *m)
         return;
     }
 
+    /*
+     * Pseudo-command packets (type byte 0x01) can also arrive over the
+     * formal-session framing -- the post-MMU interrupt-driven Egret
+     * driver (ISR 0x40814912) sends e.g. [01 08 addrHi addrLo <16
+     * bytes>] (write MCU memory, uploading autopoll parameters) and
+     * [01 1b/0e/1c ...] control settings this way.  These are MCU
+     * control traffic, not ADB: don't feed them to the ADB bus (a
+     * bogus adb_request would disturb device state); for the
+     * write/set-style commands the ROM only needs the exchange to
+     * terminate cleanly, which the no-response turnaround provides.
+     */
+    if (c[0] == 0x01 && n >= 2) {
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: pseudo (session) cmd 0x%02x"
+                      " len=%d\n", c[1], n);
+        macclassicii_egret_no_response(m);
+        return;
+    }
+
     {
         uint8_t obuf[ADB_MAX_OUT_LEN];
         int olen;
@@ -1328,6 +1456,315 @@ static void macclassicii_egret_process(MacClassicIIMachineState *m)
             macclassicii_egret_no_response(m);
         }
     }
+}
+
+/*
+ * Egret "pseudo-command" packets (packet type byte 0x01): host->MCU
+ * control requests distinct from ADB pass-through -- self-test,
+ * autopoll, PRAM/RTC access, etc (cf. the Cuda/Egret pseudo-command
+ * family, e.g. MAME's apple/egret.cpp CUDA_* command set).  The
+ * Classic II ROM issues these with a byte-level PB4(/VIA_FULL)/
+ * PB5(/SYS_SESSION) handshake and /SYS_SESSION *released* throughout
+ * -- see ROM 0x4084a556, decoded instruction-by-instruction:
+ *   send  [0x01, cmd, ...params]         (SR-out, external clock)
+ *   recv  [_, _, _, cmd-echo, data]       (SR-in, external clock)
+ * with /XCVR_SESSION required asserted (low) for every reply byte
+ * except a deassert exactly at the last one (the ROM's end marker).
+ *
+ * The reply is always [0x00, 0x00, 0x00, cmd-echo, <optional data...>]:
+ * the ROM validates only that the 4th byte (index 3) echoes the
+ * command code, then reads any trailing data bytes while /XCVR stays
+ * asserted (GET_PRAM 0x07 returns one data byte; SET_PRAM 0x0c none).
+ * Commands not modelled here are left unrecognised so the caller falls
+ * back to the pre-existing cold-start-sync-safe generic behaviour
+ * (interrupt only, no /XCVR assert) rather than guessing wrong.
+ */
+#define EGRET_PSEUDO_TYPE       0x01
+#define EGRET_PSEUDO_READ_MCU   0x02
+#define EGRET_PSEUDO_GET_TIME   0x03
+#define EGRET_PSEUDO_GET_PRAM   0x07
+#define EGRET_PSEUDO_WRITE_MCU  0x08
+#define EGRET_PSEUDO_SET_TIME   0x09
+#define EGRET_PSEUDO_SET_PRAM   0x0c
+
+/* stage the reply header [0,0,0,cmd]; caller appends any data bytes */
+static void macclassicii_egret_pseudo_reply(MacClassicIIMachineState *m,
+                                            uint8_t cmd)
+{
+    m->egret_resp_len = 0;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = cmd;
+    m->egret_resp_idx = 0;
+}
+
+/*
+ * Egret MCU address map, as the ROM uses it: 0x0100-0x01FF is the
+ * MCU-resident XPRAM -- the SAME 256-byte parameter RAM the GET_PRAM/
+ * SET_PRAM pseudo-commands address directly (and the Egret's classic
+ * 343-0042 protocol emulation serves on real hardware), so it must be
+ * backed by the one authoritative store, via1.PRAM[].  The ROM's
+ * _ReadXPRam/_WriteXPRam (trap A051/A052 -> Egret path 0x40a15204)
+ * access XPRAM exclusively through READ_MCU/WRITE_MCU at 0x100+offset;
+ * the OS-startup autopoll parameter uploads live elsewhere in MCU
+ * space and keep the scratch egret_mcu_mem[] backing.
+ */
+static uint8_t macclassicii_egret_mcu_read(MacClassicIIMachineState *m,
+                                           uint16_t addr)
+{
+    if (addr >= 0x100 && addr <= 0x1ff) {
+        return m->via1.PRAM[addr - 0x100];
+    }
+    return m->egret_mcu_mem[addr & 0xff];
+}
+
+static void macclassicii_egret_mcu_write(MacClassicIIMachineState *m,
+                                         uint16_t addr, uint8_t data)
+{
+    if (addr >= 0x100 && addr <= 0x1ff) {
+        m->via1.PRAM[addr - 0x100] = data;
+    } else {
+        m->egret_mcu_mem[addr & 0xff] = data;
+    }
+}
+
+static bool macclassicii_egret_pseudo_build(MacClassicIIMachineState *m)
+{
+    uint8_t *c = m->egret_pseudo_cmd;
+    int n = m->egret_pseudo_cmd_len;
+
+    if (n < 2) {
+        return false;
+    }
+
+    /*
+     * Type-0 packets over this framing are ADB pass-through: [00
+     * adbcmd <listen data...>].  The post-MMU interrupt-driven Egret
+     * driver (ISR 0x40a14912, trap A092) sends its ADB traffic --
+     * starting with [00 00] SendReset during ADB-manager init -- with
+     * exactly the same PB4//PB5 byte handshake as the pseudo commands,
+     * so decode them here rather than in the formal-session path.
+     * Reply framing observed to satisfy the ISR: the standard 4-byte
+     * header [0, 0, 0, cmd-echo] followed by any Talk register data
+     * (the ISR routes bytes past the header into the request block's
+     * declared receive buffer via its own a2@(20)/a2@(18) state, so
+     * data after the header is safe here -- unlike header-overflow
+     * bytes on a request that declared none).
+     */
+    if (c[0] == 0x00) {
+        uint8_t obuf[ADB_MAX_OUT_LEN];
+        ADBBusState *adb_bus = &m->via1.adb_bus;
+        int olen;
+
+        adb_autopoll_block(adb_bus);
+        olen = adb_request(adb_bus, obuf, c + 1, n - 1);
+        adb_autopoll_unblock(adb_bus);
+
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: pseudo-framed ADB cmd 0x%02x"
+                      " len=%d -> olen=%d\n", c[1], n - 1, olen);
+        macclassicii_egret_pseudo_reply(m, c[1]);
+        if (olen > 0) {
+            memcpy(m->egret_resp + m->egret_resp_len, obuf, olen);
+            m->egret_resp_len += olen;
+        }
+        return true;
+    }
+
+    if (c[0] != EGRET_PSEUDO_TYPE) {
+        return false;
+    }
+
+    switch (c[1]) {
+    case EGRET_PSEUDO_GET_PRAM:
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            uint8_t data = m->via1.PRAM[addr & 0xff];
+
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo GET_PRAM addr=0x%04x"
+                          " -> 0x%02x\n", addr, data);
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_GET_PRAM);
+            m->egret_resp[m->egret_resp_len++] = data;
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_SET_PRAM:
+        if (n >= 5) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+
+            m->via1.PRAM[addr & 0xff] = c[4];
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo SET_PRAM addr=0x%04x"
+                          " <- 0x%02x\n", addr, c[4]);
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_SET_PRAM);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_WRITE_MCU:
+        /*
+         * Write MCU memory: [01 08 addrHi addrLo data...].  The
+         * post-MMU boot uploads an autopoll/timing parameter block
+         * (ROM table 0x4080c676, 20 bytes to MCU address 0x0110) this
+         * way.  The parameters have no behavioural model here; store
+         * them in a scratch array so READ_MCU reads back consistently,
+         * and ACK.
+         */
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            int j;
+
+            for (j = 0; j + 4 < n; j++) {
+                macclassicii_egret_mcu_write(m, addr + j, c[4 + j]);
+            }
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo WRITE_MCU addr=0x%04x"
+                          " len=%d\n", addr, n - 4);
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_WRITE_MCU);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_GET_TIME:
+        /* Read the RTC: reply carries 4 big-endian seconds bytes */
+        {
+            uint32_t t = m->via1.tick_offset +
+                         (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                          NANOSECONDS_PER_SECOND);
+
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo GET_TIME -> 0x%08x\n", t);
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_GET_TIME);
+            m->egret_resp[m->egret_resp_len++] = t >> 24;
+            m->egret_resp[m->egret_resp_len++] = t >> 16;
+            m->egret_resp[m->egret_resp_len++] = t >> 8;
+            m->egret_resp[m->egret_resp_len++] = t;
+            return true;
+        }
+    case EGRET_PSEUDO_SET_TIME:
+        /* Set the RTC: [01 09 t3 t2 t1 t0] */
+        if (n >= 6) {
+            uint32_t t = ((uint32_t)c[2] << 24) | ((uint32_t)c[3] << 16) |
+                         ((uint32_t)c[4] << 8) | c[5];
+
+            m->via1.tick_offset = t - (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                                       NANOSECONDS_PER_SECOND);
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo SET_TIME <- 0x%08x\n", t);
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_SET_TIME);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_READ_MCU:
+        /*
+         * Read MCU memory: [01 02 addrHi addrLo] -> STREAMED data.
+         * The wire command carries no length: the Egret hands out
+         * successive bytes from addr for as long as the host keeps
+         * clocking, and the HOST ends the reply (its requested length
+         * lives only in its own A092 parameter block, a1@(6)) by
+         * closing /SYS_SESSION -- handled as the early-close case in
+         * macclassicii_egret_session_update.  Stage bytes to the end
+         * of the 256-byte window; undrained ones are simply dropped at
+         * the close.  (The previous single-byte reply made every
+         * multi-byte _ReadXPRam -- e.g. GetOSDefault reading XPRAM
+         * 0x76/0x77, len 2 -- return one real byte plus stale-SR
+         * garbage, which fed a garbage expected-ddType (0x6a) into the
+         * boot-driver installer at 0x40a07264 and blocked the disk
+         * boot in an endless bus-rescan.)
+         */
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            int j, len;
+
+            len = 0x100 - (addr & 0xff);
+            qemu_log_mask(LOG_UNIMP,
+                          "macclassicii egret: pseudo READ_MCU addr=0x%04x"
+                          " (stream %d) first=0x%02x\n", addr, len,
+                          macclassicii_egret_mcu_read(m, addr));
+            macclassicii_egret_pseudo_reply(m, EGRET_PSEUDO_READ_MCU);
+            for (j = 0; j < len; j++) {
+                m->egret_resp[m->egret_resp_len++] =
+                    macclassicii_egret_mcu_read(m, addr + j);
+            }
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+
+    /*
+     * Any other type-1 packet is a set/control-style MCU pseudo-command
+     * with no data reply (the post-MMU Egret driver sends e.g. [01 1b
+     * 03] -- an autopoll/one-second control setting -- through its
+     * interrupt-driven framing).  ACK it with the bare [0,0,0,cmd]
+     * header.  This must NOT fall through to the interrupt-only
+     * fallback: the ROM's Egret ISR (0x40a14912) then clocks stale SR
+     * bytes as a "reply", and on a byte-1==0 header it copies the
+     * trailing garbage through the request block's DATA POINTER at
+     * +8 -- which set-style callers (e.g. the trap-A092 thunk at
+     * 0x40a154d2, which only fills bytes 0-2 and the callback long)
+     * leave UNINITIALISED, corrupting whatever low-memory address the
+     * stack garbage points at (observed: the 0x192 Egret state vector,
+     * ending in a double fault).  A real Egret ACKs every pseudo
+     * command it accepts, so this is also simply truer to hardware.
+     *
+     * The cold-start sync's framing bytes still fall through to the
+     * old behaviour: they never form a [01 cc ...] packet at a
+     * turnaround (single 0x00/0x01 bytes only, len < 2 -- verified in
+     * a full -d unimp boot log).
+     */
+    if (n >= 2 && c[0] == EGRET_PSEUDO_TYPE) {
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: pseudo generic-ACK cmd 0x%02x"
+                      " (len=%d)\n", c[1], n);
+        macclassicii_egret_pseudo_reply(m, c[1]);
+        return true;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "macclassicii egret: unrecognised pseudo-command"
+                  " [%02x %02x %02x %02x] (len=%d)\n",
+                  n > 0 ? c[0] : 0, n > 1 ? c[1] : 0, n > 2 ? c[2] : 0,
+                  n > 3 ? c[3] : 0, n);
+    return false;
+}
+
+/*
+ * Called at the send->receive turnaround (ACR external-clock SR-OUT ->
+ * SR-IN, /SYS_SESSION released, no formal session) to decide whether
+ * the bytes just shifted out were a real pseudo-command.  On success,
+ * stages the reply and drives the receive handshake (first byte +
+ * /XCVR assert) the ROM's wait loop at 0x4084a5f8 needs; on failure
+ * (unrecognised content -- e.g. the cold-start sync's own framing
+ * bytes, which share this exact ACR pattern but carry no real pseudo-
+ * command) does nothing, leaving the caller to fall back to the
+ * existing interrupt-only behaviour.
+ */
+static bool macclassicii_egret_pseudo_try_process(MOS6522MacClassicIIState *v1s)
+{
+    MacClassicIIMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    if (!macclassicii_egret_pseudo_build(m)) {
+        m->egret_pseudo_cmd_len = 0;
+        return false;
+    }
+
+    m->egret_pseudo_cmd_len = 0;
+    m->egret_pseudo_active = true;
+    m->egret_no_resp = false;
+
+    /*
+     * The first reply byte must already be in the shift register by
+     * the time the ROM's receive wait loop sees the completion
+     * interrupt and checks /XCVR -- stage it now.
+     */
+    s->sr = m->egret_resp[0];
+    m->egret_resp_idx = 1;
+    macclassicii_egret_set_xcvr(v1s, true);
+    macclassicii_egret_schedule_int(m);
+    return true;
 }
 
 /*
@@ -1369,6 +1806,69 @@ static void macclassicii_egret_session_update(MOS6522MacClassicIIState *v1s)
     bool sys = !(s->b & EGRET_SYS_SESSION);
     uint8_t hs_change = (s->b ^ v1s->last_b) & (EGRET_SYS_SESSION |
                                                 EGRET_VIA_FULL);
+
+    /*
+     * Pseudo-command reply delivery (byte-handshake framing) is driven
+     * entirely from macclassicii_egret_sr_read -- the /VIA_FULL (PB4)
+     * and /SYS_SESSION (PB5) writes the ROM's receive helper
+     * (0x4084a6b4) makes around each shift are bookkeeping on its side
+     * only.  But those writes DO satisfy the /SYS_SESSION-based
+     * session-open edge test below (m->egret_session is never set for
+     * this framing, so "!session" always holds) -- without this guard
+     * the receive turnaround's own /SYS_SESSION-released write
+     * (0x4084a5f4) would be misread as opening a formal-session receive
+     * against whatever response state pseudo delivery has staged.
+     * Suppress all of it while a pseudo exchange is in flight.
+     */
+    if (m->egret_pseudo_active) {
+        /*
+         * Host-side early close of a STREAMED reply: the interrupt-
+         * driven Egret driver's receive (ISR 0x40a14912) reads exactly
+         * the number of data bytes its request block asked for and
+         * then drops /SYS_SESSION (bclr #5 at 0x40a149c8) and waits
+         * for /XCVR to rise as the end-of-exchange handshake.  A
+         * streamed READ_MCU reply usually stages more bytes than the
+         * host wants (the wire carries no length), so the last-byte
+         * close in macclassicii_egret_sr_read never triggers -- end
+         * the exchange here on that /SYS_SESSION falling edge instead.
+         * Gated on the header already being fully consumed (idx > 4)
+         * so the ISR's own header-phase /SYS_SESSION toggling (e.g.
+         * the bset #5 at 0x40a149a6) can't be mistaken for the close.
+         */
+        if ((v1s->last_b & EGRET_SYS_SESSION) &&
+            !(s->b & EGRET_SYS_SESSION) && m->egret_resp_idx > 4) {
+            /*
+             * A next byte was already staged in SR with its completion
+             * interrupt scheduled (the read-side chain stages ahead);
+             * the host is abandoning it -- cancel that interrupt, or
+             * it fires after the close and the ISR mistakes the stale
+             * byte for the start of an unsolicited Egret packet
+             * (observed: garbage dispatched through the autopoll
+             * handler -> Address Error at a junk PC -> sad mac).
+             */
+            timer_del(m->egret_timer);
+            macclassicii_egret_set_xcvr(v1s, false);
+            m->egret_pseudo_active = false;
+            m->egret_pseudo_closing = true;
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+        }
+        return;
+    }
+
+    /*
+     * Teardown tail: the ROM clears /SYS_SESSION then /VIA_FULL
+     * (0x4084a646/0x4084a650) after the last reply byte.  The first of
+     * those writes is a /SYS_SESSION-released edge that would otherwise
+     * match the formal-session-open test below; keep suppressing until
+     * both lines have settled low (/VIA_FULL also clear).
+     */
+    if (m->egret_pseudo_closing) {
+        if (!(s->b & (EGRET_SYS_SESSION | EGRET_VIA_FULL))) {
+            m->egret_pseudo_closing = false;
+        }
+        return;
+    }
 
     /*
      * Session-open detection must be EDGE-triggered (cf. maciisi.c): a
@@ -1510,6 +2010,24 @@ static void macclassicii_egret_sr_written(MOS6522MacClassicIIState *v1s)
         qemu_log_mask(LOG_UNIMP,
                       "macclassicii egret: <- 0x%02x (#%d) pc=%08x b=%02x\n",
                       s->sr, m->egret_cmd_len, macclassicii_trace_pc(), s->b);
+    } else if ((s->acr & SR_CTRL) == SR_CTRL) {
+        /*
+         * Outside a formal session, with the shifter in the exact
+         * external-clock SR-OUT mode the byte-handshake pseudo-command
+         * send uses (ROM 0x4084a556 sets ACR to 0x1c before shifting
+         * the first byte): collect the raw byte.  Whether this forms a
+         * recognised pseudo-command is decided at the send->receive
+         * turnaround (macclassicii_egret_acr_changed); the cold-start
+         * sync's own framing bytes share this same ACR pattern but are
+         * simply discarded there when unrecognised.
+         */
+        if (m->egret_pseudo_cmd_len < (int)sizeof(m->egret_pseudo_cmd)) {
+            m->egret_pseudo_cmd[m->egret_pseudo_cmd_len++] = s->sr;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: pseudo <- 0x%02x (#%d) pc=%08x"
+                      " b=%02x\n", s->sr, m->egret_pseudo_cmd_len,
+                      macclassicii_trace_pc(), s->b);
     }
 
     /*
@@ -1527,6 +2045,23 @@ static void macclassicii_egret_acr_changed(MOS6522MacClassicIIState *v1s)
     MacClassicIIMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
+    qemu_log_mask(LOG_UNIMP,
+                  "macclassicii egret: DBG acr=%02x sess=%d cmdlen=%d "
+                  "resplen=%d respidx=%d pseudoact=%d pc=%08x\n",
+                  s->acr, m->egret_session, m->egret_cmd_len,
+                  m->egret_resp_len, m->egret_resp_idx,
+                  m->egret_pseudo_active, macclassicii_trace_pc());
+
+    /*
+     * A fresh byte-handshake pseudo-command send always (re)starts here
+     * (ROM 0x4084a556 sets ACR to exactly this mode before shifting the
+     * first byte): drop any stale, never-turned-around collection from
+     * a prior attempt so it can't leak into this one.
+     */
+    if (!m->egret_session && (s->acr & SR_CTRL) == SR_CTRL) {
+        m->egret_pseudo_cmd_len = 0;
+    }
+
     /*
      * The host turns the shifter around to receive while still holding
      * the session: treat the bytes collected so far as the command and
@@ -1535,8 +2070,16 @@ static void macclassicii_egret_acr_changed(MOS6522MacClassicIIState *v1s)
      * (low at the first data interrupt = "discard" to this driver) and
      * goes LOW for the no-response turnaround.
      */
-    if (m->egret_session && !(s->acr & SR_OUT) && m->egret_resp_len == 0
-        && m->egret_cmd_len > 0) {
+    if (m->egret_session && !(s->acr & SR_OUT)
+        && m->egret_resp_idx >= m->egret_resp_len && m->egret_cmd_len > 0) {
+        /*
+         * A previous exchange's response counts as "pending" only while
+         * it is still partially undelivered (idx < len); a fully
+         * consumed one that just never saw its final ack toggle (the
+         * interrupt-driven Egret driver at 0x40814912 goes straight
+         * from draining the old reply into sending the next command)
+         * must not shadow this turnaround.
+         */
         macclassicii_egret_process(m);
         m->egret_cmd_len = 0;
         macclassicii_egret_set_xcvr(v1s, m->egret_no_resp &&
@@ -1552,13 +2095,33 @@ static void macclassicii_egret_acr_changed(MOS6522MacClassicIIState *v1s)
         m->egret_cmd_len = 0;
     } else if (!m->egret_session && (s->acr & SR_CTRL) && !(s->acr & SR_OUT)) {
         /*
-         * Outside a formal session (the cold-start byte-framing sync),
-         * turning the shifter to external-clock INPUT means the Egret
-         * clocks the next byte in: raise the completion interrupt so the
-         * ROM's receive helper (0x40814e6a) advances.  SR is left 0 --
-         * the framing sync only cares that the transfers complete.
+         * Outside a formal session, turning the shifter to external-
+         * clock INPUT is a send->receive turnaround.  If the bytes just
+         * collected form a recognised Egret pseudo-command, stage its
+         * reply and drive the receive handshake for it (see ROM
+         * 0x4084a5ee).  Otherwise -- including the cold-start
+         * byte-framing sync's own turnarounds (0x40814e6a), which share
+         * this same ACR pattern but carry no real command -- fall back
+         * to the original behaviour: just raise the completion
+         * interrupt so the ROM's receive helper advances with SR left
+         * at 0.
          */
-        macclassicii_egret_schedule_int(m);
+        if (!macclassicii_egret_pseudo_try_process(v1s)) {
+            /*
+             * Drop any stale, already-consumed response left over from
+             * an earlier exchange: with the interrupt-driven Egret
+             * driver's IER SR-int enabled, a leftover resp_idx <
+             * resp_len would make the read-side chain in
+             * macclassicii_egret_sr_read feed its junk bytes into this
+             * fresh turnaround's receive as if they were a reply
+             * (observed as "feed 0x00 (#2/2)" garbage after an
+             * unrecognised command, cascading into the ISR copying
+             * stale SR bytes through an uninitialised buffer pointer).
+             */
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+            macclassicii_egret_schedule_int(m);
+        }
     }
 }
 
@@ -1572,11 +2135,77 @@ static void macclassicii_egret_sr_read(MOS6522MacClassicIIState *v1s)
     }
 
     /*
+     * Pseudo-command reply delivery.  The ROM's per-byte receive helper
+     * (0x4084a6b4) WAITS for the shift-complete interrupt, THEN reads
+     * SR, THEN (a short delay later) checks /XCVR_SESSION -- so the
+     * byte this read just consumed (index egret_resp_idx-1, staged by
+     * the previous trigger) must have /XCVR asserted at read time for
+     * every byte except the last, which the ROM never checks /XCVR
+     * against directly (it only waits for /XCVR to rise afterwards, see
+     * ROM 0x4084a64a).  So: stage the NEXT byte here immediately
+     * (keeping /XCVR asserted) unless the byte just consumed WAS the
+     * last one, in which case drop /XCVR now as the end-of-reply marker
+     * instead.  Chaining forward from each read (rather than the
+     * request-side /VIA_FULL toggle) sidesteps that /VIA_FULL already
+     * reads low, with no edge, going into the very first receive call
+     * (it was left low by the preceding send phase).
+     */
+    if (m->egret_pseudo_active) {
+        int just_read = m->egret_resp_idx - 1;
+
+        qemu_log_mask(LOG_UNIMP,
+                      "macclassicii egret: pseudo -> 0x%02x (#%d/%d)"
+                      " pc=%08x b=%02x\n", s->sr, m->egret_resp_idx,
+                      m->egret_resp_len, macclassicii_trace_pc(), s->b);
+        if (just_read >= m->egret_resp_len - 1) {
+            /*
+             * That was the last byte: drop /XCVR, exchange is over.
+             * The ROM still has its own teardown writes coming
+             * (0x4084a646/0x4084a650) -- keep suppressing the formal-
+             * session detector through those (see egret_pseudo_closing
+             * in macclassicii_egret_session_update).
+             */
+            macclassicii_egret_set_xcvr(v1s, false);
+            m->egret_pseudo_active = false;
+            m->egret_pseudo_closing = true;
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+        } else {
+            s->sr = m->egret_resp[m->egret_resp_idx++];
+            macclassicii_egret_schedule_int(m);
+        }
+        return;
+    }
+
+    /*
+     * Interrupt-driven Egret driver (post-MMU boot: IER SR-int enabled,
+     * ISR 0x40814912): each reply byte is consumed by the ISR's SR
+     * read, after which the Egret clocks the next byte in -- chain
+     * delivery from the read side, exactly like the pseudo path above.
+     * (The polled boot-ROM flows instead drive delivery from their
+     * PB4//PB5 handshake edges via macclassicii_egret_ack_toggle, so
+     * this is gated on IER to avoid double-feeding them.)
+     */
+    if ((s->ier & SR_INT) && m->egret_resp_idx < m->egret_resp_len) {
+        macclassicii_egret_ack_toggle(v1s);
+        return;
+    }
+
+    /*
      * Cold-start framing sync (no formal session): each byte the host
      * reads in external-clock INPUT mode is immediately followed by the
      * Egret clocking the next one -- schedule its completion interrupt.
+     *
+     * ONLY while the ROM runs the sync by POLLING IFR (VIA1 IER has the
+     * SR interrupt disabled).  Once the interrupt-driven Egret driver
+     * is installed (post-MMU boot: IER SR-int enabled, ISR 0x40814912),
+     * its own end-of-transaction ACK read of SR would re-arm the
+     * interrupt here every time, producing a permanent level-1 storm
+     * whose re-entered ISR eventually walks a stale request pointer
+     * into an Access-Fault cascade and a double fault (observed).  A
+     * real Egret does not clock the shifter after a transaction ends.
      */
-    if (!m->egret_session && (s->acr & SR_CTRL)) {
+    if (!m->egret_session && (s->acr & SR_CTRL) && !(s->ier & SR_INT)) {
         macclassicii_egret_schedule_int(m);
         return;
     }
@@ -1827,6 +2456,7 @@ static void macclassicii_machine_init(MachineState *machine)
     CPUState *cs;
     DeviceState *dev;
     SysBusDevice *sysbus;
+    int i;
 
     if (ram_size > RAM_BANK_SPAN * 2) {
         error_report("Too much memory for this machine: %" PRId64 " MiB, "
@@ -1897,23 +2527,47 @@ static void macclassicii_machine_init(MachineState *machine)
     qdev_prop_set_uint64(DEVICE(&m->via1), "frequency", VIA_TIMER_FREQ);
     /*
      * Machine-ID straps on port A (read with DDRA all-input during
-     * identification).  The IIci/IIsi kind-5 entry wants (PA & 0x56)
-     * == 0x46 (PA4 low); the Classic II ROM carries an additional
-     * patched-in kind-5 entry matching 0x16 (PA4 HIGH -- the "sibling
-     * config" the IIci/IIsi comment warns about is, on this ROM, the
-     * Classic II itself), mask unchanged at 0x56.  0xBE (PA6 low,
-     * PA1/PA2/PA4 high, PA0 low) satisfies (PA & 0x56) == 0x16.
+     * identification).  The Classic II is a decoder-kind-7 (V8/Eagle
+     * memory controller) machine: its ROM patches a kind-7 decoder
+     * record + device table into the probe list at 0x40803ae6 (probe
+     * stub 0x40803a48: VIA1 IER walking-bit at +0x1c00 must pass, the
+     * +0x40000 mirror must be EMPTY, and the RBV-position/VDAC-position
+     * registers at +0x26000/+0x24000 must respond -- V8 provides
+     * RBV-compatible registers at the RBV offsets), and two kind-7
+     * machine entries: mask 0x56 match 0x54 (board byte 0x0d, the
+     * Classic II) and match 0x12 (board 0xfd).  0xFD gives (PA & 0x56)
+     * == 0x54.  The kind-5 entry at 0x40803b66 (match 0x16) is a dead
+     * end on this ROM: the MMU-map selector's kind-5 slot was patched
+     * into a no-op (0x40841a4e), so a kind-5 identification runs the
+     * MMU-record walker off the end of RAM; only kind 7 has a working
+     * memory-map handler (0x40841a6e, tables 0x40840f26/0x40840f14).
      *
-     * PA0 must strap LOW: after machine ID, the ROM's kind-5 setup
-     * (0x40846440) makes PA0 an input and reads it -- PA0 low sets the
-     * d7 "bit 26" flag that, post-Egret-sync, routes 0x40848ee8 to the
-     * real boot (0x40848f08) instead of the MicroBug serial monitor.
-     * The IIci/IIsi read PA0 high there via a NuBus pull-up on the
-     * VIA2-position pin; the Classic II has no NuBus, so the pin floats
-     * low.  (Bit 0 is outside the 0x56 machine-ID mask, so clearing it
-     * does not disturb identification.)
+     * PA0 must strap HIGH (pulled up, like every input strap on real
+     * boards): after machine ID, the ROM's kind-5/7 setup (0x40846440)
+     * makes PA0 an input and reads it -- PA0 LOW sets the d7 "bit 26"
+     * flag, which is the FACTORY BURN-IN/TEST strap: with bit 26 set,
+     * the POST phase sequencer's "all phases done" tail (0x40846628:
+     * btst #26,d7; bne 0x40848ed0) diverts into the MicroBug serial
+     * console (0x40849b1c -> 0x40849b56, a GetChar/'*'-prompt loop that
+     * only ever exits on received serial input), and any non-fatal POST
+     * failure restarts the whole POST (0x40846620).  With PA0 high /
+     * bit 26 CLEAR, the tail falls through at 0x40846630 into the real
+     * cold-boot continuation (capability dispatch -> happy-mac/disk
+     * boot), and non-fatal POST failures simply continue to the next
+     * phase.  (An earlier session strapped PA0 low because, before the
+     * ROM-checksum repair, POST always failed fatally and the bit26-set
+     * branch at 0x40848ee8 happened to make more forward progress; with
+     * POST now passing, PA0 low would park the machine in the burn-in
+     * console forever -- which real hardware plainly does not do.
+     * Bit 0 is outside the 0x56 machine-ID mask either way.)
+     *
+     * PA7 straps LOW: the kind-7 bring-up block at 0x40803cd0 runs only
+     * with PA7 high, and it initialises an Ariel-style colour DAC via a
+     * pointer read from 0x50f18038 -- LC/color-V8 hardware the Classic
+     * II (mono Eagle) does not have; with the pointer reading 0 it
+     * would spray a 768-byte CLUT fill over low RAM.  PA7 low skips it.
      */
-    qdev_prop_set_uint8(DEVICE(&m->via1), "pins-a", 0xbe);
+    qdev_prop_set_uint8(DEVICE(&m->via1), "pins-a", 0x7d);
     sysbus = SYS_BUS_DEVICE(&m->via1);
     sysbus_realize(sysbus, &error_fatal);
     {
@@ -1933,6 +2587,25 @@ static void macclassicii_machine_init(MachineState *machine)
     m->via1.PRAM[0x0e] = 0x4d;      /* 'M' */
     m->via1.PRAM[0x0f] = 0x63;      /* 'c' */
     m->via1.PRAM[0x8a] = 0x00;      /* boot 24-bit (ROM era), VM off */
+    /*
+     * Default OS / startup-device XPRAM bytes, as the Egret MCU's own
+     * firmware defaults provide on real hardware (the ROM's XPRAM
+     * default-rebuild pass covers 0x01-0x6d but NOT this range, so
+     * with a zeroed store the boot-driver installer's expected ddType
+     * -- GetOSDefault = XPRAM[0x76..0x77], compared at 0x40a07264
+     * against the disk's driver ddType -- reads 0, matches no driver
+     * on any disk, and the boot rescans the SCSI bus forever at the
+     * blinking "?".  0x0001 = the standard Mac SCSI driver ddType this
+     * (and every stock) disk carries; startup-device record 0x78-0x7b
+     * = 0xff.. = no preference, scan the bus (the working -M quadra700
+     * oracle reads exactly 0x0001/0xffff here).
+     */
+    m->via1.PRAM[0x76] = 0x00;
+    m->via1.PRAM[0x77] = 0x01;      /* default OS: ddType 1 (Mac SCSI) */
+    m->via1.PRAM[0x78] = 0xff;      /* default startup device: none */
+    m->via1.PRAM[0x79] = 0xff;
+    m->via1.PRAM[0x7a] = 0xff;
+    m->via1.PRAM[0x7b] = 0xff;
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, macclassicii_egret_timer_cb,
                                   m);
@@ -1964,10 +2637,11 @@ static void macclassicii_machine_init(MachineState *machine)
     memory_region_add_subregion(&m->macio, VIA1_OFS, &m->via1mem);
 
     /*
-     * Machine identification fingerprint (probe entry for decoder kind
-     * 5, the IIci): VIA1 IER mirrors at +0x40000 (the whole I/O slice
-     * repeats, so this comes for free) but must NOT respond at +0x20000
-     * (bus error there), and RBV/VDAC must be present.
+     * Machine identification fingerprint (decoder kind 7, V8/Eagle):
+     * VIA1 responds at +0x1c00 but must NOT mirror at +0x20000 or
+     * +0x40000 (both fall in unbacked slice space with the 0x80000
+     * slice), and the RBV-position/VDAC-position registers must respond
+     * to tstb (mapped below).
      */
 
     /* RBV's VIA2-emulation window at the classic VIA2 site */
@@ -2048,6 +2722,11 @@ static void macclassicii_machine_init(MachineState *machine)
                           "rbv", 0x2000);
     memory_region_add_subregion(&m->macio, RBV_OFS, &m->rbvmem);
 
+    /* Eagle +0x18000 latch, see macclassicii_eagle18_ops comment */
+    memory_region_init_io(&m->eagle18mem, OBJECT(machine),
+                          &macclassicii_eagle18_ops, m, "eagle18", 0x2000);
+    memory_region_add_subregion(&m->macio, EAGLE18_OFS, &m->eagle18mem);
+
     /* VDAC stub: present-but-inert, see macclassicii_vdac_ops comment */
     memory_region_init_io(&m->vdacmem, OBJECT(machine), &macclassicii_vdac_ops,
                           m, "vdac", 0x40);
@@ -2085,14 +2764,116 @@ static void macclassicii_machine_init(MachineState *machine)
                                 &m->rom_alias);
 
     /*
-     * Onboard video: fixed 512x342 1-bit compact-Mac framebuffer, no
-     * RBV video/VDAC and no NuBus.  Scanned out of the top of main RAM
-     * at (ram top - 0x5900), exactly as mac128k.c models the Plus/SE
-     * lineage's built-in screen.
+     * Eagle mirrors the 512KB ROM across the whole 8MB 32-bit-position
+     * ROM window 0x40800000-0x40ffffff.  The boot relocates itself to
+     * the canonical kind-7 base 0x40a00000 (see the ROM-patch block)
+     * and runs there pre-MMU, so the mirrors are required, not
+     * cosmetic.
+     */
+    for (i = 0; i < 15; i++) {
+        g_autofree char *name = g_strdup_printf("macclassicii.rom-32bit-%d", i);
+
+        memory_region_init_alias(&m->rom_mirror32[i], NULL, name, &m->rom, 0,
+                                 MACCLASSICII_ROM_SIZE);
+        memory_region_add_subregion(get_system_memory(),
+                                    MACCLASSICII_ROM_ADDR +
+                                    (i + 1) * MACCLASSICII_ROM_SIZE,
+                                    &m->rom_mirror32[i]);
+    }
+
+    /*
+     * V8/Eagle 24-bit-position ROM decode: physical 0x00a00000-
+     * 0x00dfffff, the 512KB ROM repeating.  The kind-7 device table's
+     * slot 0 declares 0xa00000 as the canonical ROM base: right after
+     * machine identification the ROM RELOCATES itself here (via
+     * device_table[28], patched below) and the rest of the boot --
+     * POST, RAM sizing, chime, MMU-table build -- runs at 0xa0xxxx PCs
+     * *before* the PMMU is enabled, so the Eagle must decode ROM at
+     * 0xa00000 in physical space (real V8/Eagle hardware does).  The
+     * ROM's own 24-bit MMU map then maps logical 0xa00000-0xdfffff
+     * onto these same physical addresses 1:1, so the whole 4MB window
+     * must answer with (mirrored) ROM.
+     */
+    for (i = 0; i < 8; i++) {
+        g_autofree char *name = g_strdup_printf("macclassicii.rom-24bit-%d", i);
+
+        memory_region_init_alias(&m->rom_mirror24[i], NULL, name, &m->rom, 0,
+                                 MACCLASSICII_ROM_SIZE);
+        memory_region_add_subregion(get_system_memory(),
+                                    0x00a00000 + i * MACCLASSICII_ROM_SIZE,
+                                    &m->rom_mirror24[i]);
+    }
+
+    /*
+     * V8/Eagle 24-bit-position I/O decode at physical 0x00f00000 (1MB):
+     * the ROM's MMU maps (both 24- and 32-bit) translate the device
+     * addresses to PHYSICAL 0xf0xxxx -- the V8 is a 24-bit-era memory
+     * controller and its devices live there; the 0x50f00000 addresses
+     * used pre-MMU are the same devices' 32-bit-position decode.
+     */
+    for (i = 0; i < 2; i++) {
+        g_autofree char *name = g_strdup_printf("macclassicii.io-24bit-%d", i);
+
+        memory_region_init_alias(&m->macio24[i], NULL, name, &m->macio, 0,
+                                 IO_SLICE);
+        memory_region_add_subregion(get_system_memory(),
+                                    ADDR24_IO_BASE + i * IO_SLICE,
+                                    &m->macio24[i]);
+    }
+
+    /*
+     * Dedicated 64KB video RAM.  Real Eagle steals the top 64KB of the
+     * onboard RAM bank for the screen, and Apple's software contract
+     * keeps that region out of the OS's usable memory; our boot,
+     * however, sizes a flat 4MB of RAM and MacOS then places ordinary
+     * heap blocks at 0x1f0000-0x1fffff -- the SAME pages QuickDraw
+     * paints through the VRAM window (observed fatal: a Resource
+     * Manager map allocated at 0x1f2470 was overwritten by the gray
+     * desktop pattern, and its next-map link read back as screen
+     * pixels 0xfd7a3400 -> bus error dialog during System startup).
+     * Backing the window/aperture/scanout with a separate VRAM region
+     * realises the same carve-out contract without needing to model
+     * whatever bank accounting the ROM uses to exclude it on real
+     * hardware: guest RAM stays a plain flat 4MB for the OS, and every
+     * screen path (ScrnBase 0x50f40000 -> window, 24-bit 0xe00000 ->
+     * physical 0x9f0000 aperture) resolves to this region.
+     */
+    memory_region_init_ram_flags_nomigrate(&m->vram, OBJECT(machine),
+                                           "macclassicii.vram", 0x10000, 0,
+                                           &error_fatal);
+
+    /*
+     * V8/Eagle video aperture at physical 0x009f0000 (64KB).  The
+     * ROM's MMU maps expose this aperture at logical 0xe00000 (24-bit)
+     * and 0xfee00000 (32-bit pseudo-slot $E).
+     */
+    memory_region_init_alias(&m->vidalias24, NULL, "macclassicii.vid-24bit",
+                             &m->vram, 0, 0x10000);
+    memory_region_add_subregion(get_system_memory(), 0x009f0000,
+                                &m->vidalias24);
+
+    /*
+     * V8/Eagle VRAM window at I/O slice offset 0x40000 (i.e. 24-bit
+     * 0xf40000 and 32-bit 0x50f40000): the ROM's screen-paint code
+     * writes the desktop pattern through this window (ScrnBase =
+     * 0x50f40000).  Gated (disabled until the V8 RAM-config register
+     * bit 5 is set, see macclassicii_rbv_write) so the cold-start
+     * kind-7 decoder probe still finds +0x41c00 empty.
+     */
+    memory_region_init_alias(&m->vram_window, NULL, "macclassicii.vram-window",
+                             &m->vram, 0, 0x10000);
+    memory_region_set_enabled(&m->vram_window, false);
+    memory_region_add_subregion(&m->macio, 0x40000, &m->vram_window);
+
+    /*
+     * Onboard video: fixed 512x342 1-bit Eagle framebuffer, scanned
+     * from the START of the VRAM (this ROM sets ScrnBase = 0x50f40000,
+     * the VRAM window base with NO additional offset -- verified with
+     * a pmemsave render of the drawn boot screen).
      */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACCLASSICII_FB);
-    m->fb.ram = machine->ram;
-    m->fb.base = ram_size - MACCLASSICII_FB_MAIN_OFS;
+    m->fb.ram = &m->vram;
+    m->fb.base = 0;
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
 
@@ -2164,6 +2945,143 @@ static void macclassicii_machine_init(MachineState *machine)
          */
         if (bios_size > 0x34fc + 4) {
             stl_be_p(ptr + 0x34fc, MACCLASSICII_ROM_ADDR);
+            /*
+             * KIND-7 (V8/Eagle) relocation/canonical-base fixups.  The
+             * Classic II identifies with the kind-7 device table at
+             * 0x40803ae6 (see the pins-a comment).  Its post-MMU world
+             * is built from two maps (builder 0x4084177c):
+             *   - the 32-BIT map (TC 0x80f05750, record list at
+             *     0x40840fa4): RAM at logical 0, ROM at logical
+             *     0x40a00000-0x40dfffff -> PHYSICAL 0xa00000-0xdfffff,
+             *     I/O at logical 0x50f00000 -> physical 0xf00000, the
+             *     slot-$E video aperture 0xfee00000 -> physical
+             *     0x9f0000.  Logical 0x400000-0x40a00000 (including
+             *     the 24-bit ROM position 0xa00000) is INVALID.
+             *   - the 24-BIT map (TC 0x80f84500, IS=8 so the top 8
+             *     address bits are ignored, record list at 0x40840fdc):
+             *     RAM, ROM at 0xa00000-0xdfffff, video 0xe00000, I/O
+             *     0xf00000 (same physical targets).
+             * The enable sequence activates the 32-bit map, keeps VBR 0
+             * and rebases the 64 exception vectors and the continuation
+             * by d3 = device_table[0] - current_base.  For both maps to
+             * resolve those addresses the canonical base must be
+             * 0x40A00000: valid in the 32-bit map directly, and valid
+             * in the 24-bit map because IS=8 masks it to 0xa00000.
+             *
+             * The shipped table's slot 0 reads 0x00a00000 (the bare
+             * 24-bit position -- unmapped in the shipped 32-bit map, so
+             * the first post-`pmove tc` fetch faults, the fault handler
+             * itself is unmapped, and the machine double-faults), and
+             * its +0x70 early-relocation slot (read by the patched
+             * relocation thunk 0x40803a96, cf. the kind-5 note above)
+             * is zero padding.  Point both at 0x40a00000: the ROM then
+             * relocates to 0x40a0xxxx right after identification (the
+             * Eagle mirrors ROM physically across 0x40800000-0x40ffffff
+             * -- modelled below -- so pre-MMU execution there works),
+             * and the post-MMU world is reachable under either map.
+             */
+            stl_be_p(ptr + 0x3ae6, 0x40a00000);
+            stl_be_p(ptr + 0x3ae6 + 0x70, 0x40a00000);
+
+            /*
+             * Make non-fatal POST test failures continue to the next
+             * phase instead of restarting the boot.  The ROM's POST
+             * phase dispatcher (0x408465de) runs each test, then on a
+             * non-fatal failure (0x40846620: bne 0x40848ed0) restarts
+             * the whole boot -- which, if a test can never pass, loops
+             * forever.  Test 0x87 (VIA1 timing) is exactly such a test:
+             * it requires the Egret to autonomously raise ten
+             * shift-register interrupts and VIA1 T1/T2 to fire specific
+             * counts inside a CPU busy-wait, ratios the emulated Egret
+             * cannot produce.  NOP the restart branch so a failed
+             * non-fatal test is skipped like a passed one -- the same
+             * fix the Quadra 700 bring-up used for these timing tests,
+             * and the behaviour the ROM itself takes on warm boots.
+             * (Test 0x86, the SCC BRG calibration, now passes for real
+             * via the escc BRG zero-count interrupt under -icount.)
+             */
+            if (bios_size > 0x46620 + 4) {
+                stw_be_p(ptr + 0x46620, 0x4e71);        /* nop */
+                stw_be_p(ptr + 0x46622, 0x4e71);        /* nop */
+            }
+
+            /*
+             * Widen the kind-7 32-BIT MMU map's I/O record to the full
+             * 1MB I/O bank.  The shipped record list (0x40840fa4,
+             * referenced from the active map pair 0x40840f14/0x40840f26;
+             * 8-byte records [size32, target24+kind8], kinds: 01=RAM,
+             * 06=ROM, 07=invalid, 26=device) maps logical 0x50f00000->
+             * physical 0xf00000 for only 0x30000 bytes, leaving the V8
+             * VRAM window position 0x50f40000 -- which the ROM itself
+             * puts in ScrnBase -- INVALID in the 32-bit map.  QuickDraw's
+             * blit engine swaps to 32-bit addressing around every screen
+             * blit (jsr [0x574] with d0=1 at 0x40a2e8ae); the very first
+             * boot-screen blit then faults reading ScrnBase (observed:
+             * Access Fault at 0x40a2e8e8, a5=0x50f4xxxx), the error path
+             * bails WITHOUT restoring 24-bit mode, and every later
+             * dereference of a 24-bit flagged handle (e.g. the video
+             * parameter handle [0x8a8] -> 0x80005104) faults in an
+             * endless retry loop that leaks a VPBlock per pass until the
+             * system heap collides with the boot stack (observed crash).
+             * Extending the I/O record to 0x100000 (and shrinking the
+             * following invalid record by the same 0xd0000 so the list
+             * still sums to 4GB) makes the 32-bit map cover the same
+             * f0xxxx device bank the 24-bit map already exposes, exactly
+             * as the real V8 decodes it.
+             */
+            if (bios_size > 0x40fc4 + 4) {
+                stl_be_p(ptr + 0x40fbc, 0x00100000);    /* was 0x00030000 */
+                stl_be_p(ptr + 0x40fc4, 0xade00000);    /* was 0xaded0000 */
+            }
+
+            /*
+             * Repair the ROM's own power-on self-checksums after the
+             * patch above.  The startup self-test (0x40846a1c/0x40846ada)
+             * runs TWO independent checksum schemes over the image and,
+             * on any mismatch, sets a bit in the POST error mask d6; a
+             * non-zero d6 makes the ROM take its failure path (0x40848eda
+             * -> 0x40849b1c) and park in the serial diagnostic console
+             * (dumping d6 at a '*' prompt) instead of sizing RAM, playing
+             * the chime and booting the disk.  Our one-word relocation
+             * patch changes both checksums, so recompute and re-store
+             * them, keeping the image self-consistent exactly as it is on
+             * real silicon (where d6 == 0 and the ROM boots through).
+             *
+             *   1. Four byte-position sums (0x40846a6e): for the 4 byte
+             *      lanes of each big-endian longword, sum that lane's
+             *      bytes over offsets [4,0x30) U [0x40,end); the four
+             *      32-bit totals are stored at offsets 0x30/0x34/0x38/
+             *      0x3c (that 16-byte block is itself excluded).  MSB
+             *      lane -> 0x30, ... , LSB lane -> 0x3c.
+             *   2. A 16-bit-word sum (0x40846af0): add every big-endian
+             *      word from offset 4 to the end into a 32-bit total
+             *      stored in the first longword (offset 0, excluded).
+             *
+             * Scheme 1's stored block lies inside scheme 2's range, so
+             * fix scheme 1 first, then compute scheme 2 over the result.
+             */
+            uint32_t lane[4] = { 0, 0, 0, 0 };
+            uint32_t sum = 0;
+            int off;
+
+            for (off = 4; off + 3 < bios_size; off += 4) {
+                if (off == 0x30) {
+                    off = 0x40 - 4;     /* skip the 0x30..0x3f block */
+                    continue;
+                }
+                for (i = 0; i < 4; i++) {
+                    lane[i] += ptr[off + i];
+                }
+            }
+            stl_be_p(ptr + 0x30, lane[0]);
+            stl_be_p(ptr + 0x34, lane[1]);
+            stl_be_p(ptr + 0x38, lane[2]);
+            stl_be_p(ptr + 0x3c, lane[3]);
+
+            for (off = 4; off + 1 < bios_size; off += 2) {
+                sum += lduw_be_p(ptr + off);
+            }
+            stl_be_p(ptr, sum);
         }
     }
 }

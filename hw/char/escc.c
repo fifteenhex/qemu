@@ -31,6 +31,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "exec/icount.h"
 #include "hw/char/escc.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
@@ -518,8 +519,37 @@ static inline void clr_extint(ESCCChannelState *s)
  * calibration (see mac_via.c), TCG executes the loop far faster than a
  * 25 MHz 68040, so the realistic ~18 ms BRG period would overflow the
  * window; a short fixed period keeps the measured spacing inside it.
+ *
+ * That fixed short period only lands in-window at free-running TCG speed.
+ * Under -icount the CPU-vs-timer ratio is deterministic and realistic, so
+ * there the *physical* BRG period -- (time constant + 2) input clocks of
+ * the escc's programmed frequency -- is used instead, which both lands the
+ * calibration in-window and lets a ROM that sweeps the time constant to
+ * calibrate (e.g. the Mac Classic II POST) settle on a working value.
  */
 #define ZCOUNT_PERIOD_NS 50000
+
+static uint64_t escc_zcount_period_ns(ESCCChannelState *s)
+{
+    if (icount_enabled() && s->clock > 0) {
+        uint32_t tc = s->wregs[W_BRGLO] | (s->wregs[W_BRGHI] << 8);
+        uint64_t ns = ((uint64_t)tc + 2) * NANOSECONDS_PER_SECOND / s->clock;
+
+        /*
+         * The nominal (TC+2)/clock zero-count period is the physical BRG
+         * period, but even under -icount the modelled busy loop the ROM
+         * times this against runs somewhat faster per virtual-ns than the
+         * real CPU, so the nominal period lands the measured spacing just
+         * over the ROM's 0x10000 upper bound.  Scale by a small constant
+         * (like the fixed TCG-speed hack above) to centre the spacing well
+         * inside the [0x100, 0x10000] window.  The window is 256x wide, so
+         * this keeps a large margin.
+         */
+        ns /= 4;
+        return ns < 1000 ? 1000 : ns;
+    }
+    return ZCOUNT_PERIOD_NS;
+}
 
 static void escc_zcount_update(ESCCChannelState *s)
 {
@@ -533,7 +563,7 @@ static void escc_zcount_update(ESCCChannelState *s)
         if (!timer_pending(s->zcount_timer)) {
             timer_mod(s->zcount_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      ZCOUNT_PERIOD_NS);
+                      escc_zcount_period_ns(s));
         }
     } else {
         timer_del(s->zcount_timer);
@@ -553,7 +583,7 @@ static void escc_zcount_cb(void *opaque)
         set_extint(s);
     }
     timer_mod(s->zcount_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ZCOUNT_PERIOD_NS);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + escc_zcount_period_ns(s));
 }
 
 static inline void clr_rxint(ESCCChannelState *s)

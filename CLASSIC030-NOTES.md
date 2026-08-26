@@ -586,6 +586,470 @@ Command line for testing (unchanged from above).  `-M maciici`/`-M maciisi`/
 `-M q800` re-verified to still init/run after the strap change (macclassicii.c
 -local).
 
+### Egret pseudo-command handshake SOLVED (2026-08-26, branch `fin-classicii`)
+
+Picked up in worktree `/workspace/src/qemu-clii` (branch `fin-classicii`, off
+`amiga` HEAD, which already carries every fix above).  Configured
+`--target-list=m68k-softmmu` once, built once, then iterated incrementally.
+
+**Decoded the full transaction** at ROM 0x4084a556 with a scripted gdb trace
+(breakpoint + `stepi` N + toggling `monitor log unimp` around the hit, so the
+`-D` log only captures the transaction itself) and a full disassembly dump
+(`x/80i`) of 0x4084a556-0x4084a760:
+
+- **Send** (ACR forced to 0x1c = external-clock shift-OUT, `/SYS_SESSION`
+  released/high): byte 0 (`0x01`, the Egret **pseudo-command type marker**)
+  is written directly to SR with a raw PB4/PB5 bit-bang (no helper call);
+  bytes 1-3 (`0x07`, addr-hi, addr-lo) go through a per-byte send helper at
+  0x4084a694 (`SR=byte; bset PB4; wait SR-int; bclr PB4`).  Captured command:
+  `[0x01, 0x07, 0x00, 0xfc]` = Cuda/Egret pseudo-command family byte 1 = 7 =
+  **CUDA_GET_PRAM**, address bytes = `0x00fc` (a 16-bit XPRAM offset).  This
+  matches the Cuda/Egret pseudo-command set documented in MAME's
+  `apple/egret.cpp` (type byte 1 = "pseudo command", cmd 7 = read PRAM).
+- **Turnaround**: ACR bit4 cleared (0x0c = external-clock shift-IN),
+  `/SYS_SESSION` re-asserted low.
+- **Receive**: the ROM waits for the SR-complete interrupt, then requires
+  `/XCVR_SESSION` (PB3) asserted low, then reads **five** bytes total (one
+  direct read at 0x4084a606, four more via a per-byte receive helper at
+  0x4084a6b4 which does `bclr PB4; wait SR-int; bset PB4; SR->d2; btst PB3`
+  and returns the PB3 state as a Z flag the caller checks).  `/XCVR` must
+  stay asserted through all five; byte index 3 (0-based, the 4th byte) is
+  explicitly compared against `0x07` (**must echo the command code**) before
+  the 5th/last byte (the actual PRAM data) is read and returned to the
+  caller as the function's result.  After the last byte, the ROM clears
+  `/SYS_SESSION` then `/VIA_FULL` and waits for `/XCVR` to rise as the
+  end-of-reply marker.
+
+**Fix** (`hw/m68k/macclassicii.c` only, all new code, nothing removed from
+the existing session-based/cold-sync paths):
+
+- New machine-state fields `egret_pseudo_cmd[8]`/`egret_pseudo_cmd_len`,
+  `egret_pseudo_active`, `egret_pseudo_closing`.
+- `macclassicii_egret_sr_written`: outside a formal session, when ACR reads
+  exactly `SR_CTRL` (0x1c, external-clock shift-OUT), collect the byte into
+  `egret_pseudo_cmd` (parallel to, and independent of, the existing
+  session-based `egret_cmd` collection).  A fresh entry into this exact ACR
+  pattern (detected in `macclassicii_egret_acr_changed`) always clears the
+  buffer first, so a prior aborted/unrecognised attempt can't leak into a
+  later real command.
+- `macclassicii_egret_acr_changed`: at the existing send->receive turnaround
+  branch (previously: cold-sync-only, interrupt-only), first try
+  `macclassicii_egret_pseudo_try_process()`.  It decodes `egret_pseudo_cmd`
+  via `macclassicii_egret_pseudo_build()` (currently only `[0x01, 0x07,
+  addrHi, addrLo]` -> `CUDA_GET_PRAM`, reading `via1.PRAM[addr & 0xff]` --
+  the *same* PRAM array the existing 343-0042 RTC bit-bang emulation
+  already reads/writes, so both paths see consistent state) and, on
+  success, stages a 5-byte reply `[0, 0, 0, 0x07, data]`, asserts `/XCVR`,
+  and schedules the completion interrupt.  On failure (unrecognised
+  content -- notably the cold-start sync's own framing, which shares this
+  exact ACR pattern but carries no real pseudo-command) it falls back
+  unchanged to the original interrupt-only behaviour, so the already-working
+  cold-sync fix is untouched.
+- `macclassicii_egret_sr_read`: reply delivery is **chained from the read
+  side**, not the request-side PB4 edge -- the ROM's receive helper does
+  `bclr PB4` (a genuine falling edge on every call *except* the very first,
+  where PB4 is already low left over from the send phase, so an edge-based
+  trigger silently misses byte 2 and the ROM hangs forever waiting for an
+  interrupt that never comes).  Instead, each SR read stages the *next*
+  byte and reschedules the interrupt immediately, and drops `/XCVR` only
+  when the byte **just consumed** was the last one (checked via the index
+  already read, not the index about to be staged) -- this was the second
+  bug found: dropping `/XCVR` at *staging* time for the last byte broke the
+  4th byte's own `/XCVR`-still-asserted check, since that check runs
+  shortly *after* the 4th byte's read, by which point the 5th byte would
+  already have been (wrongly) staged with `/XCVR` low.
+- `macclassicii_egret_session_update`: guards the whole exchange (and a
+  short `egret_pseudo_closing` tail through the ROM's final
+  `/SYS_SESSION`-then-`/VIA_FULL` teardown writes) against the *existing*
+  formal-session-open detector, which would otherwise misread the
+  transaction's own `/SYS_SESSION` toggles as a real session opening (this
+  was the third bug: the teardown's first write, clearing `/SYS_SESSION`
+  with `/VIA_FULL` still high, is indistinguishable from a genuine session
+  open and produced a spurious extra "feed"/no-response exchange
+  immediately after every otherwise-correct PRAM read until the
+  closing-tail guard was added).
+
+**Verified**: a full `-d unimp` boot log shows the ROM successively reading
+PRAM offsets `0x00fc, 0x00fd, 0x00fe, 0x00ff, 0x007c, 0x007d, 0x007e,
+0x007f` via this exact mechanism -- eight clean `GET_PRAM` request/response
+cycles, each with the right 4-byte command, the right 5-byte reply
+(`[.., .., .., 0x07, data]`), `/XCVR` asserted throughout and dropped
+exactly once at the end, and **no** spurious extra exchanges.  This is
+unambiguously **past the documented blocker**: the ROM is running its own
+pseudo-command protocol against our Egret and getting believable answers,
+not spinning in the `0x4084a5f8-604` wait loop.
+
+### New frontier: PRAM reads all 0x00 -> ROM treats PRAM as invalid -> reboot loop -> new stall in a "ram-hole" read cycle
+
+Because `via1.PRAM[]` is only seeded at the handful of bytes the existing
+343-0042/RTC code cares about (`'NuMc'` at 0x0c-0x0f, boot flags at 0x8a --
+see `macclassicii_machine_init`), the eight offsets above (`0x7c-0x7f`,
+`0xfc-0xff`) all read back **0x00**.  These are plausibly an XPRAM
+validity/checksum region (Apple's extended-PRAM layout keeps signature/
+checksum bytes near the end of each 256-byte block) and an all-zero readback
+reads as "PRAM never initialised" to the ROM: right after the eighth
+`GET_PRAM`, the boot log shows a **second full machine-ID pass** (the same
+`0x40803124` BERR probes, RBV/VDAC probe, VIA2 bring-up sequence, byte for
+byte) -- i.e. a real diagnostic-triggered warm restart, the classic Mac
+"PRAM corrupt, reinitialise and reboot" behaviour, not a bug in the
+transaction itself.
+
+On the second pass, boot reaches a **different** outcome than the first:
+PC parks (confirmed with `-s` gdb, re-sampled ~75 s apart, identical PC both
+times) at **0x4084a248**, inside the same MicroBug-era serial polling block
+already characterised in "MicroBug entry was REAL" above
+(0x40849b68-0x4084a296, GetChar/PutChar over the SCC at `a3=0x50f04000`) --
+i.e. this PRAM-invalid path re-enters the serial debug polling code even
+though the PA0 strap fix still holds (the strap is read once from a board
+pin, not re-evaluated per warm-restart branch; PRAM-invalid apparently
+routes here independently of that fork).  The `-d unimp` log goes quiet for
+this stretch (VIA1 IER writes and SCC accesses aren't in the logged register
+set) but does show **further** progress after some real time: a third
+machine-ID pass, then a tight, indefinitely-repeating four-address read
+cycle at addresses **0x00c12c18, 0x00c12c1c, 0x00c12c18, 0x00c12c1c,
+0x00c22000, 0x00c22004, 0x00c22008, 0x00c2200c** (repeat), all logged via
+the generic `ram-hole` catch-all with `pc=0x00000000` (exception/interrupt
+context, or the trace-pc helper not tracking correctly there) -- a new,
+distinct, indefinite loop, not yet decoded.
+
+**Screen is still blank white** (`screendump` via QMP confirms solid
+0xFFFFFF, `(255, 255)` luma extrema) -- boot has not reached the framebuffer
+draw.  Getting further needs either (a) seeding believable PRAM
+signature/checksum bytes at the offsets this ROM's PRAM-integrity check
+reads (start with `0x7c-0x7f`/`0xfc-0xff`) so the first pass validates and
+the ROM never takes the reinit/reboot branch, or (b) decoding what the
+`0x00c1xxxx`/`0x00c2xxxx` ram-hole loop is doing/waiting for.  Both are
+scoped entirely to `macclassicii.c` (PRAM seeding) or need fresh ROM
+disassembly (the ram-hole loop) -- next-session starting points, not
+attempted further this session given time budget.
+
+**Regression check**: changes are 100% confined to `hw/m68k/macclassicii.c`
+(`git diff --stat`: one file); no shared Egret/mos6522/ncr5380 code touched.
+`-M maciici` (`macIIci.rom`, the only Mac II-family ROM image present in
+this environment): re-verified via QMP screendump -- boots all the way to a
+**fully interactive Finder desktop** (Control Panels window open, live
+menu-bar clock), identical to the pre-existing baseline.  `-M maciisi` and
+`-M q800` ROM images are not present in this environment (as noted in the
+SE/30 section above); both machine types were smoke-tested with no `-bios`
+and fail cleanly with "could not load MacROM" (expected, confirms the
+machine/device models still register and initialise without crashing) --
+the strongest available check without their ROMs, and by construction
+(zero shared-file changes) there is no plausible regression vector for
+them anyway.
+
+Committed to `fin-classicii`: the documented Egret pseudo-command blocker is
+**solved** (verified with eight clean back-to-back `GET_PRAM` transactions
+executing to completion, `/XCVR` framing correct throughout).  Boot advances
+substantially further than the old blocker into real ROM PRAM-integrity/
+reboot logic, and a new, distinct, precisely-located stall is documented for
+the next session.  No happy-mac yet -- screen confirmed still blank white.
+
+### SET_PRAM + ROM-checksum repair -> boot runs the full POST (RAM sizing, boot chime, PRAM rebuild); stops at the SCC-BRG speed calibration (2026-08-26, `fin-classicii`)
+
+Continued in the same worktree.  The previous note's "PRAM-invalid ->
+reinit -> reboot loop" and "0x00c1xxxx ram-hole read loop" were BOTH
+misdiagnosed -- there is no reboot and no separate read loop.  Root-caused
+the real flow instruction-by-instruction and got the machine much further.
+
+**1. Not a reboot.**  The `0x40803124`/`rbv`/`vdac`/`rbv-via2` probe
+sequence that recurs in the `-d unimp` log is the shared **capability-
+dispatch routine** (`0x40802f18`, reached via `0x4084679e`) which
+re-touches those probe addresses every time it runs -- and it runs several
+times during a single normal boot (it is the `d0 = machine capability word`
+computation, `0x773f`).  A `-s -S` region-log trace from the
+identification-success fork shows one continuous forward path, never a
+restart.  The `0x00c1xxxx`/`0x04000000` "ram-hole" reads are the ROM's
+**RAM-sizing** scan (`0x4084aa02`, writing the `'Tina'`/`0xAAAA5555`-style
+signatures down the address space); with our 1 GB zero-return `ramio`
+container it is slow but bounded and correct.
+
+**2. SET_PRAM pseudo-command added.**  Past GET_PRAM the ROM issues the
+Egret **SET_PRAM** pseudo-command (type `0x01`, cmd `0x0c`: `[01 0c addrHi
+addrLo data]`, 5-byte send) to write PRAM defaults (offsets `0xf0-0xfb`).
+Decoded its framing at `0x4084a3c0`: identical byte-handshake to GET_PRAM
+but the 4-byte reply `[0,0,0,0x0c]` carries no data byte (the ROM validates
+reply byte[3]==cmd, then `/XCVR` must drop -- `0x4084a4c6 cmpib #12,d2`).
+Generalised the pseudo-command responder (`macclassicii_egret_pseudo_build`
++ new `macclassicii_egret_pseudo_reply` helper): reply is always
+`[0,0,0,cmd, <optional data>]`; GET_PRAM (`0x07`) appends the byte,
+SET_PRAM (`0x0c`) writes `via1.PRAM[addr] = data` and appends nothing.
+With this the ROM's PRAM rebuild completes cleanly (log shows GET_PRAM of
+`0x7c-0x7f`,`0xf9`,`0xfc-0xff` then SET_PRAM of `0xf0-0xf3`,`0xf9-0xfb`).
+
+**3. The real blocker was our own relocation ROM-patch breaking the ROM's
+self-checksum.**  The prior session's relocation fix (`stl_be_p(ptr +
+0x34fc, 0x40800000)`, offset `0x34fc` `0x00000000 -> 0x40800000`) alters
+ROM bytes, so the ROM's **power-on self-test** (`0x40846a1c`/`0x40846ada`)
+computes a wrong checksum, sets a bit in the **POST error mask d6**, and the
+boot **phase sequencer** (`0x408465de`: for each phase `moveq #0,d6; jmp
+phase; tstl d6; bne 0x40848eda`) diverts to `0x40848eda -> 0x40849b1c`, the
+ROM's **serial diagnostic console** (a `GetChar`/timer/`'*'`-prompt loop
+that only exits on serial input -- with `-serial null` it idles forever).
+The console is NOT a normal cold-boot path; it is the POST-failure handler,
+gated purely by `d6 != 0`.  Two checksum schemes both cover offset `0x34fc`:
+  - word-sum (`0x40846af0`): 16-bit big-endian words `[4..end]`, 32-bit
+    total stored in the first longword (offset 0).  Measured broken:
+    computed `0x3193a78e` vs stored `0x3193670e`.
+  - four byte-lane sums (`0x40846a6e`): per big-endian byte lane, summed
+    over `[4,0x30) U [0x40,end)`, stored at offsets `0x30/0x34/0x38/0x3c`.
+  **Fix** (`macclassicii.c`, in the ROM-patch block): after the `0x34fc`
+  patch, recompute both schemes and re-store them (byte-lane block first,
+  then the word-sum, since the word-sum range includes `0x30-0x3f`).
+  Verified: the word-sum now matches (`MATCH=True`), the `d6=0xffff`
+  checksum error is gone.
+
+With SET_PRAM + the checksum repair, boot now runs the **entire POST**:
+machine ID -> relocation -> Egret ADB init (GET_PRAM/SET_PRAM) -> RAM sizing
+-> **boot-chime generation** (ASC waveform fill at `0x40807040`, `a3` = ASC)
+-> PRAM rebuild -> into the phase sequencer.
+
+**New frontier: POST phase 0x86 -- SCC Baud-Rate-Generator speed
+calibration (precisely characterized, unresolved).**  The remaining `d6 !=
+0` is `d6 = 4` from **phase 0x86** (routine `0x4084704c`), a CPU/bus-speed
+calibration: it programs SCC channel-A's Baud-Rate-Generator (WR12/WR13
+time constant, WR14 bit0 = enable; setup table at ROM `0x40847122` =
+`09 c0 0c ff 0d ff 0e 00 0e 03`), installs a **level-4 (SCC) autovector
+handler** at `VBR+0x70` (`0x408470e0`, which acks with SCC `WR0 = 0x10` =
+reset-ext/status), and counts busy-loop iterations between two BRG
+zero-count interrupts (`d5 = d0@int1 - d0@int2`).  Pass requires `256 <= d5
+<= 65536`; `d5 < 256` -> `d6 = 4` ("too fast"), `d5 > 65536` -> `d6 = 3`.
+`-d int` confirms only a fast 2-interrupt burst fires (INT `Level 4(0x70)`
+at `pc=0x40847094`/`0x4084709e`) then nothing -- because **QEMU's shared
+`escc` does not model the BRG's free-running zero-count interrupt**, so
+there is no periodic level-4 tick to measure.  Notably the ROM
+**self-calibrates**: on a bad `d5` it sweeps the WR12/WR13 time constant and
+retries, so an escc that honoured the time constant would let the ROM home
+in on a passing value on its own.
+
+Attempted a Classic-II-local SCC MMIO wrapper (forward-to-escc + a BRG
+timer driving a 3rd escc-orgate line, cleared by the `WR0=0x10` ack) but
+**reverted it**: driving it correctly needs shadowing the escc's exact
+write-register-pointer / channel-mapping / `it_shift`+`bit_swap` access
+model (the BRG setup and the console SCC init interleave writes to the same
+ports), which could not be reproduced reliably here.  The clean path is to
+add a real BRG zero-count interrupt to `hw/char/escc.c` (shared -- would
+need `-M q800`/`maciici`/`maciisi` re-verified) or a faithful
+Classic-II-local escc-register model; documented for a focused next session.
+
+Screen is still not a boot image: a `screendump` shows only a diagonal
+stripe pattern (uninitialised RAM at `ram_size-0x5900` scanned out by the
+fixed framebuffer) -- the happy-mac draw is past this POST phase.
+
+**Regression check**: all changes remain confined to `macclassicii.c`
+(`git diff --stat`: one file; the reverted BRG wrapper left no residue).
+`-M maciici` re-verified via QMP screendump -> still boots to a fully
+interactive Finder desktop.  `-M maciisi`/`-M q800` ROM images absent here;
+unaffected by construction (zero shared-file changes).
+
+### POST phase 0x86 SOLVED via the existing escc BRG interrupt (icount-aware); now past all POST, stops at the cold-boot serial-console loop (2026-08-26, `fin-classicii`)
+
+The previous note's SCC-BRG frontier is **solved** -- and the support was
+already in the tree, no new escc model needed (thanks to the Quadra 700
+bring-up, which added the BRG zero-count interrupt to `hw/char/escc.c`).
+
+**Why the existing BRG interrupt didn't fire in-window for the Classic II.**
+`escc.c` models the WR15-bit1 / WR14-bit0 baud-rate-generator zero-count
+ext/status interrupt with a *fixed* 50 us period (`ZCOUNT_PERIOD_NS`),
+deliberately short so the Q700's POST (which runs free-running at TCG host
+speed) measures an in-window spacing.  The Classic II runs under
+`-icount shift=7`, where the ROM's busy-loop-vs-timer ratio is realistic, so
+50 us is far too short: measured spacing `d5 ~= 97` (or, with two stale
+setup-time fires latched, `~0`) against the ROM's required `[0x100,0x10000]`
+window -> `d6=4` "too fast".  The escc IRQ *wiring* was fine all along
+(chn0/1 -> or-gate -> glue level-4, exactly the line the calibration times).
+
+**Fix** (`hw/char/escc.c`, shared): make the zero-count period
+icount-aware.  Under `-icount` use the *physical* BRG period,
+`(time_constant + 2) / escc_clock`, which lands the Classic II's spacing
+in-window (and lets a ROM that sweeps the time constant self-calibrate);
+at free-running TCG speed keep the fixed 50 us.  A small `/4` factor
+centres the icount spacing well inside the window (nominal `(TC+2)/clock`
+alone landed at `d5=69443`, ~6% over the `0x10000` top).  Verified: phase
+0x86's measured `d5 = 17359` (in window) -> `d6=0`; the Classic II advances
+past it.  `#include "exec/icount.h"` added.
+
+**Then POST test 0x87 (VIA1 timing) blocks -- genuinely unpassable, so patch
+it out** (same approach the Q700 used).  Routine `0x4084714c`: two
+busy-wait sub-phases each requiring the VIA1 to raise *exactly ten Egret
+shift-register interrupts* (`d3==10`), 128..207 T1 interrupts, and one T2
+interrupt inside a 983040-iteration loop.  The emulated Egret does not
+autonomously raise SR interrupts mid-idle, so `d3` stays 0 and the test can
+never pass.  On such a (non-fatal, `d7` bit15 clear) failure the ROM's phase
+dispatcher restarts the whole boot (`0x40846620: bne 0x40848ed0`), looping
+forever.  **Fix** (`macclassicii.c`, in the ROM-patch block before the
+checksum recompute): NOP that restart branch (`0x46620`: `66 00 28 ae` ->
+`4e 71 4e 71`) so a failed non-fatal test is skipped like a passed one -- the
+documented Q700 fix, and what the ROM itself does on warm boots.  With it,
+**all POST phases (0x87..0x97) now complete**.
+
+**New frontier: the cold-boot serial-console loop at 0x40849b1c.**  After
+POST completes, the dispatcher's "all phases done" tail
+(`0x4084662c: btst #26,d7; bne 0x40848ed0`, bit26 set by our PA0 strap)
+jumps to `0x40848eda` -> machine-ID -> the warm-restart *resume-vector*
+check: it reads `a0@(4) = 0x58000000` expecting the magic `0xAAAA5555` +
+a resume address, and on mismatch drops to `0x40849b1c`.  **Confirmed by
+instrumentation** (temporary logging region at `0x58000000`, since removed):
+the ROM only ever *reads* `0x58000000` (at `0x408463d4` and `0x40848f1a`),
+never writes it -- it is a warm-boot resume vector the OS/a-previous-run
+populates, legitimately empty (reads 0) on a cold boot.  So the resume
+check correctly fails and `0x40849b1c` **is the normal cold-boot path**, not
+an error path.  But our emulation gets stuck there: `0x40849b1c` (bit26-set
+path -> `0x40849b56`) initialises the SCC then enters a `GetChar`
+(`0x4084a268`, SCC RR0 bit0) / VIA-T2-delay (`0x4084a23c`) / `'*'`-banner
+poll loop (`0x40849b68`-`0x40849cea`) whose *only* exit is a received serial
+character -- which `-serial null` never delivers -- so it idles forever
+(PC parks at `0x4084a242`/`0x4084a272`).  On real hardware this loop must
+exit to continue booting (real HW cold-boots to disk from here); the exit
+mechanism we're missing is the next frontier -- likely an interrupt-driven
+boot step, or a subtle GetChar/console-state path, that needs fresh
+disassembly of `0x40849b56`-`0x40849d60`.  Screen still shows only
+uninitialised-RAM noise (framebuffer draw is past this).
+
+**Regression check (shared `hw/char/escc.c` touched -- REQUIRED):** all
+three escc-sharing machines re-verified via QMP screendump ->
+  - `-M quadra700` (host speed, the machine the BRG interrupt was written
+    for): boots to the **full MacOS desktop** (shutdown-notice dialog).  The
+    icount gate leaves its 50 us behaviour unchanged.
+  - `-M q800` (`quadra650.rom`, host speed): boots to the **full MacOS
+    desktop**.
+  - `-M maciici` (`-icount shift=7`, exercises the icount path): boots to a
+    **fully interactive Finder desktop**.
+No regressions.  Classic-II-side changes stay in `macclassicii.c`; the only
+shared edit is the icount-aware BRG period in `escc.c`.
+
+### Deep OS-startup session (2026-08-26, `fin-classicii`): five root causes fixed -- boot now runs the FULL ROM startup, draws the boot screen, installs the disk driver and loads System 7.5.3 to a rendered system-error dialog
+
+Continued from the parked WIP (kind-7/V8-Eagle identity, ROM relocated to
+0x40a00000, MMU maps, VRAM window).  The parked commit actually DOUBLE-
+FAULTED ~2s in; this session root-caused and fixed five distinct blockers
+in sequence.  All changes are `hw/m68k/macclassicii.c`-local (zero shared
+files touched -- `git diff --stat`: one file).
+
+**1. Egret ISR pseudo-command garbage-copy crash (trap A092, cmd 0x1b).**
+The post-MMU interrupt-driven Egret driver (ISR 0x40a14912, OS trap A092 =
+_EgretDispatch, table entry [0x648]) sends control pseudo-commands like
+`[01 1b 03]` through its PB4/PB5 byte-handshake framing.  Unrecognised
+commands fell back to "interrupt only"; the ISR then clocked STALE SR
+bytes as a reply, and -- decoded from the ISR's completion path at
+0x40a14a4e-0x40a14a6a -- on a reply-header byte1==0 it copies trailing
+bytes through the request block's buffer pointer at +8, which set-style
+callers (the A092 thunk at 0x40a154d2 fills only bytes 0-2 + callback)
+leave UNINITIALISED.  The stack garbage happened to point at low-mem
+0x192 (an Egret vector), corrupting it byte-by-byte -> exception cascade
+-> "DOUBLE MMU FAULT".  Fix: generic `[0,0,0,cmd]` ACK for any
+unrecognised type-1 pseudo-command (a real Egret ACKs whatever it
+accepts), plus clearing stale response state on a failed pseudo
+turnaround.  (Cold-sync framing is unaffected: its turnaround buffers
+never form a `[01 cc ...]` packet -- verified in a full -d unimp log.)
+
+**2. ADB packets over the same framing.**  Next stop: `[00 00]` (ADB
+SendReset) arrives via the SAME handshake framing; unhandled, it decayed
+into a no-response signature the ISR misread -> level-1 storm -> stack
+grew down through 0xffff8000.  Fix: type-0 packets at the pseudo
+turnaround now run `adb_request` and reply `[0,0,0,cmd]` + register
+data (the ISR routes post-header bytes into the request's declared
+receive buffer by itself).
+
+**3. QuickDraw's swap-to-32-bit blits faulted on ScrnBase -> mode leak
+-> VPBlock-leak heap death.**  With the OS resting in 24-BIT mode
+(MMU32Bit [0xcb2]=0, 24-bit map TC 0x80f84500 masking via IS=8),
+QuickDraw's blit engine swaps to 32-bit around every screen blit
+(`jsr [0x574]` d0=1 at 0x40a2e8ae; SwapMMUMode = trap A05D, records at
+[0xcb4]=24-bit/[0xcb8]=32-bit, loaded by the type-4 pmove sequence at
+0x40a03ed8).  The shipped kind-7 32-BIT map's record list (0x40840fa4;
+8-byte records [size32, target24+kind8]; kinds 01=RAM 06=ROM 07=invalid
+26=device) maps I/O 0x50f00000->0xf00000 for only 0x30000 bytes -- the
+VRAM window position 0x50f40000, which this ROM itself puts in ScrnBase,
+is INVALID in the 32-bit map.  The first boot-screen blit faulted
+(observed Access Fault at 0x40a2e8e8, a5=0x50f4xxxx), the error path
+bailed WITHOUT restoring 24-bit mode, and every subsequent dereference
+of a 24-bit flagged handle (video parameter handle [0x8a8] -> master
+pointer 0x80005104) faulted; the retry loop leaked one 0x34-byte VPBlock
+per pass (9337 of them) until the system heap collided with the boot
+stack.  Fix: ROM-patch the record list -- I/O record size 0x30000 ->
+0x100000 and the following invalid record 0xaded0000 -> 0xade00000
+(list still sums to 4GB) -- so the 32-bit map covers the same f0xxxx
+device bank the 24-bit map already exposes.  (The A31-half remains
+invalid in the 32-bit map BY ROM DESIGN -- unlike the IIci's map -- so
+any flagged-pointer deref while swapped to 32-bit still faults; on this
+machine such derefs are only correct in 24-bit mode, which is where the
+OS rests.)  With this the boot draws the FULL gray-desktop/cursor/
+boot-disk screen.
+
+**4. Framebuffer scanout base.**  The ROM sets ScrnBase = 0x50f40000 =
+the VRAM window base with NO offset; the screen image demonstrably sits
+at RAM 0x1f0000 (pmemsave render), not at MAME-Eagle's 0x1f9a80.
+`m->fb.base` 0x1f9a80 -> 0x1f0000.
+
+**5. XPRAM was three disconnected stores; ReadXPRam returned stack
+garbage -> boot-driver installer rejected every disk.**  The SCSI boot
+scan ran forever re-reading LBA 0: the boot-driver installer (0x40a07224,
+byte-identical to the Q950/Q700 one -- this is the SAME "ddType" blocker
+Q950-NOTES finding 16/17 left unpinned!) compares the disk's driver
+ddType (a0@(6), =1 on this disk) against an expected type in d3 byte 1.
+d3 is built at 0x40a01430 from traps A07D/A084 = _GetDefaultStartup/
+_GetOSDefault = _ReadXPRam(4,@0x78)/_ReadXPRam(2,@0x76); on Egret
+machines _ReadXPRam ((0xdd4&0x70)==0x20 path, 0x40a15204) is an A092
+**READ_MCU pseudo-command at MCU address 0x100+offset** -- i.e. the
+Egret MCU's XPRAM lives at MCU 0x100-0x1FF, one store shared with
+GET_PRAM/SET_PRAM.  Our READ_MCU (a) was backed by a separate scratch
+array and (b) returned exactly ONE byte, so multi-byte reads consumed
+stale garbage (expected ddType read 0x6a) -> no driver ever matched ->
+endless "?" rescan.  Fixes: READ_MCU/WRITE_MCU at 0x100-0x1FF now map
+onto via1.PRAM[] (single authoritative XPRAM); READ_MCU replies are
+STREAMED to the end of the 256-byte window (the wire carries no length
+-- the host reads what its A092 block asked for and then closes
+/SYS_SESSION; handled as a new early-close case in session_update,
+which also cancels the already-scheduled next-byte interrupt, or the
+ISR mistakes the stale byte for an unsolicited packet -> Address Error
+-> sad mac 0F/0002, observed); response/command buffers grown to 4+256.
+Plus PRAM seeds matching the Egret firmware defaults the ROM's own
+XPRAM-rebuild pass (it covers 0x01-0x6d only) does not provide:
+XPRAM[0x76-0x77] = 0x0001 (default OS = ddType 1, the standard Mac SCSI
+driver) and XPRAM[0x78-0x7b] = 0xff (no preferred startup device) --
+exactly the values the working -M quadra700 oracle reads at the same
+compare.
+
+**Result:** boot now runs machine-ID -> POST -> OS startup -> gray
+desktop + cursor + boot-disk icon (RENDERED in the QEMU display) ->
+SCSI scan -> boot blocks accepted -> driver installed -> **System 7.5.3
+loads and runs far enough to render its own system-error dialog**
+("Sorry, a system error occurred / bus error", Dialog Manager fully
+drawing, Restart button) -- i.e. real System code with working video.
+
+**6. (root-caused from the "bus error" dialog) Framebuffer/heap
+overlap -- fixed with a dedicated VRAM region -> FINDER BOOTS.**  The
+System-startup bus error traced (via the Resource Manager map-chain
+walker at 0x40a1b778) to a resource map allocated at 0x1f2470 whose
+memory read back as the GRAY DESKTOP PATTERN (0x5555/0xAAAA) -- the
+screen (VRAM window -> RAM 0x1f0000-0x1f5580) and the MacOS heap were
+the SAME physical pages.  Real Eagle steals the top 64KB of the onboard
+bank and Apple's software contract keeps it out of usable RAM; our
+boot sizes a flat 4MB and MacOS heap-allocates straight through the
+screen, so QuickDraw painting the desktop shredded live heap blocks
+(the garbage next-map link 0xfd7a3400 was literally boot-icon pixels).
+Fix: back the VRAM window / 0x9f0000 aperture / scanout with a
+dedicated 64KB `macclassicii.vram` region instead of aliasing
+machine->ram -- same carve-out contract, no bank-accounting model
+needed; guest RAM stays flat 4MB.
+
+**RESULT: `-M macclassicii` boots MacOS 7.5.3 to a FULLY INTERACTIVE
+FINDER DESKTOP.**  The -snapshot "computer was not shut down properly"
+dialog appears (exactly as on the IIci baseline), an injected ADB
+Return keypress dismisses it, and the Finder comes up with the menu
+bar (clock ticking 6:05 PM -> 6:06 PM across screenshots), System
+Folder + Control Panels windows, the mounted OpenRetroSCSI 7.5 volume,
+Trash, and desktop icons all rendering.  This is the best tier --
+matching the IIci.  Known follow-up: mouse movement injected via QMP
+did not visibly move the cursor (the Egret model never sends
+unsolicited/autopoll ADB packets; the keyboard works through explicit
+Talk polls) -- input-polish work for a future session.
+
+**Regression check:** zero shared files touched (macclassicii.c only),
+so q800/quadra700/maciisi are unaffected by construction; `-M maciici`
+re-verified with the new binary via QMP screendump -> boots to the
+Finder desktop as before.
+
 ## Mac SE/30 — hw/m68k/macse30.c
 
 Approach: clone of maciici.c, keeping the classic VIA1 ADB transceiver
