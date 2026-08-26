@@ -1,0 +1,27 @@
+diff --git a/arch/m68k/apollo/dn_ints.c b/arch/m68k/apollo/dn_ints.c
+index ba96a92f8f18..d08f363cd438 100644
+--- a/arch/m68k/apollo/dn_ints.c
++++ b/arch/m68k/apollo/dn_ints.c
+@@ -11,6 +11,14 @@ static unsigned int apollo_irq_startup(struct irq_data *data)
+ {
+ 	unsigned int irq = data->irq;
+ 
++	/*
++	 * Install the m68k user-interrupt vector (user_inthandler) for this
++	 * IRQ before unmasking it - without this the vector still points at
++	 * bad_inthandler and the very first interrupt (e.g. the timer tick
++	 * that calibrate_delay() waits for) is dropped as "unexpected".
++	 * Mirrors atari_irq_startup()/the default m68k_irq_startup().
++	 */
++	m68k_irq_startup(data);
+ 	if (irq < 8)
+ 		*(volatile unsigned char *)(pica+1) &= ~(1 << irq);
+ 	else
+@@ -26,6 +34,7 @@ static void apollo_irq_shutdown(struct irq_data *data)
+ 		*(volatile unsigned char *)(pica+1) |= (1 << irq);
+ 	else
+ 		*(volatile unsigned char *)(picb+1) |= (1 << (irq - 8));
++	m68k_irq_shutdown(data);
+ }
+ 
+ static void apollo_irq_eoi(struct irq_data *data)

@@ -4,6 +4,9 @@ config CD2401
 config ESCC
     bool
 
+config SCN2681
+    bool
+
 config HTIF
     bool
 
