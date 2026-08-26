@@ -22,6 +22,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "exec/target_page.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "hw/core/boards.h"
@@ -46,6 +47,8 @@
 #include "hw/intc/m68k_irqc.h"
 #include "hw/block/flash.h"
 #include "hw/vme/vme.h"
+#include "standard-headers/asm-m68k/bootinfo.h"
+#include "bootinfo.h"
 
 #define MVME147_ROM_BANK1    0xff800000
 #define MVME147_ROM_BANK1_SZ (2 * MiB)
@@ -144,18 +147,49 @@ static void mvme147_vme_irq(void *opaque, int n, int value)
     mvme147_update_irq(s);
 }
 
+/*
+ * The 147Bug entry point this board normally resets into (see
+ * docs/system/m68k/mvme147.rst: the reset handler jumps here directly
+ * rather than reading the reset vector).  -kernel overrides this with
+ * the loaded ELF's entry point instead, see mvme147_init() below.
+ */
+#define MVME147_147BUG_ENTRY 0xff823952
+
+typedef struct {
+    M68kCPU *cpu;
+    hwaddr reset_pc;
+    hwaddr reset_sp;	/* 0 = leave whatever cpu_reset() fetched from
+			 * address 0; the 147Bug ROM sets up its own stack
+			 * as its first instructions and never relied on
+			 * that fetch producing anything valid either. */
+} MVME147ResetInfo;
+
 static void main_cpu_reset(void *opaque)
 {
-    M68kCPU *cpu = opaque;
-    CPUState *cs = CPU(cpu);
-
-    printf("reset!\n");
+    MVME147ResetInfo *info = opaque;
+    CPUState *cs = CPU(info->cpu);
+    CPUM68KState *env = &info->cpu->env;
 
     cpu_reset(cs);
 
-    cpu->env.pc = 0xff823952;
-
-    printf("0x%08x\n", (unsigned) cpu->env.pc);
+    env->pc = info->reset_pc;
+    if (info->reset_sp) {
+        /*
+         * Real VME bootloaders (vmelilo/tftplilo) don't actually reset
+         * the CPU at all -- they just jump into the kernel from
+         * whatever stack they were already running on.  Since this
+         * model does a real cpu_reset() first, give the kernel a valid
+         * stack explicitly rather than relying on address 0 holding a
+         * vector table (RAM there is just zeroed).  Write both the
+         * live register and its shadow slot directly instead of going
+         * through m68k_switch_sp(), which saves aregs[7] into the
+         * *current* context and loads aregs[7] back from whatever
+         * context env->sr says is active -- a no-op swap here, not an
+         * assignment.
+         */
+        env->aregs[7] = info->reset_sp;
+        env->sp[env->current_sp] = info->reset_sp;
+    }
 }
 
 static void mvme147_init(MachineState *machine)
@@ -175,13 +209,17 @@ static void mvme147_init(MachineState *machine)
     DeviceState *serial_dev;
     DeviceState *scsi_dev;
     MVME147IRQState *irqs;
+    MVME147ResetInfo *reset_info;
 
     if(!machine)
         printf("machine is null\n");
 
     /* CPU init */
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
-    qemu_register_reset(main_cpu_reset, cpu);
+    reset_info = g_new0(MVME147ResetInfo, 1);
+    reset_info->cpu = cpu;
+    reset_info->reset_pc = MVME147_147BUG_ENTRY;
+    qemu_register_reset(main_cpu_reset, reset_info);
 
     /* the PCC and the VMEbus share the 68030's interrupt levels */
     irqs = g_new0(MVME147IRQState, 1);
@@ -282,6 +320,77 @@ static void mvme147_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, MVME147_SCC2);
 
+    /*
+     * -kernel: load a raw vmlinux ELF and hand it a classic m68k bootinfo
+     * block (BI_* records right after the kernel image, per
+     * arch/m68k/kernel/setup_mm.c) instead of resetting into 147Bug.
+     * Modelled on the linux_boot path in q800_init() in this same file.
+     */
+    if (machine->kernel_filename) {
+        CPUState *cs = CPU(cpu);
+        uint64_t elf_entry, high;
+        int64_t kernel_size;
+        hwaddr parameters_base;
+        hwaddr top_of_ram = machine->ram_size;
+        void *param_blob, *param_ptr;
+
+        kernel_size = load_elf(machine->kernel_filename, NULL, NULL, NULL,
+                               &elf_entry, NULL, &high, NULL, ELFDATA2MSB,
+                               EM_68K, 0, 0);
+        if (kernel_size < 0) {
+            error_report("could not load kernel '%s'", machine->kernel_filename);
+            exit(1);
+        }
+        reset_info->reset_pc = elf_entry;
+
+        parameters_base = (high + 1) & ~1;
+        param_blob = g_malloc(machine->kernel_cmdline ?
+                              strlen(machine->kernel_cmdline) + 1024 : 1024);
+        param_ptr = param_blob;
+
+        /*
+         * Tag order matches virt_init()'s linux_boot path in this same
+         * file: BI_MMUTYPE before the (repeated) BI_CPUTYPE, and no
+         * BI_FPUTYPE record at all for a board with no on-chip/coprocessor
+         * FPU.  head.S parses machtype/cputype/fputype/mmutype itself
+         * before the generic C bootinfo scanner ever runs, so match a
+         * proven-working sequence rather than the (also spec-legal, but
+         * untested) ordering used for q800's MAC_* records.
+         */
+        BOOTINFO1(param_ptr, BI_MACHTYPE, MACH_MVME147);
+        BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68030);
+        BOOTINFO1(param_ptr, BI_MMUTYPE, MMU_68030);
+        BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68030);
+        BOOTINFO2(param_ptr, BI_MEMCHUNK, 0, machine->ram_size);
+
+        if (machine->kernel_cmdline)
+            BOOTINFOSTR(param_ptr, BI_COMMAND_LINE, machine->kernel_cmdline);
+
+        if (machine->initrd_filename) {
+            int64_t initrd_size = get_image_size(machine->initrd_filename, NULL);
+            hwaddr initrd_base;
+
+            if (initrd_size < 0) {
+                error_report("could not load initial ram disk '%s'",
+                             machine->initrd_filename);
+                exit(1);
+            }
+            initrd_base = (machine->ram_size - initrd_size) & TARGET_PAGE_MASK;
+            load_image_targphys(machine->initrd_filename, initrd_base,
+                                machine->ram_size - initrd_base, &error_fatal);
+            BOOTINFO2(param_ptr, BI_RAMDISK, initrd_base, initrd_size);
+            top_of_ram = initrd_base;
+        }
+
+        BOOTINFO0(param_ptr, BI_LAST);
+        rom_add_blob_fixed_as("bootinfo", param_blob, param_ptr - param_blob,
+                              parameters_base, cs->as);
+        g_free(param_blob);
+
+        /* A temporary stack is all this needs -- head.S sets up the
+         * kernel's real one almost immediately. */
+        reset_info->reset_sp = (top_of_ram - 0x1000) & ~3;
+    }
 }
 
 #define MVME147_DEFAULT_SDRAM_SIZE (16 * MiB)
