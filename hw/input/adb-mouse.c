@@ -239,6 +239,31 @@ static bool adb_mouse_has_data(ADBDevice *d)
              s->dx == 0 && s->dy == 0);
 }
 
+/*
+ * Force the mouse to report its *current* button state on the next poll
+ * even if nothing has actually changed, WITHOUT injecting any spurious
+ * cursor movement.  An ADB mouse normally only answers a Talk R0 when
+ * its state has changed; a host that needs the device to re-announce a
+ * held button (e.g. the SE/30 ROM's boot-time 0x172 mouse rendezvous,
+ * which must observe a "button down" reply but must NOT see the cursor
+ * move) can call this before each poll.  It is a no-op for any bus that
+ * has no ADB mouse.  Added for hw/m68k/macse30.c; unused by other
+ * machines.
+ */
+void adb_mouse_force_report(ADBBusState *bus)
+{
+    int i;
+
+    for (i = 0; i < bus->nb_devices; i++) {
+        ADBDevice *d = bus->devices[i];
+        MouseState *s = ADB_MOUSE(object_dynamic_cast(OBJECT(d),
+                                                      TYPE_ADB_MOUSE));
+        if (s) {
+            s->last_buttons_state = ~s->buttons_state;
+        }
+    }
+}
+
 static void adb_mouse_reset(DeviceState *dev)
 {
     ADBDevice *d = ADB_DEVICE(dev);

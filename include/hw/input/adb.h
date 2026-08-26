@@ -101,6 +101,7 @@ void adb_set_autopoll_rate_ms(ADBBusState *s, int rate_ms);
 void adb_set_autopoll_mask(ADBBusState *s, uint16_t mask);
 void adb_register_autopoll_callback(ADBBusState *s, void (*cb)(void *opaque),
                                     void *opaque);
+void adb_mouse_force_report(ADBBusState *bus);
 
 #define TYPE_ADB_KEYBOARD "adb-keyboard"
 #define TYPE_ADB_MOUSE "adb-mouse"

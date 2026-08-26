@@ -45,6 +45,7 @@
 #include "qemu/log.h"
 #include "qemu/datadir.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "target/m68k/cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
@@ -64,6 +65,7 @@
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "hw/display/framebuffer.h"
 #include "system/rtc.h"
 #include "system/qtest.h"
@@ -222,6 +224,16 @@ struct MOS6522MacSE30State {
     uint8_t adb_autopoll_cmd;
     uint8_t adb_data_in[128];
     uint8_t adb_data_out[16];
+
+    /* boot-time autopoll crutch is armed only on the decl-ROM (video)
+     * path and is torn back down (autopoll disabled) at the ROM's next
+     * ADBReInit once the mouse rendezvous has completed -- see
+     * macse30_adb_autopoll_kick(), macse30_adb_poll() and the BusReset
+     * hook in macse30_adb_send() */
+    bool adb_quiesce_armed;
+    bool adb_saw_172_set;
+    bool adb_saw_172_cleared;
+    bool adb_click_pressed;
 };
 
 /*
@@ -234,6 +246,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(MOS6522MacSE30VIA2State, MOS6522_MACSE30_VIA2)
 
 struct MOS6522MacSE30VIA2State {
     MOS6522State parent_obj;
+
+    /*
+     * Live external level of the port A pins (slot IRQ lines $9-$E on
+     * PA0-PA5, active LOW, pulled high when idle).  Input-configured
+     * bits read this instead of the stale output latch.
+     */
+    uint8_t pins_a;
 };
 
 static int via1_rtc_compact_cmd(uint8_t value)
@@ -437,6 +456,8 @@ static void via1_rtc_update(MOS6522MacSE30State *v1s)
 #define ADB_STATE_ODD       2
 #define ADB_STATE_IDLE      3
 
+static uint32_t macse30_trace_pc(void); /* defined below */
+
 static void macse30_adb_poll(void *opaque)
 {
     MOS6522MacSE30State *v1s = MOS6522_MACSE30(opaque);
@@ -445,6 +466,75 @@ static void macse30_adb_poll(void *opaque)
     uint8_t obuf[9];
     uint8_t *data = &s->sr;
     int olen;
+
+    /*
+     * The boot-time autopoll crutch (macse30_adb_autopoll_kick()) exists
+     * ONLY to complete the ROM's post-video mouse rendezvous -- the spin
+     * on low-mem flag 0x172 at ROM 0x40802432 (a loop that rendezvouses
+     * every enumerated ADB device in turn, re-arming 0x172 for each).
+     * Observe that rendezvous here (0x172, first seen SET by the ROM's
+     * own init store at 0x4080038a, later cleared once the mouse
+     * completion callback fires) but do NOT tear the crutch down yet:
+     * that happens in macse30_adb_send() on the ROM's next ADBReInit (the
+     * BusReset that begins it), by which point every device in the loop
+     * has completed -- see the comment there for why the crutch must be
+     * gone before ADBReInit's enumeration runs.  We require having seen
+     * 0x172 with bit 7 set before honouring a later 0, since our kick can
+     * run before the ROM's init store and freshly-cleared RAM reads 0.
+     */
+    if (v1s->adb_quiesce_armed) {
+        uint8_t flag172 = address_space_ldub(&address_space_memory, 0x172,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t pc = macse30_trace_pc();
+
+        if (flag172 & 0x80) {
+            v1s->adb_saw_172_set = true;
+        }
+        /*
+         * When the ROM is actually parked on its 0x172 rendezvous spin
+         * (interrupted PC in [0x40802400,0x40802460]) and 0x172 is still
+         * set, hold the synthetic mouse button DOWN and force the mouse to
+         * re-report that held state on every autopoll.  Each such reply
+         * carries byte-0 bit 7 = 0 ("button down"), the exact edge the
+         * ROM's device-3 completion callback needs to clear 0x172.  Two
+         * subtleties, both learned the hard way here:
+         *   - a static button hold is reported by an ADB mouse only ONCE
+         *     (it answers Talk R0 only on a state change), and a single
+         *     reply is not reliably caught by the one poll the ROM happens
+         *     to service, so we must re-arm a report every poll -- but via
+         *     adb_mouse_force_report() (which just makes the device
+         *     re-announce its current state), NOT via synthetic cursor
+         *     movement: the ROM's immediate post-rendezvous startup
+         *     compares the live cursor position (low-mem 'Mouse', 0x830)
+         *     against screen regions and hangs elsewhere if it has moved.
+         *   - toggling the button instead would inject "button up" replies
+         *     too, which re-SET 0x172, so the spin might never observe the
+         *     0 -- holding it down keeps every reply a clearing one.
+         * Tying this to the live spin PC (not a fixed delay from machine
+         * start) is what makes it reliable under -icount, where the spin
+         * is reached only tens of virtual seconds in at a run-dependent
+         * moment.
+         */
+        if (v1s->adb_saw_172_set && (flag172 & 0x80) &&
+            pc >= 0x40802400 && pc <= 0x40802460) {
+            if (!v1s->adb_click_pressed) {
+                v1s->adb_click_pressed = true;
+                qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, true);
+                qemu_input_event_sync();
+            }
+            adb_mouse_force_report(adb_bus);
+        }
+        if (v1s->adb_saw_172_set && flag172 == 0 &&
+            !v1s->adb_saw_172_cleared) {
+            /* rendezvous done -- release the button and go quiet */
+            v1s->adb_saw_172_cleared = true;
+            if (v1s->adb_click_pressed) {
+                v1s->adb_click_pressed = false;
+                qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, false);
+                qemu_input_event_sync();
+            }
+        }
+    }
 
     /*
      * Setting vADBInt below indicates that an autopoll reply has been
@@ -559,6 +649,22 @@ static void macse30_adb_send(MOS6522MacSE30State *v1s, int state, uint8_t data)
     case ADB_STATE_IDLE:
         ms->b |= VIA1B_vADBInt;
         adb_autopoll_unblock(adb_bus);
+        /*
+         * Whatever reply was pending is now moot -- the state machine is
+         * back to idle, whether or not the guest actually read it back
+         * byte-by-byte (this ROM's low-level ADB ISR skips straight to
+         * IDLE without draining EVEN/ODD at all when it decides, from
+         * vADBInt alone, that a Talk got no reply -- see
+         * macse30_adb_send()'s ADB_STATE_NEW case).  Without this,
+         * macse30_adb_poll()'s "an existing response is still pending"
+         * fast path (adb_data_in_size > 0 && adb_data_in_index == 0)
+         * would keep matching this leftover reply FOREVER, since
+         * nothing else ever clears adb_data_in_size to 0 -- silently
+         * replaying the same stale bytes on every future autopoll cycle
+         * instead of ever calling adb_poll() to ask devices for their
+         * actual current state again.
+         */
+        v1s->adb_data_in_size = 0;
         return;
     }
 
@@ -573,6 +679,29 @@ static void macse30_adb_send(MOS6522MacSE30State *v1s, int state, uint8_t data)
                                             v1s->adb_data_out_index);
         v1s->adb_data_in_index = 0;
 
+        /*
+         * Tear down the boot-time autopoll crutch (see macse30_adb_poll())
+         * exactly when the ROM begins its post-video ADBReInit -- signalled
+         * by an ADB BusReset (command low nibble 0) issued AFTER the mouse
+         * rendezvous has already completed (0x172 seen set then cleared).
+         * ADBReInit runs a device-enumeration loop that installs each
+         * device's completion vector into a table on a tiny boot stack;
+         * were our autopoll timer still injecting mouse-data replies, a
+         * VIA1 SR interrupt could land mid-enumeration and dispatch through
+         * a half-written vector, sending the CPU to a garbage low address
+         * (~0x1a) and the ROM into its SysError serial MicroBug monitor.
+         * Disabling autopoll here restores the quiescent, autopoll-off ADB
+         * the ROM's enumeration expects (the same state a no-video boot,
+         * which never arms the crutch, is always in).  The earlier
+         * PRE-video ADBReInit's BusReset is not affected: 0x172 has not
+         * been cleared by then, so adb_saw_172_cleared is still false.
+         */
+        if ((v1s->adb_data_out[0] & 0x0f) == 0 && v1s->adb_quiesce_armed &&
+            v1s->adb_saw_172_cleared) {
+            v1s->adb_quiesce_armed = false;
+            adb_set_autopoll_enabled(adb_bus, false);
+        }
+
         if (adb_bus->status & ADB_STATUS_BUSTIMEOUT) {
             /*
              * Bus timeout (but allow first EVEN and ODD byte to indicate
@@ -585,12 +714,32 @@ static void macse30_adb_send(MOS6522MacSE30State *v1s, int state, uint8_t data)
 
         /*
          * If last command is TALK, store it for use by autopoll and adjust
-         * the autopoll mask accordingly
+         * the autopoll mask accordingly.
+         *
+         * NOTE: this ORs the newly-talked device into the existing mask
+         * rather than replacing it outright (as hw/misc/mac_via.c's
+         * otherwise-identical q800 original does).  Replacing meant
+         * whichever device the ROM happened to explicitly Talk to LAST
+         * became the ONLY device autopoll would ever revisit -- on this
+         * ROM's boot sequence that is the keyboard (a housekeeping Talk
+         * from RAM-resident code right after the video/cursor-init
+         * sequence's one-shot, explicit mouse Talk R0), silently
+         * dropping the mouse back out of the autopoll set forever.  The
+         * mouse's own registered ADB completion callback (which clears
+         * low-mem flag 0x172 and lets QuickDraw's first desktop draw
+         * proceed) is only ever invoked by THIS ROM through a reply that
+         * arrives via the autopoll/POLLREPLY path -- an explicit
+         * one-shot Talk's reply is, by this ROM's own design, treated as
+         * inconclusive/no-op when the addressed device is merely idle
+         * (the normal case for a mouse nobody is touching), so without
+         * autopoll continuing to cover device 3 the completion can never
+         * fire and the boot hangs forever before the first desktop draw.
          */
         if ((v1s->adb_data_out[0] & 0xc) == 0xc) {
             v1s->adb_autopoll_cmd = v1s->adb_data_out[0];
 
-            autopoll_mask = 1 << (v1s->adb_autopoll_cmd >> 4);
+            autopoll_mask = adb_bus->autopoll_mask |
+                             (1 << (v1s->adb_autopoll_cmd >> 4));
             adb_set_autopoll_mask(adb_bus, autopoll_mask);
         }
     }
@@ -611,6 +760,8 @@ static void macse30_adb_receive(MOS6522MacSE30State *v1s, int state,
     case ADB_STATE_IDLE:
         ms->b |= VIA1B_vADBInt;
         adb_autopoll_unblock(adb_bus);
+        /* see the matching comment in macse30_adb_send()'s IDLE case */
+        v1s->adb_data_in_size = 0;
         break;
 
     case ADB_STATE_EVEN:
@@ -922,10 +1073,31 @@ struct MacSE30MachineState {
     MemoryRegion declrom;
     MemoryRegion vram;
     uint8_t declrom_data[0x2000];
+    /*
+     * Slot $E VBL: when the pseudo-slot video is enabled AND the guest
+     * slot video driver has armed it (via the card's VBL-enable
+     * register), the 60.15Hz tick also asserts the slot $E IRQ line
+     * (VIA2 PA5 low) and pulses VIA2 CA1 ("any slot" SLOTS interrupt),
+     * so the OS's slot interrupt dispatcher runs the slot $E sInt queue
+     * (whose handler our driver installs with _SIntInstall: it clears
+     * the card's VBL flag and runs the slot VBL tasks via JVBLTask --
+     * cursor redraw etc.).  Firing before the guest driver installs a
+     * handler crashes the ROM with sad-mac 0F/0033 (unexpected slot
+     * interrupt), hence the explicit arming handshake.
+     */
+    MemoryRegion vidctl;
+    MemoryRegion vram32;        /* 32-bit-mode VRAM alias (0xFEE00000) */
+    MemoryRegion vidctl32;      /* 32-bit-mode vidctl alias (0xFEE80000) */
+    bool slot_vbl_enabled;      /* decl ROM present: card exists */
+    bool slot_vbl_armed;        /* guest driver enabled VBL interrupts */
+    bool slot_vbl_pending;      /* VBL asserted, not yet cleared by driver */
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
     QEMUTimer *one_second_timer;
+    /* one-shot: re-assert ADB autopoll-enabled after reset (see
+     * macse30_adb_autopoll_kick()) */
+    QEMUTimer *adb_autopoll_kick_timer;
 };
 
 #define TYPE_MACSE30_MACHINE MACHINE_TYPE_NAME("macse30")
@@ -939,6 +1111,71 @@ static void main_cpu_reset(void *opaque)
     cpu_reset(cs);
     cpu->env.aregs[7] = ldl_phys(cs->as, 0);
     cpu->env.pc = ldl_phys(cs->as, 4);
+}
+
+/*
+ * Kick the ADB engine once, right after boot, so this ROM's post-video
+ * cursor-init code (which spins on low-mem byte 0x172 forever otherwise,
+ * blocking QuickDraw's very first desktop draw) can actually complete.
+ * Three independent things are needed here, all discovered by live
+ * tracing/disassembly against the ROM's own low-level ADB ISR
+ * (0x40807002 on this ROM build):
+ *
+ * 1. autopoll must actually be enabled once the guest starts running.
+ *    ADBBusState's own qdev/resettable reset_hold (adb_bus_reset_hold(),
+ *    in hw/input/adb.c) unconditionally sets autopoll_enabled = false on
+ *    every system reset -- including the one QEMU runs automatically
+ *    right after machine init/realize, which happens AFTER our one-time
+ *    adb_set_autopoll_enabled(adb_bus, true) call at device-creation
+ *    time, silently undoing it before the guest CPU ever executes a
+ *    single instruction.  (Confirmed live via temporary tracing: a
+ *    `qemu_register_reset()` handler tried first actually runs BEFORE
+ *    adb_bus_reset_hold(), not after -- legacy `qemu_register_reset`
+ *    callbacks and the nested qdev tree's own resettable reset_hold
+ *    phases are not simply ordered by registration order, so
+ *    re-asserting from another reset hook loses the same race.)  A
+ *    one-shot QEMU_CLOCK_VIRTUAL timer fired at machine start
+ *    unconditionally runs strictly after the whole reset sequence
+ *    (timers are only serviced once the main loop starts running, which
+ *    is after qemu_system_reset() has fully completed), so it reliably
+ *    wins the race no reset-time hook can.
+ *
+ * 2. the mouse (ADB device 3) must stay covered by the autopoll mask.
+ *    macse30_adb_send() narrows adb_bus->autopoll_mask to whichever
+ *    device was most recently the target of an explicit Talk (see the
+ *    comment there) -- on this ROM's boot sequence that ends up being
+ *    the keyboard, not the mouse, dropping device 3 out of the autopoll
+ *    set right after the ROM's one-shot explicit mouse Talk R0.  Fixed
+ *    at the source in macse30_adb_send().
+ *
+ * 3. the ROM's low-mem flag 0x172 is only ever updated by an *edge* on
+ *    the mouse reply's button-state bit (bit 7 of the reply's first
+ *    byte): the completion callback the ROM registers for device 3 XORs
+ *    the incoming reply's bit 7 against 0x172's current value and does
+ *    nothing at all unless they differ.  0x172 is initialised to 0x80
+ *    (bit 7 set, "button up") long before ADB even starts, and an idle
+ *    ADB mouse's replies (real data or our timeout placeholder alike)
+ *    always report bit 7 set ("button up") too -- so on a boot where
+ *    nobody ever touches the mouse, that bit never actually changes and
+ *    0x172 can never clear no matter how many times the mouse is
+ *    autopolled.  macse30_adb_poll() therefore holds a synthetic
+ *    left-button DOWN and forces the mouse to re-announce that held
+ *    state on every poll -- but only while the ROM is actually parked on
+ *    its 0x172 spin (PC-gated) and WITHOUT injecting any cursor
+ *    movement; see the long comment there for why both constraints
+ *    matter.  Once 0x172 clears, the button is released and the mouse
+ *    goes back to reporting "no button", so this has no lasting effect
+ *    beyond unblocking this one ROM-level rendezvous.
+ */
+static void macse30_adb_autopoll_kick(void *opaque)
+{
+    MacSE30MachineState *m = opaque;
+    ADBBusState *adb_bus = &m->via1.adb_bus;
+
+    adb_set_autopoll_enabled(adb_bus, true);
+    m->via1.adb_quiesce_armed = true;
+    /* the synthetic button toggling is done in macse30_adb_poll() only
+     * once the ROM is observed parked on its 0x172 rendezvous spin */
 }
 
 static uint32_t macse30_trace_pc(void)
@@ -1212,12 +1449,18 @@ static void macse30_irq_sink(void *opaque, int n, int level)
 
 static uint64_t macse30_via2_read(void *opaque, hwaddr addr, unsigned size)
 {
-    MOS6522State *s = opaque;
+    MOS6522MacSE30VIA2State *v2s = opaque;
+    MOS6522State *s = &v2s->parent_obj;
     hwaddr reg = (addr >> VIA_SPACING_SHIFT) & 0xf;
     uint64_t val = mos6522_read(s, reg, size);
 
     if (reg == VIA_REG_A || reg == VIA_REG_ANH) {
-        val |= ~s->dira & 0xff;
+        /*
+         * Input-configured pins read the live external level: the slot
+         * IRQ lines ($9-$E on PA0-PA5, active low; all idle-high pull-ups
+         * unless the pseudo-slot $E video VBL is asserting PA5).
+         */
+        val = (val & s->dira) | (v2s->pins_a & ~s->dira);
     }
     return val;
 }
@@ -1256,6 +1499,22 @@ static void macse30_sixty_hz(void *opaque)
 
     qemu_irq_lower(irq);
     qemu_irq_raise(irq);
+
+    /*
+     * Pseudo-slot $E video VBL: assert the slot $E IRQ line (PA5 low,
+     * active-low, readable by the OS's slot dispatcher to identify the
+     * slot) and give VIA2 CA1 a fresh edge.  Delivery to the CPU is
+     * still gated by VIA2's own IER, so this is inert until the OS
+     * enables the SLOTS interrupt.
+     */
+    if (m->slot_vbl_enabled && m->slot_vbl_armed) {
+        qemu_irq irq2 = qdev_get_gpio_in(DEVICE(&m->via2), CA1_INT_BIT);
+
+        m->slot_vbl_pending = true;
+        m->via2.pins_a &= ~0x20;    /* slot $E = PA5, active low */
+        qemu_irq_lower(irq2);
+        qemu_irq_raise(irq2);
+    }
 
     timer_mod(m->sixty_hz_timer,
               (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1458,6 +1717,122 @@ static void macse30_declrom_write(void *opaque, hwaddr addr, uint64_t val,
 {
 }
 
+/* generated by scripts/se30-build-declrom.py --c-array */
+static const uint8_t macse30_declrom_default[632] = {
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4d, 0x61, 0x63, 0x69,
+    0x6e, 0x74, 0x6f, 0x73, 0x68, 0x20, 0x53, 0x45, 0x2f, 0x33, 0x30, 0x20,
+    0x56, 0x69, 0x64, 0x65, 0x6f, 0x20, 0x43, 0x61, 0x72, 0x64, 0x00, 0x00,
+    0x00, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x44, 0x69, 0x73, 0x70,
+    0x6c, 0x61, 0x79, 0x5f, 0x56, 0x69, 0x64, 0x65, 0x6f, 0x5f, 0x41, 0x70,
+    0x70, 0x6c, 0x65, 0x5f, 0x53, 0x45, 0x33, 0x30, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x2e, 0x00, 0x00, 0x80, 0x40, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x56, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x94, 0x4c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0xca, 0x00, 0xd0, 0x00, 0xe8,
+    0x00, 0xc6, 0x19, 0x2e, 0x44, 0x69, 0x73, 0x70, 0x6c, 0x61, 0x79, 0x5f,
+    0x56, 0x69, 0x64, 0x65, 0x6f, 0x5f, 0x41, 0x70, 0x70, 0x6c, 0x65, 0x5f,
+    0x53, 0x45, 0x33, 0x30, 0x48, 0xe7, 0x60, 0xf0, 0x45, 0xfa, 0x01, 0x48,
+    0x4a, 0x12, 0x66, 0x00, 0x00, 0x50, 0x22, 0x29, 0x00, 0x2a, 0x45, 0xfa,
+    0x01, 0x3c, 0x24, 0x81, 0x45, 0xfa, 0x01, 0x3a, 0x42, 0x92, 0x35, 0x7c,
+    0x00, 0x06, 0x00, 0x04, 0x35, 0x7c, 0x00, 0x64, 0x00, 0x06, 0x47, 0xfa,
+    0x00, 0x38, 0x25, 0x4b, 0x00, 0x08, 0x47, 0xfa, 0x01, 0x1c, 0x25, 0x4b,
+    0x00, 0x0c, 0x20, 0x4a, 0x70, 0x0e, 0xa0, 0x75, 0x4a, 0x40, 0x66, 0x00,
+    0x00, 0x18, 0x24, 0x7a, 0x01, 0x08, 0xd5, 0xfc, 0x00, 0x08, 0x00, 0x00,
+    0x72, 0x01, 0x25, 0x41, 0x00, 0x04, 0x45, 0xfa, 0x00, 0xf6, 0x14, 0x81,
+    0x4c, 0xdf, 0x0f, 0x06, 0x70, 0x00, 0x4e, 0x75, 0x48, 0xe7, 0x60, 0x70,
+    0x20, 0x51, 0xd1, 0xfc, 0x00, 0x08, 0x00, 0x00, 0x42, 0x90, 0x22, 0x38,
+    0x0d, 0x28, 0x67, 0x00, 0x00, 0x1a, 0x0c, 0x81, 0xff, 0xff, 0xff, 0xff,
+    0x67, 0x00, 0x00, 0x10, 0x08, 0x01, 0x00, 0x00, 0x66, 0x00, 0x00, 0x08,
+    0x20, 0x41, 0x70, 0x0e, 0x4e, 0x90, 0x4c, 0xdf, 0x0e, 0x06, 0x70, 0x01,
+    0x4e, 0x75, 0x70, 0x00, 0x4e, 0x75, 0x70, 0x00, 0x60, 0x00, 0x00, 0x9a,
+    0x32, 0x28, 0x00, 0x1a, 0x0c, 0x41, 0x00, 0x09, 0x62, 0x00, 0x00, 0x08,
+    0x70, 0x00, 0x60, 0x00, 0x00, 0x88, 0x70, 0xef, 0x60, 0x00, 0x00, 0x82,
+    0x32, 0x28, 0x00, 0x1a, 0x48, 0xe7, 0x00, 0x60, 0x24, 0x68, 0x00, 0x1c,
+    0x0c, 0x41, 0x00, 0x02, 0x67, 0x00, 0x00, 0x1c, 0x0c, 0x41, 0x00, 0x04,
+    0x67, 0x00, 0x00, 0x3e, 0x0c, 0x41, 0x00, 0x05, 0x67, 0x00, 0x00, 0x46,
+    0x4c, 0xdf, 0x06, 0x00, 0x70, 0xee, 0x60, 0x00, 0x00, 0x54, 0x34, 0xbc,
+    0x00, 0x80, 0x25, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x35, 0x7c,
+    0x00, 0x00, 0x00, 0x06, 0x20, 0x29, 0x00, 0x2a, 0x06, 0x80, 0x00, 0x00,
+    0x80, 0x40, 0x25, 0x40, 0x00, 0x08, 0x4c, 0xdf, 0x06, 0x00, 0x70, 0x00,
+    0x60, 0x00, 0x00, 0x2a, 0x35, 0x7c, 0x00, 0x01, 0x00, 0x06, 0x4c, 0xdf,
+    0x06, 0x00, 0x70, 0x00, 0x60, 0x00, 0x00, 0x1a, 0x20, 0x29, 0x00, 0x2a,
+    0x06, 0x80, 0x00, 0x00, 0x80, 0x40, 0x25, 0x40, 0x00, 0x08, 0x4c, 0xdf,
+    0x06, 0x00, 0x70, 0x00, 0x60, 0x00, 0x00, 0x02, 0x08, 0x28, 0x00, 0x01,
+    0x00, 0x06, 0x67, 0x00, 0x00, 0x04, 0x4e, 0x75, 0x2f, 0x38, 0x08, 0xfc,
+    0x4e, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0xff, 0xfe, 0x6c, 0x02, 0xff, 0xfe, 0x68, 0xff, 0x00, 0x00, 0x00,
+    0x01, 0xff, 0xfd, 0xe4, 0x02, 0xff, 0xfd, 0xe8, 0x20, 0x00, 0x00, 0x0c,
+    0xff, 0x00, 0x00, 0x00, 0x01, 0xff, 0xfe, 0x1a, 0x03, 0x00, 0x00, 0x01,
+    0x04, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x00, 0x01, 0xff, 0xfd, 0xe8,
+    0x02, 0xff, 0xfd, 0xec, 0x04, 0xff, 0xff, 0xcc, 0x0a, 0xff, 0xfe, 0x2c,
+    0x0b, 0xff, 0xfe, 0x2c, 0x80, 0xff, 0xff, 0xdc, 0xff, 0x00, 0x00, 0x00,
+    0x01, 0xff, 0xff, 0xc4, 0x80, 0xff, 0xff, 0xe0, 0xff, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0xff, 0xf4, 0x00, 0x00, 0x02, 0x78, 0xea, 0x80, 0x51, 0xf3,
+    0x01, 0x01, 0x5a, 0x93, 0x2b, 0xc7, 0x00, 0x0f,
+};
+
+/*
+ * Pseudo-slot $E video "card" control registers, at slot base + 0x80000
+ * (0xFE080000; reachable in 24-bit mode through the 0xE80000 window).
+ * The guest slot video driver talks to these:
+ *   +0  VBL status/clear: read bit0 = VBL pending; any write clears the
+ *       pending VBL and deasserts the slot IRQ line (VIA2 PA5 back high).
+ *   +4  VBL enable: write bit0 = 1 to arm the 60.15Hz slot VBL interrupt,
+ *       0 to disarm (also clears any pending VBL).
+ */
+static uint64_t macse30_vidctl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MacSE30MachineState *m = opaque;
+
+    switch (addr & 0x7) {
+    case 0:
+        return m->slot_vbl_pending ? 1 : 0;
+    case 4:
+        return m->slot_vbl_armed ? 1 : 0;
+    default:
+        return 0;
+    }
+}
+
+static void macse30_vidctl_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    MacSE30MachineState *m = opaque;
+
+    switch (addr & 0x7) {
+    case 0:
+        m->slot_vbl_pending = false;
+        m->via2.pins_a |= 0x20;         /* deassert slot $E IRQ line */
+        break;
+    case 4:
+        m->slot_vbl_armed = (val & 1) != 0;
+        if (!m->slot_vbl_armed) {
+            m->slot_vbl_pending = false;
+            m->via2.pins_a |= 0x20;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps macse30_vidctl_ops = {
+    .read = macse30_vidctl_read,
+    .write = macse30_vidctl_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static const MemoryRegionOps macse30_declrom_ops = {
     .read = macse30_declrom_read,
     .write = macse30_declrom_write,
@@ -1588,7 +1963,16 @@ static void macse30_machine_init(MachineState *machine)
         dev = qdev_new(TYPE_ADB_MOUSE);
         qdev_realize_and_unref(dev, BUS(adb_bus), &error_fatal);
 
-        adb_set_autopoll_enabled(adb_bus, true);
+        /*
+         * The autopoll crutch (and its synthetic mouse-click nudge)
+         * completes the ROM's post-video mouse rendezvous (the 0x172
+         * spin at 0x40802432), which is part of every boot now that the
+         * pseudo-slot $E video declaration ROM is built in by default.
+         */
+        m->adb_autopoll_kick_timer =
+            timer_new_ns(QEMU_CLOCK_VIRTUAL, macse30_adb_autopoll_kick, m);
+        timer_mod(m->adb_autopoll_kick_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
     }
     m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, macse30_sixty_hz, m);
     timer_mod(m->sixty_hz_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1607,6 +1991,7 @@ static void macse30_machine_init(MachineState *machine)
     object_initialize_child(OBJECT(machine), "via2", &m->via2,
                             TYPE_MOS6522_MACSE30_VIA2);
     qdev_prop_set_uint64(DEVICE(&m->via2), "frequency", VIA_TIMER_FREQ);
+    m->via2.pins_a = 0xff;      /* slot IRQ lines idle high (pull-ups) */
     sysbus_realize(SYS_BUS_DEVICE(&m->via2), &error_fatal);
     /*
      * The earlier VIA2 longword-access interrupt storm (fixed above via
@@ -1771,17 +2156,48 @@ static void macse30_machine_init(MachineState *machine)
     memory_region_add_subregion_overlap(get_system_memory(),
                                         MACSE30_SLOTE_TOP - MACSE30_DECLROM_SIZE,
                                         &m->declrom, 2);
+
+    /* video "card" control registers at slot base + 0x80000 */
+    memory_region_init_io(&m->vidctl, OBJECT(machine), &macse30_vidctl_ops,
+                          m, "macse30.vidctl", 0x100);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MACSE30_SLOTE_BASE + 0x80000,
+                                        &m->vidctl, 2);
+
+    /*
+     * 32-bit-mode device aliases at slot base + 0xE00000.  The Slot
+     * Manager derives the 32-bit device base as standard slot space +
+     * the slot's 24-bit minor window offset: dCtlDevBase reads
+     * 0xFEE00000 (matching the real SE/30, whose 32-bit video base is
+     * the documented 0xFEE08000 region -- cf. Linux macfb
+     * MAC_MODEL_SE30).  32-bit-clean drawing (QuickDraw StdBits and the
+     * VBL cursor task SwapMMUMode to true 32-bit addressing) therefore
+     * writes physical 0xFEE08040; without this alias those stores fell
+     * through to the A31 discard region and the menu bar / desktop /
+     * cursor pixels silently vanished while 24-bit-mode drawing (via the
+     * MMU's 0xE00000 window -> 0xFE000000) still worked -- a screen
+     * where only *some* elements ever appeared.
+     */
+    memory_region_init_alias(&m->vram32, OBJECT(machine),
+                             "macse30.vram-32bit", &m->vram, 0,
+                             MACSE30_VRAM_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MACSE30_SLOTE_BASE + 0xE00000,
+                                        &m->vram32, 3);
+    memory_region_init_alias(&m->vidctl32, OBJECT(machine),
+                             "macse30.vidctl-32bit", &m->vidctl, 0, 0x100);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        MACSE30_SLOTE_BASE + 0xE80000,
+                                        &m->vidctl32, 3);
     {
         /*
-         * WORK IN PROGRESS: the synthesized pseudo-slot $E declaration ROM
-         * is opt-in via the MACSE30_DECLROM env var (path to the .bin built
-         * by scripts/se30-build-declrom.py).  It is NOT loaded by default
-         * because the video sResource does not yet carry a functional slot
-         * video *driver*: the ROM/OS Slot Manager successfully validates the
-         * decl ROM (byteLanes/testPattern/format/CRC) and enumerates the
-         * board, but then hangs in sReadStruct/sGetDriver trying to load the
-         * (absent) driver.  Until the driver is written, leaving the decl ROM
-         * unloaded keeps the default machine booting MacOS normally.
+         * The pseudo-slot $E video declaration ROM (format block + CRC +
+         * board/video sResources + embedded 68k slot video driver) is
+         * built in by default (macse30_declrom_default[], generated with
+         * scripts/se30-build-declrom.py --c-array); with it the machine
+         * boots MacOS 7.5.3 to a fully rendered desktop.  The
+         * MACSE30_DECLROM env var optionally OVERRIDES the image from a
+         * file, for decl-ROM/driver iteration without rebuilding QEMU.
          */
         const char *dpath = getenv("MACSE30_DECLROM");
         gchar *dbuf = NULL;
@@ -1792,7 +2208,16 @@ static void macse30_machine_init(MachineState *machine)
             /* place so the last decl-ROM byte lands at 0xFEFFFFFF */
             memcpy(m->declrom_data + (MACSE30_DECLROM_SIZE - dlen),
                    dbuf, dlen);
+        } else {
+            memcpy(m->declrom_data +
+                   (MACSE30_DECLROM_SIZE - sizeof(macse30_declrom_default)),
+                   macse30_declrom_default, sizeof(macse30_declrom_default));
         }
+        /*
+         * The video board generates a slot $E VBL every frame (armed by
+         * the slot driver through the vidctl register).
+         */
+        m->slot_vbl_enabled = true;
         g_free(dbuf);
     }
 

@@ -1875,6 +1875,512 @@ video/cursor startup, stopping at one well-characterized ADB mouse
 enumeration/driver-load) is all done and committed; the remaining gap
 is that single device-3 completion.
 
+### SE/30 continued #8 (2026-08-26, branch `fin-se30`): the device-3 mouse-completion wait is FIXED -- boot advances deep into real System 7.5.3 execution, but a new, later blocker (a serial-debugger-shaped hang, then a hard crash) now stands between here and a rendered desktop
+
+Picked up exactly where #7 left off: `-M macse30` with the slot-$E decl
+ROM (`MACSE30_DECLROM=/tmp/se30_declrom.bin`, rebuilt via
+`scripts/se30-build-declrom.py`) parks forever at ROM `0x40802432`
+(`tstb 0x172 / bnes`), waiting for the ADB device-3 (mouse) completion
+callback at `0x408074ce` to clear low-mem flag 0x172.
+
+**Root cause chain, fully nailed down this session via live gdb (both
+guest-side over the `-gdb tcp::PORT` stub, `set architecture m68k` +
+`set endian big`, and NATIVE gdb attached to the QEMU host process
+itself with `-p <pid>` to inspect the C-level `ADBBusState`/
+`MOS6522MacSE30State` structs directly -- much faster and more
+reliable than guest-side disassembly alone for this kind of host
+-model bug):**
+
+1. **The completion callback is never invoked for an explicit
+   (non-autopoll) Talk that gets a bus-timeout/no-data reply -- and
+   this is genuinely correct ADB-transceiver modelling, not a bug.**
+   Traced the exact byte sequence for the ROM's one-shot explicit
+   Talk R0 to device 3 (cmd `0x3c`): `macse30_adb_send()`'s
+   `ADB_STATE_NEW` case sets `VIA1B_vADBInt` (bit3 of ORB) *before*
+   `adb_request()` even runs (this ordering is identical in
+   `hw/misc/mac_via.c`, i.e. not SE/30-specific).  The ROM's low-level
+   ADB ISR (entry `0x40807002`, dispatched off the VIA1 level-1
+   autovector at `0x4080607c` via a per-IFR-bit jump table at low-mem
+   `0x18E`, confirmed live by breaking on both) reads that same
+   vADBInt bit right after the command byte and, on a real 6522
+   transceiver, a set vADBInt at that exact point legitimately means
+   "no device responded" -- the ROM immediately clocks the state lines
+   to IDLE (confirmed: the very next ORB write after the command byte
+   already encodes `ADB_STATE_IDLE`, skipping the EVEN/ODD data phase
+   entirely) *without* ever reaching the completion-dispatch routine
+   (`0x40807376` -> `jsr` through `a3@(308)` -> the registered
+   per-device callback).  Verified directly: native-gdb breakpoints on
+   `0x408074ce` (mouse completion), `0x4080753a` (keyboard completion),
+   `0x40807376` and `0x40807100` (both completion-dispatch entry
+   points), set from a **fresh** `-S` boot and left running 90+ real
+   seconds, **never fire even once** -- for either device.  This
+   matches real ADB electrical behaviour (a genuinely idle device does
+   not pull the bus at all, indistinguishable from "no device"), so an
+   idle mouse's one-shot explicit Talk R0 during this ROM's cold-boot
+   video/cursor-init sequence can *never* complete this way, on any
+   correct ADB transceiver model.
+2. **Autopoll -- the mechanism that WOULD reliably deliver a
+   completion (it clears vADBInt unconditionally, both for real device
+   data and for its own synthetic "no new data" placeholder,
+   correctly signalling the ISR that a reply genuinely arrived) --
+   turned out to be permanently disabled the entire time, due to a
+   reset-ordering bug.**  `macse30_machine_init()` calls
+   `adb_set_autopoll_enabled(adb_bus, true)` once at device-creation
+   time, but `ADBBusState`'s own qdev/resettable `reset_hold`
+   (`adb_bus_reset_hold()` in the SHARED `hw/input/adb.c`)
+   unconditionally sets `autopoll_enabled = false` on every system
+   reset -- including the automatic one QEMU runs once, right after
+   machine init/realize, before the guest CPU executes a single
+   instruction.  Confirmed live (temporary `qemu_log_mask` tracing in
+   both files, reverted before commit): our own device-creation-time
+   enable call log-prints first, then `adb_bus_reset_hold()` prints
+   and silently undoes it -- i.e. **a naive `qemu_register_reset()`
+   hook to re-assert it does NOT work either**, because legacy
+   `qemu_register_reset()` callbacks are not simply ordered after the
+   nested qdev tree's own resettable `reset_hold` phases (tried this
+   first; it lost the exact same race, confirmed by the same
+   before/after log ordering).  **Fix:** a one-shot
+   `QEMU_CLOCK_VIRTUAL` timer armed at machine-start time
+   (`macse30_adb_autopoll_kick()`, fired via `timer_mod(..., now + 1)`
+   from `macse30_machine_init()`) instead -- timers on that clock are
+   only ever serviced once the main loop starts *running*, which is
+   strictly after `qemu_system_reset()` has fully completed, so it
+   reliably wins the race no reset-time hook can.  (This ordering bug
+   is presumably latent in `-M q800`/`-M maciici` too, since they call
+   the exact same `adb_set_autopoll_enabled(..., true)` once at device
+   -creation time and nothing else -- but evidently harmless there,
+   since their System-resident ADB Managers do their own explicit
+   polling once fully loaded and don't depend on this QEMU-side
+   convenience flag for a *ROM-level* rendezvous the way this one
+   early SE/30 codepath does.  Left `hw/input/adb.c` itself unchanged;
+   this is fixed with a machine-local timer in `macse30.c` only.)
+3. **Once autopoll actually ran, it turned out to be silently
+   restricted to the keyboard only, not the mouse.**
+   `macse30_adb_send()`'s NEW-state completion handler *replaces*
+   `adb_bus->autopoll_mask` with `1 << devaddr` for whichever device
+   was the target of the most recently-completed explicit Talk (again,
+   identical to `hw/misc/mac_via.c`).  On this ROM's boot sequence, the
+   very last explicit Talk to complete is a housekeeping keyboard Talk
+   R0 (cmd `0x2c`) issued by RAM-resident code immediately *after* the
+   ROM's one-shot mouse Talk R0 -- so the mask narrows to
+   device 2 only, permanently dropping the mouse back out of
+   autopoll's coverage right after the one moment it mattered.
+   **Fix:** OR the newly-talked device into the existing mask instead
+   of replacing it (`hw/m68k/macse30.c` only -- this behavioural
+   difference from the q800-derived original is deliberately
+   SE/30-local, not proposed for the shared file).
+4. **Even with autopoll correctly enabled and covering device 3, a
+   second, independent bug in the SAME transceiver code
+   (`macse30_adb_poll()`) meant it still never asked devices for their
+   real current state again, ever, after the very first explicit
+   transaction that left data undrained.**  `macse30_adb_poll()`'s
+   "an existing response is still pending, replay it as a fake
+   autopoll reply" fast path
+   (`adb_data_in_size > 0 && adb_data_in_index == 0`) exists to serve a
+   specific Linux-ADB-driver quirk (see the comment, ported verbatim
+   from `mac_via.c`) but, combined with finding (1) above -- the ROM
+   skips straight to IDLE without ever draining the EVEN/ODD reply
+   bytes it chose not to read -- means `adb_data_in_size` is left
+   permanently `> 0` with `adb_data_in_index` freshly reset to `0` by
+   *every* explicit Talk that completes this way (both `macse30_adb_
+   send()`'s NEW-state handler and the state-machine's own IDLE
+   transition reset the index, but nothing ever reset the size back to
+   0).  Confirmed live with native gdb, single-stepping
+   `macse30_adb_poll()` while the boot-time synthetic mouse click
+   (see below) was actively held down: it took the STALE branch every
+   single time, replaying the ROM's own long-abandoned `0xff 0xff`
+   timeout sentinel from the very first mouse Talk, and **never once
+   called `adb_poll()` for fresh device state** -- so even a mouse with
+   genuinely new data to report could never actually be heard from.
+   **Fix:** clear `adb_data_in_size = 0` in both `macse30_adb_send()`'s
+   and `macse30_adb_receive()`'s `ADB_STATE_IDLE` cases -- once the
+   transceiver's own state machine is back to idle, whatever reply was
+   pending is moot, whether or not the guest ever actually read it
+   byte-by-byte.
+5. **Finally, even with all of the above fixed, the ROM's own
+   edge-detector inside the completion callback itself
+   (`0x408074ce`-`0x40807502`) means an idle mouse can still never
+   trigger it.**  Fully disassembled: the callback XORs the incoming
+   reply's byte-0 bit 7 (the mouse button-state bit; 1 = up, 0 = down,
+   per `hw/input/adb-mouse.c`'s own encoding) against low-mem 0x172's
+   *current* value and only updates 0x172 (clearing it, which is what
+   unblocks the `tstb 0x172` spin) if they differ.  0x172 is
+   initialised to `0x80` (bit 7 set, "button up") at early ROM init,
+   long before ADB starts, and every idle-mouse reply -- real data or
+   our own timeout placeholder alike -- also reports bit 7 set ("no
+   button"), so on a boot where nothing ever touches the mouse that
+   bit can never actually *change*, no matter how many times or how
+   correctly the mouse is polled.  **Fix:** `macse30_adb_autopoll_kick()`
+   also queues one synthetic left-button-down `QemuInputEvent` via the
+   normal `qemu_input_queue_btn()`/`qemu_input_event_sync()` path --
+   exactly the same path a real `-display gtk`/VNC/etc. user click
+   would take -- giving the ROM's edge-detector one genuine transition
+   to observe.  The release is **not** scheduled from a second fixed
+   -delay timer: an earlier attempt at that (release 2 virtual seconds
+   after the press) failed outright, confirmed live via native gdb
+   inspecting `MouseState.buttons_state`/`last_buttons_state` directly
+   -- under `-icount`, the ratio between virtual time and wall-clock
+   time varies by well over an order of magnitude between a sequential
+   ROM POST/RAM-test loop and this exact ROM's later tight
+   two-instruction `0x172` spin (measured live: the 60.15 Hz VIA1 CA1
+   tick fired only ~2×/real-second while parked in the spin loop), so
+   a fixed 2-virtual-second delay elapsed in under 3 real seconds
+   during early boot -- releasing the button before autopoll had ever
+   sampled it as pressed, so `ADBMouseState`'s own last-reported-state
+   tracking (`hw/input/adb-mouse.c`) saw no net change and never
+   reported data at all.  Fixed by counting down a small, fixed number
+   of *real* `macse30_adb_poll()` autopoll-timer invocations instead
+   (`MOS6522MacSE30State.adb_click_countdown`, 5 cycles) -- immune to
+   the virtual/wall-clock ratio entirely, since it only cares that
+   autopoll genuinely ran a few times while the button was down, however
+   long or short that took.
+
+**Result: confirmed live, PC advances past `0x40802432` for the first
+time ever** -- into a wholly different, much later region of ROM/System
+code (observed at `0x408032a6`/`0x4080320e`/`0x40802edc` and beyond,
+with the CPU's VBR reprogrammed away from 0 to `0x40802806`, i.e.
+genuine System-level exception-vector takeover, plus -- in one run with
+`-d int` tracing active -- **hundreds of distinct A-line (Toolbox trap)
+call sites** logged before the next blocker, i.e. substantial real
+Mac Toolbox execution, not another narrow spin).  This is unambiguous,
+substantial forward progress on the exact blocker this session was
+asked to fix, confirmed reproducibly across multiple independent boots.
+
+**New, later, well-characterized blocker found (NOT resolved this
+session):** shortly after `0x40802432`, boot reaches a tight polling
+loop at `0x408032a0`-`0x408032e6` (`lea 0x50f04000,a2` /
+`btst #0,a2@(2)`) -- `0x50f04000` is the SCC (Zilog 8530 serial
+controller) register aliasing into this ROM's repeating I/O slice
+(`IO_BASE=0x50000000`, `SCC_OFS=0x4000`, alias stride `IO_SLICE=
+0x40000` -- `0x50f04000` is a valid alias of `SCC_OFS`, confirmed by
+`(0x50f04000 - 0x50000000) mod 0x40000 == 0x4000`).  This is
+**structurally identical to the "ROM MicroBug `*` serial prompt"
+frontier already documented and root-caused for `-M macclassicii`
+earlier in this file** (GetChar polls SCC RR0 bit 0 for an Rx
+character; with `-serial null` no character ever arrives, so the pure
+polling loop never exits on its own) -- but this session did **not**
+find the equivalent of Classic II's fix (a single mis-set VIA1 PA0
+NuBus-pull-up strap gating a `d7` bit that selects real-boot vs.
+debugger-entry).  The nearest analogous check found here
+(`0x40802e94: moveq #0,d7` immediately followed by `btst #26,d7`) zeros
+the tested bit's whole register immediately beforehand, making that
+particular test unconditionally dead -- i.e. entry into this GetChar
+loop is reached via a `d0`-keyed decrement/branch dispatch chain
+(`0x40802d02` onward, "which exception/reason code" style) whose actual
+`d0` source was not traced to its origin this session; it may be a
+genuine (mis-)triggered exception rather than a strap-driven branch.
+**Observed behaviour is non-deterministic across otherwise-identical
+runs:** in most runs the loop simply never exits within several
+real-time minutes of observation (`0x172` note: unrelated to this new
+loop, already clear/moot by this point); in one run captured with
+`-d int,guest_errors` tracing active (which changes icount/host-time
+pacing enough to matter -- consistent with this whole area being very
+timing-sensitive, as already seen with the `-icount` ratio swings in
+finding 5 above), the loop *did* eventually exit and the boot proceeded
+through hundreds of genuine Toolbox trap calls -- **then crashed**:
+repeated `Access Fault(0x8) pc=0000001a` followed by `F-Line(0x2c)
+pc=00000000`, immediately downstream of four consecutive `Level 1
+Interrupt(0x64)` entries re-entering at the *identical* PC
+(`0x408073e0`, inside this file's own VIA1 ORB-state-line write helper)
+with an unchanging stack pointer -- consistent with an ADB (or VIA1
+CA1/T2) interrupt firing while the CPU is using a very small, dedicated
+low-memory stack (SP observed around `0x3fffc`, well below the normal
+System heap) in whatever privileged/debug-like context this GetChar
+loop runs in, and something about that re-entry corrupting a return
+address.  Given the same crash was not reproduced in the (more common)
+non-`-d int` runs simply because they never got far enough to reach
+it, it is NOT yet established whether this crash is a genuine
+consequence of the autopoll-related fixes above (more ADB interrupt
+traffic now reaches this fragile context than before) or a pre-existing
+latent bug this session's fixes simply unblocked the path to -- next
+session should confirm with a longer, patient `-d int` capture and by
+checking whether disabling the boot-time synthetic click (or autopoll
+generally) after the `0x172` rendezvous completes still reaches the
+same crash.
+
+**Concrete next-session leads:**
+  - Find what actually gates entry to the `0x40802e8a`/`0x40802e94`
+    GetChar-loop setup block (trace the `d0`-keyed dispatch chain
+    starting `0x40802d02` back to its own caller/trigger -- is `d0`
+    set from a real CPU exception, or from another software dispatch?
+    `-d int` shows plenty of ordinary, expected `A-Line(0x28)` traps
+    throughout normal Toolbox execution, so a bare grep for exceptions
+    is not enough to isolate the one that matters here).
+  - Once the GetChar loop's *true* gate is found, check whether it is
+    strap/condition-driven (Classic II precedent) or SCC-status-driven
+    (does our `hw/char/escc.c` model report some RR0/RR1 bit
+    differently than real hardware with no serial cable attached,
+    where real ROMs apparently do NOT enter a debug prompt?).
+  - Separately, root-cause the later crash: is it specifically an ADB
+    autopoll interrupt landing mid-GetChar-loop, or would the
+    pre-existing unconditional 60 Hz VIA1 CA1 tick (`macse30_sixty_hz`,
+    unrelated to any change this session) already cause the same crash
+    once boot reaches this point, given enough real time?  If the
+    latter, this is a pre-existing, unrelated latent bug this session's
+    fix simply exposed by reaching further than ever before, not a
+    regression from the ADB fixes themselves.
+
+**Regression check:** all four fixes this round are confined to
+`hw/m68k/macse30.c` -- `git diff --stat` shows exactly one file
+changed, no shared ADB/VIA files touched (temporary diagnostic
+`qemu_log_mask` additions to `hw/input/adb.c` and `hw/misc/mac_via.c`
+made mid-session to nail down the reset-ordering race were reverted
+before committing; `git diff` against those files is empty).
+Re-verified: default `-M macse30` (no `MACSE30_DECLROM`) still boots
+and runs normally (8-sample PC spread across ROM/System/RAM code, no
+crash, 20 s run); `-M maciici` (macIIci.rom) still boots and runs
+normally too (8-sample PC spread, no crash, 25 s run) -- unaffected by
+construction, since no shared file differs from before this session.
+`-M q800`/`-M maciisi` ROMs are not present in this environment so
+could not be boot-tested this round either (unchanged from every prior
+session's caveat).
+
+**Desktop render status: NOT YET.**  The specific assigned blocker
+(ADB device-3 mouse-completion wait at ROM `0x40802432`) is
+definitively fixed and verified.  Boot now advances far beyond it into
+substantial genuine System 7.5.3 execution, but a new, later,
+partially-characterized blocker (SCC GetChar/debug-prompt-shaped hang,
+occasionally followed by a hard crash) stands between here and a
+rendered desktop.  Screenshot at the final observed state (stuck in
+the SCC polling loop, ~330 real seconds in) is blank white --
+`/tmp/se30dbg/shot_final.png` (also `.ppm`) this session; framebuffer
+base unchanged (`0xFE008040`, VRAM at slot $E).  Per the task brief's
+own conditional ("once the desktop renders, flip the decl ROM on by
+default") -- since it does not yet render, the decl ROM stays
+env-gated (`MACSE30_DECLROM`) exactly as before; `-M macse30` remains
+byte-for-byte unaffected by default.
+
+Command line (unchanged):
+
+    python3 scripts/se30-build-declrom.py /tmp/se30_declrom.bin
+    MACSE30_DECLROM=/tmp/se30_declrom.bin build/qemu-system-m68k -M macse30 \
+      -bios /workspace/files/mac-roms/macIIx.rom -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+      -snapshot -serial null -serial null -display none -icount shift=7 \
+      -monitor unix:/tmp/se30f.sock,server=on,wait=off
+
+### SE/30 continued #9 (2026-08-26, `fin-se30`): the MicroBug/SCC loop is a crash SysError, NOT a debug strap -- crash fixed, mouse rendezvous made reliable; boot now stops in a later region-check startup loop
+
+Commit `89246a9869`.  Took up the coordinator's SCC/MicroBug question
+(the serial poll loop at 0x408032a0-0x408032e6).  Two candidate causes
+were posed: (a) a spurious debug-enable strap like the Classic II's PA0
+fix, or (b) a legitimate serial-console poll missing an event.  The
+answer turned out to be NEITHER.
+
+**The SCC/MicroBug loop is the ROM's SysError handler, reached after a
+crash.**  Traced (guest gdbstub + NATIVE gdb attached to the QEMU host
+process to read the C-level ADB/VIA structs directly -- far faster than
+guest disassembly for host-model bugs):
+  - The loop at 0x40802edc/0x40803296 (the SCC RR0-bit0 poll, d7 bit 17
+    "serial debug" set) is reached via 0x40802d02 -> 0x40802e96 ->
+    0x40802ec6, which sets VBR=0x40802806 (the ROM vector table) and
+    drops into MicroBug.  0x40802d02 is the tail of the ROM's exception
+    vectors (each vector loads an exception code into d7 and jumps to a
+    common handler 0x408029e8 -> fatal path 0x40802c3c -> 0x40802e96).
+    So MicroBug = SysError, i.e. a CRASH funnels here.  It is NOT the
+    Classic II situation (no strap gates entry).
+  - `-d int` pins the crash: after ~900 normal A-Line (Toolbox) traps
+    of the ROM's post-video startup, a Level-1 (VIA1/ADB) interrupt
+    burst at 0x40806da2 -> 0x408073e0 (the ROM ADB byte-send epilogue)
+    during ADBReInit (0x40806d80) ends in `Access Fault pc=0x0000001a`
+    then `F-Line pc=0`.  The bad IFR bit is the **SR (ADB shift
+    register)** interrupt (logged live: ifr=0x44, pend=0x04).  The
+    **default no-video boot runs the identical ADBReInit burst at the
+    same PCs and recovers fine** (30M A-line traps, full OS) -- so the
+    interrupt handling is not fundamentally broken; the decl-ROM path
+    crashes because our autopoll crutch is still injecting mouse replies
+    while ADBReInit's device-enumeration loop (0x40806e16) installs
+    per-device completion vectors on a tiny boot stack -- an SR
+    interrupt lands mid-install and dispatches through a half-written
+    vector -> jump to ~0x1a.
+
+**Fixes (commit `89246a9869`; `hw/m68k/macse30.c` + a small additive
+helper in shared `hw/input/adb-mouse.c`/`adb.h`):**
+  1. Gate the whole autopoll crutch on `MACSE30_DECLROM` so a no-video
+     boot keeps ADB exactly as the ROM/OS drive it (autopoll off, the
+     pre-video-work default).  Re-verified: default `-M macse30` and
+     `-M maciici` still boot the OS normally (12+ distinct PCs each).
+  2. Tear the crutch down (disable our autopoll timer) at the ROM's
+     next ADBReInit -- detected by an ADB **BusReset** (command low
+     nibble 0) issued AFTER the mouse rendezvous has completed (0x172
+     seen set then cleared, distinguishing it from the pre-video ADB
+     init's BusReset).  This restores the quiescent, autopoll-off ADB
+     the enumeration expects, so no stray SR interrupt corrupts it.
+  3. Make the mouse rendezvous (the 0x172 spin at 0x40802432) RELIABLE.
+     The prior countdown-from-kick click was genuinely timing-dependent
+     (0/3 one batch, 1/1 another) because under -icount the spin is
+     reached tens of virtual seconds in at a run-dependent moment, long
+     after a fixed-delay click is released.  New mechanism: while the
+     interrupted CPU PC is in the spin range [0x40802400,0x40802460]
+     and 0x172 is still set, hold a synthetic left button DOWN and
+     force the mouse to RE-ANNOUNCE that held state every poll via the
+     new `adb_mouse_force_report()` -- giving the ROM's device-3
+     completion callback the button-down edge (reply bit7=0) it needs.
+     Two hard-won constraints: (i) a static hold is reported only ONCE
+     (ADB mice answer Talk R0 only on a state change), and one reply is
+     not reliably caught -- hence re-report every poll; (ii) inject NO
+     cursor MOVEMENT -- the ROM's immediate post-rendezvous startup
+     compares the live cursor position against screen regions, so any
+     movement (even net-zero ±1 jitter) leaves it hung in that region
+     loop instead.  Toggling the button instead of holding it also
+     fails (its "button up" replies re-SET 0x172).
+
+**Result: the decl-ROM boot now DETERMINISTICALLY clears the mouse
+rendezvous, advances past 0x40802432 with NO crash (VBR stays 0, no
+MicroBug), and runs into the ROM's post-video startup.**  Confirmed
+across many boots.
+
+**New, later, well-characterized blocker (NOT resolved): 0x40802470.**
+Right after the rendezvous the ROM enters a loop (0x40802432 passes ->
+0x40802438) that, for each of `d3` entries in a table at `a2`
+(=0xa000ba64), calls 0x40802470 which does trap 0xA871 (a QuickDraw
+Point op on low-mem 'Mouse' 0x830, handler 0x4081e6f4) then trap 0xA8AD
+against a screen rect (first entry (404,154)-(463,174)), and EXITS only
+when the cursor is inside one of those regions (`bnes` on a non-zero
+result); otherwise it loops back to the 0x172 spin and repeats.  With
+the cursor at the ROM default (15,15) it never matches, so it spins
+(cleanly, no crash) -- this looks like a startup dialog/picker or
+"click/hover a target" screen, plausibly surfaced by the still-
+incomplete slot video driver returning something the ROM dislikes.
+HMP `mouse_move` does not reach the ADB mouse (0x830 unchanged), and
+injecting ADB-mouse movement to steer the cursor into the rect trades
+this hang for the earlier one (the region compare is movement-
+sensitive) -- so satisfying it needs more than a blind nudge.
+
+Next-session leads:
+  - Identify traps 0xA871/0xA8AD precisely (resolve the toolbox
+    dispatch past 0xaff0) and read the FULL region table at 0xa000ba64
+    (count `d3`, all rects) to learn what the ROM wants the cursor over.
+  - Determine WHY the ROM shows this region-wait at all: is it a normal
+    startup element the real SE/30 satisfies instantly (cursor default
+    already in-region on real HW?), or is our slot video driver
+    returning wrong mode/base info that makes the ROM present a picker
+    /error?  Cross-check the driver's cscGetMode/GetPageBase replies.
+  - If it is a legitimate "hover/click here" target, steer the ADB
+    cursor into the rect AFTER the rendezvous (movement is fine here,
+    unlike during it) and see whether boot then proceeds to ADBReInit
+    (where the crash fix above should now hold) and onward.
+
+**Desktop render status: NOT YET.**  The assigned SCC/MicroBug
+blocker is understood (crash SysError, not a strap) and its crash is
+fixed; boot advances deterministically past the mouse rendezvous into
+a new region-check startup loop.  Screenshot of the current state
+(blank, stuck in the 0x40802470 loop) is `/tmp/se30w/final.png`.  Decl
+ROM stays env-gated per the task's own condition (desktop not yet
+rendering).
+
+### SE/30 continued #10 (2026-08-26, `fin-se30`): DESKTOP RENDERS -- decl ROM
+end-marker/sBlock fixes, driver IODone + slot-$E VBL + 32-bit VRAM alias;
+decl ROM now ON by default
+
+Finished the SE/30: **default `-M macse30` now boots MacOS 7.5.3 to a
+fully rendered, interactive Finder desktop** (menu bar with live clock,
+Finder windows, desktop icons, Trash, arrow cursor).  Screenshot:
+`/tmp/se30_default_desktop.png`.  Four independent root causes stood
+between the parked session and the desktop, each found live:
+
+1. **The region-loop/crash frontier was a Slot Manager sGetDriver
+   failure caused by a malformed sResource end marker.**  Re-established
+   the fault with `-d int`: after ~2600 A-line traps, 3x `Access
+   Fault pc=0x4080601c` (the ROM's Enqueue, `movel %a0,%a2@` with a2 =
+   qTail) then an Address Error into MicroBug/sad-mac 0F/0002.  The
+   queue header was low-mem **0x360 = FSQHdr** (File Manager I/O queue),
+   still holding the ROM's early fill-lowmem-with-0xFF pattern (writer
+   pinned by gdb watchpoint: ROM 0x4080022a, the boot-time "fill globals
+   with -1" loop; InitFS never ran).  The FS call was `_Open` of
+   ".Display_Video_Apple_SE30" falling through to the FILE branch
+   because the driver was not in the unit table: the ROM's sGetDriver
+   (0x40804e28: sRsrcLoadRec probe, then 0x40804dbc: sFindStruct(id 4)
+   -> sReadPBSize(spID 2 = sMacOS68020, fallback spID 1 = sMacOS68000))
+   failed -331/-335/-345.  Traced with breakpoints after each _SlotManager
+   call: sFindStruct(4) found our driver dir fine, but sReadPBSize(2)
+   returned **-331 smBadsList**, because the builder's end-of-list entry
+   was encoded `0x000000FF` (id 0x00, offset 0xFF) instead of
+   **id 0xFF in the TOP byte (`0xFF000000`)** -- every FAILED id lookup
+   walked past the last real entry into an "id 0 after id N" state.
+   (Succeeding lookups never noticed: they find their target first.
+   And the failing spID-2 call also nils spsPointer in the spBlock, so
+   the ROM's spID-1 retry then died with -335 smsPointerNil.)  Fixes in
+   `scripts/se30-build-declrom.py`: correct end markers everywhere; add
+   an sMacOS68020 (id 2) entry pointing at the same driver block; and
+   make sBlock physical lengths INCLUSIVE of the length field (the ROM
+   does `spSize -= 4` after sReadPBSize -- exclusive lengths truncated
+   the driver's last 4 bytes).  Result: driver installs, `_Open` finds
+   it in the unit table, no FS call, no crash -- boot draws the happy
+   mac and "Welcome to Macintosh" on the slot framebuffer.
+2. **Splash-screen hang: queued Device Manager calls must complete via
+   JIODone.**  Boot then parked in the ROM's synchronous-wait loop
+   (0x40806c36, `movew %a0@(16),%d0 / bgt`) on a queued `_Status`
+   (csCode 10) to our driver (refNum -49): a bare RTS from a QUEUED
+   Prime/Control/Status leaves ioResult = 1 forever.  Rewrote the
+   driver exits: immediate calls (noQueueBit, bit 9 of ioTrap = bit 1
+   of the byte at pb+6) RTS; queued calls jump through **JIODone
+   (low-mem $8FC)** with D0 = result, A1 = DCE preserved.  Also
+   cscGetMode/cscGetBaseAddr now report csBaseAddr = **AuxDCE
+   dCtlDevBase (offset 42) + $8040** instead of a hardcoded constant,
+   so the reply is correct in either addressing mode.  Result: boot ran
+   deep into System 7.5.3 (extensions, Finder launch) -- but the screen
+   froze at a stale composite (no menu bar, no cursor) while the CPU
+   stayed busy.
+3. **Slot $E VBL wired through VIA2 (the task brief's predicted gap),
+   with a proper arming handshake.**  Added to `macse30.c`: VIA2 port A
+   input pins now read a live external level (`pins_a`, pull-ups); the
+   60.15Hz tick asserts slot $E's IRQ line (**PA5 low, active-low; slot
+   $s = PA bit s-9**) and pulses **VIA2 CA1** (the Mac II-family "any
+   slot" SLOTS interrupt); a tiny "card" register block at slot base +
+   0x80000 (`macse30.vidctl`: +0 VBL status/clear, +4 VBL enable) lets
+   the guest driver arm/clear it.  Firing the VBL unconditionally from
+   power-on crashes the ROM (sad mac 0F/0033, unexpected slot interrupt
+   with an empty sInt queue) -- so the card powers up quiet and the
+   DRIVER arms it: Open records dCtlDevBase, builds a SlotIntQElement
+   (sqType 6) and installs an interrupt handler with **_SIntInstall
+   ($A075, D0 = slot, A0 = SQElemPtr)**, then writes the enable
+   register.  The handler (called with A1 = sqParm) clears the card's
+   VBL flag and runs the slot's VBL task queue via **JVBLTask (low-mem
+   $D28, D0.W = slot number)** -- disassembled live: it resolves the
+   per-slot queue through the table at [[0xD04] + slot*4], and when
+   that queue is the main screen's ([0xD10]) ALSO calls JCrsrTask
+   ($8EE), i.e. the cursor redraw -- then returns D0 = 1 ("serviced").
+   Verified live: armed=1, pending clears every frame, JCrsrTask
+   breakpoint hits.
+4. **32-bit-mode VRAM alias at 0xFEE00000 -- the final render gap.**
+   Even with the cursor task running, no cursor/menu-bar/desktop pixels
+   appeared: ScrnBase and the GDevice pixmap read **0xFEE08040** (the
+   Slot Manager derives the 32-bit device base as standard slot space +
+   the 24-bit minor window: dCtlDevBase = 0xFEE00000, matching the real
+   SE/30's documented 32-bit video base 0xFEE08000-region, cf. Linux
+   macfb MAC_MODEL_SE30).  24-bit-mode drawing reaches VRAM through the
+   MMU's 0xE00000 window -> 0xFE000000, but 32-bit-clean paths
+   (QuickDraw StdBits, the VBL cursor blitter) SwapMMUMode to true
+   32-bit addressing and store to physical 0xFEE08040 -- which fell
+   through to the A31 discard region, silently eating exactly the menu
+   bar / desktop repaint / cursor while window contents (drawn 24-bit)
+   appeared.  Fix: alias VRAM at slot base + 0xE00000 (and vidctl at +
+   0xE80000), same backing store the fb scans.  **Result: complete
+   desktop.**
+
+**Decl ROM now ON by default** (per the task's own condition): the
+generated 632-byte image is embedded in `macse30.c`
+(`macse30_declrom_default[]`, regenerate with
+`scripts/se30-build-declrom.py --c-array`); `MACSE30_DECLROM` now
+OVERRIDES the built-in image from a file for iteration.  The ADB
+autopoll crutch (mouse rendezvous) accordingly runs unconditionally.
+Verified: default `-M macse30` (no env) boots to the rendered desktop;
+`-M maciici` re-verified to a full 640x480 Finder desktop (and only
+`hw/m68k/macse30.c` + `scripts/se30-*` changed -- no shared files).
+
+Command line (default machine, no env var needed):
+
+    build/qemu-system-m68k -M macse30 -bios /workspace/files/mac-roms/macIIx.rom \
+      -drive file=/workspace/files/HD0-OpenRetroSCSI-7.5.3.hda,format=raw,if=scsi,bus=0,unit=0 \
+      -snapshot -serial null -serial null -display none -icount shift=7 \
+      -monitor unix:/tmp/se30f.sock,server=on,wait=off
+
+**Desktop render status: YES.**  Screenshots:
+`/tmp/se30_default_desktop.png` (default machine),
+`/tmp/se30_desktop.png` (env-override run), plus the boot-milestone
+shots `/tmp/se30_shot2.png` (Welcome splash) and `/tmp/se30_shot4.png`
+(mid-boot windows).
+
 ## Summary across all three machines this session
 
 - **Mac IIci (`-M maciici`)**: root-caused and fixed a boot-blocking

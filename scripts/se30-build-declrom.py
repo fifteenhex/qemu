@@ -56,39 +56,67 @@ class Blob:
         while len(self.buf) & 1:
             self.buf += b'\0'
         return off
+    def cstr(self, s):
+        # sResource names are C strings (Slot Manager sGetCString/sReadDrvrName
+        # convention) -- a Pascal string here makes the ROM's sReadDrvrName
+        # embed the length byte in the derived driver name, so its by-name SRT
+        # search never matches and ROM sGetDriver fails with -345.
+        d = s.encode('mac_roman')
+        off = self.emit(d + b'\0')
+        while len(self.buf) & 1:
+            self.buf += b'\0'
+        return off
 
 b = Blob()
 
 # ---- data records (emit first so we know their offsets) ----
 # Board sResource type record: catBoard, 0, 0, 0
 off_board_type = b.tell(); b.long(0x00010000); b.long(0x00000000)
-off_board_name = b.pstr("Macintosh SE/30 Video Card")
+off_board_name = b.cstr("Macintosh SE/30 Video Card")
 # Video sResource type record: catDisplay(3), typVideo(1), drSwApple(1), drHwXXX(1)
 off_vid_type = b.tell(); b.long(0x00030001); b.long(0x00010001)
-off_vid_name = b.pstr("SE/30 Onboard Video")
+off_vid_name = b.cstr("Display_Video_Apple_SE30")
 
-# vidMode params (mVidParams) for the 1-bit 512x342 mode
-# fields: physBlockSize? Actually SPBlock: {mBaseOffset(l), rowBytes(w),
-#   bounds(t,l,b,r w), version(w), packType(w), packSize(l), hRes(l),
-#   vRes(l), pixelType(w), pixelSize(w), cmpCount(w), cmpSize(w),
-#   planeBytes(l) }
+# vidMode params (mVidParams) for the 1-bit 512x342 mode, emitted as an
+# sBlock (leading physical length long, then the VPBlock) because the ROM's
+# screen-init fetches it with sGetBlock (Slot Manager selector 5), which
+# expects a length-prefixed block -- same convention that already works for
+# the sMacOS68000 driver sBlock below.
+# VPBlock: {vpBaseOffset(l), vpRowBytes(w), vpBounds(t,l,b,r w), vpVersion(w),
+#   vpPackType(w), vpPackSize(l), vpHRes(l), vpVRes(l), vpPixelType(w),
+#   vpPixelSize(w), vpCmpCount(w), vpCmpSize(w), vpPlaneBytes(l) }
 def emit_vidparams(base_off, rowbytes, w, h, depth):
+    body = struct.pack(">IHHHHHHHI II HHHH I",
+                       base_off,          # vpBaseOffset ($8040)
+                       rowbytes,          # vpRowBytes   (64)
+                       0, 0, h, w,        # vpBounds t,l,b,r
+                       0,                 # vpVersion
+                       0,                 # vpPackType
+                       0,                 # vpPackSize
+                       0x00480000,        # vpHRes 72dpi
+                       0x00480000,        # vpVRes 72dpi
+                       0,                 # vpPixelType (0=chunky)
+                       depth,             # vpPixelSize
+                       1,                 # vpCmpCount
+                       depth,             # vpCmpSize
+                       0)                 # vpPlaneBytes
     off = b.tell()
-    b.long(base_off)          # mBaseOffset  ($8040)
-    b.word(rowbytes)          # mRowBytes    (64)
-    b.word(0); b.word(0); b.word(h); b.word(w)   # bounds t,l,b,r
-    b.word(0)                 # mVersion
-    b.word(0)                 # mPackType
-    b.long(0)                 # mPackSize
-    b.long(0x00480000)        # mHRes 72dpi
-    b.long(0x00480000)        # mVRes 72dpi
-    b.word(0)                 # mPixelType (0=chunky)
-    b.word(depth)             # mPixelSize
-    b.word(1)                 # mCmpCount
-    b.word(depth)             # mCmpSize
-    b.long(0)                 # mPlaneBytes
+    # sBlock physical length INCLUDES the length field itself (Designing
+    # Cards & Drivers; the ROM's sGetDriver does spSize -= 4 after
+    # sReadPBSize before allocating/copying, confirmed live at 0x40804df2).
+    b.long(len(body) + 4)
+    b.emit(body)
     return off
 off_vidparams1 = emit_vidparams(0x8040, 64, 512, 342, 1)
+
+# long data records for MinorBaseOS / MinorLength.  The ROM's screen-init
+# reads these via sFindDevBase (sel 27) / sReadLong (sel 2), which follow the
+# entry OFFSET to a long data record -- an inline value does not work here.
+# MinorBaseOS = 0 so sFindDevBase returns slot base 0xFE000000; the vidMode's
+# vpBaseOffset ($8040) is then added by the ROM, landing ScrnBase exactly on
+# the fb scanout at 0xFE008040.
+off_minorbase = b.tell(); b.long(0x00000000)
+off_minorlen  = b.tell(); b.long(0x00010000)   # 64KB VRAM aperture
 
 # ---- slot video driver (sMacOS68000) ----
 # Load the flat driver binary (assembled from se30-video-driver.s with
@@ -111,17 +139,24 @@ with open(_drvpath, "rb") as _f:
     driver_bytes = _f.read()
 
 off_driver_block = b.tell()
-b.long(len(driver_bytes))          # sBlock physical length (excludes this long)
+b.long(len(driver_bytes) + 4)      # sBlock physical length (INCLUDES itself)
 b.emit(driver_bytes)
 while len(b.buf) & 1:               # word align
     b.buf += b'\0'
 
-# sDriver directory: OSLstEntry(sMacOS68000=1 -> driver block), then end.
+# sDriver directory: sMacOS68000 (id 1) and sMacOS68020 (id 2) both point at
+# the same driver block -- the ROM's sGetDriver (0x40804dbc) asks for the
+# 68020 driver (spID 2) FIRST and only falls back to spID 1, and a failing
+# first lookup nils spsPointer in the spBlock so the fallback then dies with
+# -335 (smsPointerNil); serving id 2 directly avoids that entirely.
 off_drvr_dir = b.tell()
-_p = b.tell(); b.long(0)            # placeholder for the sMacOS68000 entry
-b.long(0x000000FF)                  # end
-struct.pack_into(">I", b.buf, _p,
-                 (0x01 << 24) | ((off_driver_block - _p) & 0x00FFFFFF))
+_p1 = b.tell(); b.long(0)           # placeholder sMacOS68000 entry
+_p2 = b.tell(); b.long(0)           # placeholder sMacOS68020 entry
+b.long(0xFF000000)                  # end-of-list (id 0xFF in the TOP byte)
+struct.pack_into(">I", b.buf, _p1,
+                 (0x01 << 24) | ((off_driver_block - _p1) & 0x00FFFFFF))
+struct.pack_into(">I", b.buf, _p2,
+                 (0x02 << 24) | ((off_driver_block - _p2) & 0x00FFFFFF))
 
 # ---- sResource lists ----
 # helper to build an sResource list at the current position; entries is a list
@@ -132,8 +167,12 @@ def emit_sresource(entries):
     for i,(rid,kind,val) in enumerate(entries):
         positions.append(b.tell())
         b.long(0)  # placeholder
-    # end marker
-    end_pos = b.tell(); b.long(0x000000FF)
+    # end marker: id 0xFF lives in the TOP byte of the entry long.  (The
+    # original 0x000000FF encoded id 0x00, which made every FAILED id search
+    # walk past the last real entry into an "id 0 after id N" state ->
+    # smBadsList (-331) instead of a clean not-found; successful searches
+    # never noticed because they find their target before the terminator.)
+    end_pos = b.tell(); b.long(0xFF000000)
     # backfill
     for (rid,kind,val),pos in zip(entries,positions):
         if kind == 'off':
@@ -154,14 +193,24 @@ off_board_sr = emit_sresource([
     (0x20, 'inline', 0x000C),        # boardId  (inline word value)
 ])
 
+# vidMode $80 directory: the ROM's screen-init does sFindStruct($80) and then
+# sGetBlock(1) INSIDE it, so mode $80 must itself be an sResource list:
+#   1 = mVidParams (sBlock), 3 = mPageCnt (inline), 4 = mDevType (inline,
+#   1 = fixed device: the SE/30's onboard 1-bit video has no writable CLUT).
+off_mode80_dir = emit_sresource([
+    (0x01, 'off', off_vidparams1),   # mVidParams sBlock
+    (0x03, 'inline', 1),             # mPageCnt
+    (0x04, 'inline', 1),             # mDevType (fixed)
+])
+
 # Video sResource (id in directory = 0x80)
 off_vid_sr = emit_sresource([
     (0x01, 'off', off_vid_type),     # sRsrcType (catDisplay/typVideo)
     (0x02, 'off', off_vid_name),     # sRsrcName
     (0x04, 'off', off_drvr_dir),     # sRsrcDrvrDir -> sMacOS68000 driver
-    (0x80, 'off', off_vidparams1),   # first vidMode params (mode $80)
-    (0x0A, 'inline', 0x8040),        # minorBaseOS
-    (0x0B, 'inline', 0xD580),        # minorLength (rowBytes*height rounded)
+    (0x0A, 'off', off_minorbase),    # minorBaseOS -> long data record
+    (0x0B, 'off', off_minorlen),     # minorLength -> long data record
+    (0x80, 'off', off_mode80_dir),   # first vidMode ($80) -> mode directory
 ])
 
 # ---- sResource directory ----
@@ -170,7 +219,7 @@ dir_entries = [(0x01, off_board_sr), (0x80, off_vid_sr)]
 positions = []
 for rid,_ in dir_entries:
     positions.append(b.tell()); b.long(0)
-b.long(0x000000FF)  # end
+b.long(0xFF000000)  # end-of-list (id 0xFF in the top byte)
 for (rid,target),pos in zip(dir_entries,positions):
     rel = (target - pos) & 0x00FFFFFF
     struct.pack_into(">I", b.buf, pos, ((rid & 0xFF) << 24) | rel)
@@ -201,3 +250,15 @@ open(sys.argv[1] if len(sys.argv)>1 else "/workspace/src/qemu-q630/se30_declrom.
 print("decl ROM: %d bytes, dir_pos=0x%x fb_pos=0x%x crc=0x%08x dirOff=%d" %
       (len(out), dir_pos, fb_pos, crc, dir_pos-fb_pos))
 print("last byte (byteLanes) will be at 0x00FFFFFF")
+
+# Optional: also emit a C array for embedding as the machine's built-in
+# default decl ROM (hw/m68k/macse30.c macse30_declrom_default[]).
+if "--c-array" in sys.argv:
+    lines = []
+    for i in range(0, len(out), 12):
+        lines.append("    " + " ".join("0x%02x," % byte
+                                       for byte in out[i:i+12]))
+    print("/* generated by scripts/se30-build-declrom.py --c-array */")
+    print("static const uint8_t macse30_declrom_default[%d] = {" % len(out))
+    print("\n".join(lines))
+    print("};")
