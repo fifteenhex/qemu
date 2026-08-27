@@ -7,6 +7,13 @@ config APOLLO
     select MC146818RTC
     select SCN2681
 
+config HP300
+    bool
+    default y
+    depends on M68K
+    select M68K_IRQC
+    select SERIAL_MM
+
 config AN5206
     bool
     default y
