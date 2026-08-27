@@ -540,3 +540,779 @@ multi-session work (the Classic II took a dedicated "deep OS-startup
 session").  Current committed state is unchanged from session 4: full POST
 passes, boot chime plays, dedicated-VRAM framebuffer live (dithered
 pattern), parked in the cold-boot serial console.
+
+## Session 6: root-cause narrowed and several prior theories DISPROVEN
+
+Goal this session: reach Finder.  Not reached -- same wall as sessions
+4/5 (cold-boot MicroBug serial console).  But the blocker is now
+characterised far more precisely, and several earlier hypotheses were
+tested and **disproven** with correct-endian gdb (the earlier sessions'
+gdb register reads were likely corrupted by a missing `set endian big`
+-- m68k register values come back byte-swapped without it; every gdb
+run this session uses it, and all register values below are verified).
+
+### Tooling correction (important for future sessions)
+
+- gdb-multiarch MUST have `set endian big` or every `$dN`/`$aN`/`$pc`
+  read is garbage (address breakpoints still work, register values do
+  not).  This silently invalidated some mid-session measurements until
+  caught.
+- **Never use `-gdb tcp::1234`**: that port is the other agent's
+  maclc550 debug stub.  Connecting to it runs THEIR frozen machine.
+  Use a unique port (this session used 1276) and always check
+  `/tmp/<stdout>` for "Address already in use" before trusting a run.
+- QEMU monitor `xp/Nwx <addr>` (physical) works for ROM/RAM dumps.
+
+### The exact steady state (mapped instruction-by-instruction)
+
+Parked in the ROM's MicroBug command interpreter, an infinite loop:
+`0x40849a08` (jmp GetChar `0x4084a0e6`) -> GetChar polls SCC RR0 Rx
+(`0x4084a0f0: btst #0,%a3@(2)`, a3=SCC 0x50f04000) gated by `d7` bit17,
+returns 0x8000 (no char) -> `0x40849a10 tstw d0; bmi 0x40849b02` ->
+`0x40849b02 btst #16,%d7` (bit16 clear) `beq 0x40849b8a` ->
+`0x40849b8a bra 0x40849a08`.  SR=0x2708 (I:7, interrupts masked).  The
+ONLY software exits are a received serial byte (never, with
+`-serial null`) or `d7` bit16 (never set in the loop).  A true infinite
+loop given the register state -- so the machine was mis-routed here, it
+is not "waiting" for anything deliverable.
+
+### How the console is reached (the real path, corrected)
+
+POST **passes** and the machine reaches the console via the NORMAL
+cold-boot continuation, NOT via any failure branch:
+
+1. POST word-sum checksum (routine `0x40846bd0`) returns **d6=0** at the
+   decision `0x408465fe: tstl d6; bne 0x40848dea` (verified: d6==0 there;
+   the `bne` is NOT taken).  The session-4 checksum repair is CORRECT and
+   VALIDATED: ROM length field `*(0x40800040)=0x00100000`=bios_size, and
+   the repaired `ROM[0]=0x49582bc9` makes the ROM's own algorithm (sum of
+   BE words offset 4..len-2, XOR stored word at 0) evaluate to 0.  So the
+   checksum is a solved non-issue.
+2. Fall-through cold-boot -> `0x40848dea` (sets SP=0x2600) -> `0x40848df8
+   btst #26,%d7` (**bit26 CLEAR**, so the session-5 "bit26 gate" is NOT
+   what routes it) -> `0x408499bc` -> `0x408499cc btst #26` (clear) ->
+   `0x408499ce` calls the capability routine `0x408468ba`(=`0x40802f18`)
+   -> `0x408499da btst #12,%d0` with **d0=0x773f (bit12 SET)**, so it
+   does NOT divert to console here either; it runs the continuation at
+   `0x40845ce2` (a video/EASC-register init: 0x80808080 gray fills, a
+   `cmpib #-80` 0xB0 version check) which RETURNS to `0x408499f6`, which
+   then sets up and enters the MicroBug loop.  The console is the
+   DELIBERATE next step after that init -- i.e. disk boot is simply never
+   invoked on this path.
+
+### Disproven hypotheses (all tested this session)
+
+- **Not** a POST/checksum failure (d6==0 at the decision point).
+- **Not** the d7 bit26 "factory test" gate (bit26 is CLEAR; the Classic
+  II PA0->bit26 mechanism does not apply to this ROM).
+- **Not** the d0 bit12 capability gate (bit12 is SET, d0=0x773f).
+- **Not** a `pins-a` strap: swept PA=0x00,0x7d,0x7f,0xbf,0xdf,0xef,0xfe,
+  0xff via `-global mos6522-maciivx.pins-a=` -- ALL still park in the
+  console.
+- **Not** a RAM-size mismatch: `-m 4/8/12/16/32/64/68` all park in the
+  console.  (The XOR-fill over [0..0xBFFFBC] with pattern 0xb6db6db6 seen
+  in `-d unimp` at pc `0x408469xx` is the RAM test filling the full
+  theoretical range; its ceiling 0xBFFFBC is fixed, not RAM-derived, and
+  is not the divert.)
+- **Not** an unexpected exception: `-d int,guest_errors` shows only 24
+  Access Faults, all at the EXPECTED presence-probe sites `0x40803982`
+  (FC7 decoder-kind probe) and `0x40803124` (device-presence helper) --
+  these deliberately bus-error to detect absent hardware and are handled.
+
+### The actual root cause (machine identification / decoder kind)
+
+`-d unimp` for a full boot shows the ROM **never touches SCSI**
+(0 accesses at the 0x50f10000 NCR5380 window) and **never runs the Egret
+transport** (0 shift-register/Egret packets; only 4 bit-bang RTC bytes
+and the RBV/VDAC/VIA identification reads).  So the boot process and the
+Egret cold-start are simply never entered.
+
+The capability/decoder routine `0x40802f18` (reached via thunk
+`0x408468ba`, which does `oriw #1792,%sr` then `lea 0xfffbc65a,%a0; jmp
+%pc@(...)` = `0x40802f18`) walks a record table and, for the IIvx,
+matches the record at **`0x408035b8`** (kind field `rec+18 = 0x0505`,
+matched against the low word of the probe result **d2=0x70000505**),
+yielding capability word **`rec+24 = 0x773f`**.  The sibling record
+`0x40803b82` (kind 0x260e) does not match.  d2=0x70000505 is computed
+from the FC7/`movesw` hardware probes (`0x40803982` etc.); because our
+VASP is modelled as the RBV/VDAC/VIA stub carried over from
+maciici/maciisi, those probes yield an **RBV-kind (0x05..) identity**,
+not VASP's.  With that identity + capability 0x773f the ROM's cold-boot
+does its hardware init and drops to the serial console instead of taking
+the NuBus/RBV disk-boot branch.
+
+**Conclusion:** the wall is exactly what session 5 suspected -- the ROM
+mis-identifies the machine's decoder kind because VASP's real
+identification registers are not modelled (Apple never published them).
+To advance, the next session needs to discover, by tracing the probe
+sequence around `0x40803982`/`0x40803124`/`0x40802f18`, which
+register/value distinguishes VASP from RBV to this ROM, model it so the
+identification produces the VASP decoder record (with an auto-boot
+capability), and only THEN will the Egret cold-start + SCSI disk-boot
+path be entered.  This is genuine VASP reverse-engineering, not a
+one-line strap/patch (every strap/patch shortcut was tested above).
+
+### Changes committed this session
+
+- `hw/m68k/maciivx.c`: seed XPRAM startup bytes 0x76/0x77 (default OS
+  ddType 1 = Mac SCSI) and 0x78-0x7b = 0xff (no startup-device
+  preference), matching the working Egret siblings (macclassicii.c / the
+  quadra700 oracle).  This is **forward-prep only** -- it is read far
+  past the current blocker, so it does not change today's boot behaviour
+  (re-verified: still parks in the console, no regression), but is
+  required by the boot-driver installer once the disk-boot branch is
+  reached.  Nothing else changed; the POST/checksum/overlay model from
+  session 4 is confirmed correct and untouched.
+
+### Furthest state
+
+Screenshot `/tmp/iivx-furthest.png`: 640x480, the post-POST uninitialised
+dithered-VRAM pattern (black/white checker), no Happy Mac -- the ROM
+reaches the console before any video init.  Identical to sessions 4/5.
+
+## Session 7: ROOT CAUSE PROVEN -- machine mis-identifies as IIci (RBV), not the Egret record; forcing the Egret record flips the branch
+
+Per the coordinator's plan, went after the identification.  Result: the
+misidentification hypothesis is **confirmed and the branch flips** when
+corrected.
+
+### The decoder record table (ROM 0x408032c8) fully mapped
+
+The identify routine `0x40802f18` walks a record table; each record is
+matched by decoder byte (`rec+19` == d2.b, here 0x05) AND
+`(d1 & rec+32) == rec+36`, where **d1 = 0xefff0000** (measured;
+`set endian big`).  d1's TOP byte 0xef == the VIA1 port-A straps
+(pins_a); bytes 2..0 = 0xff0000.  Records (addr: kind@+18, cap@+24,
+mask@+32, match@+36):
+
+```
+0x408035b8  0505  cap 0000773f  mask 56000000  match 46000000  <- MATCHED (PA&0x56==0x46)
+0x408035f8  0505  cap 0000773f  mask 56000000  match 56000000
+0x408036f8  0605  cap 00039807  mask 56000000  match 54000000
+0x40803638  0905  cap 0000773f  mask 56000000  match 00000000
+0x40803678  0a05  cap 0000773f  mask 56000000  match 06000000
+0x408036b8  0706  cap 00000000  mask 56000000  match 52000000
+0x40803b02  0c05  cap 04000000  mask 01265600  match 00001600  <- the EGRET record (decoder 5)
+0x40803b42  0d07  cap 04000000  mask 01a65600  match 00005400  <- Egret, decoder 7 (V8/Eagle: NOT the IIvx)
+0x40803738  fd04 / 0x40803778 fd05 / 0x408037b8 fd06 / 0x408037f8 fd00  (test/burn-in configs)
+```
+
+The 0505/0905/0a05/0605 records are the IIci-FAMILY (decoder-5 RBV, DISCRETE
+RTC).  0c05 is the decoder-5 record that uses the **Egret** (mask/match in
+the low bytes, not the PA byte).  Because the IIci records are tried first
+in table order and one always matches on the PA straps (any pins_a lands
+(PA&0x56) in {0x46,0x56,0x54,0x00,0x06}), the IIvx is identified as an IIci
+and uses the RTC bit-bang -- so the Egret transport is never entered, the
+cold boot runs its RBV/serial init and drops to the MicroBug console.
+
+The IIvx SHOULD be **0c05** (decoder-5/RBV-compatible + Egret) -- VASP is an
+RBV successor with an Egret, which fits 0c05 exactly; 0d07 is decoder-7
+(V8/Eagle, the LC/ClassicII family), not the IIvx.  To select 0c05 the ROM
+needs `(d1 & 0x01265600) == 0x00001600`, i.e. d1 byte2 bits 17/18/21 CLEAR
+and byte1 bits 9/10/12 SET; our d1 byte2 = 0xff (idle/pulled-up) blocks it.
+d1's low 24 bits are built by the identify dispatch's hardware probes
+(monitor-sense walking test at `0x408030f2` reading rec+72, plus the
+VIA-IER/decoder probes) -- a real VASP would drive them to the 0c05
+pattern; our RBV/VDAC/VIA stub returns 0xff0000.  Pinning down each exact
+d1-bit->register mapping is the remaining identification-modelling work.
+
+### Proof the branch flips (env-gated force patch)
+
+Added `IIVX_FORCE=<hex rom offset>` (env-gated, DEFAULT OFF -- no change to
+committed boot behaviour) which disables the IIci 05-records and forces a
+chosen record to match, to test the hypothesis directly.  With
+`IIVX_FORCE=3b02` (the 0c05 Egret record):
+
+- PC **escapes the MicroBug console** (was 0x40849a08; now 0x40814e08).
+- The **Egret transport RUNS**: 231024 Egret accesses (was 0), 57757 VIA1
+  accesses; the 40000 unbacked "ram-hole" reads DISAPPEAR (0).
+- Control reaches the **Egret cold-start sync** at ROM 0x40814cc8-0x40814e46
+  (a PB4//PB5 + SR byte handshake, IFR-bit2/SR-done polled at 0x40814e1a).
+
+So the identification IS the blocker, and 0c05 is the correct target record.
+This is exactly the coordinator's success signal (Egret packets > 0, off the
+console path).
+
+### Next blocker (well-scoped): the Egret cold-start protocol
+
+With 0c05 forced, the ROM now spins in the Egret cold-start handshake
+because our `maciivx_egret_*` model was grown against the WRONG
+(IIci-identified) path -- the Egret was never actually exercised before, so
+the model returns the no-response signature (0x00 0x00) and the ROM retries
+forever.  The fix is to port `macclassicii.c`'s complete, working Egret
+**pseudo-command** model (packet type byte 0x01; READ_MCU 0x02, GET_TIME
+0x03, GET_PRAM 0x07, WRITE_MCU 0x08, SET_TIME 0x09, SET_PRAM 0x0c; XPRAM
+streamed from via1.PRAM[]) plus its cold-start /XCVR sync -- maciivx's
+current framing ("raw ADB byte, no type byte") is wrong for the real
+Egret path.  Then: proper d1 modelling to select 0c05 without the force
+patch, then SCSI disk boot -> Finder.
+
+### Committed
+
+- `hw/m68k/maciivx.c`: env-gated `IIVX_FORCE` decoder-record force patch
+  (investigation tool; off by default, so default boot behaviour and the
+  session-6 state are unchanged -- re-verified no regression).  gdb port
+  used this session: 1279 (monitor sock /tmp/iivx-mon2.sock).
+
+## Session 7 (cont.): Egret model ported + console root-caused to a RAM-test failure
+
+### Ported the complete Egret model from macclassicii.c
+
+maciivx's Egret (forked from maciisi, never exercised because the machine
+had been mis-identified as an IIci that uses the RTC bit-bang) could not
+service the real Egret cold-start.  Ported macclassicii.c's complete Egret:
+the pseudo-command layer (type byte 0x01: READ_MCU/GET_PRAM/SET_PRAM/
+WRITE_MCU/GET_TIME/SET_TIME, XPRAM streamed from via1.PRAM[]), the
+cold-start /XCVR sync, and -- crucially -- the **PB3 (/XCVR) read override
+in maciivx_via1_read** (report the Egret's line state, not the ROM's ORB
+latch; without it the cold-start `btst #3` at 0x40814cfa spins forever).
+Struct gained egret_xcvr_asserted / egret_pseudo_* / egret_mcu_mem and a
+256-byte egret_resp.
+
+Result (with IIVX_FORCE=3b02): the Egret **cold-start sync now passes** and
+the ROM exchanges pseudo-commands (0x1b, 0x0e, 0x1c ...), then proceeds to
+RAM sizing.  Verified NO regression on the default (un-forced IIci) path --
+it still reaches the same console, no crash.
+
+### The console is a RAM-TEST failure (record-independent)
+
+Traced the post-chime path (0x46636 -> 0x4084664e -> `jmp 0x4084a6b0` ->
+`0x4084665a bnew 0x40848dea`).  **0x4084a6b0 is the ROM RAM test**: it walks
+a range list and writes/reads the 'Jade' (0x4A616465) pattern, accumulating
+mismatches in d6; it returns `tstl d6` and the caller consoles on non-zero.
+On our machine d6 != 0 (measured) because the test range extends beyond the
+installed 8 MB into unbacked memory (ram-hole writes at 0x04000000, reads at
+0x00909xxx): our ramio swallows the write and reads back 0 != 'Jade', so the
+test "fails" and diverts to the MicroBug console at 0x40848dea.  This is the
+SAME divert on both the IIci and the forced-Egret paths, and is independent
+of decoder record / capability (both build d0=0x773f) and of `-m` size
+(4/8/12/16 all fail -- the test range is not simply the -m size).
+
+**This is the real console root cause.**  Next: dump the RAM-test range list
+(a1/a5 at 0x4084a6f8) to see exactly which ranges it tests and why they
+exceed installed RAM -- likely our RAM-sizing (ramio open-bus behaviour)
+mis-detects size, or the ROM enumerates SIMM-bank ranges our flat RAM
+doesn't match.  Making the test pass (d6==0) should let the boot continue
+past 0x4084665a toward disk boot.
+
+Committed: the full Egret port (maciivx_egret_* rewritten from
+macclassicii.c) + PB3 read override.  Default boot behaviour unchanged
+(re-verified).  IIVX_FORCE remains the env-gated record selector.
+
+### CORRECTION + precise console divert (0x408466bc, a memory-integrity hash)
+
+The "RAM test at 0x4084a6b0 fails" claim above is WRONG (verified): that
+RAM test PASSES on both paths (d6==0; empty bank B at 0x04000000 is handled,
+bank A sizes to 8 MB), and its `bne 0x48dea` at 0x4084665a is NOT taken.
+
+The REAL console divert (found via `-d exec -dfilter` tracing the TBs into
+0x40848dea) is at **ROM 0x408466bc**: `tstl d6; bnew 0x40848dea`.  d6 is set
+by a memory-integrity XOR hash (loop at 0x408469c4, called via 0x40846950)
+over a region taken from a table at 0xBFFFBC (in the VRAM-24 window):
+
+```
+table@0x00BFFFBC:  start=0x00000000  len=0x00C00000  (then 0xFFFFFFFF end)
+HASH over [0x00000000 .. 0x00C00000], result d6=0xFFFFFFFF -> console
+```
+
+So the ROM hashes/tests **[0 .. 0x00C00000] (12 MB of 24-bit space)**.  Our
+24-bit map there is: RAM 0-0x7FFFFF (8 MB), ROM-24 alias 0x800000-0x8FFFFF,
+**GAP 0x900000-0xAFFFFF (unbacked, reads 0)**, VRAM-24 0xB00000-0xBFFFFF.
+The unbacked gap (and the read-only ROM-24 region, which can't hold the
+written pattern) makes the hash mismatch -> d6 != 0 -> MicroBug console.
+
+This is the true, precise console root cause (supersedes the "cold-boot
+always consoles" framing of sessions 4-6: it is this one memory-integrity
+check).  Candidate fixes for the next session:
+ 1. The region [0x800000..0xC00000] should decode per the IIvx 24-bit map so
+    the hash sees consistent memory (e.g. the gap 0x900000-0xAFFFFF may need
+    to be a RAM/ROM alias, or the test range/`MemTop` that produced len=
+    0xC00000 is wrong for our flat-RAM config and should be 0x800000).
+ 2. Determine why the table length is 0xC00000 (12 MB) not the sized 8 MB --
+    likely MemTop/BAT setup from the (IIci) record's RAM+video layout; the
+    correct IIvx (0c05, dedicated VRAM) layout may set it differently.
+Making this hash pass (d6==0) lets the boot continue past 0x408466bc.
+
+Verified tooling this session: gdb ports 1279/1280 (unique), monitor sock
+/tmp/iivx-mon2.sock.  Both IIci (default) and forced-0c05 paths reach this
+same 0x408466bc divert.
+
+### The memory-integrity test is a 32-bit WRITE-VERIFY over [0,0xC00000]
+
+Disassembled the d6 producer (0x40846950 fills [a0..a1] with a 24-byte
+moveml pattern from ROM 0x40846a4e; 0x40846a20 reads it back, eor-compares,
+ORs mismatches into d6).  So 0x408466bc's check is a **write-verify RAM test
+over [0x00000000 .. 0x00C00000] (12 MB)**.  Both the IIci-default and the
+forced-0c05 paths use the identical range (table (0,0xC00000) at 0xBFFFBC),
+so this is NOT fixed by identification.
+
+Root cause of the failure on our machine: this test runs expecting the low
+12 MB to be contiguous writable RAM (a real IIvx has 68 MB contiguous at
+0-0x43FFFFF in 32-bit mode).  Our machine has only 8 MB of RAM AND the file
+maps STATIC 24-bit aliases -- ROM-24 at 0x800000-0x8FFFFF (read-only) and
+VRAM-24 at 0xB00000-0xBFFFFF -- right in the middle of that 12 MB window.
+So the test hits read-only ROM at 0x800000 and unbacked gap at 0x900000-
+0xAFFFFF, the pattern doesn't read back, d6 != 0 -> MicroBug console.
+
+**This is the concrete, precise blocker.**  The 24-bit aliases (added in
+sessions 1-3 for the ROM's early 24-bit execution) overlap the 32-bit RAM
+region and break the 32-bit memory test.  Fix directions for next session:
+ 1. Make the 24-bit ROM-24/VRAM-24 aliases LOWER priority than RAM (so real
+    RAM wins where present), and boot with >=12 MB so [0,0xC00000] is
+    backed writable RAM -- but verify this doesn't break the early 24-bit
+    ROM execution that needed the 0x800000 ROM alias (it may only be needed
+    pre-RAM-init).
+ 2. Or model the 24-bit vs 32-bit decode as mode-dependent (the classic Mac
+    32-bit/24-bit switch) instead of static physical aliases, so 0x800000-
+    0xBFFFFF is RAM in 32-bit mode and ROM/VRAM in 24-bit mode.
+ 3. Or find where the (0,0xC00000) test length is set and confirm whether a
+    correct dedicated-VRAM IIvx config would shrink it to the sized RAM.
+
+The full chain to Finder from here: fix this memory test -> continue cold
+boot past 0x408466bc -> (with the 0c05 Egret record + ported Egret) the
+Egret/SCSI disk-boot path -> Happy Mac -> Finder.
+
+### CONFIRMED: the memory test IS the console; backing its region escapes it
+
+Added env-gated `IIVX_TESTRAM` (default off): backs [0x800000..0xC00000]
+with high-priority writable RAM (overriding the ROM-24/VRAM-24 aliases).
+With `IIVX_FORCE=3b02 IIVX_TESTRAM=1`:
+
+- The boot **ESCAPES the MicroBug console** -- PC leaves 0x4084axxx and
+  runs in RAM (observed climbing 0x01ec... -> 0x0297... -> 0x032f...),
+  with live RBV/video register access (rbv=234) and the Egret working
+  (503).  So the 0x408466bc memory test IS the sole console blocker on
+  this path -- backing its target region makes d6==0 and the cold boot
+  continues into RAM-resident code.
+
+- It then RUNS AWAY (PC climbs steadily through RAM, no SCSI, blank
+  screen) because the crude 4 MB overlay CLOBBERS the ROM-24 (0x800000)
+  and VRAM-24 (0xB00000) the post-test boot still reads: after the test
+  writes its pattern over 0x800000..0xC00000, later 24-bit ROM/VRAM
+  reads there return the test pattern -> garbage -> runaway.  This is
+  the mode-dependent-decode conflict: the 32-bit memory test needs RAM
+  at 0x800000..0xC00000, but 24-bit ROM/VRAM access needs ROM/VRAM
+  there.
+
+**Clean fix (next session):** model the 24-bit vs 32-bit decode properly
+(classic Mac mode switch) so 0x800000..0xBFFFFF is RAM in 32-bit mode and
+ROM(0x800000)/VRAM(0xB00000) only in 24-bit mode, and give the machine
+>=12 MB so [0..0xC00000] is real RAM.  Then the memory test passes
+non-destructively and the boot proceeds (Egret + 0c05 already in place)
+toward SCSI disk boot / Happy Mac / Finder.
+
+Net this session: identification root-caused + Egret ported + console
+root-caused to one memory-test instruction AND proven bypassable.  Two
+env-gated investigation tools (IIVX_FORCE, IIVX_TESTRAM), both default
+off; default boot behaviour unchanged (re-verified: still consoles at
+0x4084a0f0, no crash).
+
+## Session 8: 0c05 + Egret + memory test made DEFAULT; new frontier = a garbage-stack crash past the console
+
+Per the coordinator, converted the two env-gated proofs into default behaviour.
+
+### Fix 1 (done): select the 0c05 Egret record by DEFAULT
+
+The decoder-record force patch is now applied unconditionally (target 0x3b02
+= the 0c05 Egret record); `IIVX_FORCE=<hex>` overrides the target and
+`IIVX_FORCE=off` reverts to IIci.  NOTE the coordinator's "just set the PA
+strap" plan is NOT achievable: traced d1's construction instruction-by-
+instruction (stepi) -- d1 = 0xefff0000 is built as PA/fixed bytes then a
+`<<16` (ROM 0x40803268) that ZEROES d1 byte 1, and 0c05's criterion needs
+(d1 & 0x01265600)==0x00001600 i.e. byte1==0x16, unreachable for ANY PA
+(verified: -global pins-a sweep leaves d1==0xefff0000, and the machine
+overrides -global anyway).  The natural selector is VASP's undocumented
+decoder-kind ID registers; absent those, the ROM-table patch (same class as
+the existing relocation/checksum patches) is the principled stand-in.
+
+### Fix 2 (partial): 24/32-bit decode + RAM so the memory test passes
+
+- Default RAM raised to 32 MB (real IIvx up to 68 MB) so the ROM's 32-bit
+  write-verify test over [0..0xC00000] has real contiguous DRAM backing.
+- The static 24-bit ROM/VRAM/gap aliases (0x800000/0x900000/0xB00000) are
+  now added ONLY when RAM < 12 MB (small-RAM shim for the test); with >=12 MB
+  they are skipped because they would FRAGMENT the contiguous 32-bit DRAM the
+  boot's heap/structures need.  For small RAM the 0x800000 ROM alias is a
+  WRITABLE RAM copy of the (patched) ROM (init'd + memcpy'd) so it satisfies
+  both the writable-DRAM test and 24-bit ROM reads.
+- With this, the ROM's memory-integrity test PASSES and the boot ESCAPES the
+  MicroBug console by default (Egret cold-start + pseudo-commands run, 0c05
+  identified), on both the 8 MB-shim and 32 MB-contiguous paths.
+
+### New blocker (precise): garbage-stack crash -> NOP-sled
+
+Past the console the boot runs ~thousands of ROM instructions then CRASHES:
+it reaches an `rts` at ROM 0x40848dd2 with **sp = 0xfffffffe** (a garbage/
+underflowed stack) -> pops a garbage return -> jumps into unbacked/zeroed
+RAM and NOP-sleds (observed target 0x01460000 with 8 MB, 0x00007fxx with
+32 MB -- i.e. wherever the garbage return points).  fp=0x40848dd2,
+d7=0x40800097, a5=0x4084a340 at the crash.  The 0x40848dc0-0x40848dd4 region
+around that rts disassembles as odd byte ops (`orib #-6,d6`, `addxl a4@-,
+a5@-`) -- likely a jump table / data the boot fell INTO via a bad computed
+jump, whose rts then runs on an unset stack.  Persists across RAM size and
+across NOP-ing the memory-test fill (env IIVX_SKIPMEMTEST), so it is NOT the
+memory-test corruption -- it is a stack/flow issue on the post-console
+cold-boot path (SCSI is still never touched, so disk boot isn't reached).
+
+Next session: find the bad computed jump that lands in the 0x40848dc0 data/
+rts region (trace the last good ROM PC before sp goes wild -- break where sp
+first becomes > 0x0f000000 or an odd value), fix the flow (likely a
+lowmem/vector or an a5-world/dispatch pointer left wrong by our
+0c05-vs-IIci-config or VRAM/ScrnBase decode), then SCSI disk boot -> Finder.
+
+### Status / regressions
+
+- Default now gets PAST the console (further than sessions 4-7) but crashes
+  as above; framebuffer blank white (screendump /tmp/iivx-s8.ppm).  There is
+  currently NO stable-console fallback (IIVX_FORCE=off also escapes+crashes,
+  because the memory backing is unconditional for small RAM).
+- Guardrails kept: only hw/m68k/maciivx.c touched; maciici/maciisi/
+  macclassicii and shared devices untouched.  gdb port 1279, sock
+  /tmp/iivx-mon2.sock.
+
+### Session 8 addendum: the crash is a POST memory test overlapping the active stack
+
+Localized the garbage-stack crash precisely (correct-endian gdb dprintf).
+At ROM 0x40848db0 (a cold-boot POST memory-test block) the registers are
+a0=0x00000000, a1=0x00080000, sp=**0x00007fe6**, d7=0x40800097 -- i.e. the
+test region is **[0 .. 0x80000]** (512 KB) and the ROM's own STACK is at
+0x7fe6, INSIDE that region.  The block fills [0..0x80000] with the POST
+pattern (0x6db6db6d/0xb6db6db6), overwriting its own return address on the
+stack; at the closing `rts` (0x40848dd2) the longword at sp reads
+**0xb6db6db6** -> PC = garbage -> NOP-sled (the 0x7fxx / 0x1460000 sleds).
+
+So the real defect is that the ROM's stack sits inside a region its own
+power-on memory test scrubs.  On real hardware the stack for this phase must
+be ABOVE the tested window (or the window excludes it); our value (sp low,
+~0x7fe6) comes from the ROM's stack setup on this cold-boot path and is
+wrong for our memory map / MemTop.  Neutralising the moveml fill routine
+0x40846950 does NOT fix it (a different fill -- the XOR scrubber at
+0x408469a8 -- writes the 0xb6db6db6 pattern), and RAM size only moves the
+sled target.
+
+Next session's concrete task: find where this cold-boot phase sets SP (it
+should be high -- above 0x80000 / at MemTop), and why ours is ~0x8000.
+Likely MemTop or the a5-world/BAT is computed from a layout the 0c05 record
++ our (dedicated-VRAM) memory map get wrong; fixing SP (or the test window,
+or MemTop) so the POST stack is outside the scrubbed region should clear the
+crash, after which SCSI disk boot is the next milestone.  This is the single
+remaining blocker between "boots past the console with Egret working" and
+disk boot.
+
+## Session 9: SP/MemTop root cause found; a stack fix reaches VIDEO INIT (furthest yet)
+
+### Root cause of the post-console crash (precise)
+
+Traced SP from reset to the crash (correct-endian gdb).  SP is 0x2600 through
+0x46636, and the RAM-sizing routine (ROM 0x4084a6b0) runs on a HIGH stack
+(SP=0x01FFFFBC, near the 32 MB top).  But at its tail it RELOCATES the POST
+stack:
+
+```
+0x4084a75a  moveal %sp,%a0          ; a0 = sp (high)
+0x4084a75c  moveal %a0@,%sp         ; sp = *(sp) = base of lowest RAM bank
+0x4084a75e  addal  #0x00008000,%sp  ; sp = base + 0x8000
+0x4084a764  movel  %a0,%sp@-        ; link the old (high) stack
+```
+
+`*(sp)` is the base of the lowest detected RAM bank.  On a real multi-SIMM
+IIvx that base is non-zero so the POST stack lands safely; on OUR single
+contiguous DRAM bank based at 0, `*(sp)==0` -> **SP = 0x00008000**, which is
+INSIDE bank 0.  The very next per-bank memory scrubber (ROM 0x40848d90,
+region [bank_base .. +0x80000] = [0..0x80000]) overwrites that stack with the
+0xB6DB6DB6 pattern, so a later `rts` (0x40848dd2) pops a garbage return ->
+NOP-sled.  **This is the SP/MemTop bug the coordinator predicted** -- our flat
+single-bank map makes the ROM's own SP relocation land in the scrub window.
+(MemTop 0x108 reads 0xB6DB6DB6 mid-sizing, but that is expected -- globals
+aren't set until sizing finishes.)
+
+### Fix (env IIVX_SPFIX, experimental) and how far it gets
+
+Patched the `addal #0x8000` immediate to 0x01000000 so the relocated POST
+stack lands at 16 MB (high, above every per-bank window, inside our 32 MB
+DRAM), keeping the stack-switch link intact.  Result: the boot gets PAST the
+per-bank crash and reaches **video/RBV initialization** -- a run of onboard
+video RBV register programming (ROM 0x408479a0-0x40847a1c: RBV reg 0x13
+monitor/mode writes 0x40/0xff/0x1f/0xc0) -- the FURTHEST the IIvx has booted.
+It then hits a **DOUBLE MMU FAULT**: an access to **0xFEFFFFFC** (super-slot
+$E, the onboard-video slot space) faults, and the fault frame write faults
+again.  d2=0xdc000c05 (the 0c05 kind) and a1=0x40803b02 (0c05 record) confirm
+we're on the Egret/IIvx path.
+
+### Next blocker (clear): onboard-video slot-$E space not mapped
+
+The IIvx's onboard video lives in NuBus super-slot $E (0xFE000000 window:
+VRAM + a slot Declaration ROM).  Our machine maps the dedicated VRAM only at
+0x60B00000 / 0xB00000, NOT at slot $E, so the ROM's video driver's slot-$E
+access (0xFEFFFFFC) hits the A31 catch-all / faults -> double fault.  Next:
+map the onboard VRAM (and a minimal slot-$E sResource/DeclROM) into the
+super-slot $E space at 0xFE000000 (cf. how maciici exposes its onboard video
+pseudo-slot), so the video driver initialises cleanly.  After that: Happy Mac
+-> SCSI disk boot -> Finder.
+
+The SPFIX immediate (16 MB) is a stopgap; the clean fix is to give the ROM a
+memory-bank descriptor whose lowest-bank base is non-zero OR model the
+soldered-4MB-plus-SIMMs multi-bank layout so the ROM's own SP relocation
+lands high on its own.  Kept env-gated (it double-faults on the slot-$E issue
+above); default boot behaviour unchanged (still the Session-8 sled, no abort).
+
+## Session 10: SP fix reaches VIDEO INIT; blocker is the slot-$E onboard-video DeclROM
+
+### Step 1 (SP relocation) -- analysed, kept as the working IIVX_SPFIX patch
+
+Dumped the RAM-sizing descriptor the ROM relocates SP from (at ROM 0x4084a75a,
+sp=0x01FFFFBC): it is `[base=0x00000000, top=0x02000000, 0xFFFFFFFF]`.  The ROM
+does `sp = *(sp) + 0x8000` = base + 0x8000 = 0x8000 (single contiguous bank
+based at 0).  The coordinator's "give the lowest bank a non-zero base" isn't
+reachable -- RAM must start at 0 (reset vector/low globals), so the lowest
+bank base is always 0.  Two fixes tried:
+ - Read the descriptor TOP (`moveal %a0@(4),%sp`): BROKE the sizing loop (it
+   then probed RAM up to 0x04000000 and spun on the unbacked 32-64 MB).
+ - Enlarge the `+0x8000` guard to `+0x1000000` (SP lands at 16 MB): WORKS --
+   keeps the sizing's stack-switch structure intact, POST stack lands above
+   every per-bank scrub window.  Kept as IIVX_SPFIX (env-gated; see below).
+
+### Result: IIVX_SPFIX reaches ONBOARD-VIDEO INIT (furthest yet)
+
+With IIVX_SPFIX the boot clears the per-bank crash and runs the onboard-video
+bring-up: RBV monitor/mode register programming (ROM 0x408479xx: RBV reg 0x11
+<-0xfe, 0x12, 0x13 <-0x40/0xff/0x1f/0xc0).  Identification is solid throughout
+(d2=0xdc000c05).
+
+### Precise blocker: onboard video = NuBus slot $E, DeclROM not provided
+
+The IIvx's onboard video lives in NuBus **standard slot $E** (0xFE000000-
+0xFEFFFFFF; super-slot is 0xE0000000).  The video driver reads the slot's
+Declaration ROM **format block at the top, 0xFEFFFFFC**, then follows its
+directory.  We provide no slot-$E DeclROM, so:
+ 1. the read bus-errors, AND
+ 2. the per-bank POST scrubber has just filled [0..0x80000] -- which INCLUDES
+    the 68k exception vectors at 0-0x400 -- so the bus-error vector is garbage
+    (fault delivery lands at pc=0x00000024, executing scrubbed low RAM),
+ => an infinite bus-error cascade (SP walks down ~340k frames) -> QEMU's
+    m68k "DOUBLE MMU FAULT" fatal.
+
+Experiments (env IIVX_SLOTE, reverted): backing slot $E with the VRAM, or
+with zeroed RAM, does NOT help -- with no valid format block the driver
+computes a garbage directory offset and scans DOWNWARD forever (fault address
+walks 0xFEFFFFFC -> 0xFEEFFFFC -> 0xFDFFFFFC into slot $D).  A VALID DeclROM
+(correct testPattern 0x5A932BC7, byte lanes, directory, board + video
+sResources, mode table) is genuinely required.
+
+### Next step (clear, substantial)
+
+Provide the onboard-video slot-$E DeclROM + framebuffer, mirroring the NuBus
+video DeclROM/sResource machinery in `hw/display/radius24xp.c` (and
+`hw/nubus/nubus-device.c`'s DeclROM handling), pointed at the IIvx VRAM.  Map
+the VRAM into slot $E's standard space and expose a minimal video sResource
+(1 mode) so the Slot Manager + Display Manager accept it.  Then the SP fix can
+go default-on (no more slot-$E abort), and the chain continues: video init
+completes -> SCSI disk boot -> Happy Mac -> Finder.
+
+### Status / guardrails
+- Default boot behaviour UNCHANGED (stable Session-8 sled, no abort); the SP
+  fix is env-gated IIVX_SPFIX because default-on would make `-M maciivx` abort
+  on the slot-$E DeclROM fault above.  IIVX_SPFIX=1 reaches video init.
+- Only hw/m68k/maciivx.c touched; shared mac-nubus-bridge.h / MAC_NUBUS_LAST_SLOT
+  and maciici/maciisi/macclassicii untouched.  Ports 1279/1280, sock
+  /tmp/iivx-mon2.sock.  Not touched: cc-build/hp300-build/mvme16x-build.
+
+## Session 11: slot-$E onboard-video DeclROM PROVIDED (correct + verified); Session 10's blocker diagnosis CORRECTED to a VIA-timer interrupt storm
+
+### Step 0 result: the DeclROM is ROM-embedded, aliased into slot $E (approach 1)
+
+Searched the IIvx ROM for the DeclROM testPattern `0x5A932BC7`: found at ROM
+offsets 0xc80, 0x2318, 0x5f44, and **0xffffa** (6 bytes from the end of the
+1 MB ROM).  The 0xffffa one is a real Apple **format block** at the very top of
+the system ROM (last 20 bytes, ending at 0xFFFFF):
+
+```
+dirOffset=0x00FFE8C8  length=0x174c  crc=0x32a481a7  romRev=0x01
+format=0x01  testPattern=0x5A932BC7  reserved=0x00  byteLanes=0x0F
+```
+
+`dirOffset` low 24 bits sign-extend to **-0x1738**, pointing from the format
+block (ROM off 0xFFFEC) back to ROM off **0xFE8B4** = `0x100000 - length` = the
+DeclROM base.  So the ROM carries a complete, self-contained onboard-video
+DeclROM in its top 0x174c bytes, designed to be **top-aligned in a slot space**
+(exactly the SuperMario/RBV "internal built-in-video slot ROM" pattern the
+coordinator described).  Parsing the sResource directory (base 0xFE8B4):
+board sResource (id 1) + video sResources (id 0x82/0x83/0x86/0x8a/0x8b/0x8e/
+0xb4, VRAM-size/mode variants), strings "Macintosh Z Built-In Video",
+".Display_Video_Apple_Brazil" (Brazil = the IIvx video codename),
+"&CPU_68030_\_MacIIFamily", gamma tables.  This is a **single-machine**
+DeclROM, NOT the multi-driver "whole family DeclROM" the RBV siblings
+(maciici.c ~line 1899) warn against aliasing -- so aliasing it into slot $E is
+safe here.
+
+The video sResource's frame-buffer siting: **MinorBaseOS = 0x00000000**,
+MinorLength = 0xC0000, and mode 0x80's VPBlock has **vpBaseOffset = 0** -- i.e.
+the frame buffer is at the slot's own base **0xFE000000** (640x480 / 512x384
+modes, up to 8bpp).
+
+maciici comparison: the IIci does NOT alias into slot $E -- it registers the
+motherboard DeclROM as pseudo-slot 0 (its ROM's onboard video works that way).
+The IIvx ROM is different: its Brazil video driver expects the DeclROM in slot
+$E standard space.  So "mirror maciici" does not literally apply; the correct
+IIvx behaviour is the ROM-alias.
+
+### Step 1 implemented (in maciivx.c only)
+
+- `rom_slotE`: alias the whole 1 MB system ROM at **0xFEF00000** (top-aligned:
+  ROM off 0xFFFFF -> 0xFEFFFFFF), priority 1 over the NuBus bridge (which maps
+  slots 9-E at priority -1).  Verified on a paused machine: 0xFEFFFFFA reads
+  `5A 93 2B C7`, 0xFEFFFFEC reads `0x00FFE8C8`, directory backed at 0xFEFFE8B4.
+- `vram_slotE`: alias the dedicated VRAM (also at 0x60B00000) into the bottom
+  of slot $E at **0xFE000000** (MinorBaseOS 0), priority 1, so the Brazil
+  driver's pixel writes land.
+
+Both are correct and forward-looking; the default boot (Session-8 sled) is
+unaffected (re-verified: no abort, no regression).
+
+### Step 2/3: BLOCKED -- and Session 10's blocker was MISDIAGNOSED
+
+Making IIVX_SPFIX default-on still DOUBLE-FAULTS, at the SAME point as Session
+10, and the slot-$E DeclROM aliases do NOT change it.  Instrumented slot $E
+with a full access-logging region (forwarding to the real ROM/VRAM backing):
+**there are ZERO reads anywhere in slot $E.**  The DeclROM is never consulted.
+Every slot-$E access is a *write* -- exception-frame pushes at pc=0x24/0x28,
+i.e. the runaway stack descending through slot $E from ~0xFF000000.  So
+Session 10's "video driver reads the DeclROM at 0xFEFFFFFC -> bus error" was
+WRONG: 0xFEFFFFFC was an exception-frame push onto the runaway stack, not a
+DeclROM fetch.
+
+The REAL blocker (traced with `-d int` + ROM disassembly): with IIVX_SPFIX the
+boot clears the per-bank scrub and reaches the ROM's **VIA1-timer interrupt
+calibration** at ROM 0x40847248 (a2 = VIA1 base a0@(8); registers 0x200 apart:
+0x1600=ACR, 0x1A00=IFR, 0x1C00=IER, 0x1E00=ORA).  It installs a Level-1 handler
+at 0x408473bc (VBR+0x64), programs VIA1 T1/T2, enables interrupts (SR I:0), and
+counts CA1/T1/T2 interrupts (IFR bits 1/6/5) over a fixed delay loop --
+expecting exact counts (d3==10, d4 in [128,208], d5==1) to derive a timing
+constant.  Under icount the VIA1 T1/T2 interrupts **re-assert every
+instruction** (the handler writes IFR 0x1A00 to clear bits 1/5/6, but the timer
+immediately re-fires): a Level-1 storm (observed IFR=0x20 T2, then 0x62, then
+0x44).  ~180+ storm interrupts later a downstream FC7 machine-ID probe at
+0x40803982 bus-errors -- and because the per-bank scrub wiped the low-RAM
+exception vectors (0-0x400) with the 0x6DB6DB6D pattern, the bus-error vector at
+0x8 is garbage -> the handler jumps to 0x6db6db6d -> Address Error -> infinite
+frame-push cascade down through 16 MB and slot $E -> **DOUBLE MMU FAULT**.
+
+This is the known-hard "POST/SETUPTIMEK timing calibration under icount" area
+(cf. Sessions 3-5 and macclassicii.c).  It is genuinely a different problem
+from the coordinator's stated slot-$E DeclROM blocker (which is now solved and
+forward-ready).  Disabling the 60Hz VBL timer does NOT help (the storm is
+VIA1 T1/T2, not CA1).
+
+### Next steps (well-scoped)
+
+The path to Finder now needs the VIA1-timer calibration to not storm under
+icount, one of:
+ 1. Make the mos6522 VIA1 T1/T2 one-shot IFR flags fire the expected finite
+    number of times per the ROM's delay loop (the Session-5 "VIA1-T2 IFR
+    reconstruction" idea, applied to this calibration) -- ideally maciivx-local
+    (a via1 read/write shim) without touching shared mos6522.c.
+ 2. Or stuff the calibration's result (the SETUPTIMEK/known-good-constant
+    pattern lc475/mac_via use) and NOP the interrupt-driven measurement, then
+    repair the ROM checksum -- the same class as the existing relocation/record
+    patches.
+ 3. Independently, restore the low-RAM bus-error vector after the per-bank
+    scrub (or land the SPFIX stack + keep vectors intact) so a stray bus error
+    is non-fatal rather than a cascade.
+Once the storm clears, the boot should reach the video DeclROM (now provided)
+-> onboard video up -> SCSI disk boot -> Happy Mac -> Finder.
+
+### Status / guardrails
+- `hw/m68k/maciivx.c` only: added `rom_slotE` (ROM alias into slot $E at
+  0xFEF00000) and `vram_slotE` (VRAM alias at 0xFE000000), both verified.  All
+  session debug scaffolding removed.  Default boot unchanged (stable Session-8
+  sled, no abort -- re-verified; screendump /tmp/iivx-s11.png blank white, the
+  sled never reaches video).  IIVX_SPFIX stays env-gated (default-on aborts on
+  the VIA-timer storm above).  Shared mac-nubus-bridge.h / MAC_NUBUS_LAST_SLOT
+  and maciici/maciisi/macclassicii untouched.  Not touched:
+  cc-build/hp300-build/mvme16x-build.
+
+## Session 12: VIA-timer POST storm bypassed + exception vectors preserved -> DOUBLE MMU FAULT ELIMINATED; SPFIX default-on; boot reaches the cold-boot console via the full POST+Egret path
+
+Went after the Session-11 real blocker (the VIA1-timer calibration storm) using
+the coordinator's proven sibling recipe (maclc550.c SETUPTIMEK-class bypass +
+vector safety net).  BOTH sub-blockers are now fixed and the machine no longer
+faults.
+
+### Fix 1: VIA1-timer POST diagnostic bypass (test 0x0C01, ROM 0x4084722e)
+
+Traced the storm precisely.  Past the per-bank scrub the ROM's POST sequencer
+(dispatcher at 0x408493fe / 0x40849460, test-ID markers 0x0D01/0x0D02/0x0C01
+written to a5@(24)) runs hardware diagnostics that each return a pass/fail code
+in d6.  Test 0x0C01 (entry 0x4084722e, body 0x40847248) programs VIA1 T1/T2,
+installs a Level-1 handler at 0x408473bc, enables interrupts, and COUNTS
+CA1/T1/T2 IRQs (into d3/d4/d5) over a fixed dbra delay loop, requiring exact
+ratios (d3==10, d4 in [128,208], d5==1) to pass.  a2 = VIA1 base a0@(8), regs
+0x200 apart (0x1600=ACR, 0x1A00=IFR, 0x1C00=IER).  Under icount the VIA1 T1/T2
+interrupts re-assert every instruction -> a Level-1 storm and a garbage ratio.
+Fix (mirrors macclassicii.c / maclc550.c NOP-the-calibration): patch the test
+entry to `moveq #0,%d6; jmp %fp@` (report pass without the interrupt-driven
+measurement).  The test is self-contained (its setup helper 0x40847086 saves
+VIA state and restores it), so skipping it leaves the VIA untouched.
+
+### Fix 2: exception-vector preservation across the POST scrub
+
+The storm was NOT the fatal event -- with it bypassed the boot still
+DOUBLE-FAULTED.  Root-caused with a low-vector write-logger: the POST
+write-verify fill/scrub routine (0x40846950, called by both the [0..0xC00000]
+integrity test at 0x408466b4 and the per-bank scrubber at 0x40848dc2) fills
+[a0..a1] with the 0x6DB6DB6D pattern.  For bank 0 a0==0, so it OVERWRITES the
+68k vector table at 0-0x3FF -- including the bus-error (0x8) and address-error
+(0xC) vectors the ROM had just installed at 0x408468ae -- and never restores
+them.  On a real multi-bank IIvx the lowest bank base is non-zero so the
+vectors survive; on our single bank based at 0 the post-scrub FC7 machine-ID
+probe (0x40803982 `movesw 0x22000` with SFC=7, a deliberate presence probe)
+bus-errors through the scrubbed vector 0x8 (== 0x6DB6DB6D), the CPU jumps to
+that odd address -> Address Error -> an infinite Access-Fault cascade down the
+stack -> DOUBLE MMU FAULT.  (This is what Session 10 misread as a slot-$E
+DeclROM read: 0xFEFFFFFC was the runaway stack, not a fetch.)  Fix (coordinator
+step 3): clamp the fill routine's start address a0 up to 0x2000 so the low 8 KB
+vector page is never scrubbed.  The routine keys its fill/eor-scramble/verify
+all off a0 (re-derived at 0x408469a8), so clamping a0 once at entry is
+self-consistent and the verify still passes.  Implemented as a short thunk in
+free ROM padding at 0x4084ac3c, branched to from the routine's prologue.  ROM
+checksum repaired after all patches (unchanged mechanism).
+
+### Result: no more crash; SPFIX default-on; boot reaches the cold-boot console
+
+With Fixes 1+2 (and the Session-11 slot-$E DeclROM), IIVX_SPFIX is now
+DEFAULT-ON (IIVX_NOSPFIX disables).  `-M maciivx` with no env vars runs the
+ENTIRE POST -> boot chime path -> Egret cold-start + pseudo-command layer
+(GET/SET_PRAM, READ_MCU streaming ~168 XPRAM bytes, verified 1333 Egret
+accesses) -> Toolbox A-line traps -> cold-boot, with NO DOUBLE MMU FAULT
+(verified: default boot idles, no abort; exception count dropped from ~516000
+cascade faults to ~460, all handled device probes).  This is dramatically
+further than every prior session (which faulted here).
+
+### Remaining frontier (unchanged from Sessions 5-7): the cold-boot MicroBug console
+
+The boot idles at ROM 0x4084a0f0 (SR I:7), the ROM's cold-boot serial console.
+Disassembled the path definitively: cold-boot 0x40848dea -> (btst #26,d7 clear)
+0x408499bc -> capability routine 0x408468ba (d0 bit12 set) -> video/EASC init
+0x40845ce2 -> RETURNS to 0x408499f6 -> console setup (0x40849f84/0x40849fb2:
+programs the SCC console, sets d7 bit17, VIA1 config) -> GetChar loop
+0x4084a0e6/0x4084a0f0.  This cold-boot routine ALWAYS ends in the console (both
+d7-bit26 and d0-bit12 branches lead here); SCSI is never touched (0 accesses),
+so disk boot is not invoked on this path.  This is exactly the Session 5-7
+"cold-boot serial console" wall: on a NuBus machine the disk-boot continuation
+is interrupt-driven, but the console runs at I:7.  Crossing it is the deep
+OS-startup work: the interrupt-driven cold-boot/boot-device continuation, the
+Egret READ_MCU/GET_PRAM boot-config data (our XPRAM ddType seed is read but the
+boot device is never selected), and likely the correct NuBus disk-boot branch
+routing.  Furthest screenshot /tmp/iivx-s12.png (blank 640x480 -- the console
+is reached before any Happy-Mac video draw), same visual as prior sessions but
+now via the full crash-free POST+Egret path.
+
+### Status / guardrails
+- Only hw/m68k/maciivx.c touched.  Two new ROM patches (VIA-timer test bypass
+  at 0x4722e; vector-preserve thunk at 0x4ac3c + entry redirect at 0x46956),
+  both covered by the existing checksum repair; SPFIX flipped default-on.  All
+  session debug scaffolding removed.  Default `-M maciivx` boots without env
+  vars and no abort (re-verified).  Shared mac-nubus-bridge.h /
+  MAC_NUBUS_LAST_SLOT and maciici/maciisi/macclassicii untouched.  Ports
+  1279/1280, sock /tmp/iivx-mon2.sock.  Not touched:
+  cc-build/hp300-build/mvme16x-build.

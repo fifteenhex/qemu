@@ -456,6 +456,7 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s);
 static void maciivx_egret_sr_written(MOS6522MacIIvxState *v1s);
 static void maciivx_egret_sr_read(MOS6522MacIIvxState *v1s);
 static void maciivx_egret_acr_changed(MOS6522MacIIvxState *v1s);
+static bool maciivx_egret_pseudo_try_process(MOS6522MacIIvxState *v1s);
 
 static void maciivx_via1_portA_write(MOS6522State *s)
 {
@@ -647,7 +648,11 @@ struct MacIIvxMachineState {
     MacIIvxFbState fb;
     MemoryRegion rom;
     MemoryRegion rom_alias24;
+    MemoryRegion rom24_ram;     /* writable RAM copy of ROM at 24-bit 0x800000 */
+    MemoryRegion gap24_ram;     /* writable RAM for the 0x900000-0xAFFFFF gap */
     MemoryRegion rom_alias_hi;
+    MemoryRegion rom_slotE;     /* onboard-video DeclROM aliased into slot $E */
+    MemoryRegion vram_slotE;    /* onboard VRAM framebuffer aliased into slot $E */
     uint32_t reset_sp;
     uint32_t reset_pc;
     MemoryRegion vram;
@@ -685,11 +690,29 @@ struct MacIIvxMachineState {
     QEMUTimer *egret_timer;
     uint8_t egret_cmd[16];
     int egret_cmd_len;
-    uint8_t egret_resp[16];
+    /* reply staging: 4-byte header + up to a full 256-byte MCU/XPRAM window */
+    uint8_t egret_resp[4 + 256];
     int egret_resp_len;
     int egret_resp_idx;
     bool egret_session;
     bool egret_no_resp;
+    /*
+     * /XCVR_SESSION (PB3) is an INPUT driven by the Egret; track the
+     * line state so port-B reads reflect the Egret, not the ORB latch
+     * (see maciivx_via1_read).  Idle = deasserted (PB3 high).
+     */
+    bool egret_xcvr_asserted;
+    /*
+     * Egret pseudo-command transactions (packet type byte 0x01:
+     * self-test/autopoll/PRAM/RTC control), driven with a PB4/PB5
+     * byte handshake and /SYS_SESSION released throughout -- a separate
+     * framing from the formal-session ADB commands above.
+     */
+    uint8_t egret_pseudo_cmd[4 + 256];
+    uint8_t egret_mcu_mem[256];
+    int egret_pseudo_cmd_len;
+    bool egret_pseudo_active;
+    bool egret_pseudo_closing;
 };
 
 /*
@@ -947,6 +970,28 @@ static uint64_t maciivx_via1_read(void *opaque, hwaddr addr, unsigned size)
     /* input pins on port A read the board straps, not the last output */
     if (reg == VIA_REG_A || reg == VIA_REG_ANH) {
         val = (val & s->dira) | (v1s->pins_a & ~s->dira);
+    }
+
+    /*
+     * PB3 (/XCVR_SESSION) is an Egret-driven INPUT: report the Egret's
+     * line state, not the ROM's last ORB write.  The ROM's cold-start
+     * Egret sync (0x40814cc8/0x40814cfa: btst #3) branches on this bit;
+     * reading back the host's own ORB latch would spin forever.  The
+     * Egret only asserts /XCVR (PB3 low) while actually mid-delivery of
+     * a genuine reply; it stays deasserted (PB3 high) for the
+     * no-response/discard framing and at power-on, so the sync runs its
+     * send/timeout path through to boot.  (Ported from macclassicii.c.)
+     */
+    if (reg == VIA_REG_B && v1s->machine) {
+        MacIIvxMachineState *m = v1s->machine;
+        bool xcvr = m->egret_xcvr_asserted && !m->egret_no_resp &&
+                    m->egret_resp_len > 0;
+
+        if (xcvr) {
+            val &= ~(uint64_t)EGRET_XCVR;
+        } else {
+            val |= EGRET_XCVR;
+        }
     }
 
     if (reg == VIA_REG_SR && v1s->machine) {
@@ -1208,12 +1253,22 @@ static void maciivx_one_second(void *opaque)
               (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000) / 1000 * 1000);
 }
 
-/* Egret microcontroller behaviour (grown empirically against the ROM) */
-
-static void maciivx_egret_set_xcvr(MOS6522MacIIvxState *v1s, bool assert)
+/* Egret microcontroller behaviour (ported from macclassicii.c) */
+static void maciivx_egret_set_xcvr(MOS6522MacIIvxState *v1s,
+                                        bool assert)
 {
     MOS6522State *s = MOS6522(v1s);
 
+    /*
+     * PB3 is an Egret-driven input: the authoritative line state lives
+     * in the machine struct so port-B reads report it regardless of the
+     * ROM's ORB writes (see maciivx_via1_read).  Keep s->b in sync
+     * for any code that inspects the latch, but the read override is
+     * what the guest actually observes.
+     */
+    if (v1s->machine) {
+        v1s->machine->egret_xcvr_asserted = assert;
+    }
     if (assert) {
         s->b &= ~EGRET_XCVR;            /* active low */
     } else {
@@ -1268,11 +1323,11 @@ static void maciivx_egret_process(MacIIvxMachineState *m)
     m->egret_no_resp = false;
 
     /*
-     * Packet framing as the IIvx ROM/OS drivers actually speak it
-     * (observed on the wire, session 7): a packet is the raw ADB
-     * command byte followed by optional listen data — no type byte.
-     * PRAM/RTC traffic goes over the emulated 343-0042 bit-bang
-     * protocol instead, so ADB is all these packets ever carry.
+     * Packet framing as the IIsi ROM/OS drivers actually speak it: a
+     * packet is the raw ADB command byte followed by optional listen
+     * data -- no type byte.  PRAM/RTC traffic goes over the emulated
+     * 343-0042 bit-bang protocol instead, so ADB is all these packets
+     * ever carry.
      */
     if (n == 1 && c[0] == 0x00) {
         /*
@@ -1290,6 +1345,25 @@ static void maciivx_egret_process(MacIIvxMachineState *m)
         return;
     }
 
+    /*
+     * Pseudo-command packets (type byte 0x01) can also arrive over the
+     * formal-session framing -- the post-MMU interrupt-driven Egret
+     * driver (ISR 0x40814912) sends e.g. [01 08 addrHi addrLo <16
+     * bytes>] (write MCU memory, uploading autopoll parameters) and
+     * [01 1b/0e/1c ...] control settings this way.  These are MCU
+     * control traffic, not ADB: don't feed them to the ADB bus (a
+     * bogus adb_request would disturb device state); for the
+     * write/set-style commands the ROM only needs the exchange to
+     * terminate cleanly, which the no-response turnaround provides.
+     */
+    if (c[0] == 0x01 && n >= 2) {
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: pseudo (session) cmd 0x%02x"
+                      " len=%d\n", c[1], n);
+        maciivx_egret_no_response(m);
+        return;
+    }
+
     {
         uint8_t obuf[ADB_MAX_OUT_LEN];
         int olen;
@@ -1304,7 +1378,7 @@ static void maciivx_egret_process(MacIIvxMachineState *m)
             m->egret_resp_len = olen;
         } else {
             /*
-             * Listen/no-data/absent device: ADB bus timeout — the
+             * Listen/no-data/absent device: ADB bus timeout -- the
              * Egret turns around without a response.
              */
             maciivx_egret_no_response(m);
@@ -1313,18 +1387,319 @@ static void maciivx_egret_process(MacIIvxMachineState *m)
 }
 
 /*
+ * Egret "pseudo-command" packets (packet type byte 0x01): host->MCU
+ * control requests distinct from ADB pass-through -- self-test,
+ * autopoll, PRAM/RTC access, etc (cf. the Cuda/Egret pseudo-command
+ * family, e.g. MAME's apple/egret.cpp CUDA_* command set).  The
+ * Classic II ROM issues these with a byte-level PB4(/VIA_FULL)/
+ * PB5(/SYS_SESSION) handshake and /SYS_SESSION *released* throughout
+ * -- see ROM 0x4084a556, decoded instruction-by-instruction:
+ *   send  [0x01, cmd, ...params]         (SR-out, external clock)
+ *   recv  [_, _, _, cmd-echo, data]       (SR-in, external clock)
+ * with /XCVR_SESSION required asserted (low) for every reply byte
+ * except a deassert exactly at the last one (the ROM's end marker).
+ *
+ * The reply is always [0x00, 0x00, 0x00, cmd-echo, <optional data...>]:
+ * the ROM validates only that the 4th byte (index 3) echoes the
+ * command code, then reads any trailing data bytes while /XCVR stays
+ * asserted (GET_PRAM 0x07 returns one data byte; SET_PRAM 0x0c none).
+ * Commands not modelled here are left unrecognised so the caller falls
+ * back to the pre-existing cold-start-sync-safe generic behaviour
+ * (interrupt only, no /XCVR assert) rather than guessing wrong.
+ */
+#define EGRET_PSEUDO_TYPE       0x01
+#define EGRET_PSEUDO_READ_MCU   0x02
+#define EGRET_PSEUDO_GET_TIME   0x03
+#define EGRET_PSEUDO_GET_PRAM   0x07
+#define EGRET_PSEUDO_WRITE_MCU  0x08
+#define EGRET_PSEUDO_SET_TIME   0x09
+#define EGRET_PSEUDO_SET_PRAM   0x0c
+
+/* stage the reply header [0,0,0,cmd]; caller appends any data bytes */
+static void maciivx_egret_pseudo_reply(MacIIvxMachineState *m,
+                                            uint8_t cmd)
+{
+    m->egret_resp_len = 0;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = 0x00;
+    m->egret_resp[m->egret_resp_len++] = cmd;
+    m->egret_resp_idx = 0;
+}
+
+/*
+ * Egret MCU address map, as the ROM uses it: 0x0100-0x01FF is the
+ * MCU-resident XPRAM -- the SAME 256-byte parameter RAM the GET_PRAM/
+ * SET_PRAM pseudo-commands address directly (and the Egret's classic
+ * 343-0042 protocol emulation serves on real hardware), so it must be
+ * backed by the one authoritative store, via1.PRAM[].  The ROM's
+ * _ReadXPRam/_WriteXPRam (trap A051/A052 -> Egret path 0x40a15204)
+ * access XPRAM exclusively through READ_MCU/WRITE_MCU at 0x100+offset;
+ * the OS-startup autopoll parameter uploads live elsewhere in MCU
+ * space and keep the scratch egret_mcu_mem[] backing.
+ */
+static uint8_t maciivx_egret_mcu_read(MacIIvxMachineState *m,
+                                           uint16_t addr)
+{
+    if (addr >= 0x100 && addr <= 0x1ff) {
+        return m->via1.PRAM[addr - 0x100];
+    }
+    return m->egret_mcu_mem[addr & 0xff];
+}
+
+static void maciivx_egret_mcu_write(MacIIvxMachineState *m,
+                                         uint16_t addr, uint8_t data)
+{
+    if (addr >= 0x100 && addr <= 0x1ff) {
+        m->via1.PRAM[addr - 0x100] = data;
+    } else {
+        m->egret_mcu_mem[addr & 0xff] = data;
+    }
+}
+
+static bool maciivx_egret_pseudo_build(MacIIvxMachineState *m)
+{
+    uint8_t *c = m->egret_pseudo_cmd;
+    int n = m->egret_pseudo_cmd_len;
+
+    if (n < 2) {
+        return false;
+    }
+
+    /*
+     * Type-0 packets over this framing are ADB pass-through: [00
+     * adbcmd <listen data...>].  The post-MMU interrupt-driven Egret
+     * driver (ISR 0x40a14912, trap A092) sends its ADB traffic --
+     * starting with [00 00] SendReset during ADB-manager init -- with
+     * exactly the same PB4//PB5 byte handshake as the pseudo commands,
+     * so decode them here rather than in the formal-session path.
+     * Reply framing observed to satisfy the ISR: the standard 4-byte
+     * header [0, 0, 0, cmd-echo] followed by any Talk register data
+     * (the ISR routes bytes past the header into the request block's
+     * declared receive buffer via its own a2@(20)/a2@(18) state, so
+     * data after the header is safe here -- unlike header-overflow
+     * bytes on a request that declared none).
+     */
+    if (c[0] == 0x00) {
+        uint8_t obuf[ADB_MAX_OUT_LEN];
+        ADBBusState *adb_bus = &m->via1.adb_bus;
+        int olen;
+
+        adb_autopoll_block(adb_bus);
+        olen = adb_request(adb_bus, obuf, c + 1, n - 1);
+        adb_autopoll_unblock(adb_bus);
+
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: pseudo-framed ADB cmd 0x%02x"
+                      " len=%d -> olen=%d\n", c[1], n - 1, olen);
+        maciivx_egret_pseudo_reply(m, c[1]);
+        if (olen > 0) {
+            memcpy(m->egret_resp + m->egret_resp_len, obuf, olen);
+            m->egret_resp_len += olen;
+        }
+        return true;
+    }
+
+    if (c[0] != EGRET_PSEUDO_TYPE) {
+        return false;
+    }
+
+    switch (c[1]) {
+    case EGRET_PSEUDO_GET_PRAM:
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            uint8_t data = m->via1.PRAM[addr & 0xff];
+
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo GET_PRAM addr=0x%04x"
+                          " -> 0x%02x\n", addr, data);
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_GET_PRAM);
+            m->egret_resp[m->egret_resp_len++] = data;
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_SET_PRAM:
+        if (n >= 5) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+
+            m->via1.PRAM[addr & 0xff] = c[4];
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo SET_PRAM addr=0x%04x"
+                          " <- 0x%02x\n", addr, c[4]);
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_SET_PRAM);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_WRITE_MCU:
+        /*
+         * Write MCU memory: [01 08 addrHi addrLo data...].  The
+         * post-MMU boot uploads an autopoll/timing parameter block
+         * (ROM table 0x4080c676, 20 bytes to MCU address 0x0110) this
+         * way.  The parameters have no behavioural model here; store
+         * them in a scratch array so READ_MCU reads back consistently,
+         * and ACK.
+         */
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            int j;
+
+            for (j = 0; j + 4 < n; j++) {
+                maciivx_egret_mcu_write(m, addr + j, c[4 + j]);
+            }
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo WRITE_MCU addr=0x%04x"
+                          " len=%d\n", addr, n - 4);
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_WRITE_MCU);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_GET_TIME:
+        /* Read the RTC: reply carries 4 big-endian seconds bytes */
+        {
+            uint32_t t = m->via1.tick_offset +
+                         (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                          NANOSECONDS_PER_SECOND);
+
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo GET_TIME -> 0x%08x\n", t);
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_GET_TIME);
+            m->egret_resp[m->egret_resp_len++] = t >> 24;
+            m->egret_resp[m->egret_resp_len++] = t >> 16;
+            m->egret_resp[m->egret_resp_len++] = t >> 8;
+            m->egret_resp[m->egret_resp_len++] = t;
+            return true;
+        }
+    case EGRET_PSEUDO_SET_TIME:
+        /* Set the RTC: [01 09 t3 t2 t1 t0] */
+        if (n >= 6) {
+            uint32_t t = ((uint32_t)c[2] << 24) | ((uint32_t)c[3] << 16) |
+                         ((uint32_t)c[4] << 8) | c[5];
+
+            m->via1.tick_offset = t - (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                                       NANOSECONDS_PER_SECOND);
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo SET_TIME <- 0x%08x\n", t);
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_SET_TIME);
+            return true;
+        }
+        break;
+    case EGRET_PSEUDO_READ_MCU:
+        /*
+         * Read MCU memory: [01 02 addrHi addrLo] -> STREAMED data.
+         * The wire command carries no length: the Egret hands out
+         * successive bytes from addr for as long as the host keeps
+         * clocking, and the HOST ends the reply (its requested length
+         * lives only in its own A092 parameter block, a1@(6)) by
+         * closing /SYS_SESSION -- handled as the early-close case in
+         * maciivx_egret_session_update.  Stage bytes to the end
+         * of the 256-byte window; undrained ones are simply dropped at
+         * the close.  (The previous single-byte reply made every
+         * multi-byte _ReadXPRam -- e.g. GetOSDefault reading XPRAM
+         * 0x76/0x77, len 2 -- return one real byte plus stale-SR
+         * garbage, which fed a garbage expected-ddType (0x6a) into the
+         * boot-driver installer at 0x40a07264 and blocked the disk
+         * boot in an endless bus-rescan.)
+         */
+        if (n >= 4) {
+            uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+            int j, len;
+
+            len = 0x100 - (addr & 0xff);
+            qemu_log_mask(LOG_UNIMP,
+                          "maciivx egret: pseudo READ_MCU addr=0x%04x"
+                          " (stream %d) first=0x%02x\n", addr, len,
+                          maciivx_egret_mcu_read(m, addr));
+            maciivx_egret_pseudo_reply(m, EGRET_PSEUDO_READ_MCU);
+            for (j = 0; j < len; j++) {
+                m->egret_resp[m->egret_resp_len++] =
+                    maciivx_egret_mcu_read(m, addr + j);
+            }
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+
+    /*
+     * Any other type-1 packet is a set/control-style MCU pseudo-command
+     * with no data reply (the post-MMU Egret driver sends e.g. [01 1b
+     * 03] -- an autopoll/one-second control setting -- through its
+     * interrupt-driven framing).  ACK it with the bare [0,0,0,cmd]
+     * header.  This must NOT fall through to the interrupt-only
+     * fallback: the ROM's Egret ISR (0x40a14912) then clocks stale SR
+     * bytes as a "reply", and on a byte-1==0 header it copies the
+     * trailing garbage through the request block's DATA POINTER at
+     * +8 -- which set-style callers (e.g. the trap-A092 thunk at
+     * 0x40a154d2, which only fills bytes 0-2 and the callback long)
+     * leave UNINITIALISED, corrupting whatever low-memory address the
+     * stack garbage points at (observed: the 0x192 Egret state vector,
+     * ending in a double fault).  A real Egret ACKs every pseudo
+     * command it accepts, so this is also simply truer to hardware.
+     *
+     * The cold-start sync's framing bytes still fall through to the
+     * old behaviour: they never form a [01 cc ...] packet at a
+     * turnaround (single 0x00/0x01 bytes only, len < 2 -- verified in
+     * a full -d unimp boot log).
+     */
+    if (n >= 2 && c[0] == EGRET_PSEUDO_TYPE) {
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: pseudo generic-ACK cmd 0x%02x"
+                      " (len=%d)\n", c[1], n);
+        maciivx_egret_pseudo_reply(m, c[1]);
+        return true;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "maciivx egret: unrecognised pseudo-command"
+                  " [%02x %02x %02x %02x] (len=%d)\n",
+                  n > 0 ? c[0] : 0, n > 1 ? c[1] : 0, n > 2 ? c[2] : 0,
+                  n > 3 ? c[3] : 0, n);
+    return false;
+}
+
+/*
+ * Called at the send->receive turnaround (ACR external-clock SR-OUT ->
+ * SR-IN, /SYS_SESSION released, no formal session) to decide whether
+ * the bytes just shifted out were a real pseudo-command.  On success,
+ * stages the reply and drives the receive handshake (first byte +
+ * /XCVR assert) the ROM's wait loop at 0x4084a5f8 needs; on failure
+ * (unrecognised content -- e.g. the cold-start sync's own framing
+ * bytes, which share this exact ACR pattern but carry no real pseudo-
+ * command) does nothing, leaving the caller to fall back to the
+ * existing interrupt-only behaviour.
+ */
+static bool maciivx_egret_pseudo_try_process(MOS6522MacIIvxState *v1s)
+{
+    MacIIvxMachineState *m = v1s->machine;
+    MOS6522State *s = MOS6522(v1s);
+
+    if (!maciivx_egret_pseudo_build(m)) {
+        m->egret_pseudo_cmd_len = 0;
+        return false;
+    }
+
+    m->egret_pseudo_cmd_len = 0;
+    m->egret_pseudo_active = true;
+    m->egret_no_resp = false;
+
+    /*
+     * The first reply byte must already be in the shift register by
+     * the time the ROM's receive wait loop sees the completion
+     * interrupt and checks /XCVR -- stage it now.
+     */
+    s->sr = m->egret_resp[0];
+    m->egret_resp_idx = 1;
+    maciivx_egret_set_xcvr(v1s, true);
+    maciivx_egret_schedule_int(m);
+    return true;
+}
+
+/*
  * /XCVR_SESSION (PB3) as sampled by the ROM driver at each shift
- * interrupt (dispatch 0x4080a700: btst #3, then the continuation
- * branches on it):
- *  - receive loop: a byte is consumed while PB3 is HIGH; PB3 LOW at an
- *    interrupt ends the response (cont 0x4080a63c).
- *  - PB3 LOW already at the first post-turnaround interrupt sets flag
- *    bit5 (cont 0x4080a624) and the whole byte count is DISCARDED at
- *    the end (seq/and at 0x4080a646) — that is the driver's "the Egret
- *    had no response / wants the bus" case.
- * So: real responses keep PB3 high while bytes flow and drop it as the
- * end marker; a no-response exchange holds PB3 low throughout (the
- * driver still clocks two junk bytes through SR).
+ * interrupt: real responses keep PB3 high while bytes flow and drop it
+ * as the end marker; a no-response exchange holds PB3 low throughout
+ * (the driver still clocks two junk bytes through SR).
  */
 static void maciivx_egret_ack_toggle(MOS6522MacIIvxState *v1s)
 {
@@ -1335,7 +1710,8 @@ static void maciivx_egret_ack_toggle(MOS6522MacIIvxState *v1s)
         s->sr = m->egret_resp[m->egret_resp_idx++];
         maciivx_egret_set_xcvr(v1s, m->egret_no_resp);
         maciivx_egret_schedule_int(m);
-        qemu_log_mask(LOG_UNIMP, "maciivx egret: feed 0x%02x (#%d/%d) pc=%08x b=%02x\n",
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: feed 0x%02x (#%d/%d) pc=%08x b=%02x\n",
                       s->sr, m->egret_resp_idx, m->egret_resp_len,
                       maciivx_trace_pc(), s->b);
     } else {
@@ -1345,7 +1721,8 @@ static void maciivx_egret_ack_toggle(MOS6522MacIIvxState *v1s)
         m->egret_session = false;
         maciivx_egret_set_xcvr(v1s, true);
         maciivx_egret_schedule_int(m);
-        qemu_log_mask(LOG_UNIMP, "maciivx egret: response complete pc=%08x b=%02x\n",
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: response complete pc=%08x b=%02x\n",
                       maciivx_trace_pc(), s->b);
     }
 }
@@ -1359,22 +1736,88 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
                                                 EGRET_VIA_FULL);
 
     /*
-     * Session-open detection must be EDGE-triggered: after an exchange
-     * completes, /TIP is often left asserted (the OS-era driver chains
-     * poll exchanges without ever parking the bus), and unrelated port
-     * B writes — the RTC bit-bang on PB0-2 runs from the Time Manager
-     * between exchanges — must not re-open a session (observed: such a
-     * write reset /XCVR to idle underneath an armed end-of-response
-     * continuation; the pending "session closed" interrupt then read
-     * /XCVR high = "more data" and clocked junk until the exchange
-     * died).  A session opens on:
-     *  - a /TIP assert edge (fresh session, or the poll cadence's
-     *    ORB ^= 0x20 receive reopen after its ORB ^= 0x30 close), or
-     *  - a /TACK assert edge with /TIP already held and the shifter
-     *    outbound (chained send via 0x4080a656: ORB &= 0xCF straight
-     *    after the previous exchange, /TIP never released).
+     * Pseudo-command reply delivery (byte-handshake framing) is driven
+     * entirely from maciivx_egret_sr_read -- the /VIA_FULL (PB4)
+     * and /SYS_SESSION (PB5) writes the ROM's receive helper
+     * (0x4084a6b4) makes around each shift are bookkeeping on its side
+     * only.  But those writes DO satisfy the /SYS_SESSION-based
+     * session-open edge test below (m->egret_session is never set for
+     * this framing, so "!session" always holds) -- without this guard
+     * the receive turnaround's own /SYS_SESSION-released write
+     * (0x4084a5f4) would be misread as opening a formal-session receive
+     * against whatever response state pseudo delivery has staged.
+     * Suppress all of it while a pseudo exchange is in flight.
      */
-    if (sys && !m->egret_session &&
+    if (m->egret_pseudo_active) {
+        /*
+         * Host-side early close of a STREAMED reply: the interrupt-
+         * driven Egret driver's receive (ISR 0x40a14912) reads exactly
+         * the number of data bytes its request block asked for and
+         * then drops /SYS_SESSION (bclr #5 at 0x40a149c8) and waits
+         * for /XCVR to rise as the end-of-exchange handshake.  A
+         * streamed READ_MCU reply usually stages more bytes than the
+         * host wants (the wire carries no length), so the last-byte
+         * close in maciivx_egret_sr_read never triggers -- end
+         * the exchange here on that /SYS_SESSION falling edge instead.
+         * Gated on the header already being fully consumed (idx > 4)
+         * so the ISR's own header-phase /SYS_SESSION toggling (e.g.
+         * the bset #5 at 0x40a149a6) can't be mistaken for the close.
+         */
+        if ((v1s->last_b & EGRET_SYS_SESSION) &&
+            !(s->b & EGRET_SYS_SESSION) && m->egret_resp_idx > 4) {
+            /*
+             * A next byte was already staged in SR with its completion
+             * interrupt scheduled (the read-side chain stages ahead);
+             * the host is abandoning it -- cancel that interrupt, or
+             * it fires after the close and the ISR mistakes the stale
+             * byte for the start of an unsolicited Egret packet
+             * (observed: garbage dispatched through the autopoll
+             * handler -> Address Error at a junk PC -> sad mac).
+             */
+            timer_del(m->egret_timer);
+            maciivx_egret_set_xcvr(v1s, false);
+            m->egret_pseudo_active = false;
+            m->egret_pseudo_closing = true;
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+        }
+        return;
+    }
+
+    /*
+     * Teardown tail: the ROM clears /SYS_SESSION then /VIA_FULL
+     * (0x4084a646/0x4084a650) after the last reply byte.  The first of
+     * those writes is a /SYS_SESSION-released edge that would otherwise
+     * match the formal-session-open test below; keep suppressing until
+     * both lines have settled low (/VIA_FULL also clear).
+     */
+    if (m->egret_pseudo_closing) {
+        if (!(s->b & (EGRET_SYS_SESSION | EGRET_VIA_FULL))) {
+            m->egret_pseudo_closing = false;
+        }
+        return;
+    }
+
+    /*
+     * Session-open detection must be EDGE-triggered (cf. maciisi.c): a
+     * session opens on a /TIP assert edge (fresh session, or the poll
+     * cadence's ORB ^= 0x20 receive reopen after its ORB ^= 0x30
+     * close), or a /TACK assert edge with /TIP already held and the
+     * shifter outbound (chained send, /TIP never released).
+     */
+    /*
+     * Only recognise an Egret session when the VIA shift register is
+     * actually enabled for the transport (ACR shift-control bits set).
+     * The ROM's one-time port-B *initialisation* write during early
+     * bring-up (pc 0x40802ea4) happens to drop /SYS_SESSION as an edge
+     * while ACR=0 (SR disabled); without this guard it was misread as a
+     * receive session, asserting /XCVR_SESSION (PB3) before the Egret
+     * cold-start sync ran -- which then trapped the sync in its
+     * XCVR-asserted receive path forever.  Real Egret transactions
+     * (send and receive alike) always run with the SR shifting (ACR &
+     * SR_CTRL != 0), so this excludes only the spurious init write.
+     */
+    if (sys && !m->egret_session && (s->acr & SR_CTRL) &&
         ((hs_change & EGRET_SYS_SESSION) ||
          ((hs_change & EGRET_VIA_FULL) && !(s->b & EGRET_VIA_FULL) &&
           (s->acr & SR_OUT)))) {
@@ -1383,7 +1826,7 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
         if (s->acr & SR_OUT) {
             /*
              * Send session: a new command begins; any response still
-             * held from the previous exchange is stale — discard it.
+             * held from the previous exchange is stale -- discard it.
              * The ROM preloads the first byte into SR before asserting
              * the session, so collect it now.
              */
@@ -1394,14 +1837,11 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
             maciivx_egret_sr_written(v1s);
         } else if (m->egret_resp_len > 0 && m->egret_resp_idx == 0) {
             /*
-             * Receive session with a held response: the poll cadence
-             * (ROM 0x4080a5f6/0x4080a5fc: turnaround ORB ^= 0x30 which
-             * transiently releases /TIP, then ORB ^= 0x20 re-asserting
-             * it with the shifter inbound) closes the command session
-             * and opens a fresh session to collect the answer.  The
-             * first byte must already be in SR when the opening shift
-             * interrupt is dispatched (cont 0x4080a624 reads SR at the
-             * NEXT interrupt via 0x4080a68e).
+             * Receive session with a held response: the poll cadence's
+             * turnaround (ORB ^= 0x30 then ORB ^= 0x20) closes the
+             * command session and opens a fresh session to collect the
+             * answer.  The first byte must already be in SR when the
+             * opening shift interrupt is dispatched.
              */
             s->sr = m->egret_resp[0];
             m->egret_resp_idx = 1;
@@ -1410,7 +1850,7 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
         } else {
             /*
              * Receive session with nothing to deliver: the Egret has
-             * nothing to say — run the no-response signature (/XCVR
+             * nothing to say -- run the no-response signature (/XCVR
              * low throughout, two junk bytes clocked and discarded).
              */
             m->egret_resp_len = 0;
@@ -1426,9 +1866,7 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
 
     /*
      * TIP/TACK toggles during the receive phase acknowledge the byte
-     * in SR and clock the next one; /TIP alternates as part of the ack
-     * cadence (ORB ^= 0x30), so mid-receive states always have exactly
-     * one of TIP/TACK asserted.  BOTH released while a response is
+     * in SR and clock the next one; BOTH released while a response is
      * flowing is not an ack (it is the poll cadence's session close,
      * handled below).
      */
@@ -1442,15 +1880,13 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
 
     /*
      * Host released /TIP: the session is closed.  Only act on the
-     * transition — further port B writes with /TIP high (e.g. the RTC
+     * transition -- further port B writes with /TIP high (e.g. the RTC
      * bit-bang on PB0-2) must not disturb the transport state.
      */
     if (!sys && (hs_change & EGRET_SYS_SESSION)) {
         /*
          * A packet sent without the receive turnaround (Listen
-         * commands: the driver expects no response) is processed now —
-         * it was never seen by maciivx_egret_process, and ADB Listens
-         * must reach the devices (address relocation!).
+         * commands: the driver expects no response) is processed now.
          */
         if (m->egret_cmd_len > 0 && m->egret_resp_len == 0
             && m->egret_resp_idx == 0) {
@@ -1460,10 +1896,9 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
         m->egret_cmd_len = 0;
         /*
          * A staged but undelivered response SURVIVES the close: the
-         * poll cadence closes the command session (ORB ^= 0x30) and
-         * immediately reopens a receive session (ORB ^= 0x20) to
-         * collect it.  A response already being delivered (idx > 0)
-         * was abandoned mid-read — drop it.
+         * poll cadence closes the command session and immediately
+         * reopens a receive session to collect it.  A response already
+         * being delivered (idx > 0) was abandoned mid-read -- drop it.
          */
         if (m->egret_resp_idx > 0) {
             m->egret_resp_len = 0;
@@ -1473,12 +1908,8 @@ static void maciivx_egret_session_update(MOS6522MacIIvxState *v1s)
         maciivx_egret_set_xcvr(v1s, false);
         /*
          * The Egret clocks one final shift-register interrupt when the
-         * host releases /TIP: the "session closed" acknowledgement.
-         * The OS Egret driver parks its state machine (state byte 0x01)
-         * on this interrupt after every exchange, and the poll cadence
-         * advances on it (cont 0x4080a5fc does the ORB ^= 0x20 reopen);
-         * without it the next queued ADB request is never started.
-         * The ROM startup driver simply eats the extra interrupt.
+         * host releases /TIP: the "session closed" acknowledgement,
+         * needed to advance the poll cadence's ORB ^= 0x20 reopen.
          */
         maciivx_egret_schedule_int(m);
     }
@@ -1489,21 +1920,51 @@ static void maciivx_egret_sr_written(MOS6522MacIIvxState *v1s)
     MacIIvxMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
-    if (!m->egret_session || !(s->acr & SR_OUT)) {
+    if (!(s->acr & SR_OUT)) {
         return;
     }
+
     /*
-     * If an Egret-initiated packet is staged (resp pending), /XCVR is
-     * low: the host's send interrupt takes the collision path
-     * (0x4080a614), turns around and receives our packet before
-     * re-sending — the command bytes collected here get dropped at the
-     * turnaround.
+     * Inside a formal session, collect the byte as a command byte.  If
+     * an Egret-initiated packet is staged (resp pending), /XCVR is low:
+     * the host's send interrupt takes the collision path, turns around
+     * and receives our packet before re-sending -- the command bytes
+     * collected here get dropped at the turnaround.
      */
-    if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
-        m->egret_cmd[m->egret_cmd_len++] = s->sr;
+    if (m->egret_session) {
+        if (m->egret_cmd_len < (int)sizeof(m->egret_cmd)) {
+            m->egret_cmd[m->egret_cmd_len++] = s->sr;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: <- 0x%02x (#%d) pc=%08x b=%02x\n",
+                      s->sr, m->egret_cmd_len, maciivx_trace_pc(), s->b);
+    } else if ((s->acr & SR_CTRL) == SR_CTRL) {
+        /*
+         * Outside a formal session, with the shifter in the exact
+         * external-clock SR-OUT mode the byte-handshake pseudo-command
+         * send uses (ROM 0x4084a556 sets ACR to 0x1c before shifting
+         * the first byte): collect the raw byte.  Whether this forms a
+         * recognised pseudo-command is decided at the send->receive
+         * turnaround (maciivx_egret_acr_changed); the cold-start
+         * sync's own framing bytes share this same ACR pattern but are
+         * simply discarded there when unrecognised.
+         */
+        if (m->egret_pseudo_cmd_len < (int)sizeof(m->egret_pseudo_cmd)) {
+            m->egret_pseudo_cmd[m->egret_pseudo_cmd_len++] = s->sr;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: pseudo <- 0x%02x (#%d) pc=%08x"
+                      " b=%02x\n", s->sr, m->egret_pseudo_cmd_len,
+                      maciivx_trace_pc(), s->b);
     }
-    qemu_log_mask(LOG_UNIMP, "maciivx egret: <- 0x%02x (#%d) pc=%08x b=%02x\n", s->sr,
-                  m->egret_cmd_len, maciivx_trace_pc(), s->b);
+
+    /*
+     * Regardless of session framing, the Egret provides the shift clock:
+     * each byte the host shifts OUT in external-clock SR mode completes
+     * and raises the SR interrupt.  This is what carries the ROM's Egret
+     * cold-start byte-framing sync (0x40814cc8), whose send helpers clock
+     * bytes with /SYS_SESSION released (no formal session open).
+     */
     maciivx_egret_schedule_int(m);
 }
 
@@ -1511,6 +1972,23 @@ static void maciivx_egret_acr_changed(MOS6522MacIIvxState *v1s)
 {
     MacIIvxMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
+
+    qemu_log_mask(LOG_UNIMP,
+                  "maciivx egret: DBG acr=%02x sess=%d cmdlen=%d "
+                  "resplen=%d respidx=%d pseudoact=%d pc=%08x\n",
+                  s->acr, m->egret_session, m->egret_cmd_len,
+                  m->egret_resp_len, m->egret_resp_idx,
+                  m->egret_pseudo_active, maciivx_trace_pc());
+
+    /*
+     * A fresh byte-handshake pseudo-command send always (re)starts here
+     * (ROM 0x4084a556 sets ACR to exactly this mode before shifting the
+     * first byte): drop any stale, never-turned-around collection from
+     * a prior attempt so it can't leak into this one.
+     */
+    if (!m->egret_session && (s->acr & SR_CTRL) == SR_CTRL) {
+        m->egret_pseudo_cmd_len = 0;
+    }
 
     /*
      * The host turns the shifter around to receive while still holding
@@ -1520,8 +1998,16 @@ static void maciivx_egret_acr_changed(MOS6522MacIIvxState *v1s)
      * (low at the first data interrupt = "discard" to this driver) and
      * goes LOW for the no-response turnaround.
      */
-    if (m->egret_session && !(s->acr & SR_OUT) && m->egret_resp_len == 0
-        && m->egret_cmd_len > 0) {
+    if (m->egret_session && !(s->acr & SR_OUT)
+        && m->egret_resp_idx >= m->egret_resp_len && m->egret_cmd_len > 0) {
+        /*
+         * A previous exchange's response counts as "pending" only while
+         * it is still partially undelivered (idx < len); a fully
+         * consumed one that just never saw its final ack toggle (the
+         * interrupt-driven Egret driver at 0x40814912 goes straight
+         * from draining the old reply into sending the next command)
+         * must not shadow this turnaround.
+         */
         maciivx_egret_process(m);
         m->egret_cmd_len = 0;
         maciivx_egret_set_xcvr(v1s, m->egret_no_resp &&
@@ -1535,6 +2021,35 @@ static void maciivx_egret_acr_changed(MOS6522MacIIvxState *v1s)
          * bytes afterwards, so drop the partial command.
          */
         m->egret_cmd_len = 0;
+    } else if (!m->egret_session && (s->acr & SR_CTRL) && !(s->acr & SR_OUT)) {
+        /*
+         * Outside a formal session, turning the shifter to external-
+         * clock INPUT is a send->receive turnaround.  If the bytes just
+         * collected form a recognised Egret pseudo-command, stage its
+         * reply and drive the receive handshake for it (see ROM
+         * 0x4084a5ee).  Otherwise -- including the cold-start
+         * byte-framing sync's own turnarounds (0x40814e6a), which share
+         * this same ACR pattern but carry no real command -- fall back
+         * to the original behaviour: just raise the completion
+         * interrupt so the ROM's receive helper advances with SR left
+         * at 0.
+         */
+        if (!maciivx_egret_pseudo_try_process(v1s)) {
+            /*
+             * Drop any stale, already-consumed response left over from
+             * an earlier exchange: with the interrupt-driven Egret
+             * driver's IER SR-int enabled, a leftover resp_idx <
+             * resp_len would make the read-side chain in
+             * maciivx_egret_sr_read feed its junk bytes into this
+             * fresh turnaround's receive as if they were a reply
+             * (observed as "feed 0x00 (#2/2)" garbage after an
+             * unrecognised command, cascading into the ISR copying
+             * stale SR bytes through an uninitialised buffer pointer).
+             */
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+            maciivx_egret_schedule_int(m);
+        }
     }
 }
 
@@ -1543,11 +2058,93 @@ static void maciivx_egret_sr_read(MOS6522MacIIvxState *v1s)
     MacIIvxMachineState *m = v1s->machine;
     MOS6522State *s = MOS6522(v1s);
 
-    if ((s->acr & SR_OUT) || m->egret_resp_len == 0) {
+    if (s->acr & SR_OUT) {
         return;
     }
-    qemu_log_mask(LOG_UNIMP, "maciivx egret: -> 0x%02x (#%d/%d) pc=%08x b=%02x\n", s->sr,
-                  m->egret_resp_idx, m->egret_resp_len, maciivx_trace_pc(), s->b);
+
+    /*
+     * Pseudo-command reply delivery.  The ROM's per-byte receive helper
+     * (0x4084a6b4) WAITS for the shift-complete interrupt, THEN reads
+     * SR, THEN (a short delay later) checks /XCVR_SESSION -- so the
+     * byte this read just consumed (index egret_resp_idx-1, staged by
+     * the previous trigger) must have /XCVR asserted at read time for
+     * every byte except the last, which the ROM never checks /XCVR
+     * against directly (it only waits for /XCVR to rise afterwards, see
+     * ROM 0x4084a64a).  So: stage the NEXT byte here immediately
+     * (keeping /XCVR asserted) unless the byte just consumed WAS the
+     * last one, in which case drop /XCVR now as the end-of-reply marker
+     * instead.  Chaining forward from each read (rather than the
+     * request-side /VIA_FULL toggle) sidesteps that /VIA_FULL already
+     * reads low, with no edge, going into the very first receive call
+     * (it was left low by the preceding send phase).
+     */
+    if (m->egret_pseudo_active) {
+        int just_read = m->egret_resp_idx - 1;
+
+        qemu_log_mask(LOG_UNIMP,
+                      "maciivx egret: pseudo -> 0x%02x (#%d/%d)"
+                      " pc=%08x b=%02x\n", s->sr, m->egret_resp_idx,
+                      m->egret_resp_len, maciivx_trace_pc(), s->b);
+        if (just_read >= m->egret_resp_len - 1) {
+            /*
+             * That was the last byte: drop /XCVR, exchange is over.
+             * The ROM still has its own teardown writes coming
+             * (0x4084a646/0x4084a650) -- keep suppressing the formal-
+             * session detector through those (see egret_pseudo_closing
+             * in maciivx_egret_session_update).
+             */
+            maciivx_egret_set_xcvr(v1s, false);
+            m->egret_pseudo_active = false;
+            m->egret_pseudo_closing = true;
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+        } else {
+            s->sr = m->egret_resp[m->egret_resp_idx++];
+            maciivx_egret_schedule_int(m);
+        }
+        return;
+    }
+
+    /*
+     * Interrupt-driven Egret driver (post-MMU boot: IER SR-int enabled,
+     * ISR 0x40814912): each reply byte is consumed by the ISR's SR
+     * read, after which the Egret clocks the next byte in -- chain
+     * delivery from the read side, exactly like the pseudo path above.
+     * (The polled boot-ROM flows instead drive delivery from their
+     * PB4//PB5 handshake edges via maciivx_egret_ack_toggle, so
+     * this is gated on IER to avoid double-feeding them.)
+     */
+    if ((s->ier & SR_INT) && m->egret_resp_idx < m->egret_resp_len) {
+        maciivx_egret_ack_toggle(v1s);
+        return;
+    }
+
+    /*
+     * Cold-start framing sync (no formal session): each byte the host
+     * reads in external-clock INPUT mode is immediately followed by the
+     * Egret clocking the next one -- schedule its completion interrupt.
+     *
+     * ONLY while the ROM runs the sync by POLLING IFR (VIA1 IER has the
+     * SR interrupt disabled).  Once the interrupt-driven Egret driver
+     * is installed (post-MMU boot: IER SR-int enabled, ISR 0x40814912),
+     * its own end-of-transaction ACK read of SR would re-arm the
+     * interrupt here every time, producing a permanent level-1 storm
+     * whose re-entered ISR eventually walks a stale request pointer
+     * into an Access-Fault cascade and a double fault (observed).  A
+     * real Egret does not clock the shifter after a transaction ends.
+     */
+    if (!m->egret_session && (s->acr & SR_CTRL) && !(s->ier & SR_INT)) {
+        maciivx_egret_schedule_int(m);
+        return;
+    }
+
+    if (m->egret_resp_len == 0) {
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "maciivx egret: -> 0x%02x (#%d/%d) pc=%08x b=%02x\n",
+                  s->sr, m->egret_resp_idx, m->egret_resp_len,
+                  maciivx_trace_pc(), s->b);
 }
 
 /*
@@ -1964,6 +2561,26 @@ static void maciivx_machine_init(MachineState *machine)
     m->via1.PRAM[0x0e] = 0x4d;      /* 'M' */
     m->via1.PRAM[0x0f] = 0x63;      /* 'c' */
     m->via1.PRAM[0x8a] = 0x00;      /* boot 24-bit (ROM era), VM off */
+    /*
+     * Default OS / startup-device XPRAM bytes, matching the working
+     * Egret siblings (macclassicii.c / the quadra700 oracle).  The ROM's
+     * XPRAM default-rebuild pass covers 0x01-0x6d but NOT this range, so
+     * with a zeroed store the boot-driver installer's GetOSDefault
+     * (XPRAM[0x76..0x77], the disk driver ddType) reads 0, matches no
+     * driver on any disk, and the boot rescans the SCSI bus forever.
+     * 0x0001 = the standard Mac SCSI driver ddType every stock disk
+     * carries; startup-device record 0x78-0x7b = 0xff = "no preference,
+     * scan the bus".  NOTE (session 6): this is forward-prep only -- it
+     * is read far past the current blocker (the cold-boot MicroBug
+     * console, see IIVX-NOTES.md), so it does not itself change boot
+     * behaviour yet, but is required once the disk-boot branch is taken.
+     */
+    m->via1.PRAM[0x76] = 0x00;
+    m->via1.PRAM[0x77] = 0x01;      /* default OS: ddType 1 (Mac SCSI) */
+    m->via1.PRAM[0x78] = 0xff;      /* default startup device: none */
+    m->via1.PRAM[0x79] = 0xff;
+    m->via1.PRAM[0x7a] = 0xff;
+    m->via1.PRAM[0x7b] = 0xff;
     m->via1.machine = m;
     m->egret_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maciivx_egret_timer_cb,
                                   m);
@@ -2132,6 +2749,34 @@ static void maciivx_machine_init(MachineState *machine)
                                 &m->rom_alias_hi);
 
     /*
+     * Onboard-video Declaration ROM in NuBus standard slot $E
+     * (0xFE000000-0xFEFFFFFF).  The IIvx's built-in "Brazil" video is a
+     * NuBus pseudo-slot whose DeclROM is embedded in the top of the system
+     * ROM: the last 0x174c bytes are a valid Apple format block
+     * (testPattern 0x5A932BC7, byteLanes 0x0F, revision/format 0x01,
+     * directoryOffset -0x1738 pointing back to the DeclROM base) whose
+     * sResource directory names a board sResource + the video sResources
+     * (".Display_Video_Apple_Brazil" driver, "Macintosh Built-In Video",
+     * VRAM-size/mode variants + gamma tables).  On real hardware VASP
+     * aliases the top of the system ROM into slot $E, so the Slot/Display
+     * Manager finds it: the video driver reads the format block at the top
+     * of the slot (0xFEFFFFFC) and follows its directory.  Alias the whole
+     * 1 MB ROM at 0xFEF00000 so ROM offset 0xFFFFF (the byteLanes byte)
+     * lands at 0xFEFFFFFF -- the DeclROM's backward directoryOffset/sOffsets
+     * then resolve inside slot $E.  This is embedded-ROM aliasing (like the
+     * SuperMario/RBV ROMs' internal built-in-video slot ROM), NOT the wrong
+     * "whole family DeclROM" copy the RBV siblings warn against: this is the
+     * IIvx-specific Brazil DeclROM only.  Overlaps the NuBus bridge's slot
+     * window (added at priority -1 below) at higher priority so slot $E
+     * decodes to the onboard-video DeclROM while card slots 9-D keep the
+     * bridge.
+     */
+    memory_region_init_alias(&m->rom_slotE, NULL, "maciivx.rom-slotE",
+                             &m->rom, 0, MACIIVX_ROM_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        0xFEF00000, &m->rom_slotE, 1);
+
+    /*
      * 24-bit ROM window (Table 1-2: $80 0000-$8F FFFF, 1 MB, exactly
      * ADDR24_ROM_BASE/MACIIVX_ROM_SIZE): unlike the IIci/IIsi ROMs,
      * this ROM demonstrably switches to 24-bit addressing and jumps to
@@ -2144,11 +2789,38 @@ static void maciivx_machine_init(MachineState *machine)
      * IS mapped unconditionally.  This does not clash with 24-bit
      * RAM-sizing probes: Table 1-2 puts 24-bit RAM at $00 0000-$7F
      * FFFF (8 MB) specifically because ROM starts right at $80 0000.
+     *
+     * Session 8: this is a WRITABLE RAM region PRE-LOADED with the (patched)
+     * ROM image, not a read-only alias.  Reason: the ROM's 32-bit power-on
+     * write-verify memory test (ROM 0x408466bc) sweeps [0..0xC00000] and, in
+     * 32-bit addressing mode, expects that whole window to be contiguous
+     * writable DRAM (a real IIvx has up to 68 MB there).  A read-only ROM
+     * alias here fails that test (pattern can't be written back) -> the ROM
+     * parks in the MicroBug serial console.  Backing 0x800000-0x8FFFFF with a
+     * writable RAM copy of the ROM satisfies BOTH users: the 32-bit memory
+     * test (writable DRAM) AND the 24-bit-mode ROM fetches/reads the ROM
+     * makes here (the copy holds real ROM code/data).  The memory test is
+     * effectively non-destructive for boot (it restores, or the values it
+     * leaves are re-derived), verified by boot progressing past it.
+     *
+     * These 24-bit RAM-window backings are ONLY added when installed RAM is
+     * small (< 0xC00000): they exist purely so the 32-bit memory test over
+     * [0..0xC00000] has writable backing at 0x800000-0xBFFFFF.  With >=12 MB
+     * of contiguous DRAM the real RAM already covers that window, and adding
+     * these aliases would FRAGMENT it (0x800000-0xBFFFFF served by the
+     * aliases instead of contiguous RAM), corrupting the boot's 32-bit heap/
+     * structures -> a wild jump / NOP-sled.  So skip them for large RAM.
      */
-    memory_region_init_alias(&m->rom_alias24, NULL, "maciivx.rom-alias24",
-                             &m->rom, 0, MACIIVX_ROM_SIZE);
-    memory_region_add_subregion(get_system_memory(), ADDR24_ROM_BASE,
-                                &m->rom_alias24);
+    if (ram_size < 0x00C00000) {
+        memory_region_init_ram(&m->rom24_ram, NULL, "maciivx.rom24-ram",
+                               MACIIVX_ROM_SIZE, &error_abort);
+        memory_region_add_subregion(get_system_memory(), ADDR24_ROM_BASE,
+                                    &m->rom24_ram);
+        memory_region_init_ram(&m->gap24_ram, NULL, "maciivx.gap24-ram",
+                               0x00200000, &error_abort);
+        memory_region_add_subregion(get_system_memory(), 0x00900000,
+                                    &m->gap24_ram);
+    }
 
     /*
      * No RAM shadow / overlay at physical 0.  StartBoot's self-relocation
@@ -2190,15 +2862,39 @@ static void maciivx_machine_init(MachineState *machine)
                            VRAM_SIZE, &error_abort);
     memory_region_add_subregion(get_system_memory(), VRAM_ADDR, &m->vram);
 
-    memory_region_init_alias(&m->vram_alias24, NULL,
-                             "maciivx.vram-alias24", &m->vram, 0, VRAM_SIZE);
-    memory_region_add_subregion(get_system_memory(), VRAM_ADDR24,
-                                &m->vram_alias24);
+    /*
+     * The onboard-video slot-$E DeclROM (see the rom_slotE alias above)
+     * declares the frame buffer at MinorBaseOS 0 / vpBaseOffset 0, i.e. at
+     * the slot's own base address 0xFE000000 (MinorLength 0xC0000).  The
+     * Brazil video driver reads/writes pixels through that NuBus slot view,
+     * so alias the same dedicated VRAM into the bottom of slot $E as well
+     * as at its Table 1-2 window (0x60B00000).  Overlaps the NuBus bridge
+     * (priority -1) at higher priority; sits below the DeclROM alias at the
+     * top of the slot (0xFEF00000), no overlap between the two.
+     */
+    memory_region_init_alias(&m->vram_slotE, NULL, "maciivx.vram-slotE",
+                             &m->vram, 0, VRAM_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(), 0xFE000000,
+                                        &m->vram_slotE, 1);
+
+    /*
+     * 24-bit VRAM alias (0xB00000): only for small RAM, same rationale as
+     * the rom24/gap24 backings above -- with >=12 MB it would fragment the
+     * contiguous DRAM window the 32-bit boot uses.
+     */
+    if (ram_size < 0x00C00000) {
+        memory_region_init_alias(&m->vram_alias24, NULL,
+                                 "maciivx.vram-alias24", &m->vram, 0,
+                                 VRAM_SIZE);
+        memory_region_add_subregion(get_system_memory(), VRAM_ADDR24,
+                                    &m->vram_alias24);
+    }
 
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACIIVX_FB);
     m->fb.ram = &m->vram;
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
+
 
     /*
      * NuBus card bus.  The IIvx has only the 030 PDS, but a PDS->NuBus
@@ -2264,6 +2960,175 @@ static void maciivx_machine_init(MachineState *machine)
         }
 
         /*
+         * POST-stack relocation fix (default on; IIVX_NOSPFIX disables).
+         * The RAM-sizing routine (ROM 0x4084a6b0) builds a per-bank descriptor
+         * [base, top, ...] at the top of RAM, then relocates the POST stack to
+         * `*(SP) + 0x8000` (ROM 0x4084a75c/0x4084a75e) where *(SP) is the
+         * lowest bank's BASE.  On a real multi-SIMM IIvx that base is non-zero
+         * and the stack lands safely; on our single contiguous DRAM bank based
+         * at 0 it is 0, so SP becomes 0x8000 -- INSIDE the [0..0x80000] window
+         * the very next per-bank scrubber (ROM 0x40848d90) fills, which
+         * destroys the stack (return addr reads back the 0xB6DB6DB6 pattern)
+         * -> rts to garbage -> NOP-sled.
+         *
+         * Fix: keep the ROM's stack-switch intact (it still reads *(SP)=base
+         * and links the old high stack at 0x4a764, which the sizing's caller
+         * relies on) but enlarge the `addal #imm,sp` guard from 0x8000 to
+         * 0x1000000 so the relocated POST stack lands at 16 MB -- above every
+         * per-bank scrub window, well within our >=32 MB DRAM, and low enough
+         * to leave the high MemTop region for the a5-world/heap.  (Reading the
+         * descriptor TOP instead was tried and broke the sizing loop.)
+         *
+         * Default-on (IIVX_NOSPFIX disables).  Combined with the VIA-timer
+         * diagnostic bypass and the vector-preservation patch below, the boot
+         * now clears the per-bank scrub, the VIA1-timer POST storm, and the
+         * scrubbed-vector FC7 cascade (all Session 12), and runs the full
+         * POST -> Egret cold-start/pseudo-commands -> cold-boot path without
+         * any DOUBLE MMU FAULT; it currently idles in the ROM's cold-boot
+         * MicroBug serial console (0x4084a0f0) awaiting the disk-boot
+         * continuation (the Session 5-7 OS-startup frontier), so `-M maciivx`
+         * boots cleanly (no abort) without env vars.
+         */
+        if (!getenv("IIVX_NOSPFIX") && bios_size > 0x4a764) {
+            stl_be_p(ptr + 0x4a760, 0x01000000);   /* was 0x00008000 */
+        }
+
+        /*
+         * VIA1-timer POST diagnostic bypass (SETUPTIMEK-class hack, cf.
+         * maclc550.c / macclassicii.c).  Past the per-bank scrub the ROM's
+         * POST sequencer runs a VIA1 T1/T2 interrupt-timing diagnostic (test
+         * id 0x0C01, entry ROM 0x4084722e -> body 0x40847248): it programs
+         * VIA1 T1/T2, installs a Level-1 handler at 0x408473bc, enables
+         * interrupts, and counts CA1/T1/T2 IRQs (into d3/d4/d5) over a fixed
+         * dbra delay loop, requiring exact ratios (d3==10, d4 in [128,208],
+         * d5==1) to pass (d6==0).  Under icount the VIA1 T1/T2 interrupts
+         * re-assert every instruction -> a Level-1 storm, the measured ratios
+         * are garbage, d6 != 0, and the POST sequencer's failure path re-runs
+         * an FC7 machine-ID probe (0x40803982) that bus-errors through the
+         * now-scrubbed low-RAM exception vectors -> DOUBLE MMU FAULT.  This is
+         * the same "dbra timer calibration is unmeasurable under TCG/icount"
+         * wall the siblings hit; like them, short-circuit the diagnostic to
+         * report success without the interrupt-driven measurement.  The test
+         * is self-contained (its setup helper 0x40847086 saves VIA state on
+         * the stack and restores it at the end), so replacing its entry with
+         * `moveq #0,d6; jmp %fp@` cleanly returns "pass" and leaves the VIA in
+         * its pre-test state.  ROM checksum is repaired below.
+         */
+        if (bios_size > 0x4722e + 4) {
+            stw_be_p(ptr + 0x4722e, 0x7c00);   /* moveq #0,%d6 */
+            stw_be_p(ptr + 0x47230, 0x4ed6);   /* jmp %fp@      */
+        }
+
+        /*
+         * Preserve the low exception-vector page across the POST memory
+         * scrub (coordinator step 3: keep the bus-/address-error vectors
+         * sane so a stray FC7 machine-ID probe is non-fatal).  The ROM's
+         * write-verify fill/scrub routine (0x40846950, called by both the
+         * [0..0xC00000] integrity test at 0x408466b4 and the per-bank
+         * scrubber at 0x40848dc2) fills [a0..a1] with the 0x6DB6DB6D POST
+         * pattern.  For bank 0 a0==0, so it overwrites the 68k vector table
+         * at 0-0x3FF -- including the bus-error (0x8) and address-error
+         * (0xC) vectors the ROM installed at 0x408468ae -- and never
+         * restores them.  On real multi-bank hardware the lowest bank base
+         * is non-zero, so the vectors survive; on our single bank based at 0
+         * the post-scrub FC7 probe (0x40803982) then bus-errors through the
+         * scrubbed vector -> the bus-error handler jumps to the 0x6DB6DB6D
+         * pattern -> an infinite Access-Fault cascade -> DOUBLE MMU FAULT.
+         *
+         * Fix: clamp the routine's start address a0 up to 0x2000 so the low
+         * 8 KB (vector table) is never scrubbed.  The routine keys its fill,
+         * eor-scramble and verify passes all off a0 (it re-derives a2 from a0
+         * at 0x408469a8), so clamping a0 once at entry is self-consistent and
+         * the verify still passes (the skipped low page simply isn't tested;
+         * our emulated DRAM never faults there).  A0>=0x2000 callers are
+         * unaffected (the clamp is a no-op).  Implemented as a short thunk in
+         * free ROM padding at 0x4084ac3c, branched to from the routine entry
+         * (replacing the `moveal %a0,%a2 / subaw #120,%a1 / bras` prologue).
+         * ROM checksum is repaired below.
+         */
+        if (bios_size > 0x4ac3c + 0x18) {
+            /* entry 0x40846956: bra.w thunk; nop; nop */
+            stw_be_p(ptr + 0x46956, 0x6000);
+            stw_be_p(ptr + 0x46958, 0x42e4);   /* -> 0x4084ac3c */
+            stl_be_p(ptr + 0x4695a, 0x4e714e71);
+            /* thunk @ 0x4084ac3c */
+            stw_be_p(ptr + 0x4ac3c, 0xb1fc);   /* cmpal #0x2000,%a0 */
+            stl_be_p(ptr + 0x4ac3e, 0x00002000);
+            stw_be_p(ptr + 0x4ac42, 0x6406);   /* bcc.s +6 (a0>=0x2000) */
+            stw_be_p(ptr + 0x4ac44, 0x207c);   /* moveal #0x2000,%a0 */
+            stl_be_p(ptr + 0x4ac46, 0x00002000);
+            stw_be_p(ptr + 0x4ac4a, 0x2448);   /* moveal %a0,%a2 */
+            stw_be_p(ptr + 0x4ac4c, 0x92fc);   /* subaw #120,%a1 */
+            stw_be_p(ptr + 0x4ac4e, 0x0078);
+            stw_be_p(ptr + 0x4ac50, 0x6000);   /* bra.w 0x4084697e */
+            stw_be_p(ptr + 0x4ac52, 0xbd2c);
+        }
+
+        /*
+         * Decoder-record selection: make the ROM identify this board as the
+         * IIvx's own Egret machine (record rom+0x3b02, kind 0x0c05: decoder-5
+         * RBV-compatible + Egret) instead of the IIci (rom+0x35b8, kind
+         * 0x0505, discrete RTC), which it otherwise defaults to.
+         *
+         * Why a ROM patch and not a hardware strap: the identify walk
+         * (ROM 0x40802f78) picks a record by decoder byte rec+19 == d2.b
+         * (==0x05) AND (d1 & rec+32) == rec+36.  The machine-ID word d1 is
+         * built by the identify probes as 0xefff0000 -- top byte 0xef, then
+         * 0xff, then a <<16 that ZEROES d1's byte 1.  The Egret 0c05 record's
+         * criterion needs (d1 & 0x01265600) == 0x00001600, i.e. d1 byte 1 ==
+         * 0x16 -- unreachable because byte 1 is always 0 after that <<16, for
+         * ANY VIA1 PA strap (verified: sweeping PA leaves d1 == 0xefff0000).
+         * The real distinction is VASP's decoder-kind identification
+         * registers, which Apple never published, so we cannot reproduce the
+         * natural d1/d2 that selects 0c05.  Instead -- exactly as this file
+         * already patches the relocation slot and repairs the checksum, and
+         * as macclassicii.c patches its decoder records -- we edit the
+         * in-memory decoder table so the walk selects 0c05: disable the
+         * IIci-family 05-decoder records (tried first) by making their
+         * (d1 & mask)==match impossible, and make 0c05 always-match.
+         *
+         * IIVX_FORCE=<hex rom offset> overrides the target (debug only);
+         * IIVX_FORCE=off disables the patch (reverts to IIci identification).
+         */
+        {
+            const char *fe = getenv("IIVX_FORCE");
+            unsigned long tgt = 0x3b02;         /* 0c05 Egret record */
+
+            if (fe && !strcmp(fe, "off")) {
+                tgt = 0;
+            } else if (fe) {
+                tgt = strtoul(fe, NULL, 16);
+            }
+            if (tgt) {
+                static const int comp[] = {
+                    0x35b8, 0x35f8, 0x36f8, 0x3638, 0x3678
+                };
+                int i;
+                for (i = 0; i < (int)ARRAY_SIZE(comp); i++) {
+                    stl_be_p(ptr + comp[i] + 36, 0xffffffff);
+                }
+                stl_be_p(ptr + tgt + 32, 0);
+                stl_be_p(ptr + tgt + 36, 0);
+                ptr[tgt + 19] = 0x05;
+            }
+        }
+
+        /*
+         * EXPERIMENT (env-gated IIVX_SKIPMEMTEST): the ROM's power-on
+         * write-verify memory test (fill routine 0x40846950, called from the
+         * loop at 0x408466b4 over [0..0xC00000]) DESTRUCTIVELY fills that
+         * whole window with a pattern and does not restore it, clobbering the
+         * ROM's own low-memory globals; the boot then jumps through a
+         * corrupted vector into unbacked/zeroed RAM (NOP-sled).  Skip the
+         * fill call (NOP the `jmp 0x40846950` at 0x466b4) so d6 stays 0 and
+         * the boot continues without corrupting low memory.
+         */
+        if (getenv("IIVX_SKIPMEMTEST") && bios_size > 0x466b4 + 4) {
+            stw_be_p(ptr + 0x466b4, 0x4e71);   /* nop */
+            stw_be_p(ptr + 0x466b6, 0x4e71);   /* nop */
+        }
+
+        /*
          * Repair the ROM's power-on self-checksum after the patch above,
          * exactly as the Classic II bring-up does (macclassicii.c).  The
          * POST word-sum test (ROM 0x46bd0) adds every big-endian 16-bit
@@ -2282,6 +3147,17 @@ static void maciivx_machine_init(MachineState *machine)
                 sum += lduw_be_p(ptr + off);
             }
             stl_be_p(ptr, sum);
+        }
+
+        /*
+         * Pre-load the writable 24-bit ROM window (0x800000-0x8FFFFF) with
+         * the fully-patched ROM image, so 24-bit-mode fetches/reads there see
+         * real ROM code/data while the 32-bit power-on memory test can still
+         * write-verify it as DRAM (see the rom24_ram mapping above).
+         */
+        if (machine->ram_size < 0x00C00000) {
+            void *r24 = memory_region_get_ram_ptr(&m->rom24_ram);
+            memcpy(r24, ptr, MIN(bios_size, (int)MACIIVX_ROM_SIZE));
         }
 
         /*
@@ -2346,7 +3222,7 @@ static void maciivx_machine_class_init(ObjectClass *oc, const void *data)
     mc->valid_cpu_types = valid_cpu_types;
     mc->max_cpus = 1;
     mc->block_default_type = IF_SCSI;
-    mc->default_ram_size = 8 * MiB;
+    mc->default_ram_size = 32 * MiB;
     mc->default_ram_id = "maciivx.ram";
     machine_add_audiodev_property(mc);
 }
