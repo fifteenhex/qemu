@@ -333,6 +333,11 @@ config MVME16X
     select VME
     select AVME352
 
+config BVME4000
+    bool
+    default y
+    depends on M68K
+
 config ELTEC_E17
     bool
     default y
