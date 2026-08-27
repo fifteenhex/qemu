@@ -1,0 +1,63 @@
+diff --git a/arch/m68k/apollo/config.c b/arch/m68k/apollo/config.c
+index e324c5f671de..d1206e660ebd 100644
+--- a/arch/m68k/apollo/config.c
++++ b/arch/m68k/apollo/config.c
+@@ -5,6 +5,9 @@
+ #include <linux/mm.h>
+ #include <linux/rtc.h>
+ #include <linux/interrupt.h>
++#include <linux/err.h>
++#include <linux/platform_device.h>
++#include <linux/platform_data/simplefb.h>
+ 
+ #include <asm/setup.h>
+ #include <asm/bootinfo.h>
+@@ -238,3 +241,48 @@ static void dn_heartbeat(int on) {
+ }
+ #endif
+ 
++/*
++ * Apollo display: the QEMU apollo-dn3000 machine exposes a linear xrgb8888
++ * framebuffer in a dedicated high-memory window and advertises it as a
++ * generic "simple-framebuffer".  Register the matching platform device so
++ * the in-tree simplefb driver (CONFIG_FB_SIMPLE) binds to it and fbcon
++ * comes up on the emulated display.  These addresses/geometry must match
++ * hw/display/apollo-fb.h in the QEMU source tree.
++ */
++#define APOLLO_SIMPLEFB_BASE	0x10000000UL
++#define APOLLO_SIMPLEFB_WIDTH	1024
++#define APOLLO_SIMPLEFB_HEIGHT	800
++#define APOLLO_SIMPLEFB_STRIDE	(APOLLO_SIMPLEFB_WIDTH * 4)
++#define APOLLO_SIMPLEFB_SIZE	(APOLLO_SIMPLEFB_STRIDE * APOLLO_SIMPLEFB_HEIGHT)
++
++static struct simplefb_platform_data apollo_simplefb_pdata __initdata = {
++	.width	= APOLLO_SIMPLEFB_WIDTH,
++	.height	= APOLLO_SIMPLEFB_HEIGHT,
++	.stride	= APOLLO_SIMPLEFB_STRIDE,
++	.format	= "x8r8g8b8",
++};
++
++static struct resource apollo_simplefb_res __initdata = {
++	.flags	= IORESOURCE_MEM,
++	.start	= APOLLO_SIMPLEFB_BASE,
++	.end	= APOLLO_SIMPLEFB_BASE + APOLLO_SIMPLEFB_SIZE - 1,
++};
++
++static int __init apollo_init_simplefb(void)
++{
++	struct platform_device_info info = {
++		.name		= "simple-framebuffer",
++		.id		= 0,
++		.res		= &apollo_simplefb_res,
++		.num_res	= 1,
++		.data		= &apollo_simplefb_pdata,
++		.size_data	= sizeof(apollo_simplefb_pdata),
++	};
++
++	if (!MACH_IS_APOLLO)
++		return 0;
++
++	return PTR_ERR_OR_ZERO(platform_device_register_full(&info));
++}
++arch_initcall(apollo_init_simplefb);
++
