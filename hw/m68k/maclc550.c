@@ -111,9 +111,17 @@
 /* Size of whole RAM area (unbacked reads return 0 for RAM sizing) */
 #define RAM_SIZE              0x40000000
 
-/* Onboard video: physical VRAM base the ROM's page tables resolve to
- * (Valkyrie/CSC-family placement, same as lc475.c) */
-#define MACLC550_VRAM_BASE     0xf9000000
+/*
+ * Onboard video VRAM base.  The Sonora "Eric" ROM does NOT use lc475.c's
+ * Valkyrie placement (0xf9000000): it probes and memory-tests its VRAM at
+ * physical 0x60B00000 (traced -- the kind-7 video capability init writes
+ * the '256K'/'768?' size signatures and a 0x6DB6DB6D walking pattern
+ * there, and stores 0x60B00000 as the video device globals base).  A
+ * wrong base left that whole region unmapped, so the bit-18 video
+ * capability's dereference faulted and the ROM bailed the machine-config
+ * POST to the serial diagnostic console (via 0x40847042 -> 0x4084a6f6).
+ */
+#define MACLC550_VRAM_BASE     0x60b00000
 #define MACLC550_VRAM_SIZE     0x00100000    /* 1 MiB */
 
 /*
@@ -820,6 +828,7 @@ struct MacLc550MachineState {
     MemoryRegion sonoraidmem;
     MemoryRegion arielmem;
     MemoryRegion valkyrie_mem;
+    MemoryRegion sonora_probe;
     uint8_t valkyrie_regs[0x4000];
     MacLc550RegBank *valkyrie_bank;
     uint8_t clut_addr;
@@ -887,6 +896,13 @@ struct MacLc550MachineState {
      * open and would otherwise be misread as one.
      */
     bool egret_pseudo_closing;
+    /*
+     * Set when the in-flight byte-handshake pseudo reply was for a command
+     * that arrived over the FORMAL-SESSION framing (see
+     * maclc550_egret_session_pseudo_reply): those drivers want a final
+     * completion shift-interrupt once the whole reply is drained.
+     */
+    bool egret_session_pseudo;
 
     /*
      * Egret power-on cold-start line handshake (this 1MB "Sonora" ROM's
@@ -958,6 +974,38 @@ static const MemoryRegionOps machine_id_ops = {
         .min_access_size = 1,
         .max_access_size = 4,
     },
+};
+
+/* Catch-all logging stub for unmodelled registers in the 0x60000000
+ * Sonora device window (the onboard VRAM below overlaps it). */
+static uint64_t sonora_probe_read(void *opaque, hwaddr addr, unsigned size)
+{
+    static int count;
+    if (count < 400) {
+        count++;
+        qemu_log_mask(LOG_UNIMP, "maclc550 sonora-probe: read  0x%08x (%d)"
+                      " pc=0x%08x\n", (unsigned)(0x60000000 + addr), size,
+                      current_cpu ? M68K_CPU(current_cpu)->env.pc : 0);
+    }
+    return 0;
+}
+static void sonora_probe_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    static int count;
+    if (count < 400) {
+        count++;
+        qemu_log_mask(LOG_UNIMP, "maclc550 sonora-probe: write 0x%08x (%d)"
+                      " <- 0x%08" PRIx64 " pc=0x%08x\n",
+                      (unsigned)(0x60000000 + addr), size, val,
+                      current_cpu ? M68K_CPU(current_cpu)->env.pc : 0);
+    }
+}
+static const MemoryRegionOps sonora_probe_ops = {
+    .read = sonora_probe_read,
+    .write = sonora_probe_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 static void main_cpu_reset(void *opaque)
@@ -1644,6 +1692,8 @@ static void maclc550_one_second(void *opaque)
  * wire protocol -- Linux's adb_type MAC_ADB_IISI covers both machines).
  */
 
+static bool maclc550_egret_session_pseudo_reply(MacLc550MachineState *m);
+
 static void maclc550_egret_set_xcvr(MOS6522MacLc550State *v1s,
                                         bool assert)
 {
@@ -1767,10 +1817,69 @@ static void maclc550_egret_process(MacLc550MachineState *m)
      * write/set-style commands the ROM only needs the exchange to
      * terminate cleanly, which the no-response turnaround provides.
      */
+    /*
+     * GET_PRAM over the formal-session framing: [01 07 addrHi addrLo].
+     * The driver (ROM 0x408b3b6e) does a receive-turnaround and clocks
+     * FOUR reply bytes through 0x408b3bea, keeping the LAST one as the
+     * returned PRAM byte.  A plain no-response turnaround delivers only
+     * junk there, so the ROM reads a corrupt XPRAM (the 'NuMc' validity
+     * signature at 0x0C, the default-OS ddType at 0x76/0x77, etc. all
+     * come back 0), decides parameter RAM is invalid, rewrites it to
+     * 0xFF and bails to the serial diagnostic console.  Stage the real
+     * value in the 4th slot -- [00 00 00 <value>] -- so the receive-
+     * turnaround's ack_toggle chain lands it in the byte the driver
+     * keeps.  Keep the no-response /XCVR-low signalling the transport
+     * already drives for this turnaround; only the data changes.
+     */
+    if (c[0] == 0x01 && c[1] == 0x07 && n >= 4) {
+        uint16_t addr = ((uint16_t)c[2] << 8) | c[3];
+        uint8_t data = m->via1.PRAM[addr & 0xff];
+
+        qemu_log_mask(LOG_UNIMP,
+                      "maclc550 egret: session GET_PRAM addr=0x%04x"
+                      " -> 0x%02x\n", addr, data);
+        m->egret_no_resp = true;
+        m->egret_resp_len = 0;
+        m->egret_resp[m->egret_resp_len++] = 0x00;
+        m->egret_resp[m->egret_resp_len++] = 0x00;
+        m->egret_resp[m->egret_resp_len++] = 0x00;
+        m->egret_resp[m->egret_resp_len++] = data;
+        m->egret_resp_idx = 0;
+        return;
+    }
+
     if (c[0] == 0x01 && n >= 2) {
         qemu_log_mask(LOG_UNIMP,
                       "maclc550 egret: pseudo (session) cmd 0x%02x"
                       " len=%d\n", c[1], n);
+        /*
+         * Two different reply framings are in play for these session-
+         * framed pseudo-commands, depending on the driver routine that
+         * sent them:
+         *
+         *  - Data-returning READS (GET_PRAM 0x07, READ_MCU 0x02, GET_TIME
+         *    0x03) are collected with the poll-cadence receive-turnaround:
+         *    the driver re-opens a receive session and clocks the reply
+         *    bytes out through maclc550_egret_ack_toggle.  The historical
+         *    no-response staging drives that turnaround (the read value is
+         *    currently junk, but the boot tolerates it), so leave it.
+         *
+         *  - WRITE/SET/control commands (SET_PRAM 0x0c, WRITE_MCU 0x08,
+         *    SET_TIME 0x09, and the [01 1b/1c/0e ...] control settings)
+         *    are read back by the driver over the /XCVR byte-handshake
+         *    instead (ROM 0x408b3a80: release the session, spin until PB3
+         *    goes low, then clock the reply straight out of SR).  That
+         *    path needs a real staged reply delivered with /XCVR asserted
+         *    -- the no-response turnaround never lowers PB3, so the driver
+         *    hangs forever.  Build the proper reply (with side effects --
+         *    SET_PRAM actually writes PRAM) and drive it out through the
+         *    same byte-handshake delivery the direct pseudo path uses.
+         */
+        /* 0x07 GET_PRAM, 0x02 READ_MCU, 0x03 GET_TIME are the data reads */
+        if (c[1] != 0x07 && c[1] != 0x02 && c[1] != 0x03 &&
+            maclc550_egret_session_pseudo_reply(m)) {
+            return;
+        }
         maclc550_egret_no_response(m);
         return;
     }
@@ -2092,6 +2201,7 @@ static bool maclc550_egret_pseudo_try_process(MOS6522MacLc550State *v1s)
 
     m->egret_pseudo_cmd_len = 0;
     m->egret_pseudo_active = true;
+    m->egret_session_pseudo = false;    /* direct byte-handshake, not session */
     m->egret_coldstart = false;         /* cold-start sync is over */
     m->egret_no_resp = false;
 
@@ -2100,6 +2210,58 @@ static bool maclc550_egret_pseudo_try_process(MOS6522MacLc550State *v1s)
      * the time the ROM's receive wait loop sees the completion
      * interrupt and checks /XCVR -- stage it now.
      */
+    s->sr = m->egret_resp[0];
+    m->egret_resp_idx = 1;
+    maclc550_egret_set_xcvr(v1s, true);
+    maclc550_egret_schedule_int(m);
+    return true;
+}
+
+/*
+ * A write/set/control pseudo-command that arrived over the FORMAL-SESSION
+ * framing (collected in egret_cmd[] by the send path, dispatched from
+ * maclc550_egret_process) but whose reply the interrupt-driven driver
+ * reads back over the /XCVR byte-handshake (ROM 0x408b3a80), not the
+ * poll-cadence receive-turnaround.  Build the reply via the shared
+ * pseudo-command builder (so SET_PRAM etc. take their real side effects)
+ * and hand it to the same byte-handshake delivery maclc550_egret_sr_read
+ * drives for the direct pseudo path: first byte staged in SR, /XCVR
+ * asserted, completion interrupt scheduled.  Returns false (caller falls
+ * back to the no-response turnaround) if the command is not a recognised
+ * pseudo-command.
+ */
+static bool maclc550_egret_session_pseudo_reply(MacLc550MachineState *m)
+{
+    MOS6522MacLc550State *v1s = &m->via1;
+    MOS6522State *s = MOS6522(v1s);
+
+    if (m->egret_cmd_len < 2 ||
+        m->egret_cmd_len > (int)sizeof(m->egret_pseudo_cmd)) {
+        return false;
+    }
+    memcpy(m->egret_pseudo_cmd, m->egret_cmd, m->egret_cmd_len);
+    m->egret_pseudo_cmd_len = m->egret_cmd_len;
+
+    if (!maclc550_egret_pseudo_build(m)) {
+        m->egret_pseudo_cmd_len = 0;
+        return false;
+    }
+    m->egret_pseudo_cmd_len = 0;
+    m->egret_pseudo_active = true;
+    m->egret_session_pseudo = true;
+    m->egret_no_resp = false;
+    /*
+     * The reply is delivered over the byte-handshake (pseudo) path from
+     * here on, not the formal session the command arrived in: close the
+     * formal session so the driver's PB4//PB5 toggles while it clocks the
+     * reply out of SR are absorbed by the pseudo branch of
+     * maclc550_egret_session_update rather than mistaken for further
+     * session command bytes, and so the NEXT command opens a clean new
+     * session once this drained reply is torn down.
+     */
+    m->egret_session = false;
+    m->egret_cmd_len = 0;
+
     s->sr = m->egret_resp[0];
     m->egret_resp_idx = 1;
     maclc550_egret_set_xcvr(v1s, true);
@@ -2160,7 +2322,21 @@ static void maclc550_egret_session_update(MOS6522MacLc550State *v1s)
      * against whatever response state pseudo delivery has staged.
      * Suppress all of it while a pseudo exchange is in flight.
      */
-    if (m->egret_pseudo_active) {
+    /*
+     * Stale, fully-drained byte-handshake reply: a session-framed
+     * write/set pseudo-command (SET_PRAM &c., dispatched through
+     * maclc550_egret_session_pseudo_reply) stages a 4-byte
+     * [00 00 00 cmd] reply, but its driver (ROM 0x408b3a80) reads only
+     * the 3-byte [00 00 00] status and moves straight on, leaving the
+     * exchange marked active with the cmd-echo byte undelivered.  When
+     * the host then opens a fresh formal-session SEND (/SYS_SESSION
+     * asserted, shifter in SR-OUT), that previous exchange is over: fall
+     * out of the pseudo branch so the teardown just below runs and the
+     * new session opens normally instead of being swallowed here.
+     */
+    if (m->egret_pseudo_active &&
+        !(m->egret_resp_idx >= m->egret_resp_len && sys &&
+          (s->acr & SR_OUT) && (hs_change & EGRET_SYS_SESSION))) {
         /*
          * Host-side early close of a STREAMED reply: the interrupt-
          * driven Egret driver's receive (ISR 0x40a14912) reads exactly
@@ -2194,6 +2370,21 @@ static void maclc550_egret_session_update(MOS6522MacLc550State *v1s)
             m->egret_resp_idx = 0;
         }
         return;
+    }
+
+    if (m->egret_pseudo_active) {
+        /*
+         * Fell through the guard above: a fully-drained session-framed
+         * write/set reply whose driver has now opened a fresh send.
+         * Drop the leftover (undelivered cmd-echo byte + its pending
+         * completion interrupt) and continue into the session-open
+         * handling below so the new command is collected normally.
+         */
+        timer_del(m->egret_timer);
+        maclc550_egret_set_xcvr(v1s, false);
+        m->egret_pseudo_active = false;
+        m->egret_resp_len = 0;
+        m->egret_resp_idx = 0;
     }
 
     /*
@@ -2340,6 +2531,22 @@ static void maclc550_egret_session_update(MOS6522MacLc550State *v1s)
             && m->egret_resp_idx == 0) {
             maclc550_egret_process(m);
         }
+        /*
+         * A session-framed write/set pseudo-command (e.g. SET_PRAM)
+         * whose reply the interrupt-driven driver reads back over the
+         * /XCVR byte-handshake: maclc550_egret_process has already staged
+         * that reply and begun its pseudo delivery (first byte in SR,
+         * /XCVR asserted, completion interrupt scheduled).  Do NOT run the
+         * ordinary close teardown below -- it would drop the staged reply
+         * (resp_idx>0) and deassert /XCVR, hanging the driver at
+         * 0x408b3a9c.  Just finish closing the formal session.
+         */
+        if (m->egret_pseudo_active) {
+            m->egret_session = false;
+            m->egret_cmd_len = 0;
+            m->egret_coldstart_session = false;
+            return;
+        }
         m->egret_session = false;
         m->egret_cmd_len = 0;
         /*
@@ -2471,8 +2678,18 @@ static void maclc550_egret_acr_changed(MOS6522MacLc550State *v1s)
          */
         maclc550_egret_process(m);
         m->egret_cmd_len = 0;
-        maclc550_egret_set_xcvr(v1s, m->egret_no_resp &&
-                                    m->egret_resp_len > 0);
+        /*
+         * A session-framed write/set pseudo-command (SET_PRAM &c.) may
+         * have started a byte-handshake reply delivery inside
+         * maclc550_egret_process (session_pseudo_reply): it already staged
+         * the first byte and asserted /XCVR for the driver's PB3 wait at
+         * ROM 0x408b3a9c.  Leave that alone -- driving /XCVR here from
+         * egret_no_resp would deassert it and hang the read.
+         */
+        if (!m->egret_pseudo_active) {
+            maclc550_egret_set_xcvr(v1s, m->egret_no_resp &&
+                                        m->egret_resp_len > 0);
+        }
     } else if (m->egret_session && !(s->acr & SR_OUT)
                && m->egret_resp_len > 0 && m->egret_cmd_len > 0) {
         /*
@@ -2557,6 +2774,7 @@ static void maclc550_egret_sr_read(MOS6522MacLc550State *v1s)
             maclc550_egret_set_xcvr(v1s, false);
             m->egret_pseudo_active = false;
             m->egret_pseudo_closing = true;
+            m->egret_session_pseudo = false;
             m->egret_resp_len = 0;
             m->egret_resp_idx = 0;
         } else {
@@ -3143,12 +3361,23 @@ static void maclc550_machine_init(MachineState *machine)
                                     &m->valkyrie_mem);
     }
 
+    /*
+     * Low-priority catch-all logging stub covering the whole 0x60000000
+     * Sonora device window; the real VRAM below overlaps it at higher
+     * priority.  Keeps any as-yet-unmodelled register probes elsewhere in
+     * the window from bus-faulting the config POST.
+     */
+    memory_region_init_io(&m->sonora_probe, OBJECT(machine),
+                          &sonora_probe_ops, m, "sonora-probe", 0x01000000);
+    memory_region_add_subregion_overlap(get_system_memory(), 0x60000000,
+                                        &m->sonora_probe, 0);
+
     /* Onboard video framebuffer at its physical decode */
     object_initialize_child(OBJECT(machine), "fb", &m->fb, TYPE_MACLC550_FB);
     sysbus = SYS_BUS_DEVICE(&m->fb);
     sysbus_realize(sysbus, &error_fatal);
-    memory_region_add_subregion(get_system_memory(), MACLC550_VRAM_BASE,
-                                sysbus_mmio_get_region(sysbus, 0));
+    memory_region_add_subregion_overlap(get_system_memory(), MACLC550_VRAM_BASE,
+                                        sysbus_mmio_get_region(sysbus, 0), 1);
     /*
      * The VRAM aperture doesn't decode the upper address bits: the
      * ROM's video driver may size VRAM by looking for aliasing (a BERR
@@ -3160,10 +3389,10 @@ static void maclc550_machine_init(MachineState *machine)
                                  "maclc550.vram-alias",
                                  sysbus_mmio_get_region(sysbus, 0),
                                  0, MACLC550_VRAM_SIZE);
-        memory_region_add_subregion(get_system_memory(),
+        memory_region_add_subregion_overlap(get_system_memory(),
                                     MACLC550_VRAM_BASE +
                                     (i + 1) * MACLC550_VRAM_SIZE,
-                                    &m->vram_aliases[i]);
+                                    &m->vram_aliases[i], 1);
     }
 
     /* ROM */
@@ -3233,6 +3462,23 @@ static void maclc550_machine_init(MachineState *machine)
             ldl_be_p(ptr + 0x3d42) == 0x00a03d52 &&
             ldl_be_p(ptr + 0x3d4a) == MACLC550_ROM_ADDR + 0x3d52) {
             stl_be_p(ptr + 0x3d42, MACLC550_ROM_ADDR + 0x3d52);
+            /*
+             * Re-sign the ROM after the relocation patch.  The power-on
+             * self-test at ROM 0x40847a24 sums the ROM as 16-bit words
+             * (into a 32-bit accumulator) starting at ROM+4 and compares
+             * the result against the stored 32-bit checksum longword at
+             * ROM+0 (0xede66cbd); a mismatch sets d6=0xffff and the boot
+             * diverts to the serial diagnostic console (via 0x408472d0 ->
+             * 0x4084a6f6 -> 0x408b989a) instead of continuing to StartBoot.
+             * The relocation patch just above raised the high word at
+             * offset 0x3d42 from 0x00a0 to 0x4080, i.e. it added
+             * (0x4080-0x00a0)=0x3fe0 to that word-sum, so bump the stored
+             * checksum by the same amount to keep the self-test passing.
+             * (ROM+0 is read as the comparison target *before* the sum
+             * loop starts at ROM+4, so it is itself outside the summed
+             * range and this adjustment does not perturb the sum.)
+             */
+            stl_be_p(ptr, ldl_be_p(ptr) + (0x4080 - 0x00a0));
         }
     }
 }
