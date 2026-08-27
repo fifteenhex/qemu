@@ -165,6 +165,21 @@ config MACIICI
     select NUBUS
     select NUBUS_MAC8390
 
+config MACIIVX
+    bool
+    default y
+    depends on M68K
+    select ADB
+    select MOS6522
+    select ESCC
+    select SWIM
+    select ASC
+    select OR_IRQ
+    select FRAMEBUFFER
+    select NCR5380
+    select NUBUS
+    select NUBUS_MAC8390
+
 config MACCLASSICII
     bool
     default y
