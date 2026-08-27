@@ -114,6 +114,13 @@ typedef struct CPUArchState {
     uint32_t fp_trap_armed;
     /* complete the next faulting bus access as unassigned (030 rerun) */
     uint32_t bus_error_suppress;
+    /*
+     * 68000: PC of the instruction whose bus fault was delivered; if the
+     * handler RTEs straight back to it, the re-run faulting cycle is
+     * completed as an unassigned access instead of re-faulting (see
+     * m68k_cpu_transaction_failed).
+     */
+    uint32_t bus_error_pc;
     float_status fp_status;
 
     uint64_t mactmp;

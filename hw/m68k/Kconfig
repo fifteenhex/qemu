@@ -302,3 +302,8 @@ config AVME352
     depends on M68K
     select ESCC
     select VME
+
+config SORD_M68MX
+    bool
+    default y
+    depends on M68K

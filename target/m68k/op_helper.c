@@ -379,6 +379,33 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
         }
         env->mmu.fault = true;
+        if (!m68k_feature(env, M68K_FEATURE_EXCEPTION_FORMAT_VEC)) {
+            /*
+             * 68000 group 0 frame (7 words): access info word, access
+             * address, instruction register, then the normal SR/PC
+             * pair.  Handlers typically do `addq #8,sp; rte`.  The
+             * pushed PC is the faulting instruction; RTEing back to it
+             * completes the re-run cycle as an unassigned access (see
+             * m68k_cpu_transaction_failed).
+             */
+            uint16_t ir = 0;
+
+            if (env->mmu.ssw & 0x08) {
+                /* data fault: the opcode itself is fetchable */
+                ir = cpu_lduw_be_mmuidx_ra(env, env->pc, MMU_KERNEL_IDX, 0);
+            }
+            do_stack_frame(env, &sp, 0, oldsr, 0, env->pc);
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, ir, MMU_KERNEL_IDX, 0);
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, env->mmu.ar, MMU_KERNEL_IDX, 0);
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, env->mmu.ssw, MMU_KERNEL_IDX, 0);
+            env->bus_error_suppress = 1;
+            env->bus_error_pc = env->pc;
+            env->mmu.fault = false;
+            break;
+        }
         if (!m68k_feature(env, M68K_FEATURE_M68040)) {
             /*
              * 68020/030 bus cycle fault.  Data faults occur mid
@@ -629,6 +656,29 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
         cs->exception_index = EXCP_ACCESS;
         cpu_loop_exit(cs);
     } else if (m68k_feature(env, M68K_FEATURE_M68K)) {
+        if (!m68k_feature(env, M68K_FEATURE_EXCEPTION_FORMAT_VEC)) {
+            /*
+             * 68000/68008: deliver a group 0 bus error.  The frame's PC
+             * is the faulting instruction itself; a handler that pops
+             * the extra info words and RTEs re-runs the instruction
+             * with the faulted cycle completed as an unassigned access
+             * (read 0 / write ignored), so execution continues at the
+             * following instruction -- the net effect ROMs expect from
+             * the prefetch-advanced PC a real 68000 pushes.
+             */
+            if (env->bus_error_suppress && env->pc == env->bus_error_pc) {
+                env->bus_error_suppress = 0;
+                return;
+            }
+            env->mmu.ar = addr;
+            /* group 0 access info word: R/W(4), I/N(3), FC(2..0) */
+            env->mmu.ssw = ((access_type != MMU_DATA_STORE) ? 0x10 : 0) |
+                           ((access_type != MMU_INST_FETCH) ? 0x08 : 0) |
+                           ((env->sr & SR_S) ? 4 : 0) |
+                           ((access_type == MMU_INST_FETCH) ? 2 : 1);
+            cs->exception_index = EXCP_ACCESS;
+            cpu_loop_exit(cs);
+        }
         /* 68020/030: deliver a bus error with a format A frame */
         if (env->bus_error_suppress) {
             /*
