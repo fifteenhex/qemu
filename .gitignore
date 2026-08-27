@@ -29,3 +29,6 @@ _atarist_assets/
 /clie-poc-evidence/
 se30_declrom.bin
 scripts/se30-video-driver.bin
+# Accidentally-committed boot logs / transcripts (do not commit)
+*.log
+*-transcript.*
