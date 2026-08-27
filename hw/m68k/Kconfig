@@ -193,6 +193,19 @@ config MACCLASSICII
     select FRAMEBUFFER
     select NCR5380
 
+config MACLC550
+    bool
+    default y
+    depends on M68K
+    select ADB
+    select MOS6522
+    select ESCC
+    select SWIM
+    select ASC
+    select OR_IRQ
+    select FRAMEBUFFER
+    select NCR5380
+
 config MACSE30
     bool
     default y
