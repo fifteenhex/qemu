@@ -14,6 +14,13 @@ config HP300
     select M68K_IRQC
     select SERIAL_MM
 
+config Q40
+    bool
+    default y
+    depends on M68K
+    select M68K_IRQC
+    select SERIAL_MM
+
 config AN5206
     bool
     default y
