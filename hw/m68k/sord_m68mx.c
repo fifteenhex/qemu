@@ -19,8 +19,11 @@
  *   0xE207C1  DMA page registers (address bits 23-16)
  *   0xE30001  HD6845 CRTC (addr/data, cursor in R14/15)
  *   0xE30141  MC6850 ACIA #1 / 0xE30161 MC6850 ACIA #0 (Sunbug console)
- *   0xE40000  64KB graphics(?) RAM, probed with an unguarded readback
- *   0xE50000  palette(?), 16 word registers
+ *   0xE40000  optional SGX graphics board: 64K window onto 4 bit-planes,
+ *             640x500 1bpp/plane (16 colours), 80-byte line stride;
+ *             0xE20381 = plane read-select, 0xE203A1 = plane write-mask
+ *   0xE50000  16 palette colour registers (byte per even word offset);
+ *             0xE50001 read bit7 = graphics board present (active low)
  *   0xE80005  HD controller / 0xE80105 Z8530 SCC: left unmapped, the
  *             guarded probes take the bus-error path ("not connected")
  *
@@ -76,6 +79,10 @@
 #define SORD_ROWS         25
 #define FONT_W            8
 #define FONT_H            16
+#define CELL_H            20        /* CRTC R9+1: 20-scanline character cell */
+#define SORD_GFX_W        (SORD_COLS * FONT_W)   /* 640 */
+#define SORD_GFX_H        (SORD_ROWS * CELL_H)   /* 500 */
+#define SORD_GFX_STRIDE   (SORD_GFX_W / 8)       /* 80 bytes / plane line */
 
 extern const uint8_t vgafont16[256 * 16];
 
@@ -91,11 +98,17 @@ extern const uint8_t vgafont16[256 * 16];
 #define TYPE_SORD_M68MX_MACHINE MACHINE_TYPE_NAME("sord-m68mx")
 OBJECT_DECLARE_SIMPLE_TYPE(SordMachineState, SORD_M68MX_MACHINE)
 
+#define SORD_ACIA_FIFO 512
+
 typedef struct SordAcia {
     CharFrontend chr;
     uint8_t ctrl;
     uint8_t rxbuf;
     bool rxfull;
+    /* RX FIFO (used by the smart keyboard on ACIA0 to queue scancodes and
+     * the probe reply; also used generally so bursts are not dropped) */
+    uint8_t fifo[SORD_ACIA_FIFO];
+    unsigned fhead, ftail;
 } SordAcia;
 
 typedef struct SordDma {
@@ -160,12 +173,65 @@ struct SordMachineState {
     uint8_t crtc_addr;
     uint8_t crtc[32];
 
+    /*
+     * Graphics board (optional SGX bitmap card): 4 bit-planes banked
+     * through the 64K window at 0xE40000.  0xE20381 selects the plane
+     * read back at 0xE40000 (0-3); 0xE203A1 is the per-plane write mask
+     * (bit0..3).  Palette: 16 colour registers at 0xE50000 (byte at each
+     * even word offset).  0xE50001 read bit7 = board present (0=present).
+     * Visible raster 640x500, 1 bit/pixel/plane, 80-byte line stride.
+     */
+    uint8_t plane[4][SORD_GRAM_SIZE];
+    uint16_t palette[16];
+    uint8_t gfx_read_sel;       /* 0xE20381: plane shown at 0xE40000 */
+    uint8_t gfx_write_mask;     /* 0xE203A1: planes written at 0xE40000 */
+    uint32_t gram_lo, gram_hi;  /* observed write extent (trace) */
+
     SordAcia acia[2];
     SordDma dma;
     SordFdc fdc;
 
+    /*
+     * SORD "smart keyboard" (intelligent keyboard controller on ACIA0).
+     * When enabled, ACIA0 no longer carries plain ASCII: the boot BIOS
+     * probes it at init by sending 0x00 and expecting a 2-byte ID; a valid
+     * reply puts the BIOS into scancode mode (0xD854 = 0), where each key
+     * is reported as a make (0x80|code) / break (code) scancode that the
+     * ROM keysym table (0xE0E2) turns into console chars, function keys and
+     * edit/cursor keys.  (The GEDIT/LEONIS menu highlight and drawing
+     * cursor come from a separate graphics locator on ACIA1, below.)  Bytes
+     * the host sends on serial_hd(0) are treated as raw scancodes; the BIOS's
+     * transmitted keyboard commands (probe/beep/LED) are answered/consumed
+     * here instead of going to the host.
+     */
+    bool smartkbd;
+    bool kbd_ready;             /* handshake done */
+
+    /*
+     * SORD graphics locator ("puck"/direction pad) on ACIA1.  GEDIT and
+     * the LEONIS suite drive their menu highlight and drawing cursor from
+     * it: the driver transmits 0x00 on ACIA1 and reads a 3-byte reply
+     * [status, dx, dy].  status bit4 = right, bit5 = left, bit6 = down,
+     * bit7 = up, bits1..0 = buttons; dx/dy are signed deltas.  The host
+     * injects a step by writing one status byte to serial_hd(1); it is
+     * reported on the next poll and then auto-cleared (one event per byte).
+     */
+    bool locator;
+    uint8_t loc_status;         /* pending status byte for next poll */
+    int8_t loc_dx, loc_dy;      /* pending signed deltas */
+    uint8_t loc_pkt[3];         /* host injection packet assembly */
+    unsigned loc_pktn;
+
     QemuConsole *con;
 };
+
+/* locator status bits (as decoded by GEDIT's event reader at 0x12cf4) */
+#define LOC_RIGHT  0x10
+#define LOC_LEFT   0x20
+#define LOC_DOWN   0x40
+#define LOC_UP     0x80
+#define LOC_BTN0   0x01
+#define LOC_BTN1   0x02
 
 /* ---------------------------------------------------------------- DMA */
 
@@ -371,7 +437,15 @@ static void sord_fdc_rw_data(SordMachineState *s, bool is_write)
             break;
         }
         if (is_write) {
+            uint32_t dmaddr = sord_dma_cur_addr(s, 1);
             done = sord_dma_pull(s, 1, buf, ssz);
+            if (getenv("SORD_FDC_TRACE")) {
+                fprintf(stderr, "fdc: WRITE u%d c%d h%d r%d ssz%d off=%#llx "
+                        "dma=%#x done=%d left=%u data=%02x %02x %02x %02x\n",
+                        unit, c, head, r, ssz, (unsigned long long)off,
+                        dmaddr, done, s->dma.left[1],
+                        buf[0], buf[1], buf[2], buf[3]);
+            }
             if (done < ssz) {
                 memset(buf + done, 0, ssz - done);
             }
@@ -626,14 +700,30 @@ static void sord_sysio_write(void *opaque, hwaddr offset, uint64_t value,
     case 0x30b:
         s->rtc_addr = val;
         break;
+    case 0x381:     /* graphics board: plane read-select (0..3) */
+        s->gfx_read_sel = val & 3;
+        if (getenv("SORD_TRACE")) {
+            fprintf(stderr, "GFX read-plane select = %d\n", val & 3);
+        }
+        break;
+    case 0x3a1:     /* graphics board: plane write mask (bit0..3) */
+        s->gfx_write_mask = val & 0x0f;
+        if (getenv("SORD_TRACE")) {
+            fprintf(stderr, "GFX write-plane mask = 0x%x\n", val & 0x0f);
+        }
+        break;
     case 0x305: case 0x307: case 0x30d: case 0x30f:
-    case 0x381: case 0x3a1: case 0x3c1: case 0x3e1:   /* intc */
+    case 0x3c1: case 0x3e1:                           /* intc */
     case 0x7a0: case 0x7a1:                           /* strap latch */
         break;
     case 0x7c1 ... 0x7c7:
         sord_dma_page_write(s, offset, val);
         break;
     default:
+        if (getenv("SORD_TRACE")) {
+            fprintf(stderr, "SYSIO? write 0x%02x -> 0x%06x\n",
+                    val, (unsigned)(SORD_SYSIO_BASE + offset));
+        }
         qemu_log_mask(LOG_UNIMP,
                       "sord: sysio write 0x%02x -> 0x%06" HWADDR_PRIx "\n",
                       val, SORD_SYSIO_BASE + offset);
@@ -653,6 +743,27 @@ static const MemoryRegionOps sord_sysio_ops = {
 
 /* ------------------------------------------------- CRTC/ACIA I/O */
 
+static void sord_acia_update_irq(SordMachineState *s, int n);
+
+static bool sord_acia_rx_empty(SordAcia *a)
+{
+    return a->fhead == a->ftail;
+}
+
+/* queue one received byte on ACIA n's RX FIFO and re-evaluate the IRQ */
+static void sord_acia_rx_push(SordMachineState *s, int n, uint8_t b)
+{
+    SordAcia *a = &s->acia[n];
+    unsigned nt = (a->ftail + 1) % SORD_ACIA_FIFO;
+
+    if (nt != a->fhead) {
+        a->fifo[a->ftail] = b;
+        a->ftail = nt;
+    }
+    a->rxfull = !sord_acia_rx_empty(a);
+    sord_acia_update_irq(s, n);
+}
+
 static void sord_acia_update_irq(SordMachineState *s, int n)
 {
     SordAcia *a = &s->acia[n];
@@ -661,6 +772,29 @@ static void sord_acia_update_irq(SordMachineState *s, int n)
     if (n == 0) {
         sord_intc_set(s, SORD_INTC_SRC_KBD, irq);
     }
+}
+
+/*
+ * Smart-keyboard controller: process a byte the BIOS transmits on ACIA0.
+ * The only command that expects a reply is the 0x00 identify probe, which
+ * must return a 2-byte keyboard ID for the ROM to enter scancode mode.
+ * Everything else (0xC0 enable, 0xF6.. beep, LED/state updates) is
+ * consumed silently.  Returns true if the byte was handled here (and must
+ * not be forwarded to the host chardev).
+ */
+static void sord_kbd_command(SordMachineState *s, uint8_t val)
+{
+    if (getenv("SORD_KBD_TRACE")) {
+        fprintf(stderr, "KBD TX 0x%02x\n", val);
+    }
+    if (val == 0x00) {
+        /* identify: reply with a 2-byte ID (any value; the ROM only needs
+         * to receive two bytes to select the smart-keyboard scancode path) */
+        sord_acia_rx_push(s, 0, 0xA0);
+        sord_acia_rx_push(s, 0, 0x01);
+        s->kbd_ready = true;
+    }
+    /* all other keyboard commands: acknowledge by ignoring */
 }
 
 static uint64_t sord_acia_read(SordMachineState *s, int n, hwaddr reg)
@@ -672,7 +806,11 @@ static uint64_t sord_acia_read(SordMachineState *s, int n, hwaddr reg)
         return 0x02 | (a->rxfull ? 0x01 : 0) |
                (((a->ctrl & 0x80) && a->rxfull) ? 0x80 : 0);
     }
-    a->rxfull = false;
+    if (!sord_acia_rx_empty(a)) {
+        a->rxbuf = a->fifo[a->fhead];
+        a->fhead = (a->fhead + 1) % SORD_ACIA_FIFO;
+    }
+    a->rxfull = !sord_acia_rx_empty(a);
     sord_acia_update_irq(s, n);
     qemu_chr_fe_accept_input(&a->chr);
     return a->rxbuf;
@@ -686,9 +824,28 @@ static void sord_acia_write(SordMachineState *s, int n, hwaddr reg,
     if (reg == 0) {
         if ((val & 0x03) == 0x03) {             /* master reset */
             a->rxfull = false;
+            a->fhead = a->ftail = 0;
         }
         a->ctrl = val;
         sord_acia_update_irq(s, n);
+    } else if (n == 0 && s->smartkbd) {
+        /* ACIA0 TX in smart-keyboard mode is a keyboard command, not host
+         * serial output */
+        sord_kbd_command(s, val);
+    } else if (n == 1 && s->locator) {
+        /*
+         * ACIA1 TX in locator mode: 0x00 is the "read locator" request; the
+         * device answers with 3 bytes [status, dx, dy].  Report the pending
+         * injected state, then clear it so each injected byte yields exactly
+         * one movement/button event.
+         */
+        if (val == 0x00) {
+            sord_acia_rx_push(s, 1, s->loc_status);
+            sord_acia_rx_push(s, 1, (uint8_t)s->loc_dx);
+            sord_acia_rx_push(s, 1, (uint8_t)s->loc_dy);
+            s->loc_status = 0;
+            s->loc_dx = s->loc_dy = 0;
+        }
     } else {
         qemu_chr_fe_write_all(&a->chr, &val, 1);
     }
@@ -726,6 +883,9 @@ static void sord_ctlio_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case 0x003:
         s->crtc[s->crtc_addr & 0x1f] = val;
+        if (getenv("SORD_TRACE")) {
+            fprintf(stderr, "CRTC R%-2d = 0x%02x\n", s->crtc_addr & 0x1f, val);
+        }
         break;
     case 0x081 ... 0x08f:       /* movep-programmed timer(?), ignored */
         break;
@@ -738,6 +898,10 @@ static void sord_ctlio_write(void *opaque, hwaddr offset, uint64_t value,
         sord_acia_write(s, 0, (offset - 0x161) >> 1, val);
         break;
     default:
+        if (getenv("SORD_TRACE")) {
+            fprintf(stderr, "CTLIO? write 0x%02x -> 0x%06x\n",
+                    val, (unsigned)(SORD_CTLIO_BASE + offset));
+        }
         qemu_log_mask(LOG_UNIMP,
                       "sord: ctlio write 0x%02x -> 0x%06" HWADDR_PRIx "\n",
                       val, SORD_CTLIO_BASE + offset);
@@ -757,18 +921,97 @@ static const MemoryRegionOps sord_ctlio_ops = {
 
 static uint64_t sord_pal_read(void *opaque, hwaddr offset, unsigned size)
 {
-    return 0;
+    SordMachineState *s = opaque;
+    int idx = (offset >> 1) & 0xf;
+    uint64_t v;
+
+    /*
+     * Odd byte of palette word 0 (0xE50001) is the board status port:
+     * bit7 = graphics board present, active low (0 = present).  The SGX
+     * driver and GEDIT test it with "btst #7,0xE50001".
+     */
+    if (offset == 1 && size == 1) {
+        v = 0x00;               /* board present */
+    } else {
+        v = s->palette[idx];
+    }
+    if (getenv("SORD_TRACE")) {
+        fprintf(stderr, "PAL/CTL read off 0x%02x sz %u -> 0x%04x\n",
+                (unsigned)offset, size, (unsigned)v);
+    }
+    return v;
 }
 
 static void sord_pal_write(void *opaque, hwaddr offset, uint64_t value,
                            unsigned size)
 {
+    SordMachineState *s = opaque;
+    int idx = (offset >> 1) & 0xf;
+
+    s->palette[idx] = value;
+    if (getenv("SORD_TRACE")) {
+        fprintf(stderr, "PAL[%d] = 0x%04x (off 0x%02x sz %u)\n",
+                idx, (unsigned)value, (unsigned)offset, size);
+    }
 }
 
 static const MemoryRegionOps sord_pal_ops = {
     .read = sord_pal_read,
     .write = sord_pal_write,
     .endianness = DEVICE_BIG_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 2 },
+};
+
+/* ------------------------------------------------ graphics plane RAM */
+
+static uint64_t sord_gram_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SordMachineState *s = opaque;
+    const uint8_t *pl = s->plane[s->gfx_read_sel & 3];
+    uint64_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        v = (v << 8) | pl[(offset + i) & (SORD_GRAM_SIZE - 1)];
+    }
+    return v;
+}
+
+static void sord_gram_write(void *opaque, hwaddr offset, uint64_t value,
+                            unsigned size)
+{
+    SordMachineState *s = opaque;
+    unsigned i, p;
+
+    for (p = 0; p < 4; p++) {
+        if (!(s->gfx_write_mask & (1 << p))) {
+            continue;
+        }
+        for (i = 0; i < size; i++) {
+            s->plane[p][(offset + i) & (SORD_GRAM_SIZE - 1)] =
+                (value >> (8 * (size - 1 - i))) & 0xff;
+        }
+    }
+    if (getenv("SORD_TRACE")) {
+        if (offset < s->gram_lo) {
+            s->gram_lo = offset;
+        }
+        if (offset + size > s->gram_hi) {
+            s->gram_hi = offset + size;
+        }
+        if (getenv("SORD_TRACE_V")) {
+            fprintf(stderr, "GRAM w %06x sz%u = %0*llx\n",
+                    (unsigned)(SORD_GRAM_BASE + offset), size, size * 2,
+                    (unsigned long long)value);
+        }
+    }
+}
+
+static const MemoryRegionOps sord_gram_ops = {
+    .read = sord_gram_read,
+    .write = sord_gram_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 2 },
 };
 
 /* ------------------------------------------------------------ ACIA rx */
@@ -776,40 +1019,71 @@ static const MemoryRegionOps sord_pal_ops = {
 static int sord_acia0_can_receive(void *opaque)
 {
     SordMachineState *s = opaque;
+    SordAcia *a = &s->acia[0];
 
-    return s->acia[0].rxfull ? 0 : 1;
+    return (a->ftail + 1) % SORD_ACIA_FIFO == a->fhead ? 0 : 1;
 }
 
+/*
+ * Host bytes on serial_hd(0): in smart-keyboard mode these are raw SORD
+ * scancodes (make = 0x80|code, break = code) injected straight into the
+ * ACIA RX FIFO; otherwise they are plain ASCII console input.  Either way
+ * the FIFO carries them to the ROM keyboard driver.
+ */
 static void sord_acia0_receive(void *opaque, const uint8_t *buf, int size)
 {
     SordMachineState *s = opaque;
+    int i;
 
-    if (size > 0) {
-        s->acia[0].rxbuf = buf[0];
-        s->acia[0].rxfull = true;
-        sord_acia_update_irq(s, 0);
+    for (i = 0; i < size; i++) {
+        sord_acia_rx_push(s, 0, buf[i]);
     }
 }
 
 static int sord_acia1_can_receive(void *opaque)
 {
     SordMachineState *s = opaque;
+    SordAcia *a = &s->acia[1];
 
-    return s->acia[1].rxfull ? 0 : 1;
+    return (a->ftail + 1) % SORD_ACIA_FIFO == a->fhead ? 0 : 1;
 }
 
 static void sord_acia1_receive(void *opaque, const uint8_t *buf, int size)
 {
     SordMachineState *s = opaque;
+    int i;
 
-    if (size > 0) {
-        s->acia[1].rxbuf = buf[0];
-        s->acia[1].rxfull = true;
-        sord_acia_update_irq(s, 1);
+    for (i = 0; i < size; i++) {
+        if (s->locator) {
+            /*
+             * Host injects locator events as 3-byte packets
+             * [status, dx, dy]; latched for the next poll (one event per
+             * packet).  status bits: 0x10 R, 0x20 L, 0x40 D, 0x80 U,
+             * 0x01/0x02 buttons.  dx/dy are signed pixel deltas used
+             * directly when no direction bit is set.
+             */
+            s->loc_pkt[s->loc_pktn++] = buf[i];
+            if (s->loc_pktn == 3) {
+                s->loc_status = s->loc_pkt[0];
+                s->loc_dx = (int8_t)s->loc_pkt[1];
+                s->loc_dy = (int8_t)s->loc_pkt[2];
+                s->loc_pktn = 0;
+            }
+        } else {
+            sord_acia_rx_push(s, 1, buf[i]);
+        }
     }
 }
 
 /* ------------------------------------------------------------ display */
+
+/* 16-colour palette LUT (IRGB), indexed by the 4-bit plane value */
+static const uint32_t sord_palette_rgb[16] = {
+    0xff000000, 0xff0000aa, 0xff00aa00, 0xff00aaaa,
+    0xffaa0000, 0xffaa00aa, 0xffaa5500, 0xffaaaaaa,
+    0xff555555, 0xff5555ff, 0xff55ff55, 0xff55ffff,
+    0xffff5555, 0xffff55ff, 0xffffff55, 0xffffffff,
+};
 
 static bool sord_gfx_update(void *opaque)
 {
@@ -818,14 +1092,48 @@ static bool sord_gfx_update(void *opaque)
     uint32_t *dst;
     uint8_t *vram;
     int cursor, stride;
+    bool gfx_active = false;
 
-    if (!surface || surface_width(surface) < SORD_COLS * FONT_W) {
+    if (!surface || surface_width(surface) < SORD_GFX_W) {
         return true;
     }
     dst = surface_data(surface);
     stride = surface_stride(surface) / 4;
     vram = memory_region_get_ram_ptr(&s->vram);
     cursor = (s->crtc[14] << 8) | s->crtc[15];
+
+    /*
+     * Debug aid: SORD_GFX_TEST paints a 16-colour bar chart + a white
+     * diagonal into the four bit-planes each frame, so the graphics
+     * renderer/geometry (640x500, 4 planes, 80-byte stride, 16-colour
+     * palette) can be validated without the (keyboard-driven) app suite.
+     */
+    if (getenv("SORD_GFX_TEST")) {
+        for (int y = 0; y < SORD_GFX_H; y++) {
+            for (int bx = 0; bx < SORD_GFX_STRIDE; bx++) {
+                int colour = (bx * 16) / SORD_GFX_STRIDE;
+                int off = y * SORD_GFX_STRIDE + bx;
+
+                for (int p = 0; p < 4; p++) {
+                    s->plane[p][off] = (colour & (1 << p)) ? 0xff : 0x00;
+                }
+            }
+            int dx = (y * SORD_GFX_STRIDE) / SORD_GFX_H;
+            for (int p = 0; p < 4; p++) {
+                s->plane[p][y * SORD_GFX_STRIDE + dx] = 0xff;
+            }
+        }
+    }
+
+    /* is anything drawn in the graphics plane? (else pure text overlay) */
+    for (int p = 0; p < 4 && !gfx_active; p++) {
+        for (int i = 0; i < SORD_GFX_STRIDE * SORD_GFX_H; i++) {
+            if (s->plane[p][i]) {
+                gfx_active = true;
+                break;
+            }
+        }
+    }
 
     for (int row = 0; row < SORD_ROWS; row++) {
         for (int col = 0; col < SORD_COLS; col++) {
@@ -834,26 +1142,41 @@ static bool sord_gfx_update(void *opaque)
             uint8_t ch = vram[cell * 4 + 3];
             const uint8_t *glyph = &vgafont16[ch * FONT_H];
             uint32_t fg = (attr & 0x0f) ? 0xffe8e8e8 : 0xff404040;
-            uint32_t bg = 0xff000000;
+            bool curs = (cell == cursor);
 
-            if (cell == cursor) {
-                uint32_t t = fg;
-                fg = bg;
-                bg = t;
-            }
-            for (int y = 0; y < FONT_H; y++) {
-                uint32_t *line = dst + (row * FONT_H + y) * stride +
-                                 col * FONT_W;
-                uint8_t bits = glyph[y];
+            for (int cy = 0; cy < CELL_H; cy++) {
+                int sy = row * CELL_H + cy;
+                uint32_t *line = dst + sy * stride + col * FONT_W;
+                uint8_t bits = (cy < FONT_H) ? glyph[cy] : 0;
+                int goff = sy * SORD_GFX_STRIDE + col;
 
                 for (int x = 0; x < FONT_W; x++) {
-                    line[x] = (bits & (0x80 >> x)) ? fg : bg;
+                    uint32_t bg;
+                    bool tset = bits & (0x80 >> x);
+
+                    if (gfx_active) {
+                        int gx = col * FONT_W + x;
+                        int idx = 0;
+
+                        for (int p = 0; p < 4; p++) {
+                            if (s->plane[p][goff] & (0x80 >> (gx & 7))) {
+                                idx |= 1 << p;
+                            }
+                        }
+                        bg = sord_palette_rgb[s->palette[idx] & 0x0f];
+                    } else {
+                        bg = 0xff000000;
+                    }
+                    if (curs) {
+                        line[x] = tset ? bg : fg;
+                    } else {
+                        line[x] = tset ? fg : bg;
+                    }
                 }
             }
         }
     }
-    qemu_console_update(s->con, 0, 0, SORD_COLS * FONT_W,
-                        SORD_ROWS * FONT_H);
+    qemu_console_update(s->con, 0, 0, SORD_GFX_W, SORD_GFX_H);
     return true;
 }
 
@@ -885,12 +1208,48 @@ static const Property sord_fdc_properties[] = {
     DEFINE_PROP_DRIVE("driveB", SordFdcDevice, blk[1]),
 };
 
+static void sord_fdc_realize(DeviceState *dev, Error **errp)
+{
+    SordFdcDevice *fdc = SORD_FDC(dev);
+
+    /*
+     * Real M68MX floppies are read/write media.  Request write permission
+     * on each attached backend so guest tools (PIP, FORMAT, SYSGEN, ...)
+     * can update the disk; without this a guest WRITE DATA command trips
+     * the block layer's BLK_PERM_WRITE assertion.  Use -drive ...,readonly=on
+     * to keep a specific image read-only.
+     */
+    for (int i = 0; i < 2; i++) {
+        Error *local_err = NULL;
+
+        if (!fdc->blk[i]) {
+            continue;
+        }
+        /*
+         * Prefer read/write (real floppies are writable media, and guest
+         * tools like PIP/FORMAT need it).  If the backend is read-only
+         * (-drive ...,readonly=on) the write request fails harmlessly; fall
+         * back to a read-only claim so the drive still works.
+         */
+        if (blk_set_perm(fdc->blk[i],
+                         BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, &local_err) < 0) {
+            error_free(local_err);
+            if (blk_set_perm(fdc->blk[i], BLK_PERM_CONSISTENT_READ,
+                             BLK_PERM_ALL, errp) < 0) {
+                return;
+            }
+        }
+    }
+}
+
 static void sord_fdc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
     dc->user_creatable = false;
+    dc->realize = sord_fdc_realize;
     device_class_set_props(dc, sord_fdc_properties);
 }
 
@@ -944,6 +1303,15 @@ static void sord_machine_reset(void *opaque)
 
     s->latch = 0;
     s->crtc_addr = 0;
+    s->gram_lo = SORD_GRAM_SIZE;
+    s->gram_hi = 0;
+    /*
+     * Default: write all planes, read plane 0 -- so the boot ROM's
+     * unbanked 0xAA55 readback probe of 0xE40000 behaves like plain RAM.
+     */
+    s->gfx_read_sel = 0;
+    s->gfx_write_mask = 0x0f;
+    memset(s->plane, 0, sizeof(s->plane));
     memset(s->crtc, 0, sizeof(s->crtc));
     memset(&s->dma, 0, sizeof(s->dma));
 
@@ -956,8 +1324,14 @@ static void sord_machine_reset(void *opaque)
 
     s->acia[0].rxfull = false;
     s->acia[0].ctrl = 0;
+    s->acia[0].fhead = s->acia[0].ftail = 0;
     s->acia[1].rxfull = false;
     s->acia[1].ctrl = 0;
+    s->acia[1].fhead = s->acia[1].ftail = 0;
+    s->kbd_ready = false;
+    s->loc_status = 0;
+    s->loc_dx = s->loc_dy = 0;
+    s->loc_pktn = 0;
     s->intc_pending = 0;
 
     /*
@@ -1015,8 +1389,8 @@ static void sord_machine_init(MachineState *machine)
     memory_region_init_ram(&s->vram, NULL, "sord.vram",
                            SORD_VRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, SORD_VRAM_BASE, &s->vram);
-    memory_region_init_ram(&s->gram, NULL, "sord.gram",
-                           SORD_GRAM_SIZE, &error_fatal);
+    memory_region_init_io(&s->gram, OBJECT(machine), &sord_gram_ops, s,
+                          "sord.gram", SORD_GRAM_SIZE);
     memory_region_add_subregion(sysmem, SORD_GRAM_BASE, &s->gram);
 
     /* I/O */
@@ -1070,9 +1444,29 @@ static void sord_machine_init(MachineState *machine)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(vdev), &error_fatal);
         s->con = qemu_graphic_console_create(vdev, 0, &sord_gfx_ops, s);
     }
-    qemu_console_resize(s->con, SORD_COLS * FONT_W, SORD_ROWS * FONT_H);
+    qemu_console_resize(s->con, SORD_GFX_W, SORD_GFX_H);
 
     qemu_register_reset(sord_machine_reset, s);
+}
+
+static bool sord_get_smartkbd(Object *obj, Error **errp)
+{
+    return SORD_M68MX_MACHINE(obj)->smartkbd;
+}
+
+static void sord_set_smartkbd(Object *obj, bool value, Error **errp)
+{
+    SORD_M68MX_MACHINE(obj)->smartkbd = value;
+}
+
+static bool sord_get_locator(Object *obj, Error **errp)
+{
+    return SORD_M68MX_MACHINE(obj)->locator;
+}
+
+static void sord_set_locator(Object *obj, bool value, Error **errp)
+{
+    SORD_M68MX_MACHINE(obj)->locator = value;
 }
 
 static void sord_instance_init(Object *obj)
@@ -1085,6 +1479,25 @@ static void sord_instance_init(Object *obj)
     object_property_set_description(obj, "strap",
         "Configuration strap byte (default 0x82: boot from floppy; "
         "0xE2: Sunbug monitor on serial)");
+
+    s->smartkbd = false;        /* default: plain ASCII serial keyboard */
+    object_property_add_bool(obj, "smartkbd",
+                             sord_get_smartkbd, sord_set_smartkbd);
+    object_property_set_description(obj, "smartkbd",
+        "Model the SORD intelligent keyboard on ACIA0 (scancode protocol "
+        "with function/arrow/edit keys) instead of a plain ASCII serial "
+        "terminal; serial_hd(0) then carries raw scancodes and monitor "
+        "'sendkey' is mapped to the SORD keyboard.  Needed to drive the "
+        "GEDIT/LEONIS graphics apps.  Default off (ASCII console).");
+
+    s->locator = false;         /* default: no graphics locator on ACIA1 */
+    object_property_add_bool(obj, "locator",
+                             sord_get_locator, sord_set_locator);
+    object_property_set_description(obj, "locator",
+        "Model the SORD graphics locator (direction pad / puck) on ACIA1 "
+        "that GEDIT/LEONIS use for the menu highlight and drawing cursor.  "
+        "A host byte on serial_hd(1) is one locator event (status bits: "
+        "0x10 right, 0x20 left, 0x40 down, 0x80 up, 0x01/0x02 buttons).");
 }
 
 static const char *const sord_valid_cpu_types[] = {
