@@ -1316,3 +1316,262 @@ now via the full crash-free POST+Egret path.
   MAC_NUBUS_LAST_SLOT and maciici/maciisi/macclassicii untouched.  Ports
   1279/1280, sock /tmp/iivx-mon2.sock.  Not touched:
   cc-build/hp300-build/mvme16x-build.
+
+## Session 13: cold-boot path map CORRECTED; console root-caused to the case-5 decoder dispatch; XPRAM 'RBBI'/'SCBI' signature reads discovered; disk-boot branch proven unreachable for the kind-5 identity (maciici Rosetta diff)
+
+Goal: reach Finder by diffing against the working RBV sibling maciici.  Not
+reached (same MicroBug wall), but the divergence is now mapped far more
+precisely than Session 12, and two inherited path claims were DISPROVEN.
+
+### maciici reference (the Rosetta stone) -- confirmed to Finder
+
+`-M maciici -bios macIIci.rom` with the SAME disk
+(`HD0-OpenRetroSCSI-7.5.3.hda`, `-snapshot`) boots to the Finder desktop
+(menu bar, "not shut down properly" dialog) in ~45s -- screenshot
+`/tmp/iivx-maciici-finder.png`.  PC sampling shows maciici at t~10s in ROM
+`0x4080b578` at **SR I:0 (interrupts ENABLED)**, and by t~14s executing
+RAM-resident OS code (`0x0002ca06`): its StartBoot hands off to the disk
+boot with interrupts on.  The IIvx, by contrast, idles at **I:7** in ROM
+forever.
+
+### CORRECTION 1: the console is NOT reached via 0x40848dea
+
+Session 12's path (`0x40848dea -> btst#26,d7 -> 0x408499bc -> console`) is
+WRONG for the current build: a breakpoint at `0x40848dea` never fires in
+280s.  `0x40848dea` is actually the POST **error handler** (target of many
+`bne 0x40848dea` test-fail branches at 0x46600/0x4665a/0x466bc/0x49244/...).
+
+### The REAL live default path (gdb-traced, `set architecture m68k:68030`)
+
+Idle state: `PC=0x4084a0f0 SR=0x2708 (I:7)`, `D2=0x70000c05`,
+`A7(USP)=0x70000c05`, `VBR=0x003ffe8e`.  The path that gets there:
+
+1. POST passes -> the **cold-boot case dispatch at `0x408464a0`**: it reads
+   `d2 = USP` (= `0x70000c05`, built by helper `0x40846788` from the
+   capability word d0=0x773f: low word 0x0c05 = decoder kind, top bits from
+   d0 bits 1/12/13) and switches on the **low byte = 0x05** via a
+   `cmpib #3/#6/#5/#7/#14,d2` chain (`0x408464b0..0x408464fe`).  Low byte
+   0x05 -> **case 5** (`0x408464e6`).
+2. Case 5 tests **VIA1 port-A bit0**: `bclr #0,VIA1_DDRA(0x50f00600)` (make
+   PA0 input); `btst #0,VIA1_ORA(0x50f01e00)` at `0x408464f2`.  a2=0x50f00000
+   (=a0@(8), the VIA base), so this reads `pins_a & 1` = `0xef & 1` = **1**.
+   -> `bne 0x408465a8` (PA0=1 path).
+3. `0x408465a8` -> CACR setup -> cap -> `0x408465c4`: `(d1 & 0x0e) == 6`?
+   d1=0x126 -> yes -> computed jump to **`0x40814c4c`** = the **Egret
+   cold-start** (send-byte `0x40814cc8`, a1=VIA base, ORB bits 5/4/3 =
+   /SYS_SESSION//VIA_FULL//XCVR).  It sends pseudo-commands 0x01/0x1b/0x1c
+   (the Session 7/12 Egret layer -- runs cleanly), returns to `0x408465da`,
+   sends 0x1c, then -> `0x40846bd0` **checksum** (passes, d6=0) ->
+   `0x4084a6b0` **RAM test** -> cap -> video/EASC init `0x40845ce2` ->
+   (computed jump) `0x408499bc` -> `0x408499f6` -> **MicroBug console
+   `0x4084a0f0`**.
+
+SCSI is never touched; **StartBoot (`0x4080bxxx`, where maciici boots) is
+never reached** (breakpoint at 0x4080b578 never fires).  So the IIvx ROM's
+kind-5 cold-boot runs the Egret + a second POST-ish pass and then drops into
+the interactive `*` serial debugger -- it never invokes the disk boot.
+
+### DISCOVERY: XPRAM 'RBBI'/'SCBI' signature reads gate the case dispatch
+
+The case-3/5/6/7 branches all converge on `0x40846576`, which sets d7 bit26
+then reads a **4-byte configuration signature** via a fetcher `0x4084a3a0`.
+The fetcher is gated by decoder-record byte `rec+0x1c`: `(rec+0x1c & 0x70)`
+== 0x20 selects an Egret-SR read; ELSE (our case -- `rec+0x1c == 0x00` for
+ALL records 0x35b8/0x3b02/0x3b42) it uses the **RTC/PRAM bit-bang** alt path
+`0x4084a4de` (ORB bit2 = vRTCEnb, command `0xb8|...`).  So the signature is
+read from **XPRAM via the 343-0042 protocol our via1.PRAM[] already serves**.
+
+Proven by seeding identity markers: the RBBI fetch (d3=0x7c00fc) builds
+`d4 = [PRAM[0xfc],PRAM[0xfd],PRAM[0xfe],PRAM[0xff]]` and compares to
+**'RBBI' = 0x52424249**; the SCBI fetch (case 14, d3=0x7800f8) reads
+PRAM[0xf8..0xfb] vs **'SCBI' = 0x53434249** (both immediates live in the ROM
+at 0x46526/0x4659a).
+
+### EXPERIMENT (reverted): RBBI is a DIAGNOSTIC branch, not disk boot
+
+With `pins_a=0xee` (PA0=0 -> take the `0x40846576` fetch branch; 0xee still
+satisfies the earlier `(PA&0x56)==0x46`) AND `PRAM[0xfc..0xff]='RBBI'`, the
+ROM **escapes the MicroBug console** (PC leaves 0x4084a0f0) and reaches
+`0x40848f80` -> RAM test -> table-fill -> a SECOND RBBI fetch (0x40848fe2/
+0x40849014, which then WRITES XPRAM via 0x4084a222) -> and finally an
+**infinite blink loop `0x40849228`** (`eorib #8,a3@(16)` toggling a
+video/RBV register forever, I:7, `a5@(14)==0`).  So the 'RBBI' XPRAM
+signature triggers a **RAM/burn-in diagnostic**, NOT disk boot.  Reverted
+(pins_a back to 0xef, no PRAM seed) -- it is a dead end, and default boot is
+unchanged (re-verified: console at 0x4084a0f0, no regression;
+`/tmp/iivx-s13.png`).
+
+### Conclusion: the kind-5 identity has NO reachable disk-boot path
+
+Every branch of the `0x408464a0` case dispatch our kind-5 (0x0c05/0x0505)
+identity can take funnels to either the MicroBug console (PA0=1 -> Egret ->
+2nd-POST -> console) or a diagnostic blink (PA0=0 + XPRAM signature).  The
+ONLY branch with a clean `bset #26,d7` + StartBoot-style continuation is
+**case 14 (d2 low byte 0x0e)**, reached via `0x40846536` (gated by
+`XPRAM[0xf8..0xfb]=='SCBI'` AND `(a0@(32)@(64) & 0x1c)==0x10`) -- but the
+kind-5 identity never produces d2 low byte 0x0e.  This matches the
+Session 6/7 root cause (VASP's decoder-kind identification registers, which
+Apple never published, are not modelled, so the cap routine `0x40802f18`
+yields an RBV-family kind-5 identity), now pinned to the EXACT dispatch and
+the EXACT XPRAM/PA0 gates.
+
+Whether maciici avoids all this because its (different-binary) IIci ROM
+lacks this `cmpib #3/#5/#6/#7/#14,d2` dispatch entirely (confirmed absent in
+macIIci.rom by byte search) -- its cold-boot invokes StartBoot directly at
+I:0.  So "mirror a maciici value" does not apply verbatim: the IIvx ROM's
+cold-boot is structurally different and demands the kind-14 (or another)
+identity our VASP stub can't synthesize.
+
+### Concrete plan for next session (in priority order)
+
+1. **Find which decoder kind routes to StartBoot.**  Extend the existing
+   `IIVX_FORCE` infra to also force the USP/d2 low byte at `0x408464a0`
+   (or the kind word the helper `0x40846788` builds).  For each case
+   (3/5/6/7/14) trace whether the continuation reaches `0x4080bxxx`
+   (StartBoot) vs console/blink.  Case 14's `0x40846536->0x40846576` sets
+   d7 bit26 -- follow it past the RBBI fetch to confirm it can reach
+   StartBoot when 'SCBI' matches and `(a0@(32)@(64)&0x1c)==0x10`.
+2. **If case 14 reaches StartBoot:** (a) force d2 low byte 0x0e (record
+   kind low byte, or a targeted patch at the dispatch), (b) seed
+   `XPRAM[0xf8..0xfb]='SCBI'` (0x53 0x43 0x42 0x49), (c) set the
+   `a0@(32)@(64)` decoder-record field so `&0x1c==0x10` (identify a0@(32)
+   -- it is the decoder/globals record from the cap routine -- and which
+   byte/where it is seeded).  Verify d7 bit26 set + StartBoot reached.
+3. **Interrupts:** StartBoot must run at I:0 (maciici does).  The console is
+   entered at I:7; once StartBoot is reached, confirm the ROM lowers the
+   mask (it should, as part of the boot process) -- if not, the boot-device
+   scan (task suspect d) needs the VIA/Egret/RBV interrupt wiring live.
+4. From StartBoot: SCSI disk boot (NCR5380 model already present) -> Happy
+   Mac (slot-$E DeclROM already provided) -> System -> Finder; expect the
+   XPRAM ddType / boot-driver-installer work already staged
+   (XPRAM 0x76/0x77/0x78 seeds, READ_MCU streaming).
+
+### Status / guardrails
+
+- No code change committed this session (all experiments reverted); default
+  `-M maciivx` unchanged -- boots crash-free to the MicroBug console
+  (`PC=0x4084a0f0 I:7`), screenshot `/tmp/iivx-s13.png`.  maciici reference
+  to Finder: `/tmp/iivx-maciici-finder.png`.
+- Only investigation; `maciici`/`maciisi`/`macclassicii`/shared devices
+  untouched.  Build `/tmp/iivx-build` only.  gdb needs
+  `set architecture m68k:68030` (NOT just `set endian big`) or reads return
+  "Truncated register 16".  Ports 1279/1280, sock /tmp/iivx-mon2.sock.
+
+## Session 14: BROKE THE CONSOLE WALL -> SCSI DISK BOOT, System runs (headless).  Root-caused the whole cold-boot chain; three IIvx-local fixes committed.
+
+The Session 4-13 MicroBug wall is GONE.  `-M maciivx` now runs the full POST,
+StartBoot, the Toolbox, enables interrupts, boots off the SCSI disk, and runs
+the loaded System in RAM.  Remaining gap: the on-board video (slot-$E Brazil)
+driver does not point QuickDraw at the VRAM, so it runs headless (blank
+screen).  Four discoveries, three committed fixes:
+
+### 0. Case sweep (coordinator's decisive experiment) -- case 14 DISPROVEN
+
+Forced the `d2` low byte at the cold-boot case dispatch `0x408464a0` (fixed
+`0x408464b0`, after USP is reloaded) and swept cases 3/5/6/7/14 with the
+XPRAM 'SCBI'/'RBBI' signatures seeded: NONE reaches StartBoot.  5/6/7/14 ->
+Egret cold-start -> console; 3 (with RBBI) -> diagnostic blink `0x40849228`.
+So the `0x408464a0` dispatch is NOT the boot lever (it is a hardware-config
+sub-routine); the real boot path is elsewhere.
+
+### 1. The REAL console cause: POST phase-table device self-tests fail
+
+After the Egret cold-start the cold-boot reaches a table-driven POST phase
+sequencer (`0x408466f8`; phase table `0x40846908`, ids 0x84-0x97) and, once
+all phases pass, jumps to **StartBoot at `0x408000b8`** (via `0x4084677c`,
+`jmp pc@ + 0xfffb993a`).  Four phases FAIL because our device stubs don't
+reproduce their register-level self-test behaviour:
+  - **0x88** (`0x408473fc`): NCR5380 SCSI register self-test (a0@(32)=
+    0x50f10000: ICR reg1 <- 0x80/0x10/8/4/2 read-back, bus-status reg4/5),
+  - **0x8b/0x8c/0x8d** (`0x408478d4`/`0x40847a44`/`0x40847d32`): SCC/ASC/
+    VIA2-RBV register walks.
+Each returns d6!=0 -> the soft-fail handler `0x40848efa` routes to the
+MicroBug console (`0x40849f84`).  **FIX (commit a09bef36e2):** patch the
+soft-fail handler's first test to `rts` so unmodelled-device POST diagnostics
+are non-fatal (phases still run in full; only the verdict is ignored).  POST
+completes -> StartBoot reached -> Toolbox runs (A-line traps).
+
+### 2. StartBoot fault: VASP config register 0x5FFFFFFC unmapped
+
+StartBoot (`0x4084ab2a`) `_SwapMMUMode`s to 32-bit and reads a 3-bit
+machine/video config field at **0x5FFFFFFC** (-> lowmem 0xCB3), which was
+unmapped (gap between I/O 0x50Fxxxxx and VRAM 0x60B00000) -> bus error ->
+StartBoot stalls back to console.  **FIX (commit 179f88d34d):** back the
+0x54000000-0x5FFFFFFF decode returning 0.  With this, StartBoot completes:
+**Level-1 (Egret ADB) and Level-2 (RBV) interrupts fire at I:0** and the
+Toolbox runs extensively (exception count 459 -> 4267).
+
+### 3. dsBadSlotInt (SysError 51): slot-$E VBL with no handler
+
+With interrupts live the RBV level-2 slot dispatcher (`0x40806eaa`) fires for
+the on-board-video slot-$E VBL, finds a NULL handler slot, loads `moveq #51`
+(`0x40806f10`) and calls `_SysError(51)` = **dsBadSlotInt** -> console
+(verified: d0=0x33 at the A9C9 site `0x40806eea`; the -d int log ends with
+pc=0x40806eea just before the console).  The OS enabled slot-$E in RSIER
+before its VBL handler was installed.  **FIX (commit 2cbad0c0e6):** exclude
+slot-$E (bit6) from the level-2 CPU summary in `maciivx_rbv_update_irq`
+(`& 0x3f`; SIFR bit6 still pollable) -- matching the "VBL missed if masked is
+safe" model already documented there.
+
+### RESULT: SCSI DISK BOOT
+
+With all three, `-M maciivx` boots off the SCSI disk: the System loads and
+**executes in RAM at I:0** -- verified PC cycling through RAM + ROM Toolbox
+(0x0002eb8a, 0x0077e160, 0x007a6928, 0x4080e01c, ...) in a live event loop,
+exceptions in the thousands, Egret ADB + RBV interrupts serviced.  This is
+the goal signal (off the console, running the disk System) -- dramatically
+past the Session 4-13 wall.
+
+### Remaining gap: on-board video runs headless (the last mile to Finder)
+
+The System runs but the screen stays blank: QuickDraw's **ScrnBase (lowmem
+0x824) = 0x000072b0** (low RAM), NOT the dedicated VRAM (0x60B00000 / slot-$E
+0xFE000000), and the VRAM reads all-zero.  The slot-$E "Brazil" onboard-video
+driver (DeclROM provided in Session 11) is not establishing the VRAM frame
+buffer / gDevice, so QuickDraw draws nowhere our framebuffer scans out.
+Screenshots blank (`/tmp/iivx-long.png`).  This is the onboard-video /
+Slot-Manager frontier (Session 10/11 territory), now REACHABLE for the first
+time because the OS actually boots.  Next session:
+  1. Trace the Slot Manager / Display Manager reading the slot-$E DeclROM
+     (0xFEFxxxxx) during OS boot and loading `.Display_Video_Apple_Brazil`;
+     confirm PrimaryInit runs and where it sets the PixMap baseAddr /
+     ScrnBase.  (Session 11 saw ZERO slot-$E reads because boot never got
+     here; that should now change.)
+  2. Fix whatever prevents the driver from setting ScrnBase = the VRAM slot
+     base (0xFE000000, our vram_slotE alias) -- likely a DeclROM sResource /
+     mode-table / VDAC-depth detail, or the 8-bit-vs-1-bit renderer (our fb
+     is 1-bit; the IIvx default is 8-bit CLUT, so even a drawn desktop of
+     index-0 pixels reads as blank -- the renderer may need CLUT/depth).
+  3. Re-examine the slot-$E VBL: excluding it (fix 3) unblocks boot but the
+     VBL-driven cursor/Vertical-Retrace tasks won't run; once the video
+     driver installs its handler, assert slot-$E again (or gate the assert on
+     handler presence) so the desktop is interactive.
+
+### Status / guardrails
+
+- Three fixes, all `hw/m68k/maciivx.c` only (soft-fail handler rts; VASP
+  config-gap decode; slot-$E L2 exclusion), each covered by the existing
+  checksum repair where a ROM patch.  Commits a09bef36e2, 179f88d34d,
+  2cbad0c0e6.  maciici re-confirmed to Finder on the same disk this session
+  (`/tmp/iivx-maciici-finder.png`); maciisi/macclassicii/shared devices
+  untouched.  Build `/tmp/iivx-build` only; gdb needs
+  `set architecture m68k:68030`; ports 1279/1280, sock /tmp/iivx-mon2.sock.
+
+### Session 14 addendum: onboard-video investigation (the last mile)
+
+Traced QuickDraw's screen while the System runs: **ScrnBase (lowmem 0x824) =
+0x000072b0**, and MainDevice (0x8a4) -> GDHandle 0x2124 -> GDevice 0x80007338
+(24-bit tagged -> 0x7338) -> gdPMap 0x2114 -> PixMap 0x80007388 whose
+**baseAddr = 0x72b0** -- i.e. the OS built its main screen as a 1-bit software
+bitmap in LOW RAM, not at the dedicated VRAM (0x60B00000 / slot-$E
+0xFE000000).  So the slot-$E "Brazil" video driver is not creating a hardware
+gDevice at the VRAM; the Slot/Display Manager fell back to a RAM screen our
+framebuffer never scans.  (Pointing the fb at RAM 0x72b0 as a 640x480x1 image
+rendered solid, inconclusive -- the fallback screen's depth/rowBytes/base are
+not our fb's assumption; env knob IIVX_FBSCR was used for this and reverted.)
+Concrete next step: break during OS boot on the first slot-$E DeclROM read
+(0xFEFxxxxx) to confirm the Slot Manager enumerates it and runs the video
+sResource's PrimaryInit; find why it doesn't install a gDevice with
+baseAddr=0xFE000000 (likely a DeclROM sResource/mode-table/VDAC-depth detail),
+then the desktop lands in VRAM and the fb (which may also need 8-bit CLUT
+rendering) shows Finder.

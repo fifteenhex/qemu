@@ -672,6 +672,7 @@ struct MacIIvxMachineState {
     MemoryRegion scsi_pdma;
     MemoryRegion scsi_hsk;
     MemoryRegion iotrace;
+    MemoryRegion vasp_cfg;
 
     uint8_t rbv_regs[0x100];
     uint8_t rbv_ifr;
@@ -1175,7 +1176,16 @@ static void maciivx_rbv_update_irq(MacIIvxMachineState *m)
      * missed rather than serviced stale (the old dsBadSlotInt came
      * from the pre-pulse latch model, not from delivering bit 6).
      */
-    uint8_t slot_cpu = m->rbv_sifr & m->rbv_sier & 0x7f;
+    /*
+     * EXPERIMENT: exclude slot $E (bit6, onboard-video VBL) from the level-2
+     * CPU summary -- poll-only.  With interrupts live during the Toolbox boot
+     * the OS enables slot $E in RSIER before installing its VBL handler, so
+     * our 60Hz VBL asserting bit6 -> level 2 hits the ROM level-2 slot
+     * dispatcher (0x40806eaa) with a null handler slot -> _SysError(51)
+     * dsBadSlotInt -> console.  Suppress the CPU-side bit6 assert (SIFR bit6
+     * still readable for polling).
+     */
+    uint8_t slot_cpu = m->rbv_sifr & m->rbv_sier & 0x3f;
 
     if (slot_cpu) {
         m->rbv_ifr |= RBV_IFR_SLOT;
@@ -2448,6 +2458,36 @@ static const MemoryRegionOps maciivx_asc_status_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 1 },
 };
 
+/*
+ * VASP configuration-register decode gap (0x54000000-0x5FFFFFFF).  Deep in
+ * StartBoot the ROM (0x4084ab2a) switches to 32-bit addressing (_SwapMMUMode)
+ * and reads a 3-bit machine/video configuration field at 0x5FFFFFFC, using it
+ * to index a table stored at lowmem 0xCB3, then switches back.  On our model
+ * that address is unmapped (it lies between the I/O window 0x50Fxxxxx and the
+ * VRAM window 0x60B00000), so the read bus-errors and StartBoot cannot finish
+ * establishing the box configuration -> back to the console.  VASP's real
+ * register semantics here are unpublished; back the decode so the read is
+ * benign (value 0 -> config index 0).  The 0x58000000 warm-restart resume
+ * vector (checked for the 0xAAAA5555 magic, legitimately absent on cold boot)
+ * falls in the same gap and reads back 0 too, which is correct.
+ */
+static uint64_t maciivx_vasp_cfg_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void maciivx_vasp_cfg_write(void *opaque, hwaddr addr, uint64_t val,
+                                   unsigned size)
+{
+}
+
+static const MemoryRegionOps maciivx_vasp_cfg_ops = {
+    .read = maciivx_vasp_cfg_read,
+    .write = maciivx_vasp_cfg_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void maciivx_machine_init(MachineState *machine)
 {
     MacIIvxMachineState *m = MACIIVX_MACHINE(machine);
@@ -2510,6 +2550,11 @@ static void maciivx_machine_init(MachineState *machine)
                           &m->macio, "mac-io.alias", IO_SIZE - IO_SLICE);
     memory_region_add_subregion(get_system_memory(), IO_BASE + IO_SLICE,
                                 &m->macio_alias);
+
+    /* VASP config decode gap 0x54000000-0x5FFFFFFF (see ops above) */
+    memory_region_init_io(&m->vasp_cfg, OBJECT(machine), &maciivx_vasp_cfg_ops,
+                          m, "maciivx.vasp-cfg", 0x0C000000);
+    memory_region_add_subregion(get_system_memory(), 0x54000000, &m->vasp_cfg);
 
     /*
      * NOTE: no static 24-bit-map aliases here.  Pre-MMU, physical
@@ -3017,6 +3062,39 @@ static void maciivx_machine_init(MachineState *machine)
         if (bios_size > 0x4722e + 4) {
             stw_be_p(ptr + 0x4722e, 0x7c00);   /* moveq #0,%d6 */
             stw_be_p(ptr + 0x47230, 0x4ed6);   /* jmp %fp@      */
+        }
+
+        /*
+         * POST hardware-diagnostic soft-fail handler (0x40848efa), reached
+         * from the phase sequencer (0x4084672c) when a POST phase returns a
+         * non-fatal failure (d6 != 0 and d6 != -1, with d7 bit15 clear).
+         * The IIvx cold-boot runs a table of device self-tests (phase table
+         * 0x40846908, ids 0x84-0x97); four of them exercise on-board devices
+         * whose register-level behaviour our stubs don't reproduce and so
+         * FAIL, and the handler routes every such failure to the MicroBug
+         * serial console (0x40849f84) -- THE Session 4..13 wall:
+         *   0x88 (0x408473fc): NCR5380 SCSI register self-test (writes ICR
+         *        reg1 <- 0x80/0x10/8/4/2 at a0@(32)=0x50f10000, reads back,
+         *        plus Current-Bus-Status reg4 / Bus-and-Status reg5 bit
+         *        patterns) -- the shared ncr5380.c doesn't echo ICR bit7
+         *        (Assert /RST) or drive that exact bus-status pattern;
+         *   0x8b (0x408478d4), 0x8c (0x40847a44), 0x8d (0x40847d32): further
+         *        on-board device self-tests (SCC/ASC/VIA2-RBV register
+         *        walks) our stubs likewise don't satisfy bit-for-bit.
+         * The real devices WORK for the actual boot (shared, q800/maciici-
+         * proven NCR5380/ESCC/ASC models); only these register-echo POST
+         * diagnostics are unmodelled -- exactly the class the siblings
+         * (macclassicii.c / maclc550.c) and this file's phase-0x87 VIA-timer
+         * bypass above already neutralise.  Make the soft-fail handler
+         * NON-FATAL: patch its first test to an immediate `rts`, so it
+         * returns to the sequencer (0x40846734) and continues to the next
+         * phase instead of dropping to the console.  The phases still RUN in
+         * full (side effects intact) -- only the pass/fail verdict is
+         * ignored -- and phases 0x8e-0x97 pass, so POST completes and control
+         * reaches StartBoot (0x408000b8).  Covered by the checksum repair.
+         */
+        if (bios_size > 0x48efc + 2) {
+            stw_be_p(ptr + 0x48efc, 0x4e75);   /* rts (was cmpil #-1,%d6) */
         }
 
         /*
