@@ -1575,3 +1575,245 @@ sResource's PrimaryInit; find why it doesn't install a gDevice with
 baseAddr=0xFE000000 (likely a DeclROM sResource/mode-table/VDAC-depth detail),
 then the desktop lands in VRAM and the fb (which may also need 8-bit CLUT
 rendering) shows Finder.
+
+## Session 15: onboard-video root-caused to CASE 1 (PrimaryInit never runs) -- StartBoot's slot scan marks NuBus slot $E ABSENT, so the Brazil video sResource is never registered; ROM installs a 32x32 fallback screen.  Finder NOT yet visible; exact next-step lever pinned.
+
+Goal: make the slot-$E "Brazil" video install a real VRAM gDevice so the Finder
+is visible.  Not reached, but the onboard-video failure is now root-caused
+precisely -- it is the coordinator's **CASE 1 (PrimaryInit / slot enumeration
+never happens at StartBoot)**, NOT case 2 (PrimaryInit runs but bails) nor case
+3 (gDevice installed but unscanned).  All experiments reverted; `hw/m68k/
+maciivx.c` is byte-identical to the Session-14 HEAD (only IIVX-NOTES.md changed).
+
+### The three cases, decided: it is CASE 1
+
+Confirmed the Session-14 symptom (ScrnBase 0x824 = 0x000072b0; the single main
+GDevice 0x2124 -> 0x7338 -> PixMap 0x7388 is **32x32x1, rowBytes 4, baseAddr
+0x72b0** -- a tiny software screen, not a real display) and traced the whole
+onboard-video path with correct-endian gdb (`set architecture m68k:68030`).
+
+- **VRAM is NEVER touched** during a full boot (dedicated 0x60B00000 AND slot-$E
+  0xFE000000 read all-zero; 0 writes with an env-gated access logger).  So the
+  Brazil PrimaryInit (which does exist -- ROM sExec at **0x40800fe91c**, board
+  sResource id 0x22; it programs a video register via `move.l 0xcec,a3;
+  move.b #0x40,a3@(18)`) **never runs**.
+- The DeclROM in slot $E is read ONLY by the System's RAM-resident Slot Manager
+  (pc **0x000a01d2**, 184 byte reads) which catalogs all 6 video sResources
+  (sRsrcType [cat 3, cType 1, drvrSW 1, drvrHW 0x26]; driver
+  `.Display_Video_Apple_Brazil` blob at DeclROM 0xff040, len 0x934) into its
+  SRT -- but it installs no gDevice, because the ROM never PrimaryInit'd it.
+- The ROM's StartBoot **never reads slot $E** (0 reads at 0xFEFxxxxx from any
+  ROM pc), so the card is not in the SRT when the ROM's onboard-video init runs.
+
+### The exact ROM mechanism (instruction-level)
+
+ScrnBase = 0x72b0 is written at **ROM 0x40800f60** (watchpoint on 0x824:
+writes 0xffffffff@0x4080048a, then 0x0000ffff/0 by the 0x800-0x8f2 clear loop
+at 0x4080105a, then **0x000072b0 @ 0x40800f60**).  0x40800f60 is inside the
+"no display found" FALLBACK.  The onboard-video init:
+
+- `0x40801000` -> `bsr 0x40800d00` (find the display sResource via _SlotManager;
+  gated on spBlock@40==0x00030001 (cat 3/type 1) and spBlock@44==1) -> if not
+  found, a `_SlotManager` selector-21 (sGetTypeSRsrc) loop over the SRT for
+  a [3,1,1] display -> **found -> 0x40800bf0 (real screen setup, sets ScrnBase
+  = *(a0)+*(a1) = slot base + vpBaseOffset); NOT found -> 0x40800f40/0xf60
+  fallback (32x32 @ 0x72b0)**.  Our boot takes the fallback: NO display in SRT.
+- The SRT is built by the ROM's slot-declaration scan: loop **0x40805e2a** over
+  slots 0x0E..0x00; per slot, `_SlotManager` selector 47 then
+  `tstw a1@(4); bmi 0x5e3e` (**0x40805e38**) -- if the slot-info word a1@(4) is
+  negative (slot ABSENT), the format-block validator (0x40805f2a, which
+  byte-lane-reads the DeclROM and checks testPattern 0x5A932BC7) is SKIPPED.
+  gdb trace: slots **0x00-0x08 are marked present and validated; NuBus slots
+  0x09-0x0E are marked ABSENT and skipped** -- so slot $E's valid Brazil DeclROM
+  is never validated/registered, hence no display sResource, hence the fallback.
+- Slot presence comes from a pre-scan (**0x40805e48**) that probes each slot via
+  a slot-test routine vectored through the RAM dispatch table `*(0xdb8)` and
+  keyed off the decoder record `*(0xdd8)` (= **0x40803b02**, our forced 0c05
+  Egret record).  This vectored presence test is what reports NuBus 9-E empty.
+
+### Proof the gate is the lever (env IIVX_FORCESLOTE, tested then REVERTED)
+
+NOP-ing the `bmi` at 0x40805e38 makes the ROM's byte-lane reader (0x40805faa)
+actually read slot $E's format block (testPattern bytes at 0xFEFFFFFF..FC) --
+the ROM finally touches slot $E at StartBoot.  BUT the video sResource still is
+not registered and the boot **still falls back to 32x32 (0x40800f60)** -- so the
+true root is the **presence pre-scan / SDeclMgr present-table**, not merely the
+validation gate.  (Reverted; it is not a fix.)
+
+### Root cause + why "mirror maciici" doesn't apply verbatim
+
+The machine is forced to the IIci decoder-kind-5 identity (0c05, from sessions
+7-14, needed to clear the boot console).  That IIci-family StartBoot slot scan,
+driven by the 0c05 decoder record (0x40803b02) at lowmem 0xdd8, reports the
+NuBus slots (9-E) as unpopulated, so slot $E onboard video is never enumerated.
+The **natural VASP/Brazil identity** (which would scan slot $E) needs the
+undocumented VASP identification registers -- unreached across sessions 6-14.
+
+Rosetta (re-verified to Finder this session, `/tmp/ci-finder.png`): **maciici**
+puts onboard video at **motherboard pseudo-slot 0** (RBV RAM-based framebuffer at
+physical 0; ScrnBase = **0xFBB08000** via MMU relocation +0x50000; gDevice
+**640x480** at logical 0x49f0, gdRect (0,0,480,640)).  The IIci-family StartBoot
+DOES enumerate slot 0.  The IIvx ROM instead sites its Brazil video in NuBus
+slot $E and (unlike the IIci ROM) does NOT register a motherboard slot-0 video
+DeclROM (the System reads the DeclROM only at slot-$E addresses 0xFEFxxxxx, never
+at a system-ROM siDirPtr), so maciici's slot-0 recipe does not port directly.
+
+### Next-step lever (well-scoped, for a future session)
+
+Make StartBoot's slot-presence pre-scan mark **slot $E present** so the SDeclMgr
+registers its Brazil video sResource.  Two directions:
+ 1. Trace the slot-test routine vectored via `*(0xdb8)` (dispatch table built at
+    ROM 0x6d60/0x6d98) and keyed off the 0c05 record at `*(0xdd8)`=0x40803b02:
+    find the VASP/RBV slot-present indicator it reads for NuBus 9-E and model
+    it so slot $E reads "populated" (the RBV/VASP window is ours to define).
+ 2. Or select/patch a decoder record whose slot map includes NuBus-$E onboard
+    video (the 0c05 record's slot handling is what excludes it here).
+Once slot $E is present: validation (0x40805f2a) passes -> SDeclMgr registers
+the video sResource -> the display search (0x40801000/0xd00) finds [3,1,1] ->
+real screen setup (0x40800bf0) runs -> Brazil PrimaryInit (0x40800fe91c) sets up
+the VRAM gDevice.  THEN it becomes case 2/3: model the VASP/VDAC video registers
+the driver programs (the `move.b #0x40,a3@(18)` at 0xfe956 etc.) and the 8-bit
+CLUT so the framebuffer renders, and point the fb at the gDevice baseAddr.
+
+### Status / guardrails
+
+- **Finder NOT yet visible on maciivx** -- headless, screendump blank white
+  (`/tmp/iivx-s15.png`, extrema 255/255).  This is the furthest characterized
+  state: OS boots and runs (Session 14), root cause of the headless video now
+  pinned to the StartBoot slot-$E presence pre-scan (CASE 1).
+- No code change: `hw/m68k/maciivx.c` is byte-identical to Session-14 HEAD
+  (all Session-15 instrumentation/experiments -- an access logger and the
+  IIVX_FORCESLOTE gate patch -- were reverted).  Only IIVX-NOTES.md changed.
+- **maciici re-verified to the visible Finder** on the same disk
+  (`/tmp/ci-finder.png`: menu bar, Control Panels window, mounted volume,
+  Trash); ScrnBase 0xFBB08000, 640x480 gDevice.  maciisi/macclassicii/shared
+  devices untouched.  Build `/tmp/iivx-build` only.  gdb needs
+  `set architecture m68k:68030`; ports 1279/1280, sock /tmp/iivx-mon2.sock.
+
+## Session 16: slot-$E presence lever IMPLEMENTED and PROVEN to enumerate the Brazil video (ScrnBase -> VRAM, real screen setup runs) -- BUT it REGRESSES the disk boot (OS boots then crashes to the MicroBug console).  PARKED per the coordinator's stop condition; reverted to stable Session-14 HEAD.
+
+Goal: implement the Session-15 slot-presence lever and get the Finder on screen.
+Outcome: the lever WORKS at the enumeration level (this is real, verified
+progress past every prior session -- ScrnBase/MainDevice now point at VRAM, not
+the 32x32 fallback), but enabling it destabilises the Session-14 disk boot, so
+per the mandate ("if forcing slot-$E present destabilizes the disk boot ...
+STOP -- revert to the stable disk-boot HEAD") it is PARKED.  `hw/m68k/maciivx.c`
+is byte-identical to Session-14/15 HEAD again; only IIVX-NOTES.md changed.
+
+### The slot-presence mechanism, fully reverse-engineered (gdb-verified)
+
+Session 15 said the presence pre-scan (ROM 0x40805e48) probes each NuBus slot
+via a routine vectored through `*(0xdb8)` keyed off `*(0xdd8)`.  The actual
+per-slot presence test is the ROM routine at **0x4084aae2**, which does NOT
+touch slot space -- it reads a static **per-slot "slot-type" byte table**
+hanging off the active decoder record:
+
+```
+a3 = *(0xdd8)            ; = 0x40803b02 (the forced 0c05 Egret record)
+a3 += *(a3 + 0xc)        ; += 0x19e  -> table @ ROM 0x40803ca0
+test byte table[slot]:  btst #3 -> if set, reject (NE = "absent")
+                        else btst #5 -> if set, reject; else "present candidate"
+```
+
+table@0x40803ca0 (ROM offset 0x3ca0), indexed by slot 0..0xE:
+`03 00 00 00 00 00 00 00 00 13 13 13 01 01 08`.
+- slot $E = **0x08** (bit3 set) -> rejected outright: the pre-scan never even
+  reads slot $E.  THIS is why the Brazil DeclROM is never enumerated.
+- slots 9-D (0x13/0x01, bit3 clear) are "present candidates"; the pre-scan then
+  reads the slot's declaration space (`move.b (a1),d0` at ROM 0x40805e84) and a
+  bus error (empty slot) marks them absent (ROM 0x40805e8c writes 0xffff).
+- slots 1-8 (0x00) read our A31 low-alias -> spuriously "present" (harmless;
+  the SDeclMgr ignores non-NuBus slots).
+
+Full gdb trace of the pre-scan confirmed: `*(0xdd8)=0x40803b02`, `a3=0x40803ca0`,
+slot $E d1=0xe a1=0xfeffffff table[0xe]=0x08; slot $E appears in NEITHER the
+present-increment (0x40805e84) nor the bus-error-absent (0x40805e8c) path -- it
+is rejected by the `btst #3` before the slot is ever read.
+
+### The lever (coordinator's option b -- a maciivx-local ROM patch)
+
+Clear bit3 in slot $E's slot-type byte: **ROM offset 0x3cae `0x08` -> `0x01`**
+(0x01 = the "populated NuBus card" type slots C/D use).  Then the pre-scan
+probes slot $E, the read at 0x40805e84 lands on our `rom_slotE` DeclROM alias
+(0xFEFFFFFF -> byteLanes 0x0F, no bus error), and slot $E is marked PRESENT.
+Only bits 3/5 of the byte are consulted; covered by the existing ROM-checksum
+repair.  (This is the same class as the file's other ROM patches.)
+
+**Proven to work (gdb):** with the patch, the main slot-declaration scan
+(0x40805e2a) now runs the format-block validator (0x40805f2a) for slot $E
+(d1=0xe, FIRST) and the display search reaches the **real screen setup
+0x40800bf0** -- the 32x32 fallback (0x40800f40/0x40800f60) is NOT taken.
+Live QuickDraw globals after boot (gdb, monitor):
+- **ScrnBase (lowmem 0x824) = 0xFEE00000** (was 0x000072b0!) -- in slot-$E VRAM
+  space, not low RAM.
+- MainDevice (0x8a4) -> GDevice 0x7540 -> **PixMap baseAddr = 0xFEE00000,
+  rowBytes = 0x800 (2048), bounds (0,0,384,512)** -- a real **512x384** hardware
+  screen (matches DeclROM video sResource 0x82; rowBytes 2048/512 = 4 bytes/px).
+
+So the whole Session-15 chain (slot present -> validated -> [3,1,1] display
+sResource registered -> real screen setup -> ScrnBase = VRAM) is CLOSED.  The
+frame buffer sits 0xE00000 into slot $E's super-slot space (0xFEE00000), NOT at
+the slot base -- the DeclROM/PrimaryInit put it there (moving the `vram_slotE`
+alias from 0xFE000000 to 0xFEE00000 backs it correctly).
+
+### THE WALL: enabling slot $E regresses the disk boot to the console
+
+With the patch default-on, the machine **boots the OS, runs RAM-resident System
+code, then CRASHES back to the ROM's MicroBug serial console** (`PC=0x4084a0f0,
+SR I:7`).  This is WORSE than Session 14 (which idles headless in a STABLE live
+OS event loop), so it violates the "do not leave it in a worse/crashing state"
+guardrail.  Isolation proof: `IIVX_NOSLOTE=1` (disables ONLY the 1-byte table
+patch; the 0xFEE00000 alias move stays) -> the OS boots to the stable event
+loop (PC cycling RAM 0x007a6928/0x0002ef74/0x0077e8d2 at I:0), exactly Session
+14.  So the single byte 0x3cae 0x08->0x01 is the regression trigger.
+
+`-d int,guest_errors` around the failure: the boot DOES run System code (RAM PCs
+0x00006884/0x00007d56/... present) and then shows heavy SlotManager A-line
+traffic (ROM 0x40806d02/0x40806d34, the `*(0xdb8)` dispatch, ~347x each) ending
+in the standard device-presence Access Faults (0x40803982 FC7 / 0x40803124),
+after which the interrupt log goes silent -- i.e. the OS enumerated/serviced the
+now-present slot $E, then diverged into the console.  No unmapped-register bus
+error was seen at the Brazil PrimaryInit site, so the divert is a control-flow
+divergence in the SlotManager/cold-boot once a real video slot exists (the OS
+repeatedly re-enters the ROM SlotManager for slot $E), NOT a single missing
+VASP register I could just back.  Making the Brazil video path actually STABLE
+needs the SlotManager slot-$E driver/VBL semantics and the VASP/VDAC video
+registers PrimaryInit programs (`move.b #0x40,a3@(18)`, a3=*(0xcec)) modelled --
+undocumented VASP internals (the coordinator's step-2 stop condition).
+
+### DeclROM geometry (parsed, for a future session)
+
+DeclROM base ROM 0xFE8B4 (format block @0xFFFEC: dirOffset 0x00FFE8C8, length
+0x174c, testPattern 0x5A932BC7, byteLanes 0x0F).  Board sResource id 1; video
+sResources 0x82/0x83/0x86/0x8a/0x8b/0x8e (all sRsrcType [3,1,1,0x26],
+".Display_Video_Apple_Brazil"), plus 0xb4.  The selected mode is **sRsrc 0x82:
+512x384, rowBytes 0x800 (32bpp)**; 0x83/0x86 are 640x480 rowBytes 0x800;
+0x8a/0x8b/0x8e are the rowBytes-0x400 (16-bit) variants.  To render once the
+boot is stable: point the fb at VRAM (baseAddr 0xFEE00000), 512x384, 32bpp
+direct (rowBytes 2048) -- but note that at t=133s NOTHING writes to 0xFEE00000
+(the OS crashes to the console before the Finder paints the desktop), so the
+renderer work is downstream of fixing the boot regression above.
+
+### Status / guardrails
+
+- **PARKED.  Finder NOT visible on maciivx.**  The slot-$E presence lever is
+  proven (ScrnBase/MainDevice -> VRAM, real screen setup runs) but regresses the
+  disk boot (OS boots then crashes to the MicroBug console), so it was reverted.
+- `hw/m68k/maciivx.c` reverted to Session-14/15 HEAD (`git checkout`); default
+  `-M maciivx` re-verified to the **stable Session-14 disk boot** (live OS event
+  loop, PC cycling RAM System code at I:0) -- NOT crashing.  Screendump headless
+  white (the 32x32 fallback), as before.
+- **maciici re-verified to the visible Finder** on the same disk this session
+  (`/tmp/iivx-s16-maciici-finder.png`: menu bar, Control Panels window, mounted
+  "HD SCSI 7.5.3" volume, Trash).  maciisi/macclassicii/shared devices untouched.
+- Furthest maciivx artifact: `/tmp/iivx-s16-furthest.png` (real-screen-setup
+  path active; mostly white with faint content -- the desktop is never painted
+  because the OS consoles first).
+- Reproduction for a future session (all maciivx-local, checksum-repaired):
+  (1) ROM 0x3cae `0x08`->`0x01` marks slot $E present; (2) move the `vram_slotE`
+  alias to 0xFEE00000; (3) THEN solve the SlotManager/PrimaryInit boot
+  regression (undocumented VASP video/slot semantics) before the desktop can be
+  both stable AND rendered.  Build `/tmp/iivx-build` only; gdb needs
+  `set architecture m68k:68030`; ports 1279/1280, sock /tmp/iivx-mon2.sock.
+  Detached QEMU (survives across steps): `( setsid env X=1 qemu ... </dev/null
+  >log 2>&1 & )` -- plain `&`/nohup inside a bounded shell gets killed at ~110s.
