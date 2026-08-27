@@ -311,6 +311,13 @@ config SUN3
     select ESCC
     select ICM7170
 
+config SUN3X
+    bool
+    default y
+    depends on M68K
+    select ESCC
+    select M68K_IRQC
+
 config MVME147
     bool
     default y
