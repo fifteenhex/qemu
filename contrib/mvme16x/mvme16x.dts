@@ -1,0 +1,61 @@
+/dts-v1/;
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "motorola,mvme167";
+
+	aliases {
+		serial0 = &avme352;
+	};
+
+	chosen {
+		stdout-path = "/vme@f0c00000/serial@0";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x1000000>;
+	};
+
+	intc_vect: intc {
+		compatible = "motorola,mc68000-intc-vect";
+		#interrupt-cells = <1>;
+		interrupt-controller;
+	};
+
+	intc_user: intcuser {
+		compatible = "motorola,mc68000-intc-user";
+		#interrupt-cells = <1>;
+		interrupt-controller;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		cpu0: cpu@0 {
+			compatible = "motorola,mc68040";
+			device_type = "cpu";
+			reg = <0x0>;
+		};
+	};
+
+
+	/*
+	 * VME A24 slave window: a card mapped in the board's A24 window
+	 * answers to the 68040 at 0xf0c00000.  The AVME-352 six channel
+	 * serial card's 4 KiB dual ported RAM lands at 0xf0c00000.
+	 */
+	vme: vme@f0c00000 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0xf0c00000 0x1000000>;
+
+		avme352: serial@0 {
+			compatible = "aval,avme352";
+			reg = <0x0 0x1000>;
+			interrupts-extended = <&intc_user 5>;
+			status = "okay";
+		};
+	};
+};

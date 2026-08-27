@@ -317,6 +317,15 @@ config MVME147
     select VME
     select AVME352
 
+config MVME16X
+    bool
+    default y
+    depends on M68K
+    select CD2401
+    select M48T59
+    select VME
+    select AVME352
+
 config ELTEC_E17
     bool
     default y

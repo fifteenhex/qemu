@@ -500,8 +500,18 @@ static const MemoryRegionOps avme352_vme_ops = {
     .read = avme352_vme_read,
     .write = avme352_vme_write,
     .endianness = DEVICE_BIG_ENDIAN,
+    /*
+     * The host driver reaches the command/parameter block with 16- and
+     * 32-bit iowrite/ioread (avme352_cmd_words()); model the port a byte
+     * at a time and let the core split wider big-endian accesses into the
+     * byte transfers the doorbell logic expects.  The doorbell trigger
+     * offsets (rx port 0x00-05, tx port 0x08-0d, command 0x10-15) are only
+     * ever byte-accessed by the driver, so splitting is safe.
+     */
     .valid.min_access_size = 1,
-    .valid.max_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
 };
 
 /* ------------------------------------------------------------------ */
