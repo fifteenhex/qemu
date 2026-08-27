@@ -229,7 +229,14 @@ static void mos6522_timer1_update(MOS6522State *s, MOS6522Timer *ti,
         return;
     }
     ti->next_irq_time = get_next_irq_time(s, ti, current_time);
-    if ((s->ier & T1_INT) == 0 || (s->acr & T1MODE) != T1MODE_CONT) {
+    /*
+     * In one-shot mode (ACR bit 6 clear) T1 sets IFR only on the first
+     * zero crossing after a T1CH load; the counter keeps wrapping but
+     * no further interrupts occur until T1CH is written again (the
+     * IIfx ROM's VIA timer POST counts exactly one T1 flag per load).
+     */
+    if ((s->ier & T1_INT) == 0 ||
+        ((s->acr & T1MODE) != T1MODE_CONT && ti->oneshot_fired)) {
         timer_del(ti->timer);
     } else {
         timer_mod(ti->timer, ti->next_irq_time);
@@ -269,9 +276,17 @@ static void mos6522_timer1(void *opaque)
     MOS6522State *s = opaque;
     MOS6522Timer *ti = &s->timers[0];
 
+    bool cont = (s->acr & T1MODE) == T1MODE_CONT;
+    bool fire = cont || !ti->oneshot_fired;
+
+    if (!cont) {
+        ti->oneshot_fired = true;
+    }
     mos6522_timer1_update(s, ti, ti->next_irq_time);
-    s->ifr |= T1_INT;
-    mos6522_update_irq(s);
+    if (fire) {
+        s->ifr |= T1_INT;
+        mos6522_update_irq(s);
+    }
 }
 
 static void mos6522_timer2(void *opaque)
@@ -322,8 +337,16 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (now >= s->timers[0].next_irq_time) {
+        bool cont = (s->acr & T1MODE) == T1MODE_CONT;
+        bool fire = cont || !s->timers[0].oneshot_fired;
+
+        if (!cont) {
+            s->timers[0].oneshot_fired = true;
+        }
         mos6522_timer1_update(s, &s->timers[0], now);
-        s->ifr |= T1_INT;
+        if (fire) {
+            s->ifr |= T1_INT;
+        }
     }
     if (now >= s->timers[1].next_irq_time) {
         bool fire = !s->timers[1].oneshot_fired;
@@ -463,6 +486,8 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case VIA_REG_T1CH:
         s->timers[0].latch = (s->timers[0].latch & 0xff) | (val << 8);
         s->ifr &= ~T1_INT;
+        /* a T1CH load re-arms the one-shot */
+        s->timers[0].oneshot_fired = false;
         set_counter(s, &s->timers[0], s->timers[0].latch);
         break;
     case VIA_REG_T1LL:
@@ -686,6 +711,7 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->timers[0].frequency = s->frequency;
     s->timers[0].latch = 0xffff;
+    s->timers[0].oneshot_fired = false;
     set_counter(s, &s->timers[0], 0xffff);
     timer_del(s->timers[0].timer);
 

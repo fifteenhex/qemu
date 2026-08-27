@@ -136,6 +136,20 @@ config MACIISI
     select NUBUS
     select NUBUS_MAC8390
 
+config MACIIFX
+    bool
+    default y
+    depends on M68K
+    select ADB
+    select MOS6522
+    select ESCC
+    select SWIM
+    select ASC
+    select OR_IRQ
+    select NCR5380
+    select NUBUS
+    select RADIUS24XP
+
 config MACIICI
     bool
     default y
