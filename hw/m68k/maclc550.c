@@ -70,6 +70,7 @@
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "hw/display/framebuffer.h"
 #include "system/rtc.h"
 #include "system/qtest.h"
@@ -163,6 +164,38 @@ struct MacLc550GlueState {
 #define MACLC550_GLUE_SCC      3       /* level 4 */
 #define MACLC550_GLUE_NMI      6      /* level 7 */
 
+/*
+ * True while the 680x0 exception vector table has not yet been installed.
+ *
+ * The OS bring-up path re-enters early ROM (0x40800230) after the Egret
+ * ADB setup: it clears low RAM -- zeroing the autovector table at
+ * VBR+0x64 that the power-on POST had set up -- and only re-installs the
+ * handlers a few instructions AFTER it unmasks interrupts at 0x4080023a
+ * (`movew #8192,%sr`).  Meanwhile the Time Manager has already armed the
+ * VIA1 one-shot T2 (loaded ~0xfffb ~= 84ms at 0x4080b12e); under our
+ * virtual-time budget that one-shot expires during the long polled Egret
+ * shift-register spin (0x408d15f6) that runs in between, latching VIA1
+ * IFR bit5.  Delivering that pending level-1 autovector across the
+ * unmask->install window would dispatch through the still-zeroed
+ * *(0x64) into garbage -> bus error -> the equally-zeroed bus-error
+ * vector *(0x8) -> double fault.
+ *
+ * Real hardware never dispatches an interrupt into an uninstalled vector
+ * table; model that directly.  The bus-error vector (VBR+0x08) is a
+ * reliable "vectors present" witness: it is 0 while the table is
+ * uninitialised and a real ROM handler address once the OS has set the
+ * table up.  While it is 0 we hold every autovectored source off the CPU
+ * (the sources stay latched in their IFRs); the next glue re-evaluation
+ * after the table is installed -- guaranteed within 16ms by the 60Hz CA1
+ * tick -- delivers them cleanly.
+ */
+static bool maclc550_vectors_uninstalled(MacLc550GlueState *s)
+{
+    uint32_t vbr = s->cpu->env.vbr;
+
+    return ldl_be_phys(&address_space_memory, vbr + 8) == 0;
+}
+
 static void maclc550_glue_set_irq(void *opaque, int irq, int level)
 {
     MacLc550GlueState *s = opaque;
@@ -174,10 +207,12 @@ static void maclc550_glue_set_irq(void *opaque, int irq, int level)
         s->ipr &= ~(1 << irq);
     }
 
-    for (i = 7; i >= 0; i--) {
-        if ((s->ipr >> i) & 1) {
-            m68k_set_irq_level(s->cpu, i + 1, i + 25);
-            return;
+    if (!maclc550_vectors_uninstalled(s)) {
+        for (i = 7; i >= 0; i--) {
+            if ((s->ipr >> i) & 1) {
+                m68k_set_irq_level(s->cpu, i + 1, i + 25);
+                return;
+            }
         }
     }
     m68k_set_irq_level(s->cpu, 0, 0);
@@ -814,6 +849,7 @@ struct MacLc550MachineState {
     MemoryRegion rom_alias;
     MemoryRegion machine_id;
     MemoryRegion ramio;
+    MemoryRegion ramio_a31;
     MemoryRegion macio;
     MemoryRegion macio_alias;
     MemoryRegion via1mem;
@@ -919,6 +955,30 @@ struct MacLc550MachineState {
      */
     bool egret_coldstart;
     bool egret_coldstart_session;   /* the open session is a cold-start one */
+
+    /*
+     * Egret autopoll crutch for the boot-time mouse rendezvous.  After
+     * ADBReInit + device registration and the cursor setup, the ROM's
+     * startup dispatch loop at 0x40802a38 spins on lowmem 0x172 (set 0x80
+     * at 0x4080067a) until the ADB MOUSE (addr 3) reports through its
+     * completion (0x408b67c4, guard a2@4 == ExpandMem[480]->[4] == the
+     * mouse DCB 0x5840), which clears 0x172.  On real hardware the Egret
+     * autopolls the bus and the mouse's first Talk-R0 reply satisfies
+     * this; our Egret models no autopoll, so the mouse is never polled and
+     * the boot hangs.  This timer runs the same rendezvous crutch as
+     * hw/m68k/macse30.c: while parked on the 0x172 spin, hold a synthetic
+     * mouse button DOWN (adb_mouse_force_report re-announces it each poll,
+     * WITHOUT injecting cursor movement, which the ROM's post-rendezvous
+     * cursor-position check must not see) and deliver the polled mouse
+     * register-0 data as an unsolicited Egret autopoll packet, then release
+     * the button and go quiet once 0x172 clears.
+     */
+    QEMUTimer *autopoll_timer;
+    bool autopoll_armed;        /* boot-time 0x172 crutch active */
+    bool autopoll_click;        /* synthetic mouse button held down */
+    bool autopoll_saw172;       /* have observed 0x172 with bit7 set */
+    bool egret_unsolicited;     /* the in-flight reply is an unsolicited
+                                 * autopoll packet, not a host reply */
 
     /* VIA1 CA1 60Hz tick and CA2 one-second interrupts */
     QEMUTimer *sixty_hz_timer;
@@ -1055,6 +1115,78 @@ static const MemoryRegionOps ramio_ops = {
     .write = ramio_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/*
+ * A31-half accesses: only the low 24 bits reach the decoder (24-bit
+ * tagged master pointers must alias onto RAM).  Although this is a
+ * 32-bit-clean Sonora machine, classic MacOS boots the ROM in 24-bit
+ * mode (see the XPRAM 0x8a comment) and dereferences 24-bit-tagged
+ * Handle master pointers whose top byte carries the Handle-state flags
+ * (lock/purge/resource -- e.g. 0xA0010730 = locked+resource Handle at
+ * real address 0x00010730, seen in the post-rendezvous startup dispatch
+ * loop's _PtInRgn at ROM 0x40802a76).  Our PMMU is a no-op, so forward
+ * the whole A31 half to the low 16 MB.  Low priority (-2): the Valkyrie
+ * window at 0xf9800000 keeps its own higher-priority decode.
+ */
+static MemTxResult maclc550_a31_read(void *opaque, hwaddr addr, uint64_t *data,
+                                     unsigned size, MemTxAttrs attrs)
+{
+    MemTxResult r;
+    uint32_t val;
+
+    addr &= 0x00FFFFFF;
+    switch (size) {
+    case 4:
+        val = address_space_ldl_be(&address_space_memory, addr, attrs, &r);
+        break;
+    case 2:
+        val = address_space_lduw_be(&address_space_memory, addr, attrs, &r);
+        break;
+    case 1:
+        val = address_space_ldub(&address_space_memory, addr, attrs, &r);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    *data = val;
+    return r;
+}
+
+static MemTxResult maclc550_a31_write(void *opaque, hwaddr addr, uint64_t value,
+                                      unsigned size, MemTxAttrs attrs)
+{
+    MemTxResult r;
+
+    addr &= 0x00FFFFFF;
+    switch (size) {
+    case 4:
+        address_space_stl_be(&address_space_memory, addr, value, attrs, &r);
+        break;
+    case 2:
+        address_space_stw_be(&address_space_memory, addr, value, attrs, &r);
+        break;
+    case 1:
+        address_space_stb(&address_space_memory, addr, value, attrs, &r);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    return r;
+}
+
+static const MemoryRegionOps maclc550_a31_ops = {
+    .read_with_attrs = maclc550_a31_read,
+    .write_with_attrs = maclc550_a31_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
         .min_access_size = 1,
         .max_access_size = 4,
     },
@@ -1795,8 +1927,27 @@ static void maclc550_egret_process(MacLc550MachineState *m)
      * Answer with a reply led by 0x02.  (The other [01 xx ...] pseudo
      * session commands -- write-MCU/control -- want no response, see
      * below.)
+     *
+     * ONLY while the ROM drives the Egret by POLLING (VIA1 IER SR-interrupt
+     * disabled): that is the pre-driver cold-start sync (0x408d1b84).  Once
+     * the post-MMU interrupt-driven Egret driver is installed (IER SR-int
+     * enabled) the System still occasionally issues an [01 22]/[01 0e]
+     * control command over that ISR framing -- observed live: a single
+     * [01 22 df 02] during the disk-System ADB/startup bring-up.  That
+     * driver does NOT want the bare 3-byte [02 00 00] cold-start reply: it
+     * discards one turnaround byte (0x408d1732) and its completion
+     * (0x408d1838) computes d0 = stored_count - 4, so a 3-byte reply losing
+     * the discard stores only 2, underflows d0 to 0xFFFE, and dbf-copies
+     * ~64KB of the reply buffer through the request block's data pointer
+     * (a0@8) across low memory -- wiping a dispatch/jump slot that a later
+     * jmp (a0) then takes to address 0 (Illegal instruction 7fee @ 0x2e,
+     * the terminal bomb).  Route it instead through the session-pseudo
+     * generic-ACK path below (proper [00 00 00 cmd] header + the
+     * turnaround-discard dummy byte), exactly as the [01 1b/1c] control
+     * commands are handled -- see maclc550_egret_session_pseudo_reply.
      */
-    if (c[0] == 0x01 && (c[1] == 0x0e || c[1] == 0x22)) {
+    if (c[0] == 0x01 && (c[1] == 0x0e || c[1] == 0x22) &&
+        !(MOS6522(&m->via1)->ier & SR_INT)) {
         qemu_log_mask(LOG_UNIMP,
                       "maclc550 egret: cold-start sync cmd 0x%02x len=%d\n",
                       c[1], n);
@@ -1875,9 +2026,16 @@ static void maclc550_egret_process(MacLc550MachineState *m)
          *    SET_PRAM actually writes PRAM) and drive it out through the
          *    same byte-handshake delivery the direct pseudo path uses.
          */
-        /* 0x07 GET_PRAM, 0x02 READ_MCU, 0x03 GET_TIME are the data reads */
-        if (c[1] != 0x07 && c[1] != 0x02 && c[1] != 0x03 &&
-            maclc550_egret_session_pseudo_reply(m)) {
+        /*
+         * 0x07 GET_PRAM is collected by the polled boot driver over its
+         * own receive-turnaround (handled with real data just above).
+         * Everything else here -- SET_PRAM 0x0c, WRITE_MCU 0x08, and the
+         * post-MMU interrupt-driven driver's READ_MCU 0x02 / GET_TIME 0x03
+         * -- is read back over the /XCVR byte-handshake and needs the real
+         * reply driven out through the pseudo path (READ_MCU/GET_TIME as
+         * data, WRITE_MCU/SET_PRAM as the bare ACK).
+         */
+        if (c[1] != 0x07 && maclc550_egret_session_pseudo_reply(m)) {
             return;
         }
         maclc550_egret_no_response(m);
@@ -1885,12 +2043,63 @@ static void maclc550_egret_process(MacLc550MachineState *m)
     }
 
     {
+        MOS6522MacLc550State *v1s = &m->via1;
+        MOS6522State *s = MOS6522(v1s);
         uint8_t obuf[ADB_MAX_OUT_LEN];
         int olen;
 
         adb_autopoll_block(adb_bus);
         olen = adb_request(adb_bus, obuf, c, n);
         adb_autopoll_unblock(adb_bus);
+
+        if (s->ier & SR_INT) {
+            /*
+             * The post-MMU interrupt-driven Egret driver sends PLAIN ADB
+             * commands (not just [01 xx] pseudo-commands) over the same
+             * formal-session framing and reads the reply back over the
+             * /XCVR byte-handshake -- notably the SendReset [00 00] that
+             * ADBReInit (ADBBase = lowmem 0xcf8) issues to start the ADB
+             * bus rescan.  That driver expects the identical framing as
+             * for a pseudo-command: a [00 00 00 cmd] 4-byte header (+ any
+             * register data), one turnaround-discard byte eaten at
+             * 0x408d1732, and a final completion shift interrupt whose
+             * routine strips the header via `d0 = stored_count - 4`.
+             * Delivering the raw 2-byte no-response turnaround instead
+             * stores only one byte, so the completion is never satisfied
+             * and the ADB Manager spins forever at 0x4080a870 waiting on
+             * ADBBase[349] bit5 -- that bit only clears once the reset
+             * completion advances the rescan.  Build the header (echoing
+             * the ADB command byte) plus any device reply and drive it out
+             * through the pseudo byte-handshake path, exactly as
+             * maclc550_egret_session_pseudo_reply does.
+             */
+            m->egret_resp_len = 0;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = c[0];
+            if (olen > 0 &&
+                m->egret_resp_len + olen <= (int)sizeof(m->egret_resp)) {
+                memcpy(m->egret_resp + m->egret_resp_len, obuf, olen);
+                m->egret_resp_len += olen;
+            }
+            /* dummy byte for the driver's 0x408d1732 turnaround discard */
+            if (m->egret_resp_len + 1 <= (int)sizeof(m->egret_resp)) {
+                memmove(m->egret_resp + 1, m->egret_resp, m->egret_resp_len);
+                m->egret_resp[0] = 0x00;
+                m->egret_resp_len++;
+            }
+            m->egret_pseudo_active = true;
+            m->egret_session_pseudo = true;
+            m->egret_no_resp = false;
+            m->egret_session = false;
+            m->egret_cmd_len = 0;
+            s->sr = m->egret_resp[0];
+            m->egret_resp_idx = 1;
+            maclc550_egret_set_xcvr(v1s, true);
+            maclc550_egret_schedule_int(m);
+            return;
+        }
 
         if (olen > 0) {
             /* reply: the raw register data */
@@ -2247,6 +2456,100 @@ static bool maclc550_egret_session_pseudo_reply(MacLc550MachineState *m)
         return false;
     }
     m->egret_pseudo_cmd_len = 0;
+
+    /*
+     * READ_MCU (0x02) is a STREAMED read: the wire carries no length, so
+     * maclc550_egret_pseudo_build stages the whole 240-byte MCU window and
+     * the interrupt-driven driver (0x408d17xx) would keep clocking bytes
+     * into its request-block buffers and over-run them at completion.
+     * Snoop the request block instead: while the driver is shifting this
+     * reply in, a2 (env->aregs[2]) points at it, and the two byte counts
+     * it will read are declared there: a2@14 bytes into its buffer at
+     * a2@24 (of which the first four are the [00 00 00 cmd] protocol
+     * header the completion strips via d0 = a2@16-4) and a2@18 bytes into
+     * its second buffer at a2@20 -- for READ_MCU the requested MCU data
+     * lands in that a2@20 half (a2@14 is typically just the 4-byte
+     * header).  Rebuild the reply to exactly those two lengths, filling
+     * both data regions with the real MCU bytes, so the driver reads
+     * precisely what it declared, closes on its own count, and gets the
+     * autopoll/ADB parameters it read back rather than zeros (zeros there
+     * made it later jump through a null table into low memory).  Low RAM
+     * is identity-mapped, so a2 doubles as the physical address of the
+     * request block.
+     */
+    if (m->egret_cmd_len >= 4 && m->egret_cmd[1] == 0x02 && current_cpu) {
+        CPUM68KState *env = &M68K_CPU(current_cpu)->env;
+        uint32_t rb = env->aregs[2] & 0x00ffffff;
+        uint16_t ndata = lduw_be_phys(&address_space_memory, rb + 14);
+        uint16_t nhdr = lduw_be_phys(&address_space_memory, rb + 18);
+        uint16_t addr = ((uint16_t)m->egret_cmd[2] << 8) | m->egret_cmd[3];
+
+        qemu_log_mask(LOG_UNIMP,
+                      "maclc550 egret: READ_MCU snoop rb=0x%06x ndata=%u"
+                      " nhdr=%u addr=0x%04x\n", rb, ndata, nhdr, addr);
+        if (ndata >= 4 && (int)(ndata + nhdr) < (int)sizeof(m->egret_resp)) {
+            int i, j = 0;
+
+            m->egret_resp_len = 0;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = 0x00;
+            m->egret_resp[m->egret_resp_len++] = 0x02;
+            /* remaining a2@24-buffer bytes (past the 4-byte header) */
+            for (i = 0; i + 4 < ndata; i++) {
+                m->egret_resp[m->egret_resp_len++] =
+                    maclc550_egret_mcu_read(m, addr + j++);
+            }
+            /* a2@20-buffer bytes: the bulk of the READ_MCU payload */
+            for (i = 0; i < nhdr; i++) {
+                m->egret_resp[m->egret_resp_len++] =
+                    maclc550_egret_mcu_read(m, addr + j++);
+            }
+        }
+    }
+
+    /*
+     * The post-MMU interrupt-driven Egret driver (0x408d17xx, used for the
+     * WRITE_MCU autopoll-parameter uploads) discards ONE turnaround byte
+     * when it flips the shifter to receive (the read+discard at
+     * 0x408d1732) before it starts STORING reply bytes into its request
+     * block.  Its completion routine (0x408d1838) then computes
+     * `d0 = stored_count - 4` and dbf-copies d0+1 bytes, so if fewer than
+     * the 4 header bytes actually land in the block d0 underflows to
+     * ~0xFFFE and smashes the stack (observed: reaches _InitGraf at
+     * 0x40802842 on a corrupted A7 -> double fault).  Prepend a dummy byte
+     * so the turnaround discard eats it and the full [00 00 00 cmd] header
+     * still gets stored (stored_count == 4, d0 == 0, no bad copy).  The
+     * polled SET_PRAM driver (0x408b3a80) does NOT discard a turnaround
+     * byte and reads only its first three status bytes, so leave its reply
+     * unpadded (padding would also desync the stale-reply teardown that
+     * keys off egret_resp_len).
+     */
+    /*
+     * The turnaround-discard is a property of the post-MMU interrupt-driven
+     * Egret driver (0x408d17xx), NOT of the specific command: every one of
+     * its pseudo-commands (WRITE_MCU 0x08, READ_MCU 0x02, GET_TIME 0x03, and
+     * the [01 1b/1c ...] control settings) is read back with the same
+     * read+discard at 0x408d1732, so each needs one dummy byte prepended for
+     * the discard to eat while the full [00 00 00 cmd] header still lands
+     * (stored_count == 4, d0 == 0).  An unpadded control reply (e.g. the
+     * [01 1b] autopoll-enable) loses the discard from its own 4 bytes,
+     * stores only 3, and the completion's `d0 = stored_count - 4` underflows
+     * to 0xFFFF -- dbf then copies ~64KB of the reply buffer across all of
+     * low memory from destination 0, wiping the exception vectors and the
+     * boot globals (MemTop/BufPtr) and double-faulting a few instructions
+     * later.  Keying the pad on the command byte missed the control
+     * commands; key it instead on the interrupt-driven driver being active,
+     * which is exactly when VIA1's SR interrupt is enabled (IER bit 2).  The
+     * polled boot-ROM SET_PRAM driver (0x408b3a80) runs with the SR
+     * interrupt DISABLED and does not discard, so it stays unpadded.
+     */
+    if ((s->ier & SR_INT) &&
+        m->egret_resp_len + 1 <= (int)sizeof(m->egret_resp)) {
+        memmove(m->egret_resp + 1, m->egret_resp, m->egret_resp_len);
+        m->egret_resp[0] = 0x00;
+        m->egret_resp_len++;
+    }
     m->egret_pseudo_active = true;
     m->egret_session_pseudo = true;
     m->egret_no_resp = false;
@@ -2338,6 +2641,37 @@ static void maclc550_egret_session_update(MOS6522MacLc550State *v1s)
         !(m->egret_resp_idx >= m->egret_resp_len && sys &&
           (s->acr & SR_OUT) && (hs_change & EGRET_SYS_SESSION))) {
         /*
+         * Count-exhausted close of a STREAMED reply by the post-MMU
+         * interrupt-driven driver (READ_MCU 0x02 over the formal-session
+         * framing).  When its request-block byte count runs out that
+         * driver deasserts BOTH handshake lines together (orib #48 ->
+         * /SYS_SESSION and /VIA_FULL high at 0x408d17de) and then spins at
+         * 0x408d15a2 waiting for /XCVR to RISE before it re-asserts
+         * /SYS_SESSION for the next command.  A streamed reply stages far
+         * more bytes than the host wants, so the last-byte close in
+         * maclc550_egret_sr_read never fires and /XCVR would stay asserted
+         * -> deadlock (the host never re-asserts /SYS_SESSION, so the
+         * assert-edge early-close just below never fires either).  Detect
+         * the both-lines-high close here and drop /XCVR so the spin
+         * releases.  Clear egret_session_pseudo: this driver keys the end
+         * of the exchange off /XCVR rising, not off a completion shift
+         * interrupt (that is the WRITE_MCU/fixed-reply path, which drains
+         * its whole reply and tears down in sr_read instead).
+         */
+        if ((hs_change & (EGRET_SYS_SESSION | EGRET_VIA_FULL)) &&
+            (s->b & (EGRET_SYS_SESSION | EGRET_VIA_FULL)) ==
+                (EGRET_SYS_SESSION | EGRET_VIA_FULL) &&
+            m->egret_resp_idx > 4) {
+            timer_del(m->egret_timer);
+            maclc550_egret_set_xcvr(v1s, false);
+            m->egret_pseudo_active = false;
+            m->egret_pseudo_closing = true;
+            m->egret_session_pseudo = false;
+            m->egret_resp_len = 0;
+            m->egret_resp_idx = 0;
+            return;
+        }
+        /*
          * Host-side early close of a STREAMED reply: the interrupt-
          * driven Egret driver's receive (ISR 0x40a14912) reads exactly
          * the number of data bytes its request block asked for and
@@ -2395,6 +2729,44 @@ static void maclc550_egret_session_update(MOS6522MacLc550State *v1s)
      * both lines have settled low (/VIA_FULL also clear).
      */
     if (m->egret_pseudo_closing) {
+        /*
+         * A pseudo-command that arrived over the formal-session framing
+         * and was answered over the /XCVR byte-handshake (WRITE_MCU &c.
+         * from the post-MMU interrupt-driven Egret driver at 0x408d17xx):
+         * after draining the whole reply and seeing /XCVR rise, that
+         * driver tears the session down (orib #48 -> both lines high at
+         * 0x408d17de) and then spins at 0x408d180a for ONE final
+         * "session-closed" shift interrupt to run its completion routine
+         * (0x408d1838).  Raise exactly that single interrupt here, on the
+         * teardown write.  Scheduling it any earlier (e.g. at the last
+         * reply byte) makes the driver read a phantom extra SR byte and
+         * fault; the polled boot-ROM's own byte-handshake receive keys off
+         * /XCVR instead and never sets egret_session_pseudo, so it is
+         * unaffected.
+         */
+        if (m->egret_session_pseudo && (hs_change & EGRET_SYS_SESSION) &&
+            !sys) {
+            /*
+             * Only raise the completion interrupt when the driver is about
+             * to CONSUME it by polling with interrupts MASKED (I:7): that
+             * is the WRITE_MCU/SET_PRAM spin at 0x408d180a.  READ_MCU runs
+             * its completion tail with interrupts ENABLED (I:1), where the
+             * same raised SR line would instead re-enter the Egret ISR
+             * against a request the driver has not re-armed and jump wild
+             * into low memory.  In that case leave it to the driver's own
+             * per-byte ISR flow to finish the transaction.
+             */
+            int ipl = current_cpu ?
+                      ((M68K_CPU(current_cpu)->env.sr >> 8) & 7) : 7;
+
+            m->egret_session_pseudo = false;
+            m->egret_pseudo_closing = false;
+            if (ipl == 7) {
+                s->sr = 0;
+                maclc550_egret_schedule_int(m);
+            }
+            return;
+        }
         if (!(s->b & (EGRET_SYS_SESSION | EGRET_VIA_FULL))) {
             m->egret_pseudo_closing = false;
         }
@@ -2765,6 +3137,25 @@ static void maclc550_egret_sr_read(MOS6522MacLc550State *v1s)
                       m->egret_resp_len, maclc550_trace_pc(), s->b);
         if (just_read >= m->egret_resp_len - 1) {
             /*
+             * Unsolicited autopoll packet (Egret-initiated, not a reply to
+             * a host command): the interrupt-driven transport's receive
+             * (ROM 0x408d173e) stores this last byte and then, seeing /XCVR
+             * risen (0x408d1792), completes the receive against the pending
+             * autopoll op it re-arms after every transaction (a2@52 ==
+             * a2@48 == 0x5a14, ROM 0x40814bd6) -- no host session teardown
+             * follows, so finish clean without arming the formal-session
+             * suppression (egret_pseudo_closing would then never clear,
+             * since there is no host PB4/PB5 teardown write to end it).
+             */
+            if (m->egret_unsolicited) {
+                maclc550_egret_set_xcvr(v1s, false);
+                m->egret_pseudo_active = false;
+                m->egret_unsolicited = false;
+                m->egret_resp_len = 0;
+                m->egret_resp_idx = 0;
+                return;
+            }
+            /*
              * That was the last byte: drop /XCVR, exchange is over.
              * The ROM still has its own teardown writes coming
              * (0x4084a646/0x4084a650) -- keep suppressing the formal-
@@ -2774,7 +3165,17 @@ static void maclc550_egret_sr_read(MOS6522MacLc550State *v1s)
             maclc550_egret_set_xcvr(v1s, false);
             m->egret_pseudo_active = false;
             m->egret_pseudo_closing = true;
-            m->egret_session_pseudo = false;
+            /*
+             * egret_session_pseudo is deliberately LEFT set here: a reply
+             * to a formal-session-framed pseudo-command (SET_PRAM,
+             * WRITE_MCU &c.) needs one final "session-closed" shift
+             * interrupt once the host tears the session down -- raised in
+             * maclc550_egret_session_update's closing handler, not now
+             * (raising it mid-read makes the ISR-driven driver at
+             * 0x408d17xx read a phantom extra byte and fault).  The direct
+             * byte-handshake path clears the flag in pseudo_try_process
+             * and keys off /XCVR rising instead, so it is unaffected.
+             */
             m->egret_resp_len = 0;
             m->egret_resp_idx = 0;
         } else {
@@ -2824,6 +3225,157 @@ static void maclc550_egret_sr_read(MOS6522MacLc550State *v1s)
                   "maclc550 egret: -> 0x%02x (#%d/%d) pc=%08x b=%02x\n",
                   s->sr, m->egret_resp_idx, m->egret_resp_len,
                   maclc550_trace_pc(), s->b);
+}
+
+/*
+ * Deliver an unsolicited Egret autopoll packet to the interrupt-driven ADB
+ * driver.  The transport re-arms a receive for the registered autopoll op
+ * after every transaction (ROM 0x40814bb4: a2@52 = a2@48, up to 12 bytes
+ * into a2@24, with a2 = the transport request block at lowmem *(0xde0)); it
+ * then waits for the Egret to assert /XCVR and clock the packet in.  When
+ * the received packet's byte 1 is 0 (autopoll), the completion routes it to
+ * the autopoll op's callback (0x408b2fcc), which takes byte 3 as the ADB
+ * command byte (addr<<4 | Talk-R0), byte 2 as status and bytes 4.. as the
+ * device register data, and dispatches the addressed device's completion.
+ *
+ * We only inject when the transport is genuinely idle AND that pending
+ * receive is the registered autopoll op (a2@52 == a2@48, both non-zero),
+ * so the packet lands on the autopoll path and never collides with a host
+ * command.  `pkt` is the raw byte stream the transport stores, i.e.
+ * [b0, 0x00, status, adbcmd, data...].
+ */
+static void maclc550_egret_deliver_unsolicited(MacLc550MachineState *m,
+                                               const uint8_t *pkt, int len)
+{
+    MOS6522MacLc550State *v1s = &m->via1;
+    MOS6522State *s = MOS6522(v1s);
+    uint32_t rb;
+    uint32_t op48, op52;
+    int i;
+
+    if (len <= 0 || len > (int)sizeof(m->egret_resp)) {
+        return;
+    }
+    /* transport must be idle and the SR interrupt-driven driver installed */
+    if (!(s->ier & SR_INT) || m->egret_session || m->egret_pseudo_active ||
+        m->egret_pseudo_closing || m->egret_coldstart ||
+        m->egret_resp_len != 0 || m->egret_resp_idx != 0) {
+        return;
+    }
+    /* the pending receive must be the registered autopoll op */
+    rb = ldl_be_phys(&address_space_memory, 0xde0) & 0x00ffffff;
+    if (rb < 0x1000) {
+        return;
+    }
+    op48 = ldl_be_phys(&address_space_memory, rb + 48);
+    op52 = ldl_be_phys(&address_space_memory, rb + 52);
+    if (op48 == 0 || op48 != op52) {
+        return;
+    }
+
+    m->egret_resp_len = 0;
+    for (i = 0; i < len; i++) {
+        m->egret_resp[m->egret_resp_len++] = pkt[i];
+    }
+    m->egret_pseudo_active = true;
+    m->egret_unsolicited = true;
+    m->egret_session_pseudo = false;
+    m->egret_no_resp = false;
+    m->egret_session = false;
+    s->sr = m->egret_resp[0];
+    m->egret_resp_idx = 1;
+    maclc550_egret_set_xcvr(v1s, true);
+    maclc550_egret_schedule_int(m);
+
+    qemu_log_mask(LOG_UNIMP,
+                  "maclc550 egret: autopoll unsolicited pkt len=%d"
+                  " [%02x %02x %02x %02x ..] op=0x%06x\n", len,
+                  pkt[0], len > 1 ? pkt[1] : 0, len > 2 ? pkt[2] : 0,
+                  len > 3 ? pkt[3] : 0, op48 & 0x00ffffff);
+}
+
+/*
+ * Boot-time mouse-rendezvous crutch (see the autopoll_timer field comment
+ * and hw/m68k/macse30.c).  Fires periodically; while the ROM is parked on
+ * its 0x172 spin (0x40802a38) with 0x172 bit7 still set, hold the mouse
+ * button DOWN, force the mouse to re-announce that held state (no cursor
+ * movement) and deliver it as an unsolicited Egret autopoll packet so the
+ * mouse's ROM completion fires and clears 0x172.  Release the button and
+ * stop once 0x172 has cleared.
+ */
+static void maclc550_egret_autopoll(void *opaque)
+{
+    MacLc550MachineState *m = opaque;
+    ADBBusState *adb_bus = &m->via1.adb_bus;
+    uint8_t flag172;
+    uint32_t pc;
+
+    if (!m->autopoll_armed) {
+        return;
+    }
+
+    flag172 = address_space_ldub(&address_space_memory, 0x172,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+    pc = current_cpu ? M68K_CPU(current_cpu)->env.pc : 0;
+
+    if (flag172 & 0x80) {
+        m->autopoll_saw172 = true;
+    }
+
+    /*
+     * Rendezvous complete: 0x172 has been seen set and is now clear.
+     * Release the synthetic button and disarm the crutch so no further
+     * autopoll injection can land mid-way through whatever the ROM does
+     * next (e.g. a later ADBReInit's enumeration).
+     */
+    if (m->autopoll_saw172 && flag172 == 0) {
+        if (m->autopoll_click) {
+            m->autopoll_click = false;
+            qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, false);
+            qemu_input_event_sync();
+        }
+        m->autopoll_armed = false;
+        return;
+    }
+
+    /*
+     * Parked on the 0x172 startup spin (0x40802a38, tstb 0x172; bne) with
+     * the flag still set: hold the button down and re-announce it, then
+     * deliver the poll as an unsolicited autopoll packet.
+     */
+    if (m->autopoll_saw172 && (flag172 & 0x80) &&
+        pc >= 0x40802a30 && pc <= 0x40802a60) {
+        uint8_t obuf[ADB_MAX_OUT_LEN];
+        uint8_t pkt[8];
+        int olen;
+
+        if (!m->autopoll_click) {
+            m->autopoll_click = true;
+            qemu_input_queue_btn(NULL, INPUT_BUTTON_LEFT, true);
+            qemu_input_event_sync();
+        }
+        adb_mouse_force_report(adb_bus);
+
+        adb_autopoll_block(adb_bus);
+        olen = adb_poll(adb_bus, obuf, adb_bus->autopoll_mask);
+        adb_autopoll_unblock(adb_bus);
+
+        if (olen > 0) {
+            int i;
+            /* [b0, autopoll-type 0, status 0, adbcmd, regdata...] */
+            pkt[0] = 0x00;
+            pkt[1] = 0x00;
+            pkt[2] = 0x00;
+            pkt[3] = obuf[0];           /* ADB command byte (addr<<4|0x0c) */
+            for (i = 1; i < olen && i + 3 < (int)sizeof(pkt); i++) {
+                pkt[3 + i] = obuf[i];
+            }
+            maclc550_egret_deliver_unsolicited(m, pkt, 3 + olen);
+        }
+    }
+
+    timer_mod(m->autopoll_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * 1000000);
 }
 
 /*
@@ -3083,13 +3635,21 @@ static void maclc550_machine_init(MachineState *machine)
     memory_region_add_subregion(&m->ramio, 0, machine->ram);
 
     /*
-     * No A31/24-bit RAM aliasing here: unlike the older 24-bit-only
-     * 68030 boards (IIsi, Classic II), this is a 32-bit-clean
-     * "Sonora"-generation machine (see lc475.c, which needs none
-     * either).  If boot testing turns up 24-bit tagged-pointer
-     * dereferences through the top half of the address space, port
-     * maciisi.c's A31 forwarding here.
+     * A31-half (24-bit tagged master pointer) forwarding.  Although this
+     * is a 32-bit-clean Sonora machine, MacOS boots the ROM in 24-bit
+     * mode and dereferences 24-bit-tagged Handle master pointers whose
+     * top byte carries the Handle-state flags -- boot testing turned up
+     * exactly the case the original "32-bit-clean, needs none" note
+     * anticipated: the post-mouse-rendezvous startup dispatch loop's
+     * _PtInRgn (ROM 0x40802a76) faulted on region handle 0xA0010730
+     * (locked+resource Handle, real address 0x00010730).  Forward the
+     * whole top half to the low 16 MB, at low priority so the Valkyrie
+     * window at 0xf9800000 keeps its own decode.
      */
+    memory_region_init_io(&m->ramio_a31, OBJECT(machine), &maclc550_a31_ops,
+                          m, "maclc550.ram-a31", 0x80000000);
+    memory_region_add_subregion_overlap(get_system_memory(), 0x80000000,
+                                        &m->ramio_a31, -2);
 
     /* machine ID register */
     memory_region_init_io(&m->machine_id, NULL, &machine_id_ops, m,
@@ -3188,6 +3748,13 @@ static void maclc550_machine_init(MachineState *machine)
         dev = qdev_new(TYPE_ADB_MOUSE);
         qdev_realize_and_unref(dev, adb_bus, &error_fatal);
     }
+    /* boot-time mouse-rendezvous autopoll crutch (see field comment) */
+    m->autopoll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     maclc550_egret_autopoll, m);
+    m->autopoll_armed = true;
+    timer_mod(m->autopoll_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * 1000000);
+
     m->vbl_off_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maclc550_vbl_off, m);
     m->sixty_hz_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maclc550_sixty_hz, m);
     timer_mod(m->sixty_hz_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
