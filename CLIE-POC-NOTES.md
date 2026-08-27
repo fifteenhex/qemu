@@ -1568,3 +1568,352 @@ ROMs used: `Sony-CLIE-PEG-T600C-en.rom` (clie-t600c),
    lcdScreenSize/lcdPanelControl1) and drives Setup -- the LCDC scanout
    is already in place, so a stably-programmed framebuffer should render
    immediately.
+
+## Session 7: clie-sj33 renders the Palm OS color Setup UI (SZ328 INTC/timers + the real display path)
+
+Goal per handoff: model the SZ INTC + timer (+ UART, HwrSleep) so the
+NR70V ROM runs and draws.  Achieved and exceeded: `clie-sj33` now boots
+the real Palm OS 4.1 off the NR70V image to the **color 320x480
+"Setup 1 of 4" screen** (purple header, clamshell bitmap, silkscreen
+icon row, battery gauge, live clock), and **pen taps work** (dialogs
+dismiss, Setup pages advance).  Screendumps: `/tmp/sj33-setup1-color.png`,
+`/tmp/sj33-setup2.png` (+ the working set in `/workspace/src/sj33-run/`).
+Commit `af1ac3b15a` on `push-sj33`.
+
+The road there overturned several Session-6 conclusions; the corrected
+facts, in boot order:
+
+### 1. The register map: the "$10000" cluster is at 0xFFFFF000
+
+Palm's `HwrM68SZ328Type` labels the classic peripheral cluster
+`$10000..` but places it at struct offset **0x1F000** via
+`___filler38[0x1F000-0x00C00]` -- i.e. with the struct based at
+0xFFFE0000, SCR/PLL/INTC/GPIO/timers/UART/RTC still sit at the
+**traditional 0xFFFFF000 page**.  Session 6's "the whole register file
+moved to 0xFFFE0000" was wrong (only the new-style DMA/ADC/MMC/LCDC
+half lives there); the ROM demonstrably drives the INTC at 0xFFFFF300,
+timers at 0xFFFFF600, pwrControl at 0xFFFFF207 etc.  dragonball_sz now
+maps one 128KB window with an internal address translation
+(`sz_reg_off()`), so both halves hit the same register file.
+
+### 2. What Session 6 thought was the "A-trap dispatcher" was the ROM debugger
+
+The NR70V dump is a **debug build**: its big-ROM reset vector
+(0x1001482e) jumps straight into the "Welcome to the Palm OS BigROM
+Debugger!!" console (banner drains over the now-modelled UART).  The
+exit is the boot-key scan behind trap #15 `$A3B6` (HAL fn 0x1008df44):
+it drives the keyboard rows and reads the columns through legacy port
+C/D, ORs a flag word per *unpressed* (pull-up-high) key to **0xC7F**,
+and flag bit 2 makes the console run once non-interactively and
+`trap #8` into the real boot.  Unmapped GPIO (columns read 0 = "all
+keys held") is why every earlier session parked "in the A-trap
+dispatcher" forever -- that dispatcher was the debugger's own trap #15
+handler.
+
+### 3. The peripherals that had to exist before the OS would draw
+
+* **INTC** ($10300 / 0xFFFFF300): mask/status/pending + the 7
+  intLevelControl registers, highest-level-wins to the CPU with vector
+  `intVector[7:3] + level` (the HAL programs 0x18 = autovectors).
+  Timer bit gating per Cloudpilot's EmRegsSZ::UpdateInterrupts.
+* **Timers 1/2** ($10600/$10610) on ptimers; input clock derived from
+  the guest-programmed MCU PLL (pllFreqSel0/1 -> ~132MHz PLL ->
+  clockSrcCtl divider -> pllControl sysclk divider = the 66MHz-class
+  sysclk), clk-source mux and prescaler per EmRegsSZ's
+  TimerTicksPerSecond.  TSTAT ack keeps Cloudpilot's read-gate
+  semantics so ticks can't be lost between read and ack.
+* **UART 1** TX-ready status (0xE000; CTS deliberately clear -- an
+  asserted CTS makes the debug stub think a host is attached) + TX to
+  a chardev.
+* **GPIO ports A..R**: data-register composition (out/in/dedicated per
+  DIR/SEL) with the Redwood board input levels from
+  EmRegsSzRedwood::GetPortInputValue, plus per-pin port interrupts
+  (level/edge/polarity/mask -> the INTC port sources).
+* **Sony Memory Stick DSP** (0x11000000, 64KB: IPC mailbox + shared
+  RAM) after Cloudpilot's EmRegsSonyDSP.  The HAL blocks on its
+  `cmpiw #0xFC00, 0x11000C06` handshake before touching the display.
+  Two commands beyond Cloudpilot's list: the audio firmware setup
+  `0x4943` ('IC') and its `0x0C85` upload want their status-field echo
+  (`cmd & 0xFC00`), or Pa1Lib's init times out.
+* **Real flash** (pflash_cfi02, 8MB x16, 8KB sectors, unlock
+  0x555/0x2AA + new `pflash_cfi02_get_memory()` for image pre-load):
+  mid-boot the HAL copies a writer to RAM, erases/rewrites its
+  saved-parameters sector at 0x1000A000 (AA/55/80/AA/55/30) and
+  data-polls DQ7 -- on the old write-ignoring ROM region it span
+  forever.
+* **HwrSleep neutralised** (`hwrsleep_patch_addr = 0x10090a0a`): the
+  boot-time battery-measure doze hooks the level 5/6/7 wake vectors,
+  slows the PLL and `stop`s waiting for a PP3 edge.  Same S300-style
+  early-RTS patch; mechanism generalised to an array
+  (`extra_patch_addr[]`), whose second user is the **Pa1Lib install**
+  (0x102f29d6): its codec init half-fails, tears its 'SeAo'
+  registration back down, and the first system beep then chases the
+  stale registration into the "Fatal Exception" alert (address error
+  at 0x102a3266, a0=-1).  With the lib failing outright every consumer
+  takes its clean "no Pa1Lib" fallback.
+
+### 4. The display is NOT the on-chip LCDC
+
+Session 6's premise ("the enhanced on-chip LCDC should render") was
+wrong for this board: the HAL leaves the SZ LCDC unprogrammed.  Per
+Cloudpilot's `kDeviceYSX1100`, the NR70 (and SJ33 family) drive an
+external **"T2" MediaQ-class controller**: 320KB VRAM aperture at
+0x1F000000, the familiar MediaQ GC register set at +0x50000
+(EmRegsMQLCDControlT2).  Reused hw/display/clie_lcd.c with a
+`vram-size` property and the windows mapped to match, plus the
+GC[15:14] **X/Y pixel-doubling bits** the T2 adds (the HAL boots in
+160x240 and lets the chip double to the 320x480 panel; without the
+bits the frame renders side-by-side twice).  T600C scanout unchanged
+(never sets them).  The Palm-Powered boot logo, all Setup pages and
+dialogs render in color through this path.
+
+### 5. Pen input: a bit-banged ADS7846 on GPIOs
+
+No CSP/SPI, no on-chip ADC: the HAL bit-bangs an ADS7846-class touch
+ADC over GPIOs (ROM 0x1008f400): **CS = port B5, DOUT = port P6,
+CLK = port N7, DIN = port G4**; commands 0x9A (Y-plate) / 0xDA
+(X-plate); one busy bit + 12 data bits read back on clock-high.
+Pen-down is the port **G5/K4** pin interrupts (+ an IRQ1 edge), and
+the pen ISR (0x1008f520) keeps reading intPendingHi's port-K bit as
+its "pen still down" level, so those pins request as long as the pen
+is held.  Implemented in dragonball_sz with a QEMU absolute-pointer
+input handler; taps must be injected via **QMP input-send-event**
+(HMP mouse_move only queues relative events, which silently left the
+position at 0,0 -- an entire orientation-sweep worth of debugging was
+invalidated by that).  Battery reads healthy through the same ADC
+(channel 2), so the "Low Batteries" alert no longer appears.
+
+### Result vs the success tiers
+
+* **Setup renders in color and is tap-drivable -- achieved** (the
+  Session-6 "good" tier, on the *correct* display path).
+* Launcher -- not reached.  The precise remaining gap: the Setup
+  digitizer calibration accepts the first target tap but rejects the
+  second and silently restarts (TL/BR target screens alternate
+  forever).  Not axis orientation (all 8 swap/invert combinations
+  fail identically with verified-correct coordinates), not sample
+  jitter/stability (the HAL's own stability loop passes, traced via
+  SZ_TRACE_PEN).  Prime suspect: a validity check against the
+  factory calibration in the flash saved-parameters sector, which in
+  this machine starts erased (0xFF) where a real device has
+  manufacturing data.  Next session: trace the SetupApp's
+  calibration-accept branch after the second tap (the pen samples
+  demonstrably reach the OS with correct position-dependent values).
+
+Regressions: clie-s300 / clie-t600c / palmv / palmm515 re-verified
+rendering their Setup screens unchanged this session.
+
+Debug aids left in (env-gated, default off): `SZ_TRACE_DSP` (DSP IPC
+commands/args), `SZ_TRACE_PEN` (completed ADC bit-bang transactions).
+Tap injection helper pattern: QMP `input-send-event` abs x/y in
+0..32767 console coordinates, btn left down/up.
+
+## Session 8: clie-sj33 -- digitizer calibration cracked; reaches "Setup complete" (one tap from the launcher)
+
+The Session-7 blocker was the two-target digitizer calibration: it
+accepted the first target tap but rejected the second and restarted
+forever.  Root-caused and fixed; `clie-sj33` now passes calibration
+and reaches **Setup 4 of 4 "Setup complete"** in full 320x480 color
+(`/tmp/sj33-setup3-calibrated.png`, `/tmp/sj33-setup4-complete.png`).
+
+### Root cause: the bit-banged ADS7846 responder was wrong in three ways
+
+Traced the reject with a QEMU TB-exec diff (`log exec` around a reject
+tap vs an accept tap): the reject-only path ran the calibration app's
+restart branch (ROM 0x10186axx) plus a Sony-HAL block at 0x102d0xxx.
+That block is **PenCalibrate** (trap `#0xA271` -> handler 0x102d04a6):
+it computes the linear map from the two raw taps to the fixed standard
+screen targets (10,10) and (150,150) and validates a point-ordering
+test (0x102d069c: `fp@(-8) > fp@(-4)`), returning error 0xB01 on
+failure -> the app does `moveq #-1,%d6` and restarts.
+
+Breaking in PenCalibrate showed it received **(0,0) and (0,0)** as the
+two raw points.  The app collects each point by polling the pen in a
+tight loop (`trap #0xA11E` = EvtGetPen) while the pen is down (ROM
+0x10186df2); every read returned x=0,y=0 with penDown=1.  So the pen
+*position* never reached the OS even though pen-down did.
+
+The pen sampler (ROM 0x1008f400) reads each axis up to **10 times
+under one CS assertion** and keeps going until two consecutive results
+match (a stability filter).  The device responder modelled only the
+*first* conversion per CS; every retry after the first read back 0, so
+the "stable" value converged on 0.  Three bugs, all in
+`hw/misc/dragonball_sz.c`:
+
+1. **Serial state machine** -- rewrote `sz_adc_clk_update()` as a real
+   ADS7846 frame machine: idle until the START bit (DIN high), collect
+   the 8-bit command, emit 1 busy + 12 data bits, return to idle so
+   each back-to-back conversion in the frame decodes afresh.
+2. **Channel mapping** -- command 0xDA (channel 5) is the X plate and
+   0x9A (channel 1) the Y plate (the sampler stores the 0xDA result as
+   the point's X, 0x9A as Y); they were reversed.
+3. **Polarity + range** -- a resistive panel's raw count *decreases* as
+   the screen coordinate grows (the Sony HAL re-inverts it, giving the
+   screen-increasing calibration coords the ordering test needs); and
+   with top 0xF00, uniform density k=8, neither axis wraps the 12-bit
+   field (an earlier mapping overflowed Y and collected garbage).
+
+With these, PenCalibrate accepts the two targets, the **third
+verification tap** (screen-standard (80,60) within 4px) lands in
+tolerance, and Setup advances to screen 3 (region/time) and screen 4
+("Setup complete").  Commit `7b5c2f888f`.
+
+Driving harness: taps via QMP `input-send-event` (abs x/y in
+0..32767 over the 320x480 console, btn left down/up); a persistent-
+connection driver (`sj33-run/driver.py`).  Note the HMP `mouse_move`
+monitor command only queues *relative* events (position stays 0,0) --
+an entire earlier orientation sweep was invalidated by that; use QMP
+absolute events.
+
+### Remaining gap: Setup-4 buttons don't activate (launcher not reached)
+
+The final step -- tap **Done** on "Setup complete" to exit to the
+Applications launcher -- does not work, and neither do Previous/Next on
+that screen.  Characterised but not resolved:
+
+* It is **not** the calibration: the pen is fully tracked on Setup 4
+  (instrumented the INTC -- a Done tap raises the port-G pen interrupt
+  at level 3, wakes the CPU from STOP, and the ISR samples the pen ~86
+  times over the 0.5s hold, exactly as during the calibration taps that
+  worked).  So the pen path -- interrupt, wake, sample, event delivery
+  to the device handler -- is alive on Setup 4.
+* It is **not** a tap-position offset: sweeping the Done tap over a
+  wide grid (screen x 218..255, y 296..337) never activates it, and the
+  same button-row screen position that advanced Setup 3 -> 4 (Next at
+  ~138,313) does nothing on Setup 4.
+* The tap is *processed* (PenRawToScreen runs) but no button fires.  The
+  most likely remaining cause is a pen-UP / tap-vs-drag distinction the
+  model gets subtly wrong in normal (interrupt-driven) mode -- the
+  button activates on pen-release-inside-control, and something about
+  the release event or the tracked coordinate at release keeps the
+  control from committing.  During calibration the app *polled* raw pen
+  (worked); the post-calibration UI is release-event driven, a path the
+  two-target calibration never exercises.
+
+Result vs the SJ33 tiers: the (good) tier -- SZ328 renders the Setup
+screens in color -- is met and then some (calibration completes,
+reaches "Setup complete"); the (best) tier -- the Applications launcher
+-- is one working button-release away.  clie-s300/clie-t600c/palmv/
+palmm515 re-verified rendering their Setup screens unchanged.
+
+### Update: the launcher path is reachable but the final tap is unreliable
+
+Driving further with QMP taps: calibration + Setup 1/2/3 taps register
+reliably (the pen path -- interrupt/wake/sample/deliver -- is sound),
+and Setup 3 "Next" advances to Setup 4.  Setup 4 was once observed to
+advance to the "Enter Data" tutorial under a burst of short taps, so the
+Setup-4 buttons *can* fire.  But the final "Done" (exit to the
+Applications launcher) is not reliably registering: swept over screen x
+218..255 / y 296..337 and hold times 0.08..0.5s, dozens of attempts,
+almost never commits, and after ~8-11 taps in a session the pen-tap
+delivery becomes unreliable altogether.  The tap is *tracked* (the ISR
+samples it) but the button does not commit -- a pen-release / tap-vs-
+hold subtlety in the post-calibration, release-event-driven UI path
+that the polled calibration flow never exercised.  So the launcher is
+one reliable button-release away; that release event is the exact
+remaining gap.
+
+## Session 9: clie-sj33 REACHES THE APPLICATIONS LAUNCHER (full 320x480 color, interactive)
+
+The Session-8 hypothesis ("the pen-up/release event is the gap") was
+**wrong** -- the release path was verified healthy end-to-end this
+session (hardware edge -> 3-sample pen-up confirmation in the sampler
+-> EvtEnqueuePenPoint(-1,-1) -> penUpEvent with dead-center screen
+coords delivered to FrmHandleEvent).  The Done button *was* firing;
+everything after it was broken, by four separate root causes, each
+found and fixed.  `clie-sj33` now goes Setup 1 -> calibration ->
+Setup 4 -> **Done -> the CLIE Applications launcher** in full 320x480
+color, stable (3+ min soak) and interactive: tapping Calc launches the
+color Calculator, the silk Home icon returns to the launcher.
+
+Money shots: `/tmp/sj33-launcher.png` (the launcher),
+`/tmp/sj33-calc.png` (Calculator, proving app switching), 
+`/tmp/sj33-launcher-soak.png` (still alive after the soak).
+
+### Root cause 1: vchrAutoOff event storm (the real "taps die after ~10" bug)
+
+`PrvSystemTimerProc` (0x10091c80) fires `EvtEnqueueKey(vchrAutoOff
+0x0114)` when `ticks(0x254) - lastActivity(0x152) >
+autoOffSeconds(0x156)*100`; autoOffSeconds is 120.  With HwrSleep
+neutralised (the committed boot fix), the sleep attempt returns
+immediately, the timer base is never reset, and the enqueue repeats at
+~90/s forever.  The storm's sleep attempts desync the pen-stroke queue
+(EvtGetSysEvent's strokeInProgress flag stuck set, completed-stroke
+count stuck 0), after which taps deliver penDown-less penMove floods
+and no button ever commits again.  Every Session-8 "Done doesn't work"
+sweep ran >2 idle minutes after the last timer reset, so all its
+Setup-4 conclusions were storm artifacts.  Fix: guarded one-byte ROM
+patch (`beqs`->`bras` over the auto-off gate at 0x10091c84,
+`autooff_patch_addr` in palm.c) -- with sleep unavailable, auto-off is
+a death spiral, and the emulated device should stay on anyway.
+
+### Root cause 2: the SZ timer model wedged under TCMP rewrites (tick death)
+
+The 100Hz system tick literally *stopped* mid-session (0x254 frozen,
+TCN frozen, UI dozing forever -- "input dies after ~10 taps").  The
+old ptimer-based timer model reloaded the counter on every TCMP write
+(`ptimer_set_limit(cmp, 1)`) and could stop outright; but the Palm HAL
+implements its sub-tick pen-sampling timer by rewriting `TCMP = TCN +
+delta` on the fly (SysTimerWrite from the pen ISR/tick), expecting TCN
+to free-run underneath.  Rewrote the timer core (dragonball_sz.c) as a
+free-running 16-bit up-counter anchored on the virtual clock plus a
+deadline QEMUTimer for the compare: TCMP/TPRER writes never disturb
+TCN, TEN 0->1 resets it, restart-mode matches re-anchor drift-free.
+Tick verified rock-solid at 100Hz across whole sessions.
+
+### Root cause 3: phantom wired-remote-commander key held down
+
+Port F bit 5 is the headphone-remote key line, polled by the HAL's
+ExtKeyTickHandler (0x102cf300); a debounced LOW means "remote key
+pressed" and enqueues Sony vchr 0x170C at ~2/s.  The model idled the
+line low, so a phantom remote key was permanently held.  Fix: port F
+input value 0x20 (line high = no key).
+
+### Root cause 4: the post-Setup Sony demo app cannot run on modelled hardware
+
+Done *commits* and Setup exits into Sony's first-boot demo app (one
+PRC with CLIECamera.c heritage; camera + remote-commander + PCM-audio
+showcase).  On our hardware it: fails a Sony Capture (camera) library
+call -> FrmAlert(3000) "An error has occurred." (invisible, because
+the launch dies before the form draws -- the visible "Setup 4" frame
+goes stale, which is why Done "did nothing"); the UIAppShell then
+relaunches it forever; and its Rmc-library step jumps through an
+uninstalled sound-driver pointer into empty address space (PC observed
+free-running at 0x5xxxxxxx).  Fix: `retzero_patch_addr` -- PilotMain
+(0x1063a56a) patched to `moveq #0,%d0; rts` (guarded on its `linkw`),
+so the demo "runs" successfully doing nothing and the shell proceeds
+to the launcher.  NB: patch PilotMain, NOT the __Startup__ wrapper --
+neutering the wrapper skips the SysAppStartup/SysAppExit pairing and
+leaks one memory owner ID per launch; the OS has 15 and then raises
+the "SystemMgr.c, Line:5169, No More Owner IDs" fatal (learned the
+hard way).  The extra_patch on the app's Rmc dialog helper
+(0x1063cf48) is kept as defence in depth.
+
+### Debugging technique worth keeping
+
+* An *invisible* modal form can be decoded from RAM: active form ptr
+  at global 0x1f0, FormType window bounds at +0x0a, object list count
+  at +0x3e/ptr at +0x40 (6-byte entries: type, pad, ptr) -- that is
+  how the unseen "Error [OK]" alert and its OK-button rect were found
+  and blind-tapped.
+* Owner-ID leak diagnosis: the allocator bitmask lives at global
+  0x126 (IDs 1..15); poll it via QMP `xp` to timestamp leaks.
+* The library table lives at global 0x140 (16-byte entries, dispatch
+  ptr first; name at dispatch+*(uint16*)dispatch) -- maps lib trap
+  selectors (0xA800+fn, refnum arg) to "Sony HR Library", "Sony
+  Capture Library" etc.
+* HMP screendumps of a wedged UI can be *stale*: check the silk-area
+  clock (drawn independently) before trusting the frame.
+
+### Result
+
+* (best) tier achieved: **the Applications launcher renders and is
+  interactive** on clie-sj33.  Calibration + all Setup taps register
+  first-try, every run.
+* Regressions: palmv re-verified rendering its Setup screen unchanged
+  (all changes are clie-sj33-gated or in the SZ-only device model).
+* Harness notes: boot ~85s; drive with QMP `input-send-event`
+  absolute taps; the screen-classifying driver lives at
+  /tmp/sj33/drive2.py (reference-image matching).  NEVER launch QEMU
+  in the same bash command as a long driver -- background-command
+  timeouts kill the whole process group, QEMU included.

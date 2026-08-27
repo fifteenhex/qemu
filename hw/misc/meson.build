@@ -173,7 +173,7 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 system_ss.add(when: 'CONFIG_DRAGONBALL_PLL', if_true: files('dragonball_pll.c'))
 system_ss.add(when: 'CONFIG_DRAGONBALL_SCR', if_true: files('dragonball_scr.c'))
 system_ss.add(when: 'CONFIG_SONY_MSHC_STUB', if_true: files('sony_mshc_stub.c'))
-system_ss.add(when: 'CONFIG_DRAGONBALL_SZ', if_true: files('dragonball_sz.c'))
+specific_ss.add(when: 'CONFIG_DRAGONBALL_SZ', if_true: files('dragonball_sz.c'))
 
 # MVME147
 system_ss.add(when: 'CONFIG_MVME147_PCC', if_true: files('mvme147_pcc.c'))

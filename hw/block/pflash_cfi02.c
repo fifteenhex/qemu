@@ -993,6 +993,16 @@ static void pflash_cfi02_register_types(void)
 
 type_init(pflash_cfi02_register_types)
 
+/*
+ * The flash array (not the mapping container): what a board that wants
+ * to pre-load an image without a block backend needs, mirroring
+ * pflash_cfi01_get_memory().
+ */
+MemoryRegion *pflash_cfi02_get_memory(PFlashCFI02 *fl)
+{
+    return &fl->orig_mem;
+}
+
 PFlashCFI02 *pflash_cfi02_register(hwaddr base,
                                    const char *name,
                                    hwaddr size,

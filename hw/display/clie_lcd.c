@@ -34,6 +34,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/display/clie_lcd.h"
 #include "migration/vmstate.h"
 #include "ui/pixel_ops.h"
@@ -101,6 +102,7 @@ static bool clie_lcd_update_display(void *opaque)
     const uint8_t *vmem = memory_region_get_ram_ptr(&s->vmem_mr);
     uint32_t gc = clie_lcd_logical(s, CLIE_LCD_REG_GC_CONTROL);
     unsigned int bpp_shift, bpp, width, height, start, stride, x, y;
+    unsigned int xdouble, ydouble;
     uint32_t palette[CLIE_LCD_PALETTE_ENTRIES];
     uint32_t *dest;
 
@@ -129,14 +131,23 @@ static bool clie_lcd_update_display(void *opaque)
     }
     bpp = 1u << bpp_shift;
 
+    /*
+     * Pixel-doubling bits (GC[14]=X, GC[15]=Y): the "T2" chip of the
+     * SZ328 CLIEs scales the window up 2x to the panel -- the NR70V
+     * HAL boots in 160x240 "standard density" with both bits set on
+     * its 320x480 panel.  (Cloudpilot: GetXDoubling/GetYDoubling.)
+     * Never set by the T600C HAL, whose scanout is unchanged.
+     */
+    xdouble = (gc >> 14) & 1;
+    ydouble = (gc >> 15) & 1;
+
     width = ((clie_lcd_logical(s, CLIE_LCD_REG_GC_HWINDOW) >> 16) & 0xfff) + 1;
     height = ((clie_lcd_logical(s, CLIE_LCD_REG_GC_VWINDOW) >> 16) & 0xfff) + 1;
     if (!width || !height || width > 1024 || height > 1024) {
         goto blank;
     }
 
-    start = clie_lcd_logical(s, CLIE_LCD_REG_GC_START_ADDR) &
-            (CLIE_LCD_VMEM_SIZE - 1);
+    start = clie_lcd_logical(s, CLIE_LCD_REG_GC_START_ADDR) % s->vmem_size;
     stride = clie_lcd_logical(s, CLIE_LCD_REG_GC_STRIDE) & 0xffff;
     if (!stride) {
         stride = width * bpp / 8;
@@ -172,21 +183,24 @@ static bool clie_lcd_update_display(void *opaque)
 
     dest = surface_data(surface);
     for (y = 0; y < height; y++) {
+        unsigned int sy = y >> ydouble;
+
         for (x = 0; x < width; x++) {
-            unsigned int byte = (start + y * stride + x * bpp / 8) %
-                                CLIE_LCD_VMEM_SIZE;
+            unsigned int sx = x >> xdouble;
+            unsigned int byte = (start + sy * stride + sx * bpp / 8) %
+                                s->vmem_size;
             uint8_t b = vmem[byte];
             uint32_t pixel;
 
             switch (bpp) {
             case 1:
-                pixel = palette[(b >> (7 - x % 8)) & 1];
+                pixel = palette[(b >> (7 - sx % 8)) & 1];
                 break;
             case 2:
-                pixel = palette[(b >> (6 - x % 4 * 2)) & 3];
+                pixel = palette[(b >> (6 - sx % 4 * 2)) & 3];
                 break;
             case 4:
-                pixel = palette[x % 2 ? b & 0xf : b >> 4];
+                pixel = palette[sx % 2 ? b & 0xf : b >> 4];
                 break;
             case 8:
                 pixel = palette[b];
@@ -200,7 +214,7 @@ static bool clie_lcd_update_display(void *opaque)
                  * runs the Setup UI in 8bpp; correct for the color mode
                  * it switches to afterwards.)
                  */
-                uint16_t v = b | (vmem[(byte + 1) % CLIE_LCD_VMEM_SIZE] << 8);
+                uint16_t v = b | (vmem[(byte + 1) % s->vmem_size] << 8);
 
                 pixel = rgb_to_pixel32((v >> 11) << 3,
                                        ((v >> 5) & 0x3f) << 2,
@@ -312,7 +326,7 @@ static void clie_lcd_realize(DeviceState *dev, Error **errp)
     ClieLcdState *s = CLIE_LCD(dev);
 
     memory_region_init_ram(&s->vmem_mr, OBJECT(dev), TYPE_CLIE_LCD ".vram",
-                           CLIE_LCD_VMEM_SIZE, &error_fatal);
+                           s->vmem_size, &error_fatal);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->vmem_mr);
 
     memory_region_init_io(&s->regs_mr, OBJECT(dev), &clie_lcd_regs_ops, s,
@@ -332,11 +346,17 @@ static const VMStateDescription vmstate_clie_lcd = {
     }
 };
 
+static const Property clie_lcd_properties[] = {
+    DEFINE_PROP_UINT32("vram-size", ClieLcdState, vmem_size,
+                       CLIE_LCD_VMEM_SIZE),
+};
+
 static void clie_lcd_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, clie_lcd_reset);
+    device_class_set_props(dc, clie_lcd_properties);
     dc->realize = clie_lcd_realize;
     dc->vmsd = &vmstate_clie_lcd;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);

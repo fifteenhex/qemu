@@ -75,6 +75,7 @@
 #include "system/block-backend.h"
 #include "hw/misc/sony_mshc_stub.h"
 #include "hw/misc/dragonball_sz.h"
+#include "hw/block/flash.h"
 
 #define PALM_MMIO_SCR        0xfffff000
 #define PALM_MMIO_PLL        0xfffff200
@@ -183,6 +184,44 @@ typedef struct PalmMachineClass {
      */
     hwaddr hwrsleep_patch_addr;
     /*
+     * Additional per-ROM early-RTS patches, same guarded mechanism
+     * (0-terminated).  Used by clie-sj33 to fail the NR70V ROM's
+     * Pa1Lib (Sony audio) installation outright: with the audio DSP
+     * codec chain unmodelled its install half-fails on real init,
+     * leaving a torn-down 'SeAo' registration that the first system
+     * beep then chases into a Fatal Exception; with the lib entirely
+     * absent every consumer takes its clean "no Pa1Lib" fallback.
+     */
+    hwaddr extra_patch_addr[4];
+    /*
+     * ROM address of the auto-off gate in the HAL's system-timer tick
+     * (`beqs` over the vchrAutoOff enqueue when the auto-off timeout
+     * pref is 0), patched to a `bras` so auto-off never fires; 0 =
+     * don't patch.  With HwrSleep neutralised (above) the OS cannot
+     * actually sleep, so an expired auto-off timer becomes a
+     * tick-rate vchrAutoOff event storm: SysHandleEvent's sleep
+     * attempt returns immediately, the timer base is never reset, and
+     * the repeated sleep attempts flush/desync the pen-stroke queue
+     * (strokeInProgress stuck set) -- after which taps deliver
+     * penDown-less penMove floods and no button ever commits again.
+     * Traced live on clie-sj33: 2 idle minutes on any Setup screen
+     * killed all subsequent input, which is exactly the "Setup 4
+     * Done never commits" symptom of earlier sessions.
+     */
+    hwaddr autooff_patch_addr;
+    /*
+     * ROM address of a function entry (`linkw`) to replace with
+     * `moveq #0,%d0; rts` -- "run to completion, successfully,
+     * doing nothing".  Used for the NR70V's first-boot experience
+     * app (Setup wizard + Sony feature demo, one PRC): its post-Setup
+     * demo drives the unmodelled camera/remote-commander/PCM-audio
+     * hardware, errors into an (invisible) alert-relaunch loop and
+     * finally jumps through an uninstalled sound-driver pointer.
+     * With its entry returning success immediately the UIAppShell
+     * proceeds straight to the Applications launcher.
+     */
+    hwaddr retzero_patch_addr;
+    /*
      * MC68SZ328 "Super VZ" SoC (Sony CLIE PEG-SJ33/NR70V): entirely
      * different register window (0xFFFE0000, not 0xfffffxxx) and an
      * enhanced on-chip color LCDC, so this machine takes a separate
@@ -256,20 +295,48 @@ static void palm_init(MachineState *machine)
      * ROM.  The window reads as erased flash (0xff) where the image
      * does not cover it — PalmOS looks for saved parameters in the
      * small-ROM area and must find "erased", not zeroes.
+     *
+     * The SZ328 machine models the flash as a real AMD-command-set
+     * chip (pflash_cfi02): the NR70V HAL *writes* its saved-parameters
+     * sector mid-boot from a RAM-resident routine (AA/55 unlocks, 0x80
+     * 0x30 sector erase at 0x1000A000, then DQ7 data-polling) and
+     * wedges forever if the array ignores the commands.  The other
+     * machines' ROMs never see a write cycle and stay plain ROM.
      */
-    memory_region_init_rom(&pms->rom, NULL, "palm.rom", pmc->rom_size,
-                           &error_fatal);
-    memset(memory_region_get_ram_ptr(&pms->rom), 0xff, pmc->rom_size);
-    memory_region_add_subregion(sysmem, pmc->rom_base, &pms->rom);
+    uint8_t *romptr;
+
+    if (pmc->is_sz328) {
+        DeviceState *fl_dev = qdev_new(TYPE_PFLASH_CFI02);
+
+        qdev_prop_set_uint32(fl_dev, "num-blocks", pmc->rom_size / 0x2000);
+        qdev_prop_set_uint32(fl_dev, "sector-length", 0x2000);
+        qdev_prop_set_uint8(fl_dev, "width", 2);
+        qdev_prop_set_uint8(fl_dev, "mappings", 1);
+        qdev_prop_set_uint8(fl_dev, "big-endian", 1);
+        qdev_prop_set_uint16(fl_dev, "id0", 0x0001);
+        qdev_prop_set_uint16(fl_dev, "id1", 0x22d7);
+        qdev_prop_set_uint16(fl_dev, "unlock-addr0", 0x0555);
+        qdev_prop_set_uint16(fl_dev, "unlock-addr1", 0x02aa);
+        qdev_prop_set_string(fl_dev, "name", "palm.flash");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fl_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fl_dev), 0, pmc->rom_base);
+
+        romptr = memory_region_get_ram_ptr(
+            pflash_cfi02_get_memory(PFLASH_CFI02(fl_dev)));
+    } else {
+        memory_region_init_rom(&pms->rom, NULL, "palm.rom", pmc->rom_size,
+                               &error_fatal);
+        memory_region_add_subregion(sysmem, pmc->rom_base, &pms->rom);
+        romptr = memory_region_get_ram_ptr(&pms->rom);
+    }
+    memset(romptr, 0xff, pmc->rom_size);
 
     /*
      * Load straight into the region instead of going through the ROM
      * loader: the loader copies the image in from a reset hook, which
      * would race with palm_cpu_reset() reading the vectors.
      */
-    size = load_image_size(machine->firmware,
-                           (uint8_t *)memory_region_get_ram_ptr(&pms->rom) +
-                           pmc->rom_load_offset,
+    size = load_image_size(machine->firmware, romptr + pmc->rom_load_offset,
                            pmc->rom_size - pmc->rom_load_offset);
     if (size < 0) {
         error_report("palm: could not load ROM '%s'", machine->firmware);
@@ -299,14 +366,46 @@ static void palm_init(MachineState *machine)
      * pmc->hwrsleep_patch_addr is 0 for the Palm V/Vx/m500/m515 machines,
      * which never take this path and stay bit-exact.
      */
-    if (pmc->hwrsleep_patch_addr) {
-        uint8_t *rom = memory_region_get_ram_ptr(&pms->rom);
-        uint32_t off = pmc->hwrsleep_patch_addr - pmc->rom_base;
+    for (i = -1; i < (int)ARRAY_SIZE(pmc->extra_patch_addr); i++) {
+        hwaddr patch = i < 0 ? pmc->hwrsleep_patch_addr
+                             : pmc->extra_patch_addr[i];
+        uint32_t off = patch - pmc->rom_base;
 
+        if (!patch) {
+            continue;
+        }
         if (off + 1 < pmc->rom_size &&
-            rom[off] == 0x4e && rom[off + 1] == 0x56) {   /* linkw */
-            rom[off] = 0x4e;
-            rom[off + 1] = 0x75;                          /* rts */
+            romptr[off] == 0x4e && romptr[off + 1] == 0x56) {   /* linkw */
+            romptr[off] = 0x4e;
+            romptr[off + 1] = 0x75;                             /* rts */
+        }
+    }
+
+    /*
+     * Auto-off neutralisation (see autooff_patch_addr's comment): the
+     * tick handler's `tstw autoOffSeconds; beqs skip` becomes an
+     * unconditional `bras skip`, so the vchrAutoOff enqueue is never
+     * reached.  Guarded on the exact `beqs` opcode so a mismatched
+     * ROM revision is left untouched.
+     */
+    if (pmc->autooff_patch_addr) {
+        uint32_t off = pmc->autooff_patch_addr - pmc->rom_base;
+
+        if (off < pmc->rom_size && romptr[off] == 0x67) {       /* beqs */
+            romptr[off] = 0x60;                                 /* bras */
+        }
+    }
+
+    /* "return 0 immediately" patch (see retzero_patch_addr's comment) */
+    if (pmc->retzero_patch_addr) {
+        uint32_t off = pmc->retzero_patch_addr - pmc->rom_base;
+
+        if (off + 3 < pmc->rom_size &&
+            romptr[off] == 0x4e && romptr[off + 1] == 0x56) {   /* linkw */
+            romptr[off] = 0x70;
+            romptr[off + 1] = 0x00;                             /* moveq #0 */
+            romptr[off + 2] = 0x4e;
+            romptr[off + 3] = 0x75;                             /* rts */
         }
     }
 
@@ -320,10 +419,39 @@ static void palm_init(MachineState *machine)
          * future work (see CLIE-POC-NOTES.md).  ROM/RAM/CPU/reset above
          * are SoC-agnostic and shared.
          */
-        DeviceState *sz_dev = qdev_new(TYPE_DRAGONBALL_SZ);
+        DeviceState *sz_dev, *t2_dev;
 
+        /*
+         * "T2"-variant MediaQ-class companion LCD controller: the
+         * NR70/SJ33's display is NOT the SZ's on-chip LCDC (which the
+         * HAL leaves unprogrammed) but this external chip, per
+         * Cloudpilot's kDeviceYSX1100 -> EmRegsMQLCDControlT2: 320KB
+         * VRAM aperture at 0x1F000000, the familiar MediaQ GC register
+         * set at +0x50000.  Created first so its console is the
+         * default display.
+         */
+        t2_dev = qdev_new(TYPE_CLIE_LCD);
+        qdev_prop_set_uint32(t2_dev, "vram-size", CLIE_LCD_T2_VMEM_SIZE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(t2_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(t2_dev), 0, 0x1F000000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(t2_dev), 1,
+                        0x1F000000 + CLIE_LCD_T2_REGS_OFFSET);
+
+        sz_dev = qdev_new(TYPE_DRAGONBALL_SZ);
+
+        object_property_set_link(OBJECT(sz_dev), "m68k-cpu",
+                                 OBJECT(cpu), &error_abort);
+        qdev_prop_set_chr(sz_dev, "chardev", serial_hd(0));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sz_dev), &error_fatal);
+        /*
+         * One 128KB window: new-style peripherals + enhanced LCDC at
+         * 0xFFFE0000, the classic DragonBall peripheral cluster still
+         * at its traditional 0xFFFFF000 page (see dragonball_sz.h).
+         */
         sysbus_mmio_map(SYS_BUS_DEVICE(sz_dev), 0, DRAGONBALL_SZ_BASE);
+        /* Sony Memory Stick DSP coprocessor chip select */
+        sysbus_mmio_map(SYS_BUS_DEVICE(sz_dev), 1, 0x11000000);
+
         return;
     }
 
@@ -899,6 +1027,44 @@ static void cliesj33_machine_class_init(ObjectClass *oc, const void *data)
     pmc->mask_id = 0x01;
     pmc->gpio_ports = 10;
     pmc->is_sz328 = true;
+    /*
+     * HwrSleep entry (`linkw %fp,#...` at 0x10090a0a) in the NR70V
+     * ROM's HAL, reached through the RAM trap table (no direct ROM
+     * callers).  Mid-boot the HAL calls it to doze: it hooks the
+     * level 5/6/7 wake vectors, slows the PLL sysclk divider and
+     * `stop`s waiting for a rising edge on port P bit 3 that no
+     * modelled hardware generates -- the same boot-time auto-sleep
+     * wedge the S300 had.  Neutralised to an early RTS.
+     */
+    pmc->hwrsleep_patch_addr = 0x10090a0a;
+    /* Pa1Lib install entry -- see extra_patch_addr's comment. */
+    pmc->extra_patch_addr[0] = 0x102f29d6;
+    /*
+     * The post-Setup Sony demo app's "Remote Commander showcase"
+     * helper (0x1063cf48): it loads a 'pcmR' PCM resource and hands
+     * it to the Sony Rmc library, which pops an (invisible) error
+     * dialog on the unmodelled remote-commander hardware and then
+     * jumps through an uninstalled sound-driver pointer into empty
+     * address space (traced: PC ends up free-running at 0x5xxxxxxx).
+     * The caller ignores the helper's result, so an early RTS skips
+     * the demo step cleanly and lets the post-Setup flow continue.
+     */
+    pmc->extra_patch_addr[1] = 0x1063cf48;
+    /*
+     * The first-boot experience app's PilotMain (see
+     * retzero_patch_addr's comment).  Its __Startup__ wrapper is left
+     * intact so the SysAppStartup/SysAppExit pairing (and the launch
+     * machinery's owner-ID accounting) stays balanced -- patching the
+     * wrapper itself leaked one memory owner ID per launch and hit
+     * the OS's "No More Owner IDs" fatal after 15 launches.
+     */
+    pmc->retzero_patch_addr = 0x1063a56a;
+    /*
+     * The auto-off gate in PrvSystemTimerProc (0x10091c80: `tstw
+     * autoOffSeconds(0x156); beqs skip; ...; EvtEnqueueKey(
+     * vchrAutoOff)`) -- see autooff_patch_addr's comment.
+     */
+    pmc->autooff_patch_addr = 0x10091c84;
 }
 
 static const TypeInfo palm_machine_types[] = {

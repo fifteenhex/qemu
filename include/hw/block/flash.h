@@ -30,6 +30,7 @@ void pflash_cfi01_legacy_drive(PFlashCFI01 *dev, DriveInfo *dinfo);
 #define TYPE_PFLASH_CFI02 "cfi.pflash02"
 OBJECT_DECLARE_SIMPLE_TYPE(PFlashCFI02, PFLASH_CFI02)
 
+MemoryRegion *pflash_cfi02_get_memory(PFlashCFI02 *fl);
 
 PFlashCFI02 *pflash_cfi02_register(hwaddr base,
                                    const char *name,

@@ -243,6 +243,7 @@ config PALM
     select SD
     select SONY_MSHC_STUB
     select DRAGONBALL_SZ
+    select PFLASH_CFI02
 
 config SUN3
     bool
