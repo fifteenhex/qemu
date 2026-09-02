@@ -837,3 +837,117 @@ what format/machtype byte it requires; likely needs the real-PROM handoff to
 export a kernel-visible IDPROM (or the machtype byte adjusted) so the kernel
 identifies the Sun-3/80 instead of defaulting.  This is a vmunix-level RE task,
 materially separate from the (now-complete) si/ncr5380 bring-up.
+
+## M4 RESOLVED — kernel IDPROM: bus-error the sun3-probe -> Sun-3/80 recognized
+
+After root mount, the SunOS 4.1.1 `vmunix` kernel rejected its own IDPROM:
+
+    INVALID FORMAT TYPE IN ID PROM
+    DEFAULTING MACHINE TYPE TO SUN3X_470
+    ... mem = 16384K / avail mem = 15777792 ...
+    INVALID FORMAT CODE IN ID PROM   -> double-fault to PROM 0xfefe0502 (QEMU SIGABRT)
+
+Fully REd from a live kernel dump (gdb hbreak-free: attach once the kernel is
+running — on "SunOS Release" — and `dump binary memory 0xf8004000 0xf80c0000`;
+note the PROM clock/countdown is disrupted if gdb attaches during the PROM
+phase, and QEMU cpu_aborts a few ms after the second IDPROM message, so dump
+during the window between kernel start and the abort).  vmunix a.out is OMAGIC,
+text 0xf8004000 (no symtab); map file_off -> vaddr = 0xf8004000 + off.
+
+* The machine-type checker (0xf805e5ba) and the format checker (0xf805e550)
+  both call the IDPROM reader **0xf8061842**, which *probes* the sun3 discrete
+  IDPROM at virtual **0xfedf8c00** with a bus-error-guarded peek (0xf8059d92):
+  peek OK -> mode 1 (read 32 bytes from 0xfedf8c00); peek faults -> mode 2
+  (read from virtual **0xfedfa7d8**).
+* gva2gpa (via `monitor gva2gpa` over the gdbstub): 0xfedf8c00 -> physical
+  **0x61000c00**; 0xfedfa7d8 -> physical **0x640007d8** (our valid MK48T02).
+  Reading them live: 0xfedf8c00 = all zeros (our enareg absorb ACKs it), so the
+  kernel took mode 1, read format byte 0 -> rejected.  0xfedfa7d8 = our IDPROM
+  `01 42 08 00 20 11 22 33 ... 6b` (format=1, machtype 0x42 = Sun-3/80).
+* The machine-type checker accepts machtype **0x41 (Sun-3/470)** or **0x42
+  (Sun-3/80)** *if* format==1; our 0x42 would pass — the whole failure was that
+  the reader returned the wrong (sun3) IDPROM.
+
+FIX (sun3x.c, SunOS mode): add a second `sun3x_busfault_ops` bus-error hole
+`idprobe_hole2` at physical **0x61000c00** (0x400, the free gap between DIAGREG
++0x800 and MEMREG +0x1000), mirroring the ufsboot `idprobe_hole` at 0x61001800.
+The kernel's sun3 probe now faults like a real 3/80 -> mode 2 -> valid sun3x
+IDPROM.  Result: the two INVALID messages and the DEFAULTING/double-fault are
+gone; the kernel prints the ethernet address and enters device autoconfig:
+
+    Ethernet address = 8:0:20:11:22:33
+    sm0 at obio 0x66000000 pri 2
+    st0..st3 at sm0 slave 32/40/24/16 ; sr0 at sm0 slave 48
+
+Root still mounts (`root on sd6a fstype 4.2`).  Committed.
+
+## M5 (now exposed) — kernel "sm" SCSI driver hangs during bus probe
+
+After the SCSI target declarations, the kernel hangs (deterministic).  Live PC
+samples land across the si driver (0xf80735c4, 0xf8074dc4, 0xf807390e ...) — it
+is *looping* in the kernel's polled probe state machine, NOT waiting on an
+interrupt.  Key structural finding: the kernel probe state machine (0xf8073586)
+is **byte-for-byte the same** polled si state machine as the PROM/ufsboot one
+(si_csr `&3` gate, an `a4@0/@1/@2` state/err/retry struct — here the pointer at
+0xf80a6f92 -> struct 0xf80b8910, err codes err18/err19/err9/err12, the phase
+dbcc-search dispatch at 0xf8074b16).  So the reg2/reg3/reg0 trailing-completion
+model already in ncr5380.c should drive it too — **once the registers are
+mapped where the kernel looks.**
+
+ROOT CAUSE (pinned, not yet fixed): the kernel reads si_csr and gets **0x0**,
+which fails the `(si_csr & 3) != 0` gate (0xf80735c2) -> err19 -> the caller
+retries forever.  Our si_csr never reads 0 (it returns `ID|1|...`).  The kernel
+reads si_csr through a pointer (0xf80b8920) = virtual **0xff003000**, and
+`monitor gva2gpa`:
+
+    virt 0xff002000 (si 5380 base) -> phys 0x66000100   (NOT 0x66000000)
+    virt 0xff002008 (5380 reg0)    -> phys 0x66000108
+    virt 0xff003000 (si_csr)       -> phys 0x66001100   (NOT 0x66001000)
+
+i.e. the kernel maps the OBIO "si" device base to physical **0x66000100**, a
+consistent **+0x100** vs the PROM's (and our model's) 0x66000000/0x66001000.
+Our `sun3x_sireg_read` serves si_csr only at offset 0x1000, so offset 0x1100
+hits `default -> 0`.  The IDPROM mapping (0xfedfa7d8 -> 0x640007d8) was exact,
+so this +0x100 is specific to the si mapping, not a global PMMU offset — either
+the sun3/80 onboard "sm" register block genuinely sits 0x100 into the OBIO
+window (and the PROM "si" driver used 0x66000000 as a decode alias), or a
+residual 68030 page-descriptor low-bits quirk for this particular OBIO PTE.
+
+NEXT (M5, the effort the earlier notes predicted): RE the sun3/80 **"sm"**
+onboard-SCSI register map (NetBSD/OpenBSD `sys/arch/sun3/dev/` sm/si + the 3/80
+obio) to learn why the kernel's device base is +0x100 and the exact register
+layout the "sm" driver expects, then either serve the si registers at the
+kernel's offsets (alias/extend `sun3x_sireg_ops` + the NCR5380 mapping to
+0x66000100/0x66001100) or fix the PTE translation.  Because the kernel probe
+state machine is identical to ufsboot's, that alone may let the existing
+ncr5380 sun-mode model complete the probe; the driver may then switch to its
+interrupt-driven/Am9516-UDC path for normal I/O (INTR_EN/SBC_IP/DMA_IP
+reflection + the UDC still unmodelled).  Hang PC 0xf80735c4; state machine
+0xf8073586; si_csr ptr 0xf80b8920 = virt 0xff003000 = phys 0x66001100.
+
+### M5 progress — the +0x100 si register mapping is fixed (err19 -> err2)
+
+Implemented the +0x100 mapping (sun3x.c, SunOS mode): alias the NCR5380 at
+0x66000108 (`scsi_a`, distinct from the PROM's 0x66000008 so no conflict) and
+fold the kernel's DMA/CSR offsets (0x100/0x104 and 0x1100/0x1104/0x1108) onto
+the base-0 handlers via `sun3x_si_fold()`.  A broad 0x2000 alias was tried
+first and REGRESSED the PROM boot (it overlaps the PROM's si_csr at 0x66001000
+-> "le: cannot initialize / No bootable devices found") — only the specific
+kernel offsets may be served.  Verified: the kernel now reads si_csr = **0x1001**
+(virtual 0xff003000; was 0x0), and its probe state-machine error advances from
+**err19** (`si_csr & 3 == 0`) to **err2**.  No regression: PROM boot + root
+mount + device autoconfig (sm0, st0-3, sr0) all unchanged.
+
+The remaining M5 wall is now the kernel probe's **selection** step: state=0,
+err=2, set at 0xf8074bfe (the selection handler, reached from the beqs at
+0xf8074bac; err2 then calls 0xf8072c46).  The kernel autoconfig probes SCSI
+targets 4/5/3/2/6 (st0-3 slaves 32/40/24/16, sr0 slave 48); target 3 is our
+disk.  err2 is most likely "selection timeout / target not present" for the
+empty targets — the kernel's selection/timeout handshake (how it expects
+si_csr/CSB to behave on a selection that does/doesn't win BSY) differs from what
+the sun-mode ncr5380 model presents to the polled ufsboot path, so the probe
+loop wedges.  NEXT: RE the kernel "sm" selection handler (0xf80749xx..0xf8074cxx)
+and the ncr5380 selection/timeout presentation for both present (target 3) and
+absent targets; then the kernel may switch to its interrupt-driven/Am9516-UDC
+path (INTR_EN/SBC_IP/DMA_IP still unmodelled).  Hang loop 0xf8074b16 (the phase
+dbcc-search); err2 site 0xf8074bfe.

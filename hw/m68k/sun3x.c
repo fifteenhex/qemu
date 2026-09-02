@@ -176,6 +176,7 @@ typedef struct Sun3xState {
 
     NCR5380State scsi;          /* SunOS: "si" NCR5380 @ 0x66000000 */
     MemoryRegion sireg;         /* SunOS: si DMA/CSR block @ 0x66001000 */
+    MemoryRegion scsi_a;        /* SunOS: kernel "sm" 5380 alias @ 0x66000108 */
     uint32_t si_dma_addr;       /* si DMA address (into DVMA space) */
     uint32_t si_dma_count;      /* si DMA byte count */
     uint16_t si_csr;            /* si control/status register */
@@ -424,11 +425,31 @@ static void sun3x_si_dma_run(Sun3xState *s)
 }
 
 /* addr is relative to 0x66000000; the DMA/CSR block starts at +0x1000 */
+/*
+ * The SunOS kernel "sm" driver maps the si device base to physical 0x66000100
+ * (+0x100 vs the PROM), so it hits the DMA/CSR registers at 0x100/0x104 (count)
+ * and 0x1100/0x1104/0x1108 (si_csr/dma_addr/count).  Fold those kernel windows
+ * onto the base-0 offsets the handlers below already implement.  (The NCR5380
+ * itself is aliased separately at 0x66000108.)  The PROM's base-0 offsets are
+ * left untouched.
+ */
+static inline hwaddr sun3x_si_fold(hwaddr addr)
+{
+    if (addr >= 0x1100 && addr < 0x1110) {
+        return addr - 0x100;
+    }
+    if (addr >= 0x100 && addr < 0x130) {
+        return addr - 0x100;
+    }
+    return addr;
+}
+
 static uint64_t sun3x_sireg_read(void *opaque, hwaddr addr, unsigned size)
 {
     Sun3xState *s = opaque;
     uint64_t v = 0;
 
+    addr = sun3x_si_fold(addr);
     switch (addr) {
     case 0x00:              /* DMA transfer count, low byte */
         v = s->si_dma_count & 0xff;
@@ -476,6 +497,7 @@ static void sun3x_sireg_write(void *opaque, hwaddr addr, uint64_t val,
 {
     Sun3xState *s = opaque;
 
+    addr = sun3x_si_fold(addr);
     switch (addr) {
     case 0x00:              /* DMA transfer count, low byte */
         s->si_dma_count = (s->si_dma_count & 0xff00) | (val & 0xff);
@@ -1181,6 +1203,27 @@ static void sun3x_init(MachineState *machine)
                                             &s->siscratch, 3);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->scsi), 0,
                            qdev_get_gpio_in(s->irqc, 2 - 1));
+
+        /*
+         * Kernel "sm" driver aliases at +0x100.  The SunOS vmunix "sm" driver
+         * maps the OBIO si device base to physical 0x66000100 (verified by
+         * gva2gpa: its si_csr virtual 0xff003000 -> phys 0x66001100, 5380 base
+         * -> 0x66000100), a consistent +0x100 vs the PROM's/our 0x66000000.
+         * Its probe state machine is byte-identical to the ufsboot one, so the
+         * same sun-mode ncr5380 model can drive the kernel probe once the
+         * registers appear at the kernel's offsets.  Mirror the NCR5380 at
+         * 0x66000108 (distinct address, no conflict with the PROM's 0x66000008)
+         * and handle the kernel's +0x100 DMA/CSR offsets in sun3x_sireg_*.  A
+         * broad 0x2000 alias would overlap the PROM's si_csr at 0x66001000 and
+         * corrupt it (regresses the PROM boot), so only the specific kernel
+         * offsets are served.
+         */
+        memory_region_init_alias(&s->scsi_a, NULL, "sun3x.si.5380.alias",
+                                 sysbus_mmio_get_region(
+                                     SYS_BUS_DEVICE(&s->scsi), 0), 0, 0x20);
+        memory_region_add_subregion_overlap(sysmem, 0x66000108,
+                                            &s->scsi_a, 2);
+
         /* attach -drive if=scsi disks to the si bus */
         scsi_bus_legacy_handle_cmdline(&s->scsi.bus);
 
