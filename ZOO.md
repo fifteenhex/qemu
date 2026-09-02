@@ -56,11 +56,12 @@ Akiko), booted from a 512K Kickstart 3.1 ROM via `-bios`.
 | Machine (`-M`) | CPU | Milestone | Notes |
 |---|---|---|---|
 | `sun3-60` ("Ferrari") | 68020 (Sun-3 MMU) | ✅ NetBSD/sun3 RAMDISK + Linux `sun3` shell | `SUN3-NOTES.md`, `hw/m68k/sun3-linux-NOTES.md` |
-| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1 kernel off a UFS miniroot**, walled at `bdevvp: bad open` (root open) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
+| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1; root mounts off the UFS miniroot (`root on sd6a`) and the kernel runs to memory init** — walled at the kernel's own IDPROM reader (`INVALID FORMAT CODE IN ID PROM`, wall M4) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
 
-The SunOS bring-up is a QEMU first: five reverse-engineered `si` NCR5380 /
-Am9516 DVMA / IDPROM / reg5 unlocks let the real PROM load a ~698 KB SunOS
-4.1.1 kernel via 79 READ(6) transfers. All SunOS behavior is `-bios`-gated;
+The SunOS bring-up is a QEMU first: reverse-engineered `si` NCR5380 / Am9516
+DVMA / IDPROM / reg5 / SCSI-state-walk unlocks let the real PROM load the SunOS
+4.1.1 kernel via 79 READ(6) transfers, **mount root off the UFS miniroot, and
+run the genuine kernel to memory init**. All SunOS behavior is `-bios`-gated;
 stock Linux `sun3x` is byte-for-byte unchanged.
 
 ## Apollo (Domain workstation)
