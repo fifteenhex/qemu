@@ -661,21 +661,31 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
             /* arbitration always wins on this single-initiator bus */
             s->icr &= ~ICR_ARB_LOST;
             s->icr |= ICR_ARB_IN_PROG;
+        } else {
+            s->icr &= ~(ICR_ARB_IN_PROG | ICR_ARB_LOST);
+        }
+        /*
+         * Sun 3/80 "si" selection: the driver stages the CDB into reg0, then
+         * writes reg2 (MR) = the *target id* (low 3 bits) followed by ICR to
+         * launch selection.  The "arbitrate" bit (0x01) is NOT a mode flag
+         * here — it is just bit 0 of the target id, so it is set only for ODD
+         * targets.  The PROM/ufsboot boot target 3 (odd), so the old
+         * "trigger on MR_ARBITRATE" heuristic happened to work; but the SunOS
+         * kernel autoconfig probes ALL ids, and its first probe (target 6,
+         * MR=0x06, bit0=0) never fired selection -> dev stayed NULL -> the
+         * probe state machine looped on CSB=0 forever.  Trigger selection
+         * whenever a CDB has been staged (sun_fifo_count > 0) and no device is
+         * yet selected, using target = MR & 7 regardless of bit 0.  (Non-
+         * selection MR writes during a transfer have dev set / the FIFO
+         * drained, so they never re-trigger.)
+         */
+        if (s->sun_mode && !s->dev && s->sun_fifo_count > 0) {
+            s->icr &= ~ICR_ARB_LOST;
+            s->icr |= ICR_ARB_IN_PROG;
             /* new selection: a fresh command, no trailing-completion yet */
             s->sun_cmd_complete = false;
             s->sun_msg_taken = false;
-            /*
-             * Sun 3/80 "si": the driver arms arbitration/selection by
-             * writing the mode register (the target id occupies the low
-             * bits) rather than using the Mac ODR-bitmask + ICR-SEL path.
-             * In sun-mode, complete selection to that target here so the
-             * driver's si_csr/CSB poll sees BSY + COMMAND phase.
-             */
-            if (s->sun_mode && !s->dev) {
-                ncr5380_select_target(s, val & 0x07);
-            }
-        } else {
-            s->icr &= ~(ICR_ARB_IN_PROG | ICR_ARB_LOST);
+            ncr5380_select_target(s, val & 0x07);
         }
         break;
     case R_TCR:
