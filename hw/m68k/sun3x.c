@@ -169,6 +169,7 @@ typedef struct Sun3xState {
     MemoryRegion buserr_mr;     /* SunOS: bus error register @ 0x61000400 */
     MemoryRegion memreg_mr;     /* SunOS: memory error register @ 0x61001000 */
     MemoryRegion idprobe_hole;  /* SunOS: bus-error hole @ 0x61001800 (see below) */
+    MemoryRegion idprobe_hole2; /* SunOS: bus-error hole @ 0x61000c00 (kernel) */
     MemoryRegion busfault;      /* SunOS: background bus-timeout (latches) */
     MemoryRegion clkstat;       /* SunOS: clock int-pending @ 0xfef06010 */
     MemoryRegion clkack;        /* SunOS: clock int-ack     @ 0xfef0b400 */
@@ -1123,6 +1124,28 @@ static void sun3x_init(MachineState *machine)
                               "sun3x.idprobe-hole", 0x800);
         memory_region_add_subregion_overlap(sysmem, 0x61001800,
                                             &s->idprobe_hole, 2);
+
+        /*
+         * Bus-error hole at 0x61000c00 (overlaid on the enareg absorb).  The
+         * SunOS *kernel* (vmunix) has its own IDPROM reader (idprom_fetch,
+         * text 0xf8061842): it probes the *sun3* discrete IDPROM at virtual
+         * 0xfedf8c00 — which the kernel's page tables map to physical
+         * 0x61000c00 — with a bus-error-guarded peek (0xf8059d92).  If that
+         * peek succeeds it uses the sun3 IDPROM (mode 1, reads 0xfedf8c00);
+         * only if it faults does it fall back to the *sun3x* IDPROM (mode 2,
+         * virtual 0xfedfa7d8 = physical 0x640007d8, our valid MK48T02 format=1
+         * machtype=0x42 Sun-3/80 IDPROM).  Our broad enareg absorb ACKed the
+         * probe (read 0), so the kernel took the sun3 IDPROM, saw format byte
+         * 0 -> "INVALID FORMAT TYPE/CODE IN ID PROM", defaulted the machine
+         * type to SUN3X_470, and double-faulted.  Fault it like the real 3/80
+         * (the sun3 IDPROM is absent) so the kernel uses the sun3x IDPROM.
+         * 0x61000c00 sits in the free gap between DIAGREG (+0x800) and MEMREG
+         * (+0x1000); the real control registers are elsewhere in the block.
+         */
+        memory_region_init_io(&s->idprobe_hole2, NULL, &sun3x_busfault_ops, s,
+                              "sun3x.idprobe-hole2", 0x400);
+        memory_region_add_subregion_overlap(sysmem, 0x61000c00,
+                                            &s->idprobe_hole2, 2);
 
         /* level-7 clock interrupt status / ack registers (overlaid on the
          * monitor's relocation RAM) that the monitor's clock handler services */
