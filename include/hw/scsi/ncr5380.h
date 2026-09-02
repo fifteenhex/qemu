@@ -27,6 +27,21 @@ struct NCR5380State {
     SCSIRequest *req;
 
     uint8_t reg_shift;
+    bool sun_mode;      /* Sun si: arm selection on MR ARBITRATE (target=MR&7) */
+    uint8_t sun_fifo[16];       /* Sun si: CDB staged via reg0 writes pre-select */
+    uint8_t sun_fifo_count;
+    /*
+     * Sun si data-in DMA sub-state.  The PROM's driver reads the live SCSI
+     * phase from reg2 (low 3 bits, standard SCSI encoding) and drives a
+     * three-step data-in handshake: it first sees the DATA phase (reg2==1)
+     * and *arms* the si DMA (writes dma_addr + si_csr|=SBC_IP); the si then
+     * moves the bytes and the driver, seeing the transfer done (reg2==3),
+     * finalises it by reading back the auto-incremented dma_addr (the byte
+     * count it validates); finally it reads STATUS (reg2==7).  sun_dma_done
+     * gates the reg2 1->3 transition: false while data is pending in the
+     * data phase, true once the si DMA engine has drained it.
+     */
+    bool sun_dma_done;
 
     /* register file */
     uint8_t odr;        /* output data */
@@ -71,5 +86,7 @@ void ncr5380_ack_release(NCR5380State *s);
 bool ncr5380_pdma_ready(NCR5380State *s, bool out);
 uint8_t ncr5380_pdma_read(NCR5380State *s);
 void ncr5380_pdma_write(NCR5380State *s, uint8_t val);
+/* Sun si: move the bus to STATUS once the driver has finalised a data phase */
+void ncr5380_sun_to_status(NCR5380State *s);
 
 #endif

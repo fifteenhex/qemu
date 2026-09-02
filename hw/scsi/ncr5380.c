@@ -139,6 +139,7 @@ static void ncr5380_reset_bus(NCR5380State *s)
     s->cmd_done = false;
     s->status = 0;
     s->msg_in = 0;
+    s->sun_dma_done = false;
 }
 
 static void ncr5380_grow_dbuf(NCR5380State *s, uint32_t size)
@@ -230,6 +231,7 @@ static void ncr5380_do_command(NCR5380State *s)
     s->dev->unit_attention.key = 0;
     s->bus.unit_attention.key = 0;
     s->cmd_done = false;
+    s->sun_dma_done = false;
     s->buf_len = 0;
     s->buf_pos = 0;
     s->out_pos = 0;
@@ -299,35 +301,112 @@ static void ncr5380_do_command(NCR5380State *s)
      */
 }
 
+/* complete selection of an explicit target id */
+static void ncr5380_select_target(NCR5380State *s, int id)
+{
+    SCSIDevice *d = scsi_device_find(&s->bus, 0, id, 0);
+
+    s->dev = d;
+    if (s->dev) {
+        s->target = id;
+        s->csb |= CSB_BSY;              /* target asserted BSY */
+        ncr5380_set_phase(s, PHASE_CMD);
+        s->csb |= CSB_REQ;
+        s->bsr |= BSR_PHASE_MATCH | BSR_IRQ;
+        s->cmd_len = 0;
+        ncr5380_update_irq(s);
+        trace_ncr5380_select_ok(s->target);
+        /*
+         * Sun si: the CDB was pre-staged into sun_fifo via reg0 writes.  On
+         * a real board the si clocks it out during the command phase; here we
+         * hand the whole CDB to the target now, which moves the bus to the
+         * data (or status) phase the driver then services via DMA.
+         */
+        if (s->sun_mode && s->sun_fifo_count) {
+            int i, n = s->sun_fifo_count;
+
+            for (i = 0; i < n && i < (int)sizeof(s->cmd); i++) {
+                s->cmd[i] = s->sun_fifo[i];
+            }
+            s->cmd_len = n;
+            s->sun_fifo_count = 0;
+            ncr5380_do_command(s);
+        }
+    } else {
+        /* selection timeout: no BSY appears; the bus stays released */
+        s->csb = 0;
+        trace_ncr5380_select_timeout();
+    }
+}
+
 /* select a target: ODR holds the initiator+target ID bitmask */
 static void ncr5380_select(NCR5380State *s)
 {
     int id;
 
     /* target id = the non-initiator (bit 7 = host) bit set in ODR */
-    s->dev = NULL;
     for (id = 0; id < 7; id++) {
         if ((s->odr & 0x7f) & (1 << id)) {
-            SCSIDevice *d = scsi_device_find(&s->bus, 0, id, 0);
-            if (d) {
-                s->dev = d;
-                s->target = id;
+            if (scsi_device_find(&s->bus, 0, id, 0)) {
                 break;
             }
         }
     }
+    ncr5380_select_target(s, id);
+}
 
-    if (s->dev) {
-        s->csb |= CSB_BSY;              /* target asserted BSY */
-        ncr5380_set_phase(s, PHASE_CMD);
-        s->csb |= CSB_REQ;
-        s->bsr |= BSR_PHASE_MATCH;
-        s->cmd_len = 0;
-        trace_ncr5380_select_ok(s->target);
-    } else {
-        /* selection timeout: no BSY appears; the bus stays released */
-        s->csb = 0;
-        trace_ncr5380_select_timeout();
+/*
+ * Sun 3/80 si read-map quirk: the PROM driver derives the live SCSI bus phase
+ * from the low 3 bits of reg2 (0x66000010), and the bus-and-status (with
+ * PHASE_MATCH) from reg3 (0x66000014), rather than from CSB/BSR the way a
+ * stock 5380 driver does.  reg2 uses the *standard* SCSI phase encoding
+ * (bit0 = I/O, bit1 = C/D, bit2 = MSG):
+ *
+ *   1 = DATA IN, 0 = DATA OUT  -> the driver's state machine ARMS the si DMA
+ *                                 (0xfeff0e04: writes dma_addr + si_csr|=SBC_IP)
+ *   3 = STATUS-encoding, reused by the si driver as "data transfer complete"
+ *                              -> it finalises the DMA (0xfeff0e6e), reading the
+ *                                 auto-incremented dma_addr as the byte count
+ *   7 = MESSAGE IN, reused for STATUS -> it reads the status/message bytes
+ *   2 = COMMAND -> dispatcher error (never presented: we run the CDB at select)
+ *
+ * So a data-in transfer must be presented first as DATA (reg2==1) so the arm
+ * fires, then — once the si DMA engine has drained it (sun_dma_done) — as the
+ * "complete" code (reg2==3) so the finalise reads a non-zero byte count.
+ * Returning 3 for the data phase up-front (the old behaviour) made the driver
+ * jump straight to finalise without ever arming DMA, so dma_addr never
+ * advanced and the returned count was 0 — the PROM then skipped the disk READ.
+ */
+static uint8_t sun_phase_bits(NCR5380State *s)
+{
+    if (!s->dev) {
+        return 0;
+    }
+    switch (s->phase) {
+    case PHASE_DI:
+        return s->sun_dma_done ? 3 : 1;
+    case PHASE_DO:
+        return s->sun_dma_done ? 3 : 0;
+    case PHASE_ST:
+    case PHASE_MI:
+        return 7;
+    case PHASE_CMD:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Sun si: the driver, having finalised the data phase (read back the
+ * auto-incremented dma_addr as the byte count), clears the si DMA latches;
+ * the board then advances the bus to STATUS.  Model that here.
+ */
+void ncr5380_sun_to_status(NCR5380State *s)
+{
+    if (s->dev && (s->phase == PHASE_DI || s->phase == PHASE_DO)) {
+        s->sun_dma_done = false;
+        ncr5380_enter_status(s);
     }
 }
 
@@ -358,6 +437,37 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
                 trace_ncr5380_stale_read(s->buf_pos, s->buf_len);
                 val = s->last_data;
             }
+        } else if (s->sun_mode && !(s->icr & ICR_ASSERT_ACK)
+                   && (s->phase == PHASE_ST || s->phase == PHASE_MI)) {
+            /*
+             * Sun si blind STATUS/MESSAGE read.  ufsboot's polled driver reads
+             * reg0 in the status/message phase *without* asserting ACK (unlike
+             * the PROM probe, which does the reg1/ICR ACK handshake), and
+             * spins `while (reg5 != 0) read reg0` waiting for the bus to go
+             * idle (0x213aba).  With reg5-IRQ modelled as the live /REQ, that
+             * spin can only end if reading the byte here also advances the
+             * handshake -- take the byte, drop /REQ, and step the phase:
+             * STATUS -> MESSAGE IN, MESSAGE IN -> bus free.  Gated on ACK being
+             * de-asserted so the PROM's explicit-handshake path is untouched.
+             */
+            val = s->last_data;
+            s->csb &= ~CSB_REQ;
+            if (s->phase == PHASE_ST) {
+                ncr5380_set_phase(s, PHASE_MI);
+                s->last_data = 0x00;            /* COMMAND COMPLETE message */
+                s->csb |= CSB_REQ;
+            } else {
+                /* MESSAGE IN consumed: bus free, end of transaction */
+                s->csb = 0;
+                s->phase = PHASE_DO;
+                s->bsr |= BSR_IRQ;
+                ncr5380_update_irq(s);
+                if (s->req) {
+                    scsi_req_unref(s->req);
+                    s->req = NULL;
+                }
+                s->dev = NULL;
+            }
         } else if (s->phase & CSB_IO) {
             val = s->last_data;
         } else {
@@ -369,10 +479,26 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
         val = s->icr;
         break;
     case R_MR_R:
-        val = s->mr;
+        val = s->sun_mode ? sun_phase_bits(s) : s->mr;
         break;
     case R_TCR_R:
-        val = s->tcr;
+        if (s->sun_mode) {
+            /*
+             * reg3 read drives the driver's dispatcher (values are decoded
+             * against {0x80,0x50,0x40,0x20,0x18,0x10,0x08,...}): 0x20 routes
+             * into the STATE dispatcher (advance/complete, incl. state 32 ->
+             * done) while 0x08 routes into the phase handler that services an
+             * active data/status phase.  Present 0x08 while the target has a
+             * live REQ to service, else 0x20 so the state machine advances.
+             */
+            if (s->dev && (s->csb & CSB_REQ)) {
+                val = 0x08;
+            } else {
+                val = 0x20;
+            }
+        } else {
+            val = s->tcr;
+        }
         break;
     case R_CSB:
         val = s->csb;
@@ -390,6 +516,25 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
             val = s->bsr & ~BSR_PHASE_MATCH;
             if (s->dev && want == s->phase) {
                 val |= BSR_PHASE_MATCH;
+            }
+            /*
+             * Sun si: model reg5 (BSR) bit4 (IRQ) as a *live per-/REQ signal*,
+             * not a latch.  The polled boot driver reads reg5 two opposite
+             * ways with no reg7/RPI clear in between: at the start of a
+             * STATUS/MESSAGE byte it waits for `(reg5 & 0x1f) != 0` = "a bus
+             * event/byte is pending" (PROM 0xfeff12da; masking IRQ there hangs
+             * the probe), and after servicing it waits for `reg5 == 0` = "bus
+             * idle" before completing (ufsboot 0x213aba).  Both are satisfied
+             * if IRQ tracks the live target /REQ: asserted while a phase byte
+             * is waiting to be transferred, de-asserted once the initiator has
+             * taken it (CSB_REQ drops).  So drive bit4 from CSB_REQ rather than
+             * the stored latch.
+             */
+            if (s->sun_mode) {
+                val &= ~BSR_IRQ;
+                if (s->csb & CSB_REQ) {
+                    val |= BSR_IRQ;
+                }
             }
         }
         break;
@@ -419,6 +564,15 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
     switch (reg) {
     case R_ODR:
         s->odr = val;
+        /*
+         * Sun si: the driver stages the CDB by writing all its bytes to the
+         * data register (reg0) before it arms selection.  Buffer them; they
+         * are delivered to the target as the command once selection lands.
+         */
+        if (s->sun_mode && !s->dev
+            && s->sun_fifo_count < sizeof(s->sun_fifo)) {
+            s->sun_fifo[s->sun_fifo_count++] = val;
+        }
         /* command / message / data-out byte handed over on ACK */
         break;
     case R_ICR:
@@ -427,7 +581,11 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
 
             /* keep read-only status bits 5 (LA) and 6 (AIP) */
             s->icr = (val & 0x9f) | (s->icr & 0x60);
-            if (val & ICR_ASSERT_RST) {
+            /*
+             * In sun-mode ICR bit7 is a DMA-arming strobe (the driver writes
+             * 0x80/0x90 while setting up a transfer), not a SCSI bus reset.
+             */
+            if ((val & ICR_ASSERT_RST) && !s->sun_mode) {
                 ncr5380_reset_bus(s);
                 s->icr = 0;
                 break;
@@ -462,6 +620,16 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
             /* arbitration always wins on this single-initiator bus */
             s->icr &= ~ICR_ARB_LOST;
             s->icr |= ICR_ARB_IN_PROG;
+            /*
+             * Sun 3/80 "si": the driver arms arbitration/selection by
+             * writing the mode register (the target id occupies the low
+             * bits) rather than using the Mac ODR-bitmask + ICR-SEL path.
+             * In sun-mode, complete selection to that target here so the
+             * driver's si_csr/CSB poll sees BSY + COMMAND phase.
+             */
+            if (s->sun_mode && !s->dev) {
+                ncr5380_select_target(s, val & 0x07);
+            }
         } else {
             s->icr &= ~(ICR_ARB_IN_PROG | ICR_ARB_LOST);
         }
@@ -614,8 +782,17 @@ uint8_t ncr5380_pdma_read(NCR5380State *s)
              * flip to STATUS right now: the blind loop's byte counter
              * runs out on this access and the ROM's trailing phase
              * poll must already see the change.
+             *
+             * Sun si: do NOT advance to STATUS here.  The si driver first
+             * finalises the data phase (reads back the auto-incremented
+             * dma_addr as the byte count) while the bus still reads DATA
+             * (reg2==3, sun_dma_done); the board only moves to STATUS once
+             * the driver clears the si DMA latches — ncr5380_sun_to_status,
+             * driven from sun3x.c, does that.
              */
-            ncr5380_enter_status(s);
+            if (!s->sun_mode) {
+                ncr5380_enter_status(s);
+            }
         } else {
             /*
              * Model the per-byte SCSI /REQ handshake: the target
@@ -780,6 +957,7 @@ static void ncr5380_realize(DeviceState *dev, Error **errp)
 
 static const Property ncr5380_properties[] = {
     DEFINE_PROP_UINT8("reg-shift", NCR5380State, reg_shift, 4),
+    DEFINE_PROP_BOOL("sun-mode", NCR5380State, sun_mode, false),
 };
 
 static void ncr5380_class_init(ObjectClass *klass, const void *data)
