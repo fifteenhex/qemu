@@ -26,7 +26,7 @@ BPC   = NTRKS * NSECT               # blocks per cylinder
 TOTAL = NCYL * BPC                  # total 512-byte blocks
 SIZE  = TOTAL * 512
 
-def build_label():
+def build_label(root_blocks):
     b = bytearray(512)
     label = b"QEMU sun3x SunOS 4.1.1 miniroot\x00"
     b[0:len(label)] = label
@@ -38,10 +38,22 @@ def build_label():
     struct.pack_into(">H", b, 434, 0)        # nacyl
     struct.pack_into(">H", b, 436, NTRKS)    # ntrks
     struct.pack_into(">H", b, 438, NSECT)    # nsect
-    # partitions: a,b,c,d all start at cyl 0 covering the whole disk so
-    # 'b sd(0,30,N)' finds the boot block at disk block 1 for any N.
+    # Partition map (8 entries, be32 start_cyl + be32 num_sectors @444).
+    #
+    # CRITICAL: the SunOS standalone/kernel sd driver computes a partition's
+    # byte size as (num_sectors & 0xffff) << 9 — it reads num_sectors as a
+    # *16-bit* field.  A whole-disk 256 MiB partition (524288 sectors =
+    # 0x80000) therefore truncates to 0 and the open fails ("bdevvp: bad
+    # open" / partition size 0).  Size partition 'a' (index 0, the root the
+    # miniroot boots from) to the miniroot, rounded up to a cylinder boundary
+    # and clamped to 16 bits, so (num_sectors & 0xffff) is non-zero and the
+    # root filesystem opens.  ('c', the conventional whole-disk partition,
+    # would also truncate, but it is not opened on the miniroot boot path.)
+    a_cyls = (root_blocks + BPC - 1) // BPC
+    a_blocks = min(a_cyls * BPC, 0xffff)
     for i in range(8):
         struct.pack_into(">II", b, 444 + i * 8, 0, TOTAL)
+    struct.pack_into(">II", b, 444 + 0 * 8, 0, a_blocks)   # 'a' = root
     struct.pack_into(">H", b, 508, 0xDABE)   # magic
     # checksum: xor of all 256 be16 words (incl. magic) must be 0, so the
     # csum word at 510 = xor of words at offsets 0..508.
@@ -59,7 +71,7 @@ def main():
         f.seek(0)
         f.write(mr)               # miniroot at LBA 0 (bootblk -> blk 1..15)
         f.seek(0)
-        f.write(build_label())    # stamp disklabel over block 0
+        f.write(build_label((len(mr) + 511) // 512))  # disklabel over blk 0
     print("wrote %s  (%d MiB, %dc/%dh/%ds, miniroot %d blocks)"
           % (OUT, SIZE >> 20, NCYL, NTRKS, NSECT, len(mr) // 512))
 

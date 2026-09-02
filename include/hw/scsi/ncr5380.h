@@ -42,6 +42,29 @@ struct NCR5380State {
      * data phase, true once the si DMA engine has drained it.
      */
     bool sun_dma_done;
+    /*
+     * Sun si: set once a *blind* (ufsboot / sd-open) command has been torn
+     * down to bus-free by the blind reg0 STATUS/MESSAGE read path.  While set
+     * (and dev==NULL) sun_phase_bits() presents reg2==7 (MESSAGE IN) so the
+     * driver's state machine, called a fixed number of trailing times after
+     * completion, re-takes its benign success branch (phase 7) instead of the
+     * phase-0 retry-exhausted path (err5) that made the sd-open TUR return -1
+     * -> "bdevvp: bad open".  Cleared on the next selection (MR ARBITRATE).
+     * Only the blind path sets it; the PROM probe's ACK-handshake teardown
+     * leaves it clear, so the PROM path's trailing calls stay benign (phase 0).
+     */
+    bool sun_cmd_complete;
+    /*
+     * Sun si trailing-completion sub-state.  After sun_cmd_complete, the
+     * driver's state machine needs two more calls to reach its terminal
+     * "done" state (a4@0 == 0): the first (state 27) must route through the
+     * *phase* dispatcher (reg3 == 0x08) to read the final MESSAGE byte and
+     * advance to state 32; the second (state 32) must route through the
+     * *BSR* dispatcher (reg3 == 0x20) to complete to state 0.  reg3 therefore
+     * reads 0x08 until the trailing MESSAGE byte (reg0) has been taken, then
+     * 0x20.  sun_msg_taken records that transition.  Cleared on selection.
+     */
+    bool sun_msg_taken;
 
     /* register file */
     uint8_t odr;        /* output data */

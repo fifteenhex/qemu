@@ -733,3 +733,107 @@ root mounts.  Still the polled ufsboot si driver (no Am9516 yet).
 
 **Root did NOT mount this round.**  The reg5 live-/REQ task is complete and
 committed (both paths validated); bdevvp is the next, precisely-pinned wall.
+
+## M3 blocker #3 RESOLVED — bdevvp opens, ROOT MOUNTS, SunOS 4.1.1 kernel runs
+
+The `bdevvp: bad open` wall is **cleared**.  Two coupled fixes were needed; with
+both, auto-boot mounts the UFS miniroot as root and executes the genuine SunOS
+4.1.1 sun3x kernel (`vmunix`) to memory init.  Console now reaches:
+
+    Boot: sd(0,18,0)
+    root on sd6a fstype 4.2                 <- ROOT MOUNTED
+    Boot: vmunix
+    Size: 564040+134024+41672 bytes          <- real kernel loaded off the miniroot
+    SunOS Release 4.1.1 (MINIROOT) #1: Fri Oct 12 17:49:27 PDT 1990
+    mem = 16384K (0x1000000)   avail mem = 15777792
+    INVALID FORMAT CODE IN ID PROM           <- NEW wall (kernel IDPROM reader)
+
+### Fix 1 (ncr5380.c, sun-mode) — the trailing-completion state walk
+
+The precise mechanism of the sd-open TUR returning -1 was fully REd from the
+ufsboot state machine (0x2139c4) disassembly (dumped live 0x200000..0x220000,
+objdump m68k:68030).  After a no-data command completes, the transfer routine
+(0x213666) loops calling the state machine until the state var `a4@0` reaches
+**0 (done)** — NOT until it merely "succeeds".  Reaching 0 needs the machine to
+walk state **24 -> 27 -> 32 -> 0**, and each step is gated on the reg2/reg3/reg0
+the trailing calls observe:
+
+* reg2 (phase) must read **7** (MESSAGE IN) on every trailing call, else the
+  phase-0 retry path exhausts -> err5 -> -1.  (`sun_cmd_complete` gates this;
+  it is set ONLY by the ufsboot blind reg0 bus-free path, so the PROM probe's
+  ACK-handshake teardown never sets it and the PROM path stays benign.)
+* The phase-match dispatcher (0x213d36) then routes on **reg3**: 0x08 -> the
+  *phase* dispatcher (0x213d00), 0x20 -> the *BSR* dispatcher (0x213b50).
+  State 27 (read the final MESSAGE byte, advance to 32) needs the phase
+  dispatcher -> reg3 == **0x08**; state 32 (complete to 0) needs the BSR
+  dispatcher (its only state-32 case, 0x213b50 -> 0x213b30 -> state 0) ->
+  reg3 == **0x20**.  A *fixed* reg3 fails: 0x20 err5s state 27; 0x08 oscillates
+  27<->32 forever (a 0x10000000-count timeout, observed as a silent hang).
+* reg0 at 0x213c24 (state-27 message read) must be **0x00** (COMMAND COMPLETE)
+  so the message dispatch settles into state 32 with no error.
+
+Modelled with two flags (both cleared on selection / reset):
+`sun_cmd_complete` (set at the blind reg0 bus-free) and `sun_msg_taken` (set
+when the trailing reg0 message byte is taken).  In the trailing window
+(`!dev && sun_cmd_complete`): reg2 -> 7; reg0 -> 0x00 (and sets `sun_msg_taken`);
+reg3 -> 0x08 while `!sun_msg_taken`, then 0x20.  This walks 24->27->32->0 and the
+transfer returns a non-negative byte count.  Verified: the sd-open now runs its
+full identify (TUR, START/STOP, TUR, INQUIRY, READ-label) — all 5 transfers
+return >= 0 (0/0/0/36/512), the label READ delivers 512 bytes with magic 0xDABE
+and a valid XOR checksum.
+
+### Fix 2 (sun3x-SUNOS-mkdisk.py) — disklabel partition size is read as 16-bit
+
+With the SCSI path fully working, the sd-open then failed in the disklabel
+partition geometry (traced to sd-open 0x210770 -> 0x211b50 label-validate OK,
+then partition-size check 0x21095c).  The SunOS standalone/kernel sd driver
+computes a partition's byte size as **`(dkl_nblk & 0xffff) << 9`** — it reads
+`num_sectors` as a *16-bit* field (0x21094e `andil #0xffff`).  The old mkdisk
+sized every partition to the whole 256 MiB disk (524288 sectors = 0x80000),
+which truncates to **0** -> partition size 0 -> open fails.  Fix: size partition
+'a' (index 0, the root) to the miniroot rounded up to a cylinder boundary and
+clamped to 16 bits (14336 sectors = 0x3800), keeping magic 0xDABE + XOR==0.
+With that, partition 'a' opens and root mounts.
+
+### Validation (all three gates + root, deterministic, clean build)
+
+1. M2 PROM probe: `b sd(0,30,3)` -> probe + **79x READ(6)**, disklabel 0xDABE
+   validates, ufsboot loads.  PASS (boot reaches `Boot: sd(0,18,0)`).
+2. ufsboot post-load spin (0x213abe) stays cleared.  PASS (boot advances to
+   root mount, no hang).
+3. 0x2109f0 sd-open transfers all return >= 0 -> `bdevvp` opens dev_t 0x730 ->
+   **`root on sd6a fstype 4.2`**.  PASS — ROOT MOUNTED.
+
+The PROM probe path (0xfeff1072) is untouched: `sun_cmd_complete`/`sun_msg_taken`
+are set only by the ufsboot blind reg0 path, never by the PROM's ACK-handshake
+teardown, so the PROM's trailing calls still read phase 0 (benign) and reg3 0x20.
+
+Reproduce: `python3 hw/m68k/sun3x-SUNOS-mkdisk.py /tmp/sunos-media/miniroot_sun3x
+/tmp/sunos-boot.img`, build to /tmp/sunos-build, then
+`qemu-system-m68k -M sun3x -m 16M -bios .../sun3_80_v3.0.3.bin -drive
+file=/tmp/sunos-boot.img,format=raw,if=scsi,bus=0,unit=3 -display none -serial
+<chr> -icount shift=6`; send ESC to abort selftest; auto-boot mounts root.
+
+## M4 (now exposed) — kernel IDPROM machine-type reader
+
+After root mount + `mem = 16384K`, the sun3x `vmunix` stops at:
+
+    INVALID FORMAT TYPE IN ID PROM
+    DEFAULTING MACHINE TYPE TO SUN3X_470
+    ... (banner, mem) ...
+    INVALID FORMAT CODE IN ID PROM        <- halts here
+
+This is the **kernel's** IDPROM reader (distinct from the earlier ufsboot IDPROM
+issue, which was resolved by the sun3-probe bus-error hole).  Our IDPROM at
+physical 0x640007D8 (MK48T02) holds a valid format=1, machtype=0x42
+(SM_SUN3X|SM_3_80 = Sun-3/80), Sun OUI ethaddr, XOR checksum — the PROM reads it
+correctly (banner Host ID 42000000, ethernet 8:0:20:11:22:33) and ufsboot
+accepts it.  But `vmunix` reads its IDPROM/machine-type through its OWN MMU
+context and rejects the format ("INVALID FORMAT TYPE"), defaults the machine to
+SUN3X_470 (0x41, the Sun-3/470), then hits "INVALID FORMAT CODE" and stops.
+NEXT: RE where the sun3x kernel copies/reads the IDPROM (the `sunromvec`
+`v_idprom` export vs. a hardware read at its virtual mapping of 0x640007D8) and
+what format/machtype byte it requires; likely needs the real-PROM handoff to
+export a kernel-visible IDPROM (or the machtype byte adjusted) so the kernel
+identifies the Sun-3/80 instead of defaulting.  This is a vmunix-level RE task,
+materially separate from the (now-complete) si/ncr5380 bring-up.

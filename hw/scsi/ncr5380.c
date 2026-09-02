@@ -140,6 +140,8 @@ static void ncr5380_reset_bus(NCR5380State *s)
     s->status = 0;
     s->msg_in = 0;
     s->sun_dma_done = false;
+    s->sun_cmd_complete = false;
+    s->sun_msg_taken = false;
 }
 
 static void ncr5380_grow_dbuf(NCR5380State *s, uint32_t size)
@@ -380,7 +382,16 @@ static void ncr5380_select(NCR5380State *s)
 static uint8_t sun_phase_bits(NCR5380State *s)
 {
     if (!s->dev) {
-        return 0;
+        /*
+         * After a blind (ufsboot / sd-open) command has completed and torn
+         * the bus down to bus-free, present MESSAGE IN (7) for the fixed
+         * number of trailing state-machine calls the transfer wrapper makes,
+         * so it re-takes the benign success branch rather than the phase-0
+         * retry path (err5 -> -1 -> "bdevvp: bad open").  The PROM probe's
+         * ACK-handshake teardown does not set sun_cmd_complete, so its
+         * trailing calls still see phase 0 (unchanged, benign).
+         */
+        return s->sun_cmd_complete ? 7 : 0;
     }
     switch (s->phase) {
     case PHASE_DI:
@@ -424,7 +435,20 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
          * relying on the hardware to advance.  Deliver the current byte
          * and step to the next so successive reads drain the buffer.
          */
-        if (s->phase == PHASE_DI) {
+        if (s->sun_mode && !s->dev && s->sun_cmd_complete) {
+            /*
+             * Trailing state-machine calls after a blind completion: the
+             * benign phase-7 completion handler (0x213c24) reads reg0 as the
+             * final message byte and dispatches on it.  Present COMMAND
+             * COMPLETE (0x00) so it settles into the done state (32) with no
+             * error, rather than a stale CDB/data byte that trips err4.
+             * Record that the trailing message has been taken so reg3 flips
+             * from 0x08 (phase dispatch) to 0x20 (BSR dispatch) and the next
+             * call completes the state machine to its "done" state 0.
+             */
+            val = 0x00;
+            s->sun_msg_taken = true;
+        } else if (s->phase == PHASE_DI) {
             if (s->buf_pos < s->buf_len) {
                 val = s->dbuf[s->buf_pos++];
                 s->last_data = val;
@@ -467,6 +491,12 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
                     s->req = NULL;
                 }
                 s->dev = NULL;
+                /*
+                 * Trailing state-machine calls after this blind completion
+                 * must see MESSAGE IN (7), not phase 0, or the phase-0 retry
+                 * path exhausts (err5) and the wrapper returns -1.
+                 */
+                s->sun_cmd_complete = true;
             }
         } else if (s->phase & CSB_IO) {
             val = s->last_data;
@@ -492,6 +522,17 @@ static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
              * live REQ to service, else 0x20 so the state machine advances.
              */
             if (s->dev && (s->csb & CSB_REQ)) {
+                val = 0x08;
+            } else if (!s->dev && s->sun_cmd_complete && !s->sun_msg_taken) {
+                /*
+                 * Trailing call after a blind completion, before the final
+                 * MESSAGE byte has been taken (state 27): present 0x08 so the
+                 * phase-match dispatcher (0x213d36) routes to the *phase*
+                 * handler (0x213d00), which with reg2==7 reads the message
+                 * (reg0) and advances state 27 -> 32.  Once the message is
+                 * taken, fall through to 0x20 so the *BSR* dispatcher
+                 * (0x213b50) completes state 32 -> 0 (done).
+                 */
                 val = 0x08;
             } else {
                 val = 0x20;
@@ -620,6 +661,9 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
             /* arbitration always wins on this single-initiator bus */
             s->icr &= ~ICR_ARB_LOST;
             s->icr |= ICR_ARB_IN_PROG;
+            /* new selection: a fresh command, no trailing-completion yet */
+            s->sun_cmd_complete = false;
+            s->sun_msg_taken = false;
             /*
              * Sun 3/80 "si": the driver arms arbitration/selection by
              * writing the mode register (the target id occupies the low
