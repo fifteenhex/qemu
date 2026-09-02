@@ -951,3 +951,32 @@ and the ncr5380 selection/timeout presentation for both present (target 3) and
 absent targets; then the kernel may switch to its interrupt-driven/Am9516-UDC
 path (INTR_EN/SBC_IP/DMA_IP still unmodelled).  Hang loop 0xf8074b16 (the phase
 dbcc-search); err2 site 0xf8074bfe.
+
+### M5 diagnosis (after the +0x100 fix) — kernel probe selects NO target
+
+Confirmed a true wedge (no progress after 185 s), not slow probing.  gdb at the
+hang (unique ports, self-reaped pid — never sweep qemu by name): PC 0xf8074dc4,
+the request `a2` = 0xf80b5208 with `a2@0 = 6` (probing SCSI target 6 = sr0
+slave 48), state struct 0xf80b8910: state=0 err=2 retry=0, and the target-found
+bitmask `a0@(11) = 0x00`.  si_csr (virt 0xff003000) = 0x1001 (correct).
+
+Key finding: `found11 == 0` means the kernel selected **no** target at all —
+including **target 3, our attached disk** — even though the SAME polled state
+machine selects target 3 fine for ufsboot (root mounts).  So the kernel "sm"
+probe's selection/command sequence does not complete to the probe-success
+**state 28** (set at 0xf8073c7a via the per-target found-bit test 0xf8073c5c;
+err2 at 0xf8074bfe when state != 28) with our ncr5380 sun-mode model, and the
+probe loop wedges on the last target (6).
+
+Since the state-machine *code* is identical to ufsboot's and the registers now
+map (si_csr=0x1001), the divergence is in the higher-level "sm" probe setup: a
+different CDB/command than ufsboot's READ (likely TEST-UNIT-READY/INQUIRY with
+an IDENTIFY message-out and/or a selection-with-ATN), and/or the kernel driver's
+interrupt-driven completion (the notes' predicted INTR_EN/SBC_IP/DMA_IP + Am9516
+UDC path) which our polled model does not service.  NEXT: instrument/trace the
+exact register writes the kernel issues during a single target-3 selection
+(does ncr5380_select_target/do_command even fire? is a message-out/IDENTIFY
+phase expected? is it waiting on a selection-complete interrupt?), then extend
+the sun-mode ncr5380 model to complete the kernel probe.  This is the
+interrupt-driven "sm" driver bring-up the earlier notes scoped as the big M-final
+task; the register mapping (this commit) is the prerequisite now in place.
