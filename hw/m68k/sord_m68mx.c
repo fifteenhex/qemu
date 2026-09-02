@@ -440,7 +440,7 @@ static void sord_fdc_rw_data(SordMachineState *s, bool is_write)
             uint32_t dmaddr = sord_dma_cur_addr(s, 1);
             done = sord_dma_pull(s, 1, buf, ssz);
             if (getenv("SORD_FDC_TRACE")) {
-                fprintf(stderr, "fdc: WRITE u%d c%d h%d r%d ssz%d off=%#llx "
+                qemu_log_mask(LOG_UNIMP, "fdc: WRITE u%d c%d h%d r%d ssz%d off=%#llx "
                         "dma=%#x done=%d left=%u data=%02x %02x %02x %02x\n",
                         unit, c, head, r, ssz, (unsigned long long)off,
                         dmaddr, done, s->dma.left[1],
@@ -530,11 +530,11 @@ static void sord_fdc_execute(SordMachineState *s)
     f->phase = FDC_IDLE;
 
     if (getenv("SORD_FDC_TRACE")) {
-        fprintf(stderr, "fdc: cmd");
+        qemu_log_mask(LOG_UNIMP, "fdc: cmd");
         for (i = 0; i < f->cmd_len; i++) {
-            fprintf(stderr, " %02x", f->cmd[i]);
+            qemu_log_mask(LOG_UNIMP, " %02x", f->cmd[i]);
         }
-        fprintf(stderr, "\n");
+        qemu_log_mask(LOG_UNIMP, "\n");
     }
 
     switch (f->cmd[0] & 0x1f) {
@@ -703,13 +703,13 @@ static void sord_sysio_write(void *opaque, hwaddr offset, uint64_t value,
     case 0x381:     /* graphics board: plane read-select (0..3) */
         s->gfx_read_sel = val & 3;
         if (getenv("SORD_TRACE")) {
-            fprintf(stderr, "GFX read-plane select = %d\n", val & 3);
+            qemu_log_mask(LOG_UNIMP, "GFX read-plane select = %d\n", val & 3);
         }
         break;
     case 0x3a1:     /* graphics board: plane write mask (bit0..3) */
         s->gfx_write_mask = val & 0x0f;
         if (getenv("SORD_TRACE")) {
-            fprintf(stderr, "GFX write-plane mask = 0x%x\n", val & 0x0f);
+            qemu_log_mask(LOG_UNIMP, "GFX write-plane mask = 0x%x\n", val & 0x0f);
         }
         break;
     case 0x305: case 0x307: case 0x30d: case 0x30f:
@@ -721,7 +721,7 @@ static void sord_sysio_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     default:
         if (getenv("SORD_TRACE")) {
-            fprintf(stderr, "SYSIO? write 0x%02x -> 0x%06x\n",
+            qemu_log_mask(LOG_UNIMP, "SYSIO? write 0x%02x -> 0x%06x\n",
                     val, (unsigned)(SORD_SYSIO_BASE + offset));
         }
         qemu_log_mask(LOG_UNIMP,
@@ -785,7 +785,7 @@ static void sord_acia_update_irq(SordMachineState *s, int n)
 static void sord_kbd_command(SordMachineState *s, uint8_t val)
 {
     if (getenv("SORD_KBD_TRACE")) {
-        fprintf(stderr, "KBD TX 0x%02x\n", val);
+        qemu_log_mask(LOG_UNIMP, "KBD TX 0x%02x\n", val);
     }
     if (val == 0x00) {
         /* identify: reply with a 2-byte ID (any value; the ROM only needs
@@ -884,7 +884,7 @@ static void sord_ctlio_write(void *opaque, hwaddr offset, uint64_t value,
     case 0x003:
         s->crtc[s->crtc_addr & 0x1f] = val;
         if (getenv("SORD_TRACE")) {
-            fprintf(stderr, "CRTC R%-2d = 0x%02x\n", s->crtc_addr & 0x1f, val);
+            qemu_log_mask(LOG_UNIMP, "CRTC R%-2d = 0x%02x\n", s->crtc_addr & 0x1f, val);
         }
         break;
     case 0x081 ... 0x08f:       /* movep-programmed timer(?), ignored */
@@ -899,7 +899,7 @@ static void sord_ctlio_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     default:
         if (getenv("SORD_TRACE")) {
-            fprintf(stderr, "CTLIO? write 0x%02x -> 0x%06x\n",
+            qemu_log_mask(LOG_UNIMP, "CTLIO? write 0x%02x -> 0x%06x\n",
                     val, (unsigned)(SORD_CTLIO_BASE + offset));
         }
         qemu_log_mask(LOG_UNIMP,
@@ -936,7 +936,7 @@ static uint64_t sord_pal_read(void *opaque, hwaddr offset, unsigned size)
         v = s->palette[idx];
     }
     if (getenv("SORD_TRACE")) {
-        fprintf(stderr, "PAL/CTL read off 0x%02x sz %u -> 0x%04x\n",
+        qemu_log_mask(LOG_UNIMP, "PAL/CTL read off 0x%02x sz %u -> 0x%04x\n",
                 (unsigned)offset, size, (unsigned)v);
     }
     return v;
@@ -950,7 +950,7 @@ static void sord_pal_write(void *opaque, hwaddr offset, uint64_t value,
 
     s->palette[idx] = value;
     if (getenv("SORD_TRACE")) {
-        fprintf(stderr, "PAL[%d] = 0x%04x (off 0x%02x sz %u)\n",
+        qemu_log_mask(LOG_UNIMP, "PAL[%d] = 0x%04x (off 0x%02x sz %u)\n",
                 idx, (unsigned)value, (unsigned)offset, size);
     }
 }
@@ -1000,7 +1000,7 @@ static void sord_gram_write(void *opaque, hwaddr offset, uint64_t value,
             s->gram_hi = offset + size;
         }
         if (getenv("SORD_TRACE_V")) {
-            fprintf(stderr, "GRAM w %06x sz%u = %0*llx\n",
+            qemu_log_mask(LOG_UNIMP, "GRAM w %06x sz%u = %0*llx\n",
                     (unsigned)(SORD_GRAM_BASE + offset), size, size * 2,
                     (unsigned long long)value);
         }
