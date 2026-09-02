@@ -980,3 +980,59 @@ phase expected? is it waiting on a selection-complete interrupt?), then extend
 the sun-mode ncr5380 model to complete the kernel probe.  This is the
 interrupt-driven "sm" driver bring-up the earlier notes scoped as the big M-final
 task; the register mapping (this commit) is the prerequisite now in place.
+
+### M5 — traced the kernel sm selection; fixed the trigger; hit the probe-completion boundary
+
+Traced the exact register sequence the SunOS "sm" driver issues for a target
+selection (per-reg write log gated to kernel PCs >= 0xf8000000, self-reaped
+QEMU, unique ports).  For one probe it does, in order:
+
+    reg3 (TCR)=0x98, reg4 (SER)=0, reg5=0            (0xf80751f6..)
+    reg0 (ODR) = CDB byte  x6  (all 0x00 = TUR)      (0xf8073084, FIFO staged)
+    reg2 (MR)  = target id                           (0xf80730b6)
+    reg3 (TCR) = 0x98                                (0xf80730ba)
+    reg1 (ICR) = 0x41                                (0xf8073178, launch)
+
+This is byte-identical to the PROM/ufsboot "si" sequence.  The IDENTIFY message
+(built at 0xf8073040..0xf807304e as 0xC0|lun) is SKIPPED for this probe (no ATN,
+ICR has no 0x02), so sun_fifo holds a clean 6-byte CDB — no MESSAGE-OUT phase to
+model.
+
+FIX (committed): the kernel encodes the TARGET ID in `reg2 (MR) & 7`; the
+"arbitrate" bit (0x01) is merely bit 0 of that id, set only for ODD targets.
+Our sun-mode hook fired selection on MR_ARBITRATE, so it worked for the
+PROM/ufsboot (target 3, odd) but never for EVEN targets — and the kernel probes
+all ids.  Now selection fires whenever a CDB is staged (`sun_fifo_count > 0`)
+and `!dev`, target = `MR & 7`, regardless of bit 0.  Verified the kernel
+selection now fires for even targets (traced `SELECT id=6`).  No regression
+(root mounts, autoconfig intact).  NOTE this is *latent* for the current single
+disk at target 3 (odd, already selectable) — its value is enabling even-target
+selection, a prerequisite for a full probe scan.
+
+REMAINING BOUNDARY (banked here): the kernel probe still wedges.  It runs a
+multi-channel poll loop (0xf8073522: for each channel with `si_csr & 3`, call
+the state machine 0xf8073586) and a state machine byte-identical to ufsboot's.
+For an ABSENT target the model returns dev=NULL / CSB=0 / phase=0 / reg3(TCR)=
+0x20, and the state machine's reg3=0x20 dispatch (0xf8074afc search -> 0xf8073976
+-> state-16 handler 0xf8073ab4) sets **err3**, while other paths set err2
+(0xf8074bfe, state!=28) and the 30-count phase-timeout sets err17 (0xf8073966).
+Observed at the wedge: state=0, err=2, retry=0, looping in the poll reads
+(0xf80735e2/f4, 0xf807361e, 0xf807390a) — the absent-target probe never cleanly
+"times out and advances to the next id", so the scan never reaches the present
+target 3, and found-bitmask a0@(11) stays 0.  The err2 handler (0xf8072c46) is
+only a diagnostic printf, so the retry lives higher up, and the whole
+completion path is entangled with the driver's interrupt-driven design
+(INTR_EN/SBC_IP/DMA_IP reflection + the Am9516 UDC) that our polled sun-mode
+ncr5380 model does not implement.  Getting the probe to complete cleanly for
+both absent ids (proper selection-timeout -> advance) and the present target 3
+(selection -> IDENTIFY?/CDB -> data/status -> state 28) is the interrupt-driven
+"sm" driver bring-up — a bounded-but-non-trivial next task, NOT a small tweak.
+
+Landmarks for the next iteration:
+  poll loop            0xf8073522   (per-channel, gates on si_csr & 3)
+  state machine        0xf8073586   (== ufsboot 0x2139c4, +0x100 registers)
+  reg3=0x20 dispatch   0xf8074afc -> 0xf8073976 -> 0xf8073ab4 (state16 -> err3)
+  state!=28 -> err2    0xf8074bfe ;  30-count timeout -> err17  0xf8073966
+  probe-success state  28  (set 0xf8073c7a) ; found bitmask  a0@(11)
+  err2 diag printf     0xf8072c46
+  si_csr / 5380 base   virt 0xff003000 / 0xff002000 = phys 0x66001100 / 0x66000100
