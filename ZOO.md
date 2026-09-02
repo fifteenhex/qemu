@@ -56,7 +56,7 @@ Akiko), booted from a 512K Kickstart 3.1 ROM via `-bios`.
 | Machine (`-M`) | CPU | Milestone | Notes |
 |---|---|---|---|
 | `sun3-60` ("Ferrari") | 68020 (Sun-3 MMU) | ✅ NetBSD/sun3 RAMDISK + Linux `sun3` shell | `SUN3-NOTES.md`, `hw/m68k/sun3-linux-NOTES.md` |
-| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1: root mounts off the UFS miniroot (`root on sd6a`), the kernel recognizes the Sun-3/80, prints its ethernet address, and enters device autoconfiguration** (`sm0 at obio`, `st0-3`/`sr0` SCSI probes) — walled at the `sm` driver's SCSI selection handshake (wall M5) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
+| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1: root mounts off the UFS miniroot (`root on sd6a`), the kernel recognizes the Sun-3/80, prints its ethernet address, and enters device autoconfiguration** (`sm0 at obio`, `st0-3`/`sr0` SCSI probes) — banked at the interrupt-driven `sm`-driver boundary (kernel probes each SCSI target; absent-target completion needs the Am9516-UDC interrupt path the polled model doesn't implement; wall M5) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
 
 The SunOS bring-up is a QEMU first: reverse-engineered `si` NCR5380 / Am9516
 DVMA / IDPROM / reg5 / SCSI-state-walk unlocks let the real PROM load the SunOS
