@@ -56,7 +56,7 @@ Akiko), booted from a 512K Kickstart 3.1 ROM via `-bios`.
 | Machine (`-M`) | CPU | Milestone | Notes |
 |---|---|---|---|
 | `sun3-60` ("Ferrari") | 68020 (Sun-3 MMU) | ✅ NetBSD/sun3 RAMDISK + Linux `sun3` shell | `SUN3-NOTES.md`, `hw/m68k/sun3-linux-NOTES.md` |
-| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1: root mounts off the UFS miniroot (`root on sd6a`), the kernel recognizes the Sun-3/80, prints its ethernet address, and enters device autoconfiguration** (`sm0 at obio`, `st0-3`/`sr0` SCSI probes) — **kernel SCSI probe completes and autoconfig reaches disk config** (`sd0-sd6`, `sd6` = the attached disk); banked at wall M6 (opening `sd6` needs async interrupt-driven `sm` completion — synchronous completion recurses to a stack overflow) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
+| `sun3x` (Sun 3/80) | 68030 (68851) | ✅ Linux shell · ⧗ **genuine 3/80 PROM boots real SunOS 4.1.1: root mounts off the UFS miniroot (`root on sd6a`), the kernel recognizes the Sun-3/80, prints its ethernet address, and enters device autoconfiguration** (`sm0 at obio`, `st0-3`/`sr0` SCSI probes) — **kernel SCSI probe completes and autoconfig reaches disk config** (`sd0-sd6`, `sd6` = the attached disk); sd-open SCSI TUR completes; banked at the 82072 floppy-controller probe (wall M6/M7 — the kernel probes the FDC at obio `0x6e000000` and its early-boot interrupt-stack path; a fixed real level-7-NMI storm was the confound removed here) | `hw/m68k/sun3x-NOTES.md`, `hw/m68k/sun3x-SUNOS-{HOWTO,NOTES}.md` |
 
 The SunOS bring-up is a QEMU first: reverse-engineered `si` NCR5380 / Am9516
 DVMA / IDPROM / reg5 / SCSI-state-walk unlocks let the real PROM load the SunOS
