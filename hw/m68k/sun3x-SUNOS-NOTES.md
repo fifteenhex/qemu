@@ -1219,3 +1219,153 @@ peek probe phys 0x7e200000; sd status ACK-hold handler 0xf8073f60 (ACK
 MILESTONE recap: bdevvp -> root mount -> Sun-3/80 recognized -> full SCSI probe
 + sd0-sd6 config, all committed and stable.  sd-open completion + the FDC
 floppy subsystem is the documented next frontier.
+
+---
+
+## M7 RESOLVED — FDC probe concluded, "unknown memory error" panic fixed;
+## full autoconfig reached (sm/st/sr/sd/fdc/fd/zs/le). Next wall: DVMA rmalloc.
+
+Three fixes (commits `sun3x/SunOS: complete the kernel sm STATUS->MESSAGE
+handshake on ACK-assert` and `sun3x/SunOS: FDC responder + memory-error-reg
+status mask + level-7 to kernel`) carry the boot from the sd-open wedge to a
+clean, deterministic **full autoconfig** with no crash and no panic:
+
+```
+root on sd6a fstype 4.2
+SunOS Release 4.1.1 (MINIROOT) #1: Fri Oct 12 17:49:27 PDT 1990
+mem = 16384K (0x1000000)   avail mem = 15777792
+sm0 at obio 0x66000000 pri 2
+st0-3 / sr0 / sd0-sd6 at sm0
+fdc0 at obio 0x6e000000 vec 0x5c ; fd0 at fdc0 slave 0
+zs0 / zs1 at obio 0x62002000 / 0x62000000 pri 3
+le0 at obio 0x65002000 pri 3
+   <hangs here>
+```
+
+### 1. sd-open completion (ncr5380 ACK-advance) — RE-APPLIED, now stable
+The kernel sm STATUS handshake holds ACK (unlike the PROM's release). Advancing
+STATUS->MESSAGE IN (COMMAND COMPLETE 0x00) then bus-free on the ACK assert, gated
+to kernel text (0xf8000000..0xf9000000), completes sd-open's TEST UNIT READY and
+unblocks the probe into disk autoconfig. This is crash-free now that the FDC and
+level-7 issues below are fixed.
+
+### 2. FDC probe (82072 responder) — RESOLVED
+Minimal empty-controller responder at obio 0x6e000000 (SunOS-gated). Models the
+NEC 765 handshake: MSR ready/result-phase, SENSE INTERRUPT STATUS -> ST0+PCN,
+RECALIBRATE/SEEK to the absent unit -> fault/not-ready ST0, VERSION -> 0x90. The
+kernel's fd probe concludes "drive absent" and autoconfig continues. This also
+removes the long IPL-7 busy-wait that the old level-7 model stormed inside — so
+the earlier timeout-handler ISP crash (0xf8067d5a) is gone at the root.
+
+### 3. "unknown memory error" panic — RESOLVED (memory-error register model)
+After the FDC fix the boot intermittently panicked:
+```
+Memory Error Register ff<INTR,INTENA,TEST,CHECK,ERR24,ERR16,ERR08,ERR00>
+                      ff<INTR,INTENA,CE_ENA,TIMEOUT,UE,CE>
+DVMA = 0, physical address = 0
+panic: unknown memory error
+```
+Root cause (traced with a memreg read/write PC trace): the **PROM's own NMI stub
+at 0xfefe0566**, which the level-7 clock edge still vectors through early in
+boot, writes 0xff/0xfe to the memory-error register (0x61001000). Our model read
+that back verbatim, so the kernel's level-7 handler — which reads this register
+to distinguish a parity/ECC NMI from the clock — saw INTR + every error bit set
+and panicked. Fix: `sun3x_memreg_read` returns only the r/w control bits
+(`s->memreg & 0x70`); the error-status bits (INTR 0x80, byte-error 0x0f) are
+hardware-latched on a real fault only, so they read 0. **No PROM regression**:
+the parity self-test fails identically (obs=0x00000000) with or without the mask
+(that subtest separately needs a modelled parity-error injection + level-7
+assert we do not provide — pre-existing "future work").
+
+### 4. Level-7 clock — reverted to deliver to the kernel too
+The earlier "monitor-only VBR-window" gate starved the SunOS kernel's own hz
+clock (the kernel enables level-7 via interrupt-register bit 7). Reverted to
+deliver the edge whenever a level-7 handler is installed (vec_ok via VBR+0x7c),
+fresh 0->7 edge each period. Confirmed the kernel clock now fires (~100 Hz,
+~19.6k ticks over the run) with a stable interrupt stack and no storm. Linux is
+untouched (whole path under `if (s->sunos)`; `clk_enabled` never set in Linux).
+
+---
+
+## M8 — THE NEXT WALL: kernel DVMA resource-map allocator deadlock
+
+After `le0` the boot hangs deterministically (no crash, no panic) in a tight
+kernel spin. This is a **new, materially separate subsystem: the DVMA / kernel
+resource-map (rmalloc) allocator + the interrupt-driven DMA-completion path that
+frees DVMA.** Per the bank rule the tree is left here, at the last stable
+milestone (full autoconfig, no crash/panic), with the ACK-advance + FDC + memreg
++ level-7 fixes committed.
+
+### Precise diagnosis
+Hang PC alternates between the kernel spl helpers (0xf806441c) and the loop body
+at 0xf8018b16-0xf8018b4a. Disassembly of the loop:
+```
+0xf8018b22:  moveal #0xf80b0090,%a4      ; DVMA map head
+0xf8018b28:  moveal %a4@,%a5             ; a5 = *(0xf80b0090) = 0xff00fff0  (re-read each pass)
+0xf8018b2a:  tstl %a5 ; beqw 0xf8018c26  ; a5==0 -> exit (never taken)
+0xf8018b30:  jsr 0xf8064416              ; spl (raise IPL)
+0xf8018b36:  movel %a5@(8),%d7           ; d7 = entry.m_size  == 0
+0xf8018b40:  jsr 0xf8064446              ; splx (lower IPL - lets interrupts run)
+0xf8018b48:  tstl %d7 ; beqs 0xf8018b10  ; size==0 -> bump counter, loop
+0xf8018b10:  addql #1,0xf80b00a4         ; spin counter (observed 48,076,958)
+```
+It re-reads the SAME map head every pass and, with the free entry's `m_size==0`,
+spins forever while briefly lowering IPL — i.e. it is **waiting for an interrupt
+(a completing I/O) to refill the DVMA map**, which never comes.
+
+Map struct @ 0xf80b0090 at the hang:
+```
+0xf80b0090: 0xff00fff0  0x00000000  0xf80c03e4  0xff000000
+0xf80b00a0: 0x00000002  <spincount> 0x00000000  0x00006000
+```
+`*(0xf80b0090) = 0xff00fff0` is a **DVMA address (0xff000000 region)** used as
+the first free-list entry; reading it returns zeros (m_size=0). The free pointer
+has advanced to 0xff00fff0 ≈ 0xff000000 + 0x10000 - 0x10, i.e. the whole ~64 KiB
+DVMA window has been handed out and the map is empty. Note 0xf80b0098 holds a
+plausible kernel-heap pointer (0xf80c03e4) while 0xf80b0090 holds a DVMA
+address — so either the DVMA arena is genuinely exhausted (leak) or the map
+head (m_map) is corrupted to a DVMA pointer.
+
+### Two hypotheses for whoever resumes
+(a) **DVMA leak / no DMA completion.** The kernel allocates DVMA to set up a
+disk I/O (root READ CAPACITY / disklabel / root remount) but the sm driver's
+DMA never completes (no completion interrupt in our model), so the DVMA is never
+freed; the arena drains and the next alloc deadlocks. Only ONE SCSI command (the
+TUR) is ever issued — no disk READ fires — consistent with the very first real
+DVMA-backed I/O being stuck at allocation. The ACK-advance (which fakes TUR
+completion by driving phases directly) may not free the DVMA/clean up the DMA
+engine the way a real completion interrupt would — suspect #1.
+(b) **Map corruption.** m_map (0xf80b0090) reading a DVMA pointer rather than a
+kernel-heap array pointer hints the map struct was overwritten. Watchpoint
+0xf80b0090 from early boot to see who writes 0xff00fff0 and whether it is the
+intended rmap init or a stray store.
+
+### First concrete steps to resume
+* Watchpoint `*0xf80b0090` (and 0xf80b00a8 = 0x6000, likely the DVMA arena size)
+  from the start of kernel init to capture the DVMA map initialisation — confirm
+  the arena size the kernel programs and whether it is later exhausted vs
+  corrupted.
+* Trace SCSI/DVMA: does the kernel program the si DMA (0x66001000) and IOMMU
+  (0x60000000) for a disk READ after le0? If it allocates DVMA then waits, model
+  the sm DMA **completion interrupt** (raise the si/sm completion IRQ from a
+  QEMU BH/timer after the transfer) so the driver's completion path runs and
+  frees the DVMA — this is the proper fix vs the phase-poking ACK-advance.
+* Landmarks: DVMA rmalloc spin loop 0xf8018b00-0xf8018b5a; map head 0xf80b0090;
+  spl helpers 0xf8064400-0xf8064450; DVMA arena base 0xff000000 (size ~0x6000/
+  0x10000); IOMMU 0x60000000; si DMA/CSR 0x66001000/0x66000000.
+
+### How to build & run (unchanged)
+```
+mkdir -p /tmp/sunos-build && cd /tmp/sunos-build
+/workspace/src/qemu-sun3x-sunos/configure --target-list=m68k-softmmu
+ninja qemu-system-m68k
+qemu-system-m68k -M sun3x -m 16M \
+  -bios /tmp/sun3x-sunos-roms/sun3_80_v3.0.3.bin \
+  -drive file=/tmp/sunos-boot.img,format=raw,if=scsi,bus=0,unit=3 \
+  -display none -serial tcp:127.0.0.1:PORT,server,nowait -gdb tcp::GPORT \
+  -icount shift=6
+```
+The PROM gates its serial console on first input and ESC aborts the self-test,
+so send ESC ~2.5 s after connect to skip the (pre-existing failing) parity
+subtest and let the auto-boot run; the boot reaches `le0` then hangs at the M8
+DVMA loop. gdb: `set architecture m68k:68030` + `set endian big`.
