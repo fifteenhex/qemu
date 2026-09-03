@@ -325,12 +325,22 @@ static void ncr5380_select_target(NCR5380State *s, int id)
          * data (or status) phase the driver then services via DMA.
          */
         if (s->sun_mode && s->sun_fifo_count) {
-            int i, n = s->sun_fifo_count;
+            int i, clen, n = s->sun_fifo_count;
 
             for (i = 0; i < n && i < (int)sizeof(s->cmd); i++) {
                 s->cmd[i] = s->sun_fifo[i];
             }
-            s->cmd_len = n;
+            /*
+             * The CDB length is defined by the opcode (cmd[0]), not by how many
+             * bytes the driver happened to write to reg0.  The PROM/ufsboot
+             * "si" path stages exactly the CDB (fifo count == CDB length), but
+             * the kernel sd driver stages a padded 16-byte command buffer, so
+             * using the raw fifo count would hand a 16-byte "TUR" (opcode 0x00)
+             * to the SCSI layer and corrupt the transfer.  Use the SCSI-defined
+             * length, capped by what was actually staged.
+             */
+            clen = scsi_cdb_length(s->cmd);
+            s->cmd_len = (clen > 0 && clen <= n) ? clen : n;
             s->sun_fifo_count = 0;
             ncr5380_do_command(s);
         }
