@@ -735,9 +735,41 @@ void ncr5380_ack(NCR5380State *s)
         break;
     case PHASE_ST:
         s->status_done = true;
+        /*
+         * Sun kernel "sm" status handshake: unlike the PROM/ufsboot (which
+         * release ACK, so the STATUS->MESSAGE advance happens in
+         * ncr5380_ack_release), the SunOS kernel driver ACKs the status byte
+         * (ICR=0x10 at 0xf8073f84) and HOLDS ACK, then re-runs its state
+         * machine expecting the target already in MESSAGE IN.  Advance the bus
+         * here on the ACK assert so the held-ACK poll sees it.  Gated to kernel
+         * text (0xf8000000..0xf9000000) so the PROM/ufsboot release-based
+         * handshake is byte-for-byte unchanged.
+         */
+        if (s->sun_mode) {
+            unsigned pc = (unsigned)ncr5380_guest_pc();
+            if (pc >= 0xf8000000u && pc < 0xf9000000u) {
+                ncr5380_set_phase(s, PHASE_MI);
+                s->last_data = 0x00;            /* COMMAND COMPLETE message */
+                s->csb |= CSB_REQ;
+            }
+        }
         break;
     case PHASE_MI:
         s->msg_done = true;
+        /* kernel: the message byte is ACKed -> target releases the bus */
+        if (s->sun_mode) {
+            unsigned pc = (unsigned)ncr5380_guest_pc();
+            if (pc >= 0xf8000000u && pc < 0xf9000000u) {
+                s->csb = 0;
+                s->phase = PHASE_DO;
+                if (s->req) {
+                    scsi_req_unref(s->req);
+                    s->req = NULL;
+                }
+                s->dev = NULL;
+                s->sun_cmd_complete = true;
+            }
+        }
         break;
     default:
         break;
