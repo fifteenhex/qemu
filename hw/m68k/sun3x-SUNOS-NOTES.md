@@ -1102,3 +1102,55 @@ Landmarks: status handler 0xf8073f60 (ACK 0xf8073f84, held); completion callback
 0xf8074d6e; bit0 poll 0xf8074dc2; crash = ISP overflow at IPL 7 -> PROM
 0xfefe0502.  The ACK-advance + CDB-length + selection + bit0 changes are the
 prerequisites already in place.
+
+## M6 investigated — sd-open completes, but crashes in a post-completion IPL-7 peek/poke loop (banked)
+
+Pushed on M6 (make sd6 open).  Findings:
+
+1. **sd-open is POLLED** (traced all kernel si_csr writes: 0x0/0x1000/0x1011/0x80 --
+   never INTR_EN 0x0004).  So it is not a missing-interrupt problem.
+
+2. The sd-open TUR wedged in STATUS because the kernel status handler
+   (0xf8073f60) ACKs the status byte (ICR=0x10 at 0xf8073f84) and **holds ACK**,
+   expecting the target already in MESSAGE IN (we advanced only on ACK release).
+   An ACK-assert advance (STATUS->MESSAGE IN, deliver 0x00 COMMAND-COMPLETE,
+   bus-free on the MESSAGE-IN ACK, gated to kernel PCs) DOES complete the command
+   -- traced: phase 12->28, kernel reads the message (reg0=0x00), dev clears,
+   ~11 register ops, no spin.
+
+3. BUT that completion then **deterministically crashes** the kernel.  The
+   `-d int` exception log shows the real cause -- it is NOT the completion-callback
+   recursion first hypothesized.  After sd-open completes the kernel enters a
+   **bus-error-guarded peek/poke probe loop at IPL 7** and faults thousands of
+   times (INT 333..7214) before the interrupt-stack overflows (fault at f808dffc,
+   A7=f808e000) and it double-faults to the PROM (0xfefe0502):
+
+       peek f8059d92  (guarded read at 0xf8059dc2)   poke f8059f0a (write 0xf8059f44)
+       faulting physical addrs (kernel PC 0xf8059dc2): 0x7e200000+, 0x7c00ee00+, 0x0
+
+   The faults run at **IPL 7** (sr=0x2704/0x2708) -- the level-7/NMI context.  Our
+   sun3x model re-raises a fresh level-7 NMI edge every 100 Hz tick (see the clock
+   notes), so during this long IPL-7 loop the NMI keeps nesting and, together with
+   the guarded-fault frames, walks the ISP down from f8095exx to f808e000 ->
+   overflow.  The peeked addresses look like scattered/garbage pointers
+   (0x0, 0x7e200000, 0x7c00ee00), suggesting the kernel's post-sd-open path
+   (root-config / VTOC / a device probe) dereferences a structure via the
+   bus-error-safe peek/poke, hitting locations we bus-error.
+
+Because the validation gate requires "no IPL-7 stack overflow / no PROM
+double-fault", the ACK-advance experiment is **reverted** (it advances the
+command but destabilises), leaving the tree at the stable sd-config milestone.
+The correct completion handshake (ACK-advance) is documented here as the
+prerequisite.
+
+NEXT (M6/M7 sub-boundary): RE the kernel's post-sd-open path -- what the
+peek/poke loop is (root-device config? disklabel/VTOC copy? a device probe at
+0x7e200000/0x7c00ee00?), why those addresses fault (a missing device like the
+earlier IDPROM hole, or a corrupted pointer), and whether the level-7 NMI
+re-raise storms during long IPL-7 sections (a candidate fix independent of SCSI:
+only re-arm the NMI edge when the previous one has been acked, so it cannot nest
+during a busy IPL-7 loop).  This is a materially separate sub-system from the
+si/ncr5380 bring-up; the polled probe -> sd config milestone is solid and
+committed.  Landmarks: peek 0xf8059d92 / poke 0xf8059f0a; ACK-hold status handler
+0xf8073f60 (ACK 0xf8073f84); completion handler 0xf807292c; crash = ISP overflow
+at IPL 7 -> PROM 0xfefe0502.
