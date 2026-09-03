@@ -444,6 +444,17 @@ static inline hwaddr sun3x_si_fold(hwaddr addr)
     return addr;
 }
 
+static unsigned sun3x_guest_pc(void)
+{
+    if (current_cpu) {
+        CPUClass *cc = CPU_GET_CLASS(current_cpu);
+        if (cc->get_pc) {
+            return (unsigned)cc->get_pc(current_cpu);
+        }
+    }
+    return 0;
+}
+
 static uint64_t sun3x_sireg_read(void *opaque, hwaddr addr, unsigned size)
 {
     Sun3xState *s = opaque;
@@ -472,8 +483,32 @@ static uint64_t sun3x_sireg_read(void *opaque, hwaddr addr, unsigned size)
                              * driver's DMA-sequencing latches; the 0x40
                              * handshake bit reads back clear (completes at
                              * once). */
-        uint16_t v16 = SI_CSR_ID | 0x0001;
+        uint16_t v16 = SI_CSR_ID;
+        unsigned pc = sun3x_guest_pc();
         v16 |= (s->si_csr & (SI_CSR_SBC_IP | SI_CSR_DMA_IP));
+        /*
+         * bit0 = "bus/command busy".  The SunOS kernel "sm" driver polls bit0
+         * as its completion gate: its state-machine inner loop (0xf8074dc2)
+         * re-runs the body WHILE bit0 == 1 and exits (command complete) when
+         * bit0 == 0, its entry gate (0xf80735c2, si_csr & 3) needs bit0 == 1 to
+         * run at all, and its poll loop (0xf8073548) calls the state machine
+         * only while si_csr & 3.  So for the kernel present bit0 = 1 only while
+         * a device is selected (a command in flight): a present target holds
+         * bit0 = 1 through the command and drops to 0 at bus-free (-> its
+         * state-28 completion); an absent target reads bit0 = 0 (-> its
+         * no-device path) instead of an infinite spin.  The PROM/ufsboot polled
+         * path keeps bit0 hardwired to 1 as before -- their self-test and
+         * arbitration prologue read si_csr bit0 expecting 1 even with no device
+         * selected.  The kernel and PROM read the si_csr at the SAME offset
+         * (0x1000), so distinguish by the guest PC: only the kernel text
+         * (0xf8000000..0xf9000000) sees the busy semantics; the PROM
+         * (0xfefexxxx) and ufsboot (0x0021xxxx) keep bit0 = 1.
+         */
+        if (pc >= 0xf8000000u && pc < 0xf9000000u) {
+            v16 |= s->scsi.dev ? 0x0001 : 0;
+        } else {
+            v16 |= 0x0001;
+        }
         v = v16;
         break;
     }
