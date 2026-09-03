@@ -245,6 +245,7 @@ static void sun3x_update_irq(Sun3xState *s)
          * clock chip's interrupt enable once the handler is in place.
          */
         bool vec_ok = false;
+        bool monitor_active = false;
         if (s->clk_enabled) {
             CPUM68KState *env = &s->cpu->env;
             hwaddr vph = m68k_cpu_get_phys_addr_debug(CPU(s->cpu),
@@ -252,9 +253,23 @@ static void sun3x_update_irq(Sun3xState *s)
             if (vph != -1) {
                 vec_ok = ldl_be_phys(&address_space_memory, vph) != 0;
             }
+            /*
+             * The level-7 NMI is the MONITOR's boot-countdown clock only.  It
+             * must stop once control passes to the SunOS kernel: the kernel
+             * installs its OWN VBR (a level-7 vector meant for memory/parity
+             * errors, not a periodic clock), so continuing to inject the
+             * periodic NMI makes the kernel take spurious level-7 exceptions
+             * that never return -- during a long IPL-7 busy-wait (e.g. its FDC
+             * probe polling the floppy MSR) they nest and overflow the ISP into
+             * a double bus fault.  Deliver only while the monitor's own vector
+             * base is installed (VBR in its resident RAM window 0xfef00000..);
+             * the kernel's VBR (~0xf8003800) gates it off.
+             */
+            monitor_active = env->vbr >= 0xfef00000u && env->vbr < 0xff000000u;
         }
         qemu_set_irq(qdev_get_gpio_in(s->irqc, 7 - 1),
-                     s->clk_pending && s->clk_enabled && vec_ok);
+                     s->clk_pending && s->clk_enabled && vec_ok &&
+                     monitor_active);
     }
 
     /*
@@ -279,16 +294,23 @@ static void sun3x_tick(void *opaque)
     s->tick_latch = true;
 
     /*
-     * Re-arm the SunOS level-7 (NMI) clock edge.  Drop then raise the pending
-     * latch so sun3x_update_irq() deasserts then re-asserts level 7, giving the
-     * NMI a fresh 0->7 edge every tick.  This does not depend on the monitor's
-     * clock handler acking us (its ack goes through the monitor's MMU, which
-     * may map the ack register to a different context than we can see), so the
-     * boot-countdown tick counter advances reliably.
+     * SunOS level-7 (NMI) clock edge — model the hardware edge faithfully:
+     * present a NEW edge only once the previous one has been acknowledged
+     * (the handler pulses SUN3X_CLK_ACK, which clears clk_pending).  A real
+     * periodic clock asserts once per period and holds until acked; it does
+     * NOT re-fire on the next period while the previous interrupt is still
+     * pending.  The old model re-raised a fresh 0->7 edge every tick
+     * regardless of ack, which nests inside a long IPL-7 handler/loop (e.g.
+     * the SunOS kernel's post-sd-open bus-error-guarded peek/poke probe) and
+     * overflows the interrupt stack into a double bus fault.  Only re-arm when
+     * clk_pending is clear; if the handler hasn't acked, leave the level
+     * asserted (already delivered once) so no new edge nests.  The monitor's
+     * boot-countdown handler acks every tick, so its counter still advances.
      */
-    s->clk_pending = false;
-    sun3x_update_irq(s);
-    s->clk_pending = true;
+    if (!s->clk_pending) {
+        s->clk_pending = true;          /* fresh level-7 edge, only if acked */
+    }
+    /* still refresh level-5 (Linux) / soft-int state every tick */
     sun3x_update_irq(s);
 
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
