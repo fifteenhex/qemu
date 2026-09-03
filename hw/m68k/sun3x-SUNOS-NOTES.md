@@ -1369,3 +1369,117 @@ The PROM gates its serial console on first input and ESC aborts the self-test,
 so send ESC ~2.5 s after connect to skip the (pre-existing failing) parity
 subtest and let the auto-boot run; the boot reaches `le0` then hangs at the M8
 DVMA loop. gdb: `set architecture m68k:68030` + `set endian big`.
+
+---
+
+## M8 ROOT-CAUSED (banked) — the kmem spin is a QEMU 68030 PMMU granularity
+## limit: SunOS uses 256-byte-aligned page frames; QEMU softmmu can't go below 512 B
+
+M8 was mis-scoped as a DVMA leak / missing DMA completion.  Deep RE proved it is
+**neither DVMA nor a missing interrupt** — it is a fundamental QEMU-core
+limitation in emulating the 68030 PMMU, which is exactly the PMMU-validation
+target of this whole effort.  The tree is left at the last stable milestone
+(full autoconfig, no crash/panic — verified reaches `le0` deterministically).
+
+### The hang, precisely
+After `le0` the kernel spins in its **kernel-memory allocator** (kmem_alloc ->
+rmalloc -> grow -> rmfree), not DVMA:
+* rmalloc `0xf8018820`; grow (alloc pages, add to map) `0xf8018e20`; rmfree
+  (insert freed block, coalesce) `0xf8018a80`/entry `0xf8018a6e`; inner mapent
+  free-list allocator `0xf8019018`; the spin body `0xf8018b00-0xf8018b5a`.
+* Strings confirm the subsystem: `0xf809a508` "kmem_alloc: returning NULL,
+  nbytes = %x", `0xf809a531` "kmem_alloc", `0xf809a5b3` "kmem_free".
+* The spin re-reads the map head `*(0xf80b0090)=0xff00fff0` and its node fields;
+  the node reads **all-zero**, so rmfree loops forever (spin counter at
+  `0xf80b00a4` climbs into the tens of millions).  It brackets each read with
+  spl/splx purely for consistency — it is NOT waiting for an interrupt.
+
+### The real root cause — 256 B page frames vs QEMU's 512 B softmmu floor
+The kmem/resource-map nodes live in the **kernelmap** VA region (0xff000000+,
+range-checked by kmem_free to `[0xff000000, 0xff80f000)`).  MMU state at the
+hang: `TC030=0x80d07660` (E=1, **PS=13 → 8 KiB pages**, IS=0, TIA=7/TIB=6/TIC=6/
+TID=0), `SRE=0` (supervisor uses CRP, root at phys 0), DTTR/ITTR all 0.
+
+Walking VA `0xff00fff8` (identical for the CPU and the debug/gva2gpa paths):
+```
+L0 entry=000003f8 desc=7ffffd0a dt=2 table=000d4c40
+L1 entry=000d4cc0 desc=000d544a dt=2 table=000d5440
+L2 entry=000d545c desc=00ff4159 dt=1(PAGE) table=00ff4150  -> frame 0x00ff4100
+```
+This is a **resident 8 KiB page** (the walk consumed all 19 index bits; the
+remaining shift == PS == 13).  Its 68030 page-frame field (descriptor bits
+31-8, **256-byte resolution**) is `0x00ff4100` — 256 B aligned but NOT 1 KiB or
+8 KiB aligned.  Per the 68030 (UM 9.5.3) the physical address is
+`frame[31:8] + logical_offset` — the low frame bits ARE part of the address.
+So the correct physical of VA 0xff00fff0 is `0x00ff4100 + 0x1ff0 = 0x00ff60f0`.
+
+**Proof the low frame bits are real (not software/ignored):** the PROM maps its
+own on-board device registers through the identical mechanism — resident 8 KiB
+pages whose frames carry the register offset in the low bits: `0x61001400`
+(INTREG), `0x61001000` (MEMREG), `0x64000800` (EEPROM).  Masking those low bits
+sends the PROM to the wrong register (0x61001400 -> 0x61000000 = ENABLE reg).
+A "mask the frame to 2^PS" fix was implemented and **reverted** because it
+corrupts every PROM device access (traced live).
+
+QEMU's softmmu TLB maps a whole `TARGET_PAGE` to a single physical base, so it
+can only represent a mapping whose frame is TARGET_PAGE aligned.  With
+`TARGET_PAGE_BITS=10` (1 KiB) the 256 B-aligned frame `0x00ff4100` is rounded to
+different bases depending on which sub-page offset first fills the TLB entry
+(`paddr = *physical & ~mask`), so ONE kernel VA resolves to DIFFERENT physical
+pages over time.  Measured: for VA 0xff00fff8 the CPU read 0 while gdb's fresh
+debug-walk read the same VA as 0x00ff60f8 and the ATC reconstructed 0x00ff63f8;
+a gdb store of 0x12345678 to that VA was invisible to the guest's own load.
+The kernel wrote its rmap sentinel through one translation (a valid node landed
+at phys 0x00ff5ff0: next=0 prev=0 addr=0xff00c120 size=0x1ee0) and reads it back
+through another (0x00ff60f0/0x00ff63f0 = all zero) -> rmfree spins forever.
+
+### Why it can't be cleanly fixed here (the hard boundary)
+The correct fix is `TARGET_PAGE_BITS=8` (256 B) so the softmmu granularity
+matches the 68030's 256 B frame resolution.  **QEMU forbids it:**
+`TARGET_PAGE_BITS_MIN = 9` (include/exec/page-vary.h) — "the minimum comes from
+the number of bits required for maximum alignment (6) and TLB_FLAGS_MASK (3)".
+The softmmu TLB packs 3 flag bits into the low address bits, so 512 B is the
+hard floor for ALL targets.  Building with 8 fails the static assert
+`TARGET_PAGE_BITS < TARGET_PAGE_BITS_MIN`.  And 512 B would not help anyway:
+the frame is only 256 B aligned.  This is an architectural limit of QEMU's
+softmmu, not a target bug.
+
+Rejected approaches (all tried/analysed):
+* Mask frame to 2^PS for resident pages — breaks PROM device mappings (reverted).
+* `paddr = *physical - (addr & mask)` consistency rounding — makes translation
+  self-consistent but shifts the physical base, aliasing/corrupting adjacent
+  pages.
+* `TARGET_PAGE_BITS=8` — blocked by TARGET_PAGE_BITS_MIN=9 (softmmu flag bits).
+
+### What a genuine fix needs (resume handoff)
+One of, all substantial core-QEMU work:
+1. Lower `TARGET_PAGE_BITS_MIN` and rework the softmmu TLB so `TLB_FLAGS_MASK`
+   no longer needs 3 low address bits (or store flags elsewhere), enabling a
+   256 B `TARGET_PAGE` for m68k.  Broadest blast radius (all targets).
+2. An m68k-specific slow path: when a resident page's frame is not
+   `TARGET_PAGE` aligned, do NOT cache it via `tlb_set_page`; force every access
+   through `get_physical_address_030` (mark the entry like TLB_MMIO / always
+   re-fill) so each translation recomputes `frame[31:8] + offset` correctly and
+   consistently.  Most targeted; needs care to keep RAM semantics + speed.
+3. Emulate the 68030 ATC as the sole translation cache for such pages.
+
+### Landmarks for resume
+* kmem spin `0xf8018b00-0xf8018b5a`; rmalloc `0xf8018820`; grow `0xf8018e20`;
+  rmfree `0xf8018a80`; mapent alloc `0xf8019018`; map head `0xf80b0090`;
+  spl helpers `0xf8064400-0xf8064450`.
+* Kernelmap VA `0xff000000..0xff80f000`; example resident page: VA 0xff00e000,
+  L2 desc `0x00ff4159`, frame `0x00ff4100`, correct phys base `0x00ff4000`+off.
+* MMU regs at the hang: TC030 `0x80d07660`, CRP `7fff0003/00000000`,
+  SRP030 `7fff0003/00ffa000`, DTTR/ITTR 0, MMUSR 3.
+* PMMU walk + ATC code: `target/m68k/helper.c` `get_physical_address_030`
+  (walk 1142-1349, ATC lookup 1098-1117, ATC install 1338-1364), leaf physical
+  computation 1300-1337, `tlb_set_page` caller ~1552.  `TARGET_PAGE_BITS` in
+  `target/m68k/cpu-param.h`; floor in `include/exec/page-vary.h`.
+
+MILESTONE STANDING: PROM bring-up -> IDPROM -> root mount -> full SCSI probe ->
+sd config -> sd-open completion -> FDC probe -> full autoconfig
+(sm0/st0-3/sr0/sd0-sd6/fdc0/fd0/zs0/zs1/le0), no crash/panic — all committed and
+stable.  Reaching single-user is blocked at M8 by the QEMU softmmu 512 B page
+floor vs SunOS's 256 B 68030 page frames.  This is the definitive validation
+result: QEMU's 68030 PMMU cannot faithfully translate SunOS 4.1.1's kernelmap
+without sub-512-byte softmmu pages.
