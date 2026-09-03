@@ -177,6 +177,12 @@ typedef struct Sun3xState {
     NCR5380State scsi;          /* SunOS: "si" NCR5380 @ 0x66000000 */
     MemoryRegion sireg;         /* SunOS: si DMA/CSR block @ 0x66001000 */
     MemoryRegion scsi_a;        /* SunOS: kernel "sm" 5380 alias @ 0x66000108 */
+    MemoryRegion fdc;           /* SunOS: 82072 FDC @ 0x6e000000 (no drive) */
+    uint8_t fdc_st0;            /* FDC: pending SENSE-INTERRUPT ST0 result */
+    uint8_t fdc_fifo[8];        /* FDC: result bytes to return via data reg */
+    uint8_t fdc_res_len, fdc_res_pos;
+    uint8_t fdc_cmd[8];        /* FDC: command bytes being collected */
+    uint8_t fdc_cmd_len, fdc_cmd_need;
     uint32_t si_dma_addr;       /* si DMA address (into DVMA space) */
     uint32_t si_dma_count;      /* si DMA byte count */
     uint16_t si_csr;            /* si control/status register */
@@ -245,7 +251,6 @@ static void sun3x_update_irq(Sun3xState *s)
          * clock chip's interrupt enable once the handler is in place.
          */
         bool vec_ok = false;
-        bool monitor_active = false;
         if (s->clk_enabled) {
             CPUM68KState *env = &s->cpu->env;
             hwaddr vph = m68k_cpu_get_phys_addr_debug(CPU(s->cpu),
@@ -253,23 +258,18 @@ static void sun3x_update_irq(Sun3xState *s)
             if (vph != -1) {
                 vec_ok = ldl_be_phys(&address_space_memory, vph) != 0;
             }
-            /*
-             * The level-7 NMI is the MONITOR's boot-countdown clock only.  It
-             * must stop once control passes to the SunOS kernel: the kernel
-             * installs its OWN VBR (a level-7 vector meant for memory/parity
-             * errors, not a periodic clock), so continuing to inject the
-             * periodic NMI makes the kernel take spurious level-7 exceptions
-             * that never return -- during a long IPL-7 busy-wait (e.g. its FDC
-             * probe polling the floppy MSR) they nest and overflow the ISP into
-             * a double bus fault.  Deliver only while the monitor's own vector
-             * base is installed (VBR in its resident RAM window 0xfef00000..);
-             * the kernel's VBR (~0xf8003800) gates it off.
-             */
-            monitor_active = env->vbr >= 0xfef00000u && env->vbr < 0xff000000u;
         }
+        /*
+         * The periodic level-7 (NMI) clock serves BOTH the monitor (boot
+         * countdown) AND the SunOS kernel (its hz clock -- the kernel enables
+         * it via the interrupt register bit 7).  Deliver it whenever a level-7
+         * handler is installed (vec_ok).  sun3x_tick presents a fresh 0->7 edge
+         * each period (drop-then-raise); this does not nest because the only
+         * long IPL-7 busy-wait (the kernel's FDC-probe MSR poll) is now avoided
+         * by the 82072 responder, so there is no long IPL-7 section to nest in.
+         */
         qemu_set_irq(qdev_get_gpio_in(s->irqc, 7 - 1),
-                     s->clk_pending && s->clk_enabled && vec_ok &&
-                     monitor_active);
+                     s->clk_pending && s->clk_enabled && vec_ok);
     }
 
     /*
@@ -294,23 +294,18 @@ static void sun3x_tick(void *opaque)
     s->tick_latch = true;
 
     /*
-     * SunOS level-7 (NMI) clock edge — model the hardware edge faithfully:
-     * present a NEW edge only once the previous one has been acknowledged
-     * (the handler pulses SUN3X_CLK_ACK, which clears clk_pending).  A real
-     * periodic clock asserts once per period and holds until acked; it does
-     * NOT re-fire on the next period while the previous interrupt is still
-     * pending.  The old model re-raised a fresh 0->7 edge every tick
-     * regardless of ack, which nests inside a long IPL-7 handler/loop (e.g.
-     * the SunOS kernel's post-sd-open bus-error-guarded peek/poke probe) and
-     * overflows the interrupt stack into a double bus fault.  Only re-arm when
-     * clk_pending is clear; if the handler hasn't acked, leave the level
-     * asserted (already delivered once) so no new edge nests.  The monitor's
-     * boot-countdown handler acks every tick, so its counter still advances.
+     * SunOS level-7 (NMI) clock edge.  Present a fresh 0->7 edge every tick so
+     * both the monitor's boot-countdown handler and the SunOS kernel's hz clock
+     * (which the kernel enables via interrupt-register bit 7) get a periodic
+     * interrupt regardless of whether their ack goes through a mapping we can
+     * observe.  This nests inside a long IPL-7 busy-wait, but the only such
+     * wait — the kernel's FDC-probe MSR poll — is now avoided by the 82072
+     * responder (it never times out), so there is no long IPL-7 section for the
+     * edge to nest in.
      */
-    if (!s->clk_pending) {
-        s->clk_pending = true;          /* fresh level-7 edge, only if acked */
-    }
-    /* still refresh level-5 (Linux) / soft-int state every tick */
+    s->clk_pending = false;
+    sun3x_update_irq(s);
+    s->clk_pending = true;
     sun3x_update_irq(s);
 
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -705,6 +700,161 @@ static const MemoryRegionOps sun3x_absorb_ops = {
 };
 
 /*
+ * Minimal Intel 82072 floppy controller (Sun-3/80 "fd") at OBIO 0x6e000000.
+ * We have no floppy image, so this models an empty controller with NO DRIVE
+ * present: the SunOS kernel's fd probe drives the standard NEC/82072 command/
+ * result handshake and must conclude "drive absent" and return WITHOUT ever
+ * hitting its timeout/reset path (which overflows the tiny early ISP).  The
+ * OBIO absorb returned 0 for the MSR, so the poll for (msr & 0xc0)==0x80 never
+ * saw "ready" and timed out -> crash.  Register map (asm/sun3x.h): MSR/data at
+ * 0x6e000000 (status @+0, data @+1), FCR @0x6e000400, FVR @0x6e000800.
+ */
+#define FDC_MSR_RQM   0x80   /* request for master (host may xfer a byte) */
+#define FDC_MSR_DIO   0x40   /* data direction: 1 = controller -> host */
+#define FDC_MSR_CB    0x10   /* command busy (in command/exec/result phase) */
+
+static const uint8_t fdc_cmd_len_tbl[32] = {
+    /* command byte low 5 bits (0x1f) -> total command length incl. opcode */
+    [0x03] = 3,  /* SPECIFY */
+    [0x04] = 2,  /* SENSE DRIVE STATUS */
+    [0x07] = 2,  /* RECALIBRATE */
+    [0x08] = 1,  /* SENSE INTERRUPT STATUS */
+    [0x0a] = 2,  /* READ ID */
+    [0x0f] = 3,  /* SEEK */
+    [0x0e] = 1,  /* DUMPREG (82072) */
+    [0x10] = 1,  /* VERSION */
+    [0x12] = 2,  /* PERPENDICULAR MODE */
+    [0x13] = 4,  /* CONFIGURE */
+    [0x14] = 1,  /* LOCK */
+    [0x02] = 9, [0x05] = 9, [0x06] = 9, [0x09] = 9, [0x0c] = 9, [0x0d] = 9,
+};
+
+/* set up the result bytes the host will read from the data register */
+static void fdc_set_result(Sun3xState *s, const uint8_t *r, int n)
+{
+    int i;
+    for (i = 0; i < n && i < (int)sizeof(s->fdc_fifo); i++) {
+        s->fdc_fifo[i] = r[i];
+    }
+    s->fdc_res_len = n;
+    s->fdc_res_pos = 0;
+}
+
+/* a full command has been collected in s->fdc_cmd[] -> execute it */
+static void fdc_exec(Sun3xState *s)
+{
+    uint8_t cmd = s->fdc_cmd[0] & 0x1f;
+    uint8_t unit = s->fdc_cmd_len > 1 ? (s->fdc_cmd[1] & 3) : 0;
+    uint8_t r[10];
+
+    switch (cmd) {
+    case 0x08: /* SENSE INTERRUPT STATUS: ST0, PCN */
+        r[0] = s->fdc_st0;      /* the ST0 latched by the last seek/recal */
+        r[1] = 0;               /* present cylinder = 0 */
+        fdc_set_result(s, r, 2);
+        s->fdc_st0 = 0x80;      /* consumed; further senses -> invalid cmd */
+        break;
+    case 0x07: /* RECALIBRATE (no result phase) */
+    case 0x0f: /* SEEK (no result phase) */
+        /* absent drive: seek/recalibrate ends with Equipment Check / not
+         * ready -> ST0 = IC(01)|SE(20)|EC(10)|unit.  The driver reads this
+         * via the following SENSE INTERRUPT STATUS and marks the drive
+         * absent. */
+        s->fdc_st0 = 0x70 | unit;
+        s->fdc_res_len = 0;
+        break;
+    case 0x04: /* SENSE DRIVE STATUS: ST3 (drive not ready, no track0) */
+        r[0] = 0x00 | unit;     /* ST3: not ready, WP/T0/ready all clear */
+        fdc_set_result(s, r, 1);
+        break;
+    case 0x0a: /* READ ID: absent -> ST0 abnormal, ST1 no-data, ... (7) */
+        r[0] = 0x40 | unit; r[1] = 0x05; r[2] = 0x00;
+        r[3] = 0; r[4] = 0; r[5] = 0; r[6] = 0;
+        fdc_set_result(s, r, 7);
+        break;
+    case 0x10: /* VERSION -> 0x90 (enhanced 82072/765B) */
+        r[0] = 0x90; fdc_set_result(s, r, 1);
+        break;
+    case 0x14: /* LOCK -> lock bit echoed */
+        r[0] = (s->fdc_cmd[0] & 0x80) ? 0x10 : 0x00;
+        fdc_set_result(s, r, 1);
+        break;
+    case 0x0e: /* DUMPREG -> 10 zero bytes */
+        memset(r, 0, 10); fdc_set_result(s, r, 10);
+        break;
+    case 0x03: /* SPECIFY - no result */
+    case 0x12: /* PERPENDICULAR MODE - no result */
+    case 0x13: /* CONFIGURE - no result */
+        s->fdc_res_len = 0;
+        break;
+    default:   /* unknown/data commands: invalid-command result */
+        r[0] = 0x80; fdc_set_result(s, r, 1);
+        break;
+    }
+}
+
+static uint64_t sun3x_fdc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Sun3xState *s = opaque;
+    uint8_t v = 0;
+
+    switch (addr) {
+    case 0x00: /* Main Status Register */
+        v = FDC_MSR_RQM;                    /* always ready for a byte */
+        if (s->fdc_res_pos < s->fdc_res_len) {
+            v |= FDC_MSR_DIO | FDC_MSR_CB;  /* result phase: read from us */
+        } else if (s->fdc_cmd_len) {
+            v |= FDC_MSR_CB;                /* mid command phase */
+        }
+        break;
+    case 0x01: /* data / FIFO */
+        if (s->fdc_res_pos < s->fdc_res_len) {
+            v = s->fdc_fifo[s->fdc_res_pos++];
+        }
+        break;
+    default:   /* FCR (0x400) / FVR (0x800) read back */
+        v = 0;
+        break;
+    }
+    return v;
+}
+
+static void sun3x_fdc_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    Sun3xState *s = opaque;
+
+    switch (addr) {
+    case 0x01: /* data / FIFO: collect a command byte */
+        if (s->fdc_cmd_len == 0) {
+            s->fdc_cmd[0] = val;
+            s->fdc_cmd_need = fdc_cmd_len_tbl[val & 0x1f];
+            if (s->fdc_cmd_need == 0) {
+                s->fdc_cmd_need = 1;        /* unknown: 1-byte, invalid */
+            }
+            s->fdc_cmd_len = 1;
+        } else if (s->fdc_cmd_len < (int)sizeof(s->fdc_cmd)) {
+            s->fdc_cmd[s->fdc_cmd_len++] = val;
+        }
+        if (s->fdc_cmd_len >= s->fdc_cmd_need) {
+            fdc_exec(s);
+            s->fdc_cmd_len = 0;
+        }
+        break;
+    case 0x00: /* status/DCR write - absorb */
+    default:   /* FCR (0x400) / FVR (0x800) - absorb */
+        break;
+    }
+}
+
+static const MemoryRegionOps sun3x_fdc_ops = {
+    .read = sun3x_fdc_read,
+    .write = sun3x_fdc_write,
+    .valid = { .min_access_size = 1, .max_access_size = 1 },
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
+/*
  * Absent-memory (floating bus) reads.  A depopulated 3/80 memory bank still
  * ACKs the access (no bus error) but the data lines float high, so a read
  * returns all-ones.  The PROM's memory sizer relies on this: after writing a
@@ -760,7 +910,21 @@ static uint64_t sun3x_memreg_read(void *opaque, hwaddr addr, unsigned size)
 {
     Sun3xState *s = opaque;
 
-    return s->memreg;
+    /*
+     * Only the control bits (INTENA 0x40, TEST 0x20, CHECK 0x10) are
+     * read/write.  The error-status bits -- INTR (0x80) and the byte-error
+     * indicators (ERR24/16/08/00 = 0x0f) -- are latched by the memory
+     * controller ONLY on a real ECC/parity fault, never by a CPU write, so
+     * they read back as 0 here (we inject no memory errors).  This matters
+     * because the SunOS kernel's level-7 handler reads this register to tell a
+     * memory-error NMI apart from the periodic clock: the PROM's own NMI stub
+     * (0xfefe0566), which the level-7 clock edge can still vector through early
+     * in boot, writes 0xff/0xfe here, and reading that back verbatim made the
+     * kernel see INTR + all error bits set and panic "unknown memory error".
+     * Masking to the control bits lets the kernel correctly read "no memory
+     * error" and go on to service the clock.
+     */
+    return s->memreg & 0x70;
 }
 
 static void sun3x_memreg_write(void *opaque, hwaddr addr, uint64_t val,
@@ -1171,6 +1335,17 @@ static void sun3x_init(MachineState *machine)
                               "sun3x.obio", 0x24000000);
         memory_region_add_subregion_overlap(sysmem, 0x58000000,
                                              &s->obio[0], -1);
+
+        /*
+         * 82072 floppy controller (obio 0x6e000000), overlaid on the OBIO
+         * absorb.  Models an empty controller (no drive) so the SunOS kernel's
+         * fd probe concludes "drive absent" via the NEC handshake instead of
+         * timing out on a dead MSR and crashing its timeout/reset handler.
+         */
+        s->fdc_st0 = 0x80;
+        memory_region_init_io(&s->fdc, NULL, &sun3x_fdc_ops, s,
+                              "sun3x.fdc", 0x1000);
+        memory_region_add_subregion_overlap(sysmem, 0x6e000000, &s->fdc, 1);
 
         /* real bus error register (overlaid on the enareg absorb block) */
         memory_region_init_io(&s->buserr_mr, NULL, &sun3x_buserr_ops, s,
