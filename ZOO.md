@@ -68,7 +68,7 @@ stock Linux `sun3x` is byte-for-byte unchanged.
 
 | Machine (`-M`) | CPU | Milestone | Notes |
 |---|---|---|---|
-| `apollo-dn3000` | 68020 (68851) | ✅ Linux `-kernel` (fb console) · ⧗ **Domain/OS AEGIS SR10.4 reaches its `kernel(8), revision 10.4` banner**, walled at a post-banner page-build demand-fault storm | `APOLLO-NOTES.md`, `APOLLO-DOMAINOS-{HOWTO,NOTES}.md`, `hw/m68k/apollo-display-NOTES.md`, `APOLLO-DN3000-RESEARCH.md` |
+| `apollo-dn3000` | 68020 (68851) | ✅ Linux `-kernel` (fb console) · ⧗ **Domain/OS AEGIS SR10.4 reaches its `kernel(8), revision 10.4` banner + full early init**; walled at a post-banner stall proven (four ways) to be an **AEGIS-internal boot-sync race**, not a device/config/CPU bug. OMTI-8621 + SC-499 tape + Am9517A DMA modelled | `APOLLO-NOTES.md`, `APOLLO-DOMAINOS-{HOWTO,NOTES}.md`, `hw/m68k/apollo-display-NOTES.md`, `APOLLO-DN3000-RESEARCH.md` |
 
 Includes an OMTI-8621 Winchester, Archive SC-499 cartridge tape + Am9517A DMA,
 and a linear framebuffer — enough to run the SR10.4 tape install (`invol`)
