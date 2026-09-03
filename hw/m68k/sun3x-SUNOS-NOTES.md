@@ -1036,3 +1036,69 @@ Landmarks for the next iteration:
   probe-success state  28  (set 0xf8073c7a) ; found bitmask  a0@(11)
   err2 diag printf     0xf8072c46
   si_csr / 5380 base   virt 0xff003000 / 0xff002000 = phys 0x66001100 / 0x66000100
+
+## M5 RESOLVED — kernel SCSI probe completes; autoconfig reaches sd config
+
+The kernel "sm" probe wedge is crossed.  Root cause (traced with per-register
+kernel-PC logging, self-reaped QEMU, unique ports): the kernel completion is
+**polled on si_csr bit0 as a "bus/command busy" flag**, NOT interrupt-driven
+(the kernel never writes INTR_EN 0x0004).  Its state-machine inner loop
+(0xf8074dc2) re-runs the body WHILE bit0==1 and exits when bit0==0; the entry
+gate (0xf80735c2, si_csr & 3) and poll loop (0xf8073548) also need bit0==1.  We
+hardwired bit0=1, so the loop never exited.
+
+Fix (committed): present si_csr bit0 = 1 only while a device is selected (a
+command in flight), gated to kernel PCs (0xf8000000..0xf9000000) so the
+PROM/ufsboot keep bit0=1 (their self-test/arbitration read bit0 expecting 1 with
+no device -- the old bit0=dev dead-end).  Also: fire selection on a staged CDB
+rather than the MR "arbitrate" bit (that bit is just bit 0 of the target id, set
+only for odd targets), and use scsi_cdb_length() for the CDB length (the sd
+driver pads reg0 to 16 bytes).  Result:
+
+    sm0 at obio 0x66000000 ; st0-3 ; sr0 ; sd0 sd1 sd2 sd3 sd4 sd6
+      (sd6 = slave 24 = target 3 = the attached disk)
+
+The probe now scans ALL targets, absent ids read bit0=0 (clean no-device),
+present target 3 holds bit0=1 through its command and reaches probe-success
+state 28 -> found-bitmask bit set -> sd6 configured.  root still mounts
+(root on sd6a).  All prior gates intact.
+
+## M6 (banked boundary) — sd device-open completion needs ASYNC completion
+
+After sd config the kernel opens sd6 and issues a TEST-UNIT-READY, which wedges
+in the STATUS phase.  Fully traced:
+* The kernel status handler (0xf8073f60) reads the GOOD status, sets state=25,
+  writes ICR=0x10 (ACK at 0xf8073f84) and **HOLDS ACK** (does not release it),
+  then re-runs its state machine expecting the target already in MESSAGE IN.
+  Our model only advanced STATUS->MESSAGE on ACK *release* (which the kernel
+  never does), so CSB_REQ stayed clear (reg3=0x20) and it spun.
+* Making the kernel's ACK-assert advance the bus (STATUS->MESSAGE IN, deliver
+  the 0x00 COMMAND-COMPLETE message, then bus-free at the MESSAGE-IN ACK, all
+  gated to kernel PCs) DOES complete the command -- traced: phase advances
+  12->28, the kernel reads the message (reg0=0x00), asserts ICR=0x12 (ACK|ATN),
+  dev clears, only ~11 register ops total (no spin).
+
+BUT that completion then **crashes the kernel** (deterministic): a stack
+overflow at IPL 7 (fault at f808dffc, A7=f808e000, abort to the PROM
+double-fault handler 0xfefe0502).  Root cause: our model completes commands
+**synchronously/instantly**, so the kernel's completion callback (0xf8074d6e)
+re-issues the next command inline, which completes instantly again, recursing
+until the ISP stack overflows.  On real hardware the sm completion is
+**asynchronous** -- the command posts an interrupt, the callback returns, and
+the next command starts from a fresh context.
+
+So the sd-open (and all subsequent multi-command sequences: READ CAPACITY, the
+disklabel/VTOC READ, root remount) need an **asynchronous, interrupt-driven sm
+completion** model: assert the si/5380 completion interrupt on command-complete
+(and reflect SBC_IP/DMA_IP + the Am9516 UDC for data transfers), let the kernel
+ISR advance the state machine and post the callback, so completions do not
+recurse.  This is the interrupt-driven "sm" driver the earlier notes scoped as
+the large sub-boundary; the polled-probe path (bit0 busy) got us cleanly to sd
+config, but device I/O needs the async path.  Banked here with the reverted
+ACK-advance experiment documented (it advances the command but must be paired
+with async completion to avoid the recursion crash).
+
+Landmarks: status handler 0xf8073f60 (ACK 0xf8073f84, held); completion callback
+0xf8074d6e; bit0 poll 0xf8074dc2; crash = ISP overflow at IPL 7 -> PROM
+0xfefe0502.  The ACK-advance + CDB-length + selection + bit0 changes are the
+prerequisites already in place.
