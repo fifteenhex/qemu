@@ -1154,3 +1154,68 @@ si/ncr5380 bring-up; the polled probe -> sd config milestone is solid and
 committed.  Landmarks: peek 0xf8059d92 / poke 0xf8059f0a; ACK-hold status handler
 0xf8073f60 (ACK 0xf8073f84); completion handler 0xf807292c; crash = ISP overflow
 at IPL 7 -> PROM 0xfefe0502.
+
+## M6 DEFINITIVE BANK — sd-open completion + level-7 NMI fixed; next wall is the FDC floppy probe
+
+Combined the two levers from the M6 investigation.  Result: the level-7 NMI
+storm is eliminated (a real fix, committed), the sd-open TUR completes, but the
+kernel then reaches a NEW materially-separate subsystem — the **floppy
+controller (FDC) probe** — and crashes there.  Per the bank condition, banked
+definitively at that sub-boundary; the NMI fix is kept, the sd-open ACK-advance
+is documented (reverted, since alone it exposes the FDC crash).
+
+### Fix kept (committed): level-7 NMI is monitor-only + edge-honest
+The `-d int` log proved the crash was a **level-7 NMI storm**: after sd-open the
+kernel runs a long IPL-7 busy-wait, and our periodic level-7 clock kept
+injecting a fresh 0->7 edge EVERY tick even into the kernel phase, nesting
+(INT 7215..8361, PC f8068014-18, sp walking f8095e08 -> f808e000) -> ISP
+overflow -> PROM double fault (0xfefe0502).  Two model bugs fixed:
+(1) deliver the level-7 clock only while the MONITOR's VBR is installed
+(0xfef00000..; the kernel VBR ~0xf8003800 gates it off) — the kernel's level-7
+vector is for memory/parity errors, not a periodic clock; and (2) present a
+fresh edge only after the prior one is acked (SUN3X_CLK_ACK), matching the
+m68k edge-triggered NMI, instead of re-raising every tick.  Validated: no
+regression to PROM/root/autoconfig; Linux tick path untouched (SunOS-gated).
+
+### sd-open completion (ACK-advance) — the prerequisite, reverted
+The kernel sd status handler (0xf8073f60) ACKs the status byte (ICR=0x10 at
+0xf8073f84) and HOLDS ACK, expecting the target already in MESSAGE IN.  Making
+the kernel's ACK-assert advance STATUS->MESSAGE IN and bus-free (gated to kernel
+PCs) completes the TUR cleanly (traced: phase 12->28, reads 0x00 message, dev
+clears).  With the NMI fix, this no longer storms — but it advances the kernel
+into the FDC probe, which crashes (below), so the ACK-advance is reverted to
+keep the tree crash-free.  It is the correct completion handshake and the entry
+point for finishing sd-open once the FDC path is modelled.
+
+### The new wall — kernel FDC (floppy) probe
+After sd-open the kernel probes the **82072 floppy controller** (obio FDC @
+0x6e000000).  It polls the FDC Main Status Register (via the pointer at
+0xf80a35b8) for `(msr & 0xc0) == 0x80` (RQM set, DIO clear = ready), up to
+2000× with a delay loop (f8067fXX).  Our OBIO absorb returns 0 for 0x6e000000,
+so the MSR is never "ready" -> the probe times out and prints
+`FDCMD==>TIMEOUT, msr=0x%x`, then calls the timeout/reset handler **0xf8067d56**,
+which faults on its entry `moveml %d7/%a5,%sp@` at **0xf8067d5a**: the interrupt
+stack it runs on is tiny/exhausted (A6=f808e000, A7=f808dff8, fault at
+f808dff4) -> double bus fault -> PROM 0xfefe0502.  (Separately, a bus-error-
+GUARDED peek probe at physical **0x7e200000** — above the 0x58000000..0x7c000000
+OBIO-absorb window, so it bus-errors — faults ~12× but is handled cleanly with a
+stable stack; that one is fine.)
+
+### What the FDC path needs (next task)
+This is the floppy subsystem, materially separate from the si/ncr5380 bring-up:
+* A minimal 82072 FDC responder at 0x6e000000 so the probe does not spin to
+  timeout: respond to the reset/SENSE-INTERRUPT/SPECIFY sequence with an MSR
+  that goes ready (0x80) and a result that reports **no drive present**, so the
+  kernel concludes "no floppy" and moves on (we have no floppy image).
+* AND/OR understand the tiny/exhausted interrupt stack the timeout handler runs
+  on (A7~f808e000) — the crash is the ISP overflow at f8067d5a, so even a clean
+  timeout may need the kernel's early interrupt-stack to be larger / the handler
+  reached on the right stack.  RE why f8067d56 is entered with A7≈ISP bottom.
+Landmarks: FDC MSR poll loop f8067fXX (msr ptr *0xf80a35b8); timeout handler
+0xf8067d56 (crash f8067d5a, moveml on tiny ISP); FDC base 0x6e000000; guarded
+peek probe phys 0x7e200000; sd status ACK-hold handler 0xf8073f60 (ACK
+0xf8073f84).
+
+MILESTONE recap: bdevvp -> root mount -> Sun-3/80 recognized -> full SCSI probe
++ sd0-sd6 config, all committed and stable.  sd-open completion + the FDC
+floppy subsystem is the documented next frontier.
